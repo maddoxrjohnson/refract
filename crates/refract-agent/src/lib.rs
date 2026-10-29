@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod git;
+pub mod launch;
 pub mod procs;
 pub mod scan;
 pub mod server;

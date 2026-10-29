@@ -65,6 +65,8 @@ An `id` may be any JSON number or string and is echoed back unchanged. A line wh
 
 The first `listRepos` starts loading in the background and answers immediately with `{"repos": [...], "loading": true}`, listing what has loaded so far. Linux repos load first and repos under `/mnt/` after them. Repos arrive as `repoChanged` events as each phase finishes, and `{"event": "loadComplete"}` follows once everything is reported. After that, `loading` is `false`. A `getRepo` for a repo that has not loaded yet is answered once it has.
 
+`prepareLaunch` leaves a request file for the VS Code extension and answers with the folder URI to open; [launch.md](launch.md) describes the launch path.
+
 Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
 
 The helper never writes anything else to standard output; logs go to standard error.

@@ -30,7 +30,8 @@ pub mod code {
     pub const INVALID_PARAMS: i32 = -32602;
     /// The helper failed while handling the request.
     pub const INTERNAL_ERROR: i32 = -32603;
-    /// `getRepo` named a path that is not a known repo.
+    /// `getRepo` named a path that is not a known repo, or `prepareLaunch` a path that
+    /// is not a directory.
     pub const REPO_NOT_FOUND: i32 = 1;
 }
 
@@ -52,6 +53,9 @@ pub enum Method {
     ListRepos,
     /// One repo by path: answered with a [`RepoSnapshot`].
     GetRepo { path: String },
+    /// Leaves a request file for the VS Code extension: answered with a
+    /// [`LaunchTicket`]. See `docs/launch.md`.
+    PrepareLaunch { path: String, mode: LaunchMode },
     /// Answered with `null`, then the helper exits.
     Shutdown,
 }
@@ -94,6 +98,7 @@ pub enum Reply {
     Hello(Hello),
     Repos(RepoList),
     Repo(Box<RepoSnapshot>),
+    Launch(LaunchTicket),
     /// `null`, for methods with nothing to return.
     Done,
 }
@@ -121,6 +126,54 @@ pub struct RepoList {
     /// the rest arrive as `repoChanged` events, and `loadComplete` follows.
     #[serde(default)]
     pub loading: bool,
+}
+
+/// Version of the [`LaunchRequest`] file format.
+pub const LAUNCH_REQUEST_VERSION: u32 = 1;
+
+/// What `prepareLaunch` should start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LaunchMode {
+    /// A new agent, with an optional opening prompt.
+    New {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
+    /// Resume an existing session.
+    Resume { session_id: String },
+}
+
+/// The result of `prepareLaunch`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchTicket {
+    pub request_id: String,
+    /// Generated for a new agent; the given one for a resume.
+    pub session_id: String,
+    /// What to pass to `code --folder-uri`.
+    pub folder_uri: String,
+}
+
+/// The request file `prepareLaunch` leaves for the VS Code extension, as
+/// `<requestId>.json` in the launch directory.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LaunchRequest {
+    /// [`LAUNCH_REQUEST_VERSION`].
+    pub version: u32,
+    pub request_id: String,
+    /// Absolute Linux path of the repo, with no trailing slash.
+    pub folder: String,
+    /// The command to run in the terminal.
+    pub argv: Vec<String>,
+    /// The terminal tab's name.
+    pub title: String,
+    pub created_at: DateTime<Utc>,
 }
 
 /// An unsolicited message from the helper.
@@ -309,7 +362,7 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         ));
     };
     let takes_params = match method {
-        "getRepo" => true,
+        "getRepo" | "prepareLaunch" => true,
         "ping" | "listRepos" | "shutdown" => false,
         _ => {
             return Err(fail(
@@ -453,6 +506,89 @@ mod tests {
         assert_eq!(
             round_trip(&shutdown),
             json!({"id": 4, "method": "shutdown"})
+        );
+    }
+
+    #[test]
+    fn launch_messages_round_trip() {
+        let new = Request {
+            id: 5.into(),
+            method: Method::PrepareLaunch {
+                path: "/home/dev/projects/tidepool-api".into(),
+                mode: LaunchMode::New { prompt: None },
+            },
+        };
+        assert_eq!(
+            round_trip(&new),
+            json!({"id": 5, "method": "prepareLaunch", "params": {
+                "path": "/home/dev/projects/tidepool-api", "mode": {"kind": "new"}}})
+        );
+        let req = parse_request(
+            r#"{"id":6,"method":"prepareLaunch","params":{"path":"/x","mode":{"kind":"new","prompt":"Fix it"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.method,
+            Method::PrepareLaunch {
+                path: "/x".into(),
+                mode: LaunchMode::New {
+                    prompt: Some("Fix it".into())
+                }
+            }
+        );
+        let req = parse_request(
+            r#"{"id":7,"method":"prepareLaunch","params":{"path":"/x","mode":{"kind":"resume","sessionId":"abc"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.method,
+            Method::PrepareLaunch {
+                path: "/x".into(),
+                mode: LaunchMode::Resume {
+                    session_id: "abc".into()
+                }
+            }
+        );
+        let err = parse_request(
+            r#"{"id":8,"method":"prepareLaunch","params":{"path":"/x","mode":{"kind":"resume"}}}"#,
+        )
+        .unwrap_err();
+        assert_eq!(err.error.code, code::INVALID_PARAMS);
+
+        let ticket = Response::ok(
+            5,
+            Reply::Launch(LaunchTicket {
+                request_id: "6f1c0000-0000-4000-8000-000000000001".into(),
+                session_id: "0b7e0000-0000-4000-8000-000000000002".into(),
+                folder_uri: "vscode-remote://wsl+Ubuntu/home/dev/projects/tidepool-api".into(),
+            }),
+        );
+        assert_eq!(
+            round_trip(&ticket),
+            json!({"id": 5, "result": {
+                "requestId": "6f1c0000-0000-4000-8000-000000000001",
+                "sessionId": "0b7e0000-0000-4000-8000-000000000002",
+                "folderUri": "vscode-remote://wsl+Ubuntu/home/dev/projects/tidepool-api"}})
+        );
+
+        let file = LaunchRequest {
+            version: LAUNCH_REQUEST_VERSION,
+            request_id: "6f1c0000-0000-4000-8000-000000000001".into(),
+            folder: "/home/dev/projects/tidepool-api".into(),
+            argv: vec!["claude".into(), "--resume".into(), "abc".into()],
+            title: "Resume".into(),
+            created_at: "2026-10-29T17:54:44Z".parse().unwrap(),
+        };
+        assert_eq!(
+            round_trip(&file),
+            json!({
+                "version": 1,
+                "requestId": "6f1c0000-0000-4000-8000-000000000001",
+                "folder": "/home/dev/projects/tidepool-api",
+                "argv": ["claude", "--resume", "abc"],
+                "title": "Resume",
+                "createdAt": "2026-10-29T17:54:44Z"
+            })
         );
     }
 

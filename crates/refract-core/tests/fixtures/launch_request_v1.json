@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "requestId": "6f1c2a7e-1b8d-4c3e-9a5f-2d4b6e8f0a1c",
+  "folder": "/home/example/projects/demo-repo",
+  "argv": ["claude", "--session-id", "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e", "--", "This repo has uncommitted changes.\tReview `git diff`."],
+  "title": "New agent",
+  "createdAt": "2026-10-29T17:54:44Z"
+}

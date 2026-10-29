@@ -1,0 +1,45 @@
+{
+  "name": "refract",
+  "displayName": "Refract",
+  "description": "Opens a terminal running an agent when Refract launches this folder.",
+  "version": "0.1.1",
+  "publisher": "refract",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/maddoxrjohnson/refract"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true
+    }
+  },
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "dist/extension.js",
+  "scripts": {
+    "vscode:prepublish": "npm run build",
+    "build": "esbuild src/extension.ts --bundle --platform=node --format=cjs --external:vscode --outfile=dist/extension.js --sourcemap=external --minify",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "package": "vsce package --no-dependencies -o refract.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}

@@ -436,3 +436,75 @@ fn an_edit_made_while_git_is_still_loading_is_seen() {
     agent.send(json!({"id": 2, "method": "getRepo", "params": {"path": repo.to_str().unwrap()}}));
     assert_eq!(agent.response()["result"]["changedFiles"], 1);
 }
+
+#[test]
+fn prepare_launch_writes_a_request_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let repo = root.join("tidepool-api");
+    init_repo(&repo);
+    let state = tmp.path().join("state");
+    let mut agent = Agent::spawn_with(
+        &home,
+        &config,
+        &[
+            ("XDG_STATE_HOME", state.as_os_str()),
+            ("WSL_DISTRO_NAME", "Ubuntu".as_ref()),
+        ],
+    );
+    let repo_str = repo.to_str().unwrap();
+
+    agent.send(json!({"id": 1, "method": "prepareLaunch", "params": {
+        "path": repo_str, "mode": {"kind": "new", "prompt": "Add tide tables"}}}));
+    let ticket = agent.response();
+    assert_eq!(ticket["id"], 1);
+    let result = &ticket["result"];
+    let request_id = result["requestId"].as_str().unwrap();
+    let session_id = result["sessionId"].as_str().unwrap();
+    assert_eq!(request_id.len(), 36);
+    assert_eq!(session_id.len(), 36);
+    assert_ne!(request_id, session_id);
+    assert_eq!(
+        result["folderUri"],
+        format!("vscode-remote://wsl+Ubuntu{repo_str}")
+    );
+    let file = state.join(format!("refract/launch/{request_id}.json"));
+    let request: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(request["version"], 1);
+    assert_eq!(request["requestId"], request_id);
+    assert_eq!(request["folder"], repo_str);
+    assert_eq!(
+        request["argv"],
+        json!([
+            "claude",
+            "--session-id",
+            session_id,
+            "--",
+            "Add tide tables"
+        ])
+    );
+    assert_eq!(request["title"], "New agent");
+    let created: chrono::DateTime<Utc> = request["createdAt"].as_str().unwrap().parse().unwrap();
+    assert!((Utc::now() - created).num_seconds().abs() < 60);
+
+    let resumed = "5e2a7c10-0000-4000-8000-0000000000bb";
+    agent.send(json!({"id": 2, "method": "prepareLaunch", "params": {
+        "path": format!("{repo_str}/"), "mode": {"kind": "resume", "sessionId": resumed}}}));
+    let ticket = agent.response();
+    assert_eq!(ticket["result"]["sessionId"], resumed);
+    let request_id = ticket["result"]["requestId"].as_str().unwrap();
+    let file = state.join(format!("refract/launch/{request_id}.json"));
+    let request: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    assert_eq!(request["argv"], json!(["claude", "--resume", resumed]));
+    assert_eq!(request["title"], "Resume");
+    assert_eq!(request["folder"], repo_str);
+
+    let missing = root.join("kelp-cli");
+    agent.send(json!({"id": 3, "method": "prepareLaunch", "params": {
+        "path": missing.to_str().unwrap(), "mode": {"kind": "new"}}}));
+    assert_eq!(agent.response()["error"]["code"], 1);
+
+    agent.send(json!({"id": 4, "method": "shutdown"}));
+    assert_eq!(agent.response(), json!({"id": 4, "result": null}));
+    assert!(agent.child.wait().unwrap().success());
+}

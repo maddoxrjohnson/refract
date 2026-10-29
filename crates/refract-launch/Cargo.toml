@@ -1,0 +1,13 @@
+[package]
+name = "refract-launch"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "Opens a Refract launch in VS Code: the code arguments and the Refract profile's settings."
+
+[dependencies]
+refract-core = { path = "../refract-core" }
+jsonc-parser = { version = "0.34", default-features = false, features = ["cst", "serde_json"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tempfile = "3"
+zip = { version = "9", default-features = false, features = ["deflate"] }

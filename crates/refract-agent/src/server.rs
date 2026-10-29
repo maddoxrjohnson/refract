@@ -26,6 +26,7 @@ use refract_core::sessions::{paths_match, project_dir_matches};
 use serde::Serialize;
 
 use crate::config::Config;
+use crate::launch;
 use crate::scan;
 use crate::state::{self, path_str, Agent, Refresh};
 use crate::watch::{self, Change, FsEvent, Watcher};
@@ -346,6 +347,14 @@ impl<W: Write> Server<W> {
                 match self.get_repo(id, path) {
                     Some(response) => response,
                     None => return Ok(true),
+                }
+            }
+            Method::PrepareLaunch { path, mode } => {
+                let distro = std::env::var("WSL_DISTRO_NAME").ok();
+                let dir = launch::launch_dir();
+                match launch::prepare(&path, &mode, &dir, distro.as_deref(), Utc::now()) {
+                    Ok(ticket) => Response::ok(id, Reply::Launch(ticket)),
+                    Err(e) => Response::err(id, e.code, e.message),
                 }
             }
             Method::Shutdown => {
