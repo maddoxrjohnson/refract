@@ -1,0 +1,702 @@
+//! Messages between the Windows app and the WSL helper.
+//!
+//! Each message is one line of JSON. The app sends requests
+//! `{"id": 1, "method": "getRepo", "params": {"path": "..."}}` and gets exactly one
+//! response `{"id": 1, "result": ...}` or `{"id": 1, "error": {"code": ..., "message": ...}}`.
+//! The id may be any JSON number or string and is echoed back as sent; a line whose id
+//! cannot be read is answered with `"id": null`.
+//! The helper also sends events `{"event": "repoChanged", "data": ...}`, which have no id.
+//! Field names are camelCase on the wire.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::classify::SessionState;
+use crate::preselect::Preselect;
+
+/// Bumped whenever a message changes incompatibly.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Error codes, following JSON-RPC where one fits.
+pub mod code {
+    /// The line was not valid JSON.
+    pub const PARSE_ERROR: i32 = -32700;
+    /// The JSON was not a request object with a number or string `id` and a `method`.
+    pub const INVALID_REQUEST: i32 = -32600;
+    /// The method is not known.
+    pub const METHOD_NOT_FOUND: i32 = -32601;
+    /// The method is known but its params are wrong.
+    pub const INVALID_PARAMS: i32 = -32602;
+    /// The helper failed while handling the request.
+    pub const INTERNAL_ERROR: i32 = -32603;
+    /// `getRepo` named a path that is not a known repo.
+    pub const REPO_NOT_FOUND: i32 = 1;
+}
+
+/// A request from the app.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Request {
+    pub id: Id,
+    #[serde(flatten)]
+    pub method: Method,
+}
+
+/// What a request asks for, with its params.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "method", content = "params", rename_all = "camelCase")]
+pub enum Method {
+    /// Hello: answered with [`Hello`].
+    Ping,
+    /// Every local repo: answered with [`RepoList`].
+    ListRepos,
+    /// One repo by path: answered with a [`RepoSnapshot`].
+    GetRepo { path: String },
+    /// Answered with `null`, then the helper exits.
+    Shutdown,
+}
+
+/// A request id: any JSON number or string, echoed back unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Id {
+    Number(serde_json::Number),
+    String(String),
+}
+
+impl From<u64> for Id {
+    fn from(n: u64) -> Id {
+        Id::Number(n.into())
+    }
+}
+
+/// The helper's answer to one request. `id` is `None` (`null` on the wire) only when the
+/// request's id could not be read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Response {
+    pub id: Option<Id>,
+    #[serde(flatten)]
+    pub outcome: Outcome,
+}
+
+/// Either a result or an error, as the `result` or `error` key of a response.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Outcome {
+    Result(Reply),
+    Error(ErrorBody),
+}
+
+/// The result of a successful request. Which variant depends on the method.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Reply {
+    Hello(Hello),
+    Repos(RepoList),
+    Repo(Box<RepoSnapshot>),
+    /// `null`, for methods with nothing to return.
+    Done,
+}
+
+/// Why a request failed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorBody {
+    pub code: i32,
+    pub message: String,
+}
+
+/// The result of `ping`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Hello {
+    pub protocol_version: u32,
+    pub agent_version: String,
+}
+
+/// The result of `listRepos`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RepoList {
+    pub repos: Vec<RepoSnapshot>,
+    /// True while the first load is still running: `repos` holds what is loaded so far,
+    /// the rest arrive as `repoChanged` events, and `loadComplete` follows.
+    #[serde(default)]
+    pub loading: bool,
+}
+
+/// An unsolicited message from the helper.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "event", content = "data", rename_all = "camelCase")]
+pub enum Event {
+    /// A repo appeared or something about it changed. Carries the full snapshot.
+    RepoChanged(Box<RepoSnapshot>),
+    /// A repo is gone, or no longer under a configured root.
+    RepoRemoved { path: String },
+    /// One session of a repo changed state or content.
+    SessionChanged(SessionChange),
+    /// The first load finished; every repo has been reported. Carries no data.
+    LoadComplete,
+}
+
+/// Data of a `sessionChanged` event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionChange {
+    pub repo_path: String,
+    pub session: SessionInfo,
+    /// The repo's picker choice, which may change with the session.
+    pub preselect: Preselect,
+}
+
+/// Anything the helper writes, as the app reads it: a response if it has an `id`,
+/// otherwise an event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Message {
+    Response(Response),
+    Event(Event),
+}
+
+/// Everything the interface shows about one local repo.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoSnapshot {
+    /// Absolute path of the working tree.
+    pub path: String,
+    /// The folder name.
+    pub name: String,
+    /// `remote.origin.url` as configured.
+    pub origin_url: Option<String>,
+    /// The origin URL's host, owner and name, when it parses.
+    pub remote: Option<RemoteId>,
+    /// Current branch; `None` when HEAD is detached.
+    pub branch: Option<String>,
+    /// Commits ahead of the upstream; `None` without an upstream.
+    pub ahead: Option<u32>,
+    /// Commits behind the upstream; `None` without an upstream.
+    pub behind: Option<u32>,
+    /// Entries in `git status`: changed, staged, conflicted and untracked.
+    pub changed_files: u32,
+    /// Absolute paths of those entries. An untracked directory is one entry.
+    pub dirty_paths: Vec<String>,
+    /// `None` in a repo with no commits.
+    pub last_commit: Option<LastCommit>,
+    /// Best-effort main language of tracked files.
+    pub language: Option<String>,
+    /// Total size of files tracked at HEAD, in bytes.
+    pub tracked_bytes: u64,
+    /// Commits reachable from HEAD in the last 30 days.
+    pub commits_30d: u32,
+    /// Relative weight in 0..=1 across all repos (see [`crate::mass`]).
+    pub mass: f64,
+    /// Sessions whose working directory is this repo, most recent first.
+    pub sessions: Vec<SessionInfo>,
+    pub preselect: Preselect,
+}
+
+/// The newest commit on HEAD.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastCommit {
+    /// First line of the message.
+    pub summary: String,
+    /// Committer time, Unix seconds.
+    pub time: i64,
+}
+
+/// One Claude Code session in a repo.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionInfo {
+    pub id: String,
+    pub state: SessionState,
+    pub last_timestamp: Option<DateTime<Utc>>,
+    /// First line of the assistant's last text reply, truncated.
+    pub last_assistant_text: Option<String>,
+    /// Transcript size in bytes.
+    pub byte_size: u64,
+}
+
+/// A hosted repo named by its remote URL, such as `github.com` / `dev` / `tidepool-api`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteId {
+    /// Lowercase host, without user or port.
+    pub host: String,
+    /// Owner or group path; GitLab subgroups keep their slashes (`group/sub`).
+    pub owner: String,
+    /// Repo name without `.git`.
+    pub name: String,
+}
+
+impl RemoteId {
+    /// Parses `https://host/owner/name(.git)`, `ssh://git@host[:port]/owner/name.git`
+    /// and scp-like `git@host:owner/name.git`. Returns `None` for local paths and
+    /// anything without both an owner and a name.
+    pub fn parse(url: &str) -> Option<RemoteId> {
+        let url = url.trim();
+        let (host, path) = if let Some((scheme, rest)) = url.split_once("://") {
+            if scheme.eq_ignore_ascii_case("file") {
+                return None;
+            }
+            rest.split_once('/')?
+        } else {
+            // scp-like syntax; a colon before any slash separates host and path.
+            let (host, path) = url.split_once(':')?;
+            if host.contains('/') {
+                return None;
+            }
+            (host, path)
+        };
+        let host = host.rsplit('@').next()?;
+        let host = host.split(':').next()?.to_ascii_lowercase();
+        let path = path.trim_matches('/');
+        let path = path.strip_suffix(".git").unwrap_or(path);
+        let (owner, name) = path.rsplit_once('/')?;
+        let owner = owner.trim_start_matches('~');
+        if host.is_empty() || owner.is_empty() || name.is_empty() {
+            return None;
+        }
+        Some(RemoteId {
+            host,
+            owner: owner.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+}
+
+/// A line that could not be turned into a [`Request`]. `id` is set when the line had
+/// a readable one; otherwise the error is answered with a `null` id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestError {
+    pub id: Option<Id>,
+    pub error: ErrorBody,
+}
+
+impl RequestError {
+    /// The response that reports this error.
+    pub fn response(self) -> Response {
+        Response {
+            id: self.id,
+            outcome: Outcome::Error(self.error),
+        }
+    }
+}
+
+/// Parses one request line, telling apart bad JSON, a missing or unreadable id, an
+/// unknown method and bad params. Methods without params also accept `"params": {}`
+/// and `"params": null`.
+pub fn parse_request(line: &str) -> Result<Request, RequestError> {
+    let fail = |id, code, message: String| RequestError {
+        id,
+        error: ErrorBody { code, message },
+    };
+    let mut value: Value = serde_json::from_str(line)
+        .map_err(|e| fail(None, code::PARSE_ERROR, format!("invalid JSON: {e}")))?;
+    let Some(object) = value.as_object_mut() else {
+        return Err(fail(None, code::INVALID_REQUEST, "not an object".into()));
+    };
+    let id = object
+        .get("id")
+        .and_then(|id| serde_json::from_value::<Id>(id.clone()).ok());
+    let Some(method) = object.get("method").and_then(Value::as_str) else {
+        return Err(fail(id, code::INVALID_REQUEST, "missing method".into()));
+    };
+    let Some(id) = id else {
+        return Err(fail(
+            None,
+            code::INVALID_REQUEST,
+            "missing id, or not a number or string".into(),
+        ));
+    };
+    let takes_params = match method {
+        "getRepo" => true,
+        "ping" | "listRepos" | "shutdown" => false,
+        _ => {
+            return Err(fail(
+                Some(id),
+                code::METHOD_NOT_FOUND,
+                format!("unknown method {method:?}"),
+            ))
+        }
+    };
+    let empty = match object.get("params") {
+        Some(Value::Null) => true,
+        Some(Value::Object(params)) => params.is_empty(),
+        _ => false,
+    };
+    if !takes_params && empty {
+        object.remove("params");
+    }
+    serde_json::from_value(value)
+        .map_err(|e| fail(Some(id), code::INVALID_PARAMS, format!("bad params: {e}")))
+}
+
+impl Response {
+    /// A successful response.
+    pub fn ok(id: impl Into<Id>, reply: Reply) -> Response {
+        Response {
+            id: Some(id.into()),
+            outcome: Outcome::Result(reply),
+        }
+    }
+
+    /// A failed response.
+    pub fn err(id: impl Into<Id>, code: i32, message: impl Into<String>) -> Response {
+        Response {
+            id: Some(id.into()),
+            outcome: Outcome::Error(ErrorBody {
+                code,
+                message: message.into(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::classify::{InterruptReason, LiveState};
+    use serde_json::json;
+
+    fn snapshot() -> RepoSnapshot {
+        RepoSnapshot {
+            path: "/home/dev/projects/tidepool-api".into(),
+            name: "tidepool-api".into(),
+            origin_url: Some("git@github.com:dev/tidepool-api.git".into()),
+            remote: Some(RemoteId {
+                host: "github.com".into(),
+                owner: "dev".into(),
+                name: "tidepool-api".into(),
+            }),
+            branch: Some("main".into()),
+            ahead: Some(2),
+            behind: Some(0),
+            changed_files: 1,
+            dirty_paths: vec!["/home/dev/projects/tidepool-api/src/lib.rs".into()],
+            last_commit: Some(LastCommit {
+                summary: "Add tide tables".into(),
+                time: 1_773_489_600,
+            }),
+            language: Some("Rust".into()),
+            tracked_bytes: 48_213,
+            commits_30d: 9,
+            mass: 0.625,
+            sessions: vec![SessionInfo {
+                id: "3f6c1a52-0000-4000-8000-000000000001".into(),
+                state: SessionState::Interrupted(InterruptReason::ApiError),
+                last_timestamp: Some("2026-03-14T12:00:00Z".parse().unwrap()),
+                last_assistant_text: Some("Tide tables are wired up.".into()),
+                byte_size: 20_480,
+            }],
+            preselect: Preselect::Resume("3f6c1a52-0000-4000-8000-000000000001".into()),
+        }
+    }
+
+    fn empty_snapshot() -> RepoSnapshot {
+        RepoSnapshot {
+            path: "/home/dev/projects/aurora-notes".into(),
+            name: "aurora-notes".into(),
+            origin_url: None,
+            remote: None,
+            branch: None,
+            ahead: None,
+            behind: None,
+            changed_files: 0,
+            dirty_paths: vec![],
+            last_commit: None,
+            language: None,
+            tracked_bytes: 0,
+            commits_30d: 0,
+            mass: 0.0,
+            sessions: vec![],
+            preselect: Preselect::NoPicker,
+        }
+    }
+
+    fn round_trip<T>(value: &T) -> Value
+    where
+        T: Serialize + for<'de> Deserialize<'de> + PartialEq + std::fmt::Debug,
+    {
+        let text = serde_json::to_string(value).unwrap();
+        assert!(!text.contains('\n'));
+        let back: T = serde_json::from_str(&text).unwrap();
+        assert_eq!(&back, value);
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn requests_round_trip() {
+        let ping = Request {
+            id: 1.into(),
+            method: Method::Ping,
+        };
+        assert_eq!(round_trip(&ping), json!({"id": 1, "method": "ping"}));
+        let list = Request {
+            id: 2.into(),
+            method: Method::ListRepos,
+        };
+        assert_eq!(round_trip(&list), json!({"id": 2, "method": "listRepos"}));
+        let get = Request {
+            id: 3.into(),
+            method: Method::GetRepo {
+                path: "/home/dev/projects/tidepool-api".into(),
+            },
+        };
+        assert_eq!(
+            round_trip(&get),
+            json!({"id": 3, "method": "getRepo", "params": {"path": "/home/dev/projects/tidepool-api"}})
+        );
+        let shutdown = Request {
+            id: 4.into(),
+            method: Method::Shutdown,
+        };
+        assert_eq!(
+            round_trip(&shutdown),
+            json!({"id": 4, "method": "shutdown"})
+        );
+    }
+
+    #[test]
+    fn responses_round_trip() {
+        let hello = Response::ok(
+            1,
+            Reply::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                agent_version: "0.1.0".into(),
+            }),
+        );
+        assert_eq!(
+            round_trip(&hello),
+            json!({"id": 1, "result": {"protocolVersion": 1, "agentVersion": "0.1.0"}})
+        );
+
+        let repos = Response::ok(
+            2,
+            Reply::Repos(RepoList {
+                repos: vec![snapshot(), empty_snapshot()],
+                loading: true,
+            }),
+        );
+        assert_eq!(round_trip(&repos)["result"]["loading"], true);
+        let old: RepoList = serde_json::from_str(r#"{"repos":[]}"#).unwrap();
+        assert!(!old.loading);
+
+        let repo = Response::ok(3, Reply::Repo(Box::new(snapshot())));
+        round_trip(&repo);
+        let empty = Response::ok(3, Reply::Repo(Box::new(empty_snapshot())));
+        round_trip(&empty);
+
+        let done = Response::ok(4, Reply::Done);
+        assert_eq!(round_trip(&done), json!({"id": 4, "result": null}));
+
+        let error = Response::err(5, code::REPO_NOT_FOUND, "no such repo");
+        assert_eq!(
+            round_trip(&error),
+            json!({"id": 5, "error": {"code": 1, "message": "no such repo"}})
+        );
+    }
+
+    #[test]
+    fn snapshot_uses_camel_case() {
+        let value = serde_json::to_value(snapshot()).unwrap();
+        for key in [
+            "originUrl",
+            "changedFiles",
+            "dirtyPaths",
+            "lastCommit",
+            "trackedBytes",
+            "commits30d",
+        ] {
+            assert!(value.get(key).is_some(), "missing {key}");
+        }
+        let session = &value["sessions"][0];
+        assert_eq!(
+            session["state"],
+            json!({"kind": "interrupted", "detail": "apiError"})
+        );
+        assert_eq!(session["lastTimestamp"], json!("2026-03-14T12:00:00Z"));
+        assert_eq!(
+            value["preselect"],
+            json!({"kind": "resume", "sessionId": "3f6c1a52-0000-4000-8000-000000000001"})
+        );
+        let empty = serde_json::to_value(empty_snapshot()).unwrap();
+        assert_eq!(empty["preselect"], json!({"kind": "noPicker"}));
+    }
+
+    #[test]
+    fn events_round_trip() {
+        let changed = Event::RepoChanged(Box::new(snapshot()));
+        let value = round_trip(&changed);
+        assert_eq!(value["event"], "repoChanged");
+        assert_eq!(value["data"]["name"], "tidepool-api");
+
+        let removed = Event::RepoRemoved {
+            path: "/home/dev/projects/aurora-notes".into(),
+        };
+        assert_eq!(
+            round_trip(&removed),
+            json!({"event": "repoRemoved", "data": {"path": "/home/dev/projects/aurora-notes"}})
+        );
+
+        let session = Event::SessionChanged(SessionChange {
+            repo_path: "/home/dev/projects/tidepool-api".into(),
+            session: SessionInfo {
+                id: "3f6c1a52-0000-4000-8000-000000000002".into(),
+                state: SessionState::Live(LiveState::Unknown),
+                last_timestamp: None,
+                last_assistant_text: None,
+                byte_size: 0,
+            },
+            preselect: Preselect::NewAgent,
+        });
+        let value = round_trip(&session);
+        assert_eq!(value["event"], "sessionChanged");
+        assert_eq!(
+            value["data"]["session"]["state"],
+            json!({"kind": "live", "detail": "unknown"})
+        );
+        assert_eq!(value["data"]["preselect"], json!({"kind": "newAgent"}));
+
+        assert_eq!(
+            round_trip(&Event::LoadComplete),
+            json!({"event": "loadComplete"})
+        );
+        let message: Message = serde_json::from_str(r#"{"event":"loadComplete"}"#).unwrap();
+        assert_eq!(message, Message::Event(Event::LoadComplete));
+    }
+
+    #[test]
+    fn messages_are_told_apart_by_id() {
+        let response = Message::Response(Response::ok(7, Reply::Done));
+        round_trip(&response);
+        let event = Message::Event(Event::RepoRemoved {
+            path: "/home/dev/projects/aurora-notes".into(),
+        });
+        round_trip(&event);
+        let hello: Message = serde_json::from_str(
+            r#"{"id":1,"result":{"protocolVersion":1,"agentVersion":"0.1.0"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            hello,
+            Message::Response(Response {
+                outcome: Outcome::Result(Reply::Hello(_)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn parse_request_accepts_valid_lines() {
+        let req = parse_request(r#"{"id":9,"method":"getRepo","params":{"path":"/x"}}"#);
+        assert_eq!(
+            req,
+            Ok(Request {
+                id: 9.into(),
+                method: Method::GetRepo { path: "/x".into() }
+            })
+        );
+        let req = parse_request(r#"{"id":1,"method":"ping","params":null}"#).unwrap();
+        assert_eq!(req.method, Method::Ping);
+        let req = parse_request(r#"{"id":1,"method":"ping","params":{}}"#).unwrap();
+        assert_eq!(req.method, Method::Ping);
+        let req = parse_request(r#"{"id":1,"method":"listRepos","params":{}}"#).unwrap();
+        assert_eq!(req.method, Method::ListRepos);
+    }
+
+    #[test]
+    fn ids_may_be_numbers_or_strings_and_are_echoed() {
+        let req = parse_request(r#"{"id":"7","method":"ping"}"#).unwrap();
+        assert_eq!(req.id, Id::String("7".into()));
+        let value = serde_json::to_value(Response::ok(req.id, Reply::Done)).unwrap();
+        assert_eq!(value, json!({"id": "7", "result": null}));
+        let req = parse_request(r#"{"id":-2.5,"method":"ping"}"#).unwrap();
+        assert_eq!(serde_json::to_value(&req.id).unwrap(), json!(-2.5));
+    }
+
+    #[test]
+    fn unreadable_ids_are_answered_with_null() {
+        for line in [
+            r#"{"id":{"x":1},"method":"ping"}"#,
+            r#"{"id":true,"method":"ping"}"#,
+            r#"{"method":"ping"}"#,
+            "[1]",
+            "{not json",
+        ] {
+            let err = parse_request(line).unwrap_err();
+            assert_eq!(err.id, None, "{line}");
+            let value = serde_json::to_value(err.response()).unwrap();
+            assert_eq!(value["id"], Value::Null, "{line}");
+            assert!(value["error"]["code"].is_i64());
+        }
+    }
+
+    #[test]
+    fn parse_request_reports_each_kind_of_error() {
+        let err = parse_request("{not json").unwrap_err();
+        assert_eq!((err.id, err.error.code), (None, code::PARSE_ERROR));
+
+        let err = parse_request(r#"{"method":"ping"}"#).unwrap_err();
+        assert_eq!((err.id, err.error.code), (None, code::INVALID_REQUEST));
+
+        let err = parse_request(r#"{"id":3}"#).unwrap_err();
+        assert_eq!(
+            (err.id, err.error.code),
+            (Some(3.into()), code::INVALID_REQUEST)
+        );
+
+        let err = parse_request(r#"{"id":4,"method":"explode"}"#).unwrap_err();
+        assert_eq!(
+            (err.id, err.error.code),
+            (Some(4.into()), code::METHOD_NOT_FOUND)
+        );
+
+        let err = parse_request(r#"{"id":5,"method":"getRepo","params":{}}"#).unwrap_err();
+        assert_eq!(
+            (err.id, err.error.code),
+            (Some(5.into()), code::INVALID_PARAMS)
+        );
+
+        let err = parse_request(r#"{"id":6,"method":"ping","params":{"x":1}}"#).unwrap_err();
+        assert_eq!(
+            (err.id, err.error.code),
+            (Some(6.into()), code::INVALID_PARAMS)
+        );
+    }
+
+    #[test]
+    fn remote_urls_parse() {
+        let expect = |host: &str, owner: &str, name: &str| {
+            Some(RemoteId {
+                host: host.into(),
+                owner: owner.into(),
+                name: name.into(),
+            })
+        };
+        assert_eq!(
+            RemoteId::parse("https://github.com/dev/tidepool-api.git"),
+            expect("github.com", "dev", "tidepool-api")
+        );
+        assert_eq!(
+            RemoteId::parse("https://token@GitHub.com/dev/tidepool-api/"),
+            expect("github.com", "dev", "tidepool-api")
+        );
+        assert_eq!(
+            RemoteId::parse("git@github.com:dev/tidepool-api.git"),
+            expect("github.com", "dev", "tidepool-api")
+        );
+        assert_eq!(
+            RemoteId::parse("ssh://git@git.example.edu:2222/course/team-7/aurora-notes.git"),
+            expect("git.example.edu", "course/team-7", "aurora-notes")
+        );
+    }
+
+    #[test]
+    fn local_and_odd_urls_do_not_parse() {
+        assert_eq!(RemoteId::parse("/srv/git/tidepool-api.git"), None);
+        assert_eq!(RemoteId::parse("../tidepool-api"), None);
+        assert_eq!(RemoteId::parse("file:///srv/git/tidepool-api.git"), None);
+        assert_eq!(RemoteId::parse("https://github.com/tidepool-api"), None);
+        assert_eq!(RemoteId::parse(""), None);
+    }
+}

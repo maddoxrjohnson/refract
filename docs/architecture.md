@@ -61,6 +61,12 @@ The two sides exchange newline-delimited JSON over the helper's standard input a
 - **Requests** carry an `id` and receive exactly one response with the same `id`.
 - **Events** have no `id` and arrive when something changes, such as a repo becoming dirty, a session starting or ending, or usage totals moving.
 
+An `id` may be any JSON number or string and is echoed back unchanged. A line whose `id` cannot be read (bad JSON, invalid UTF-8 with no readable id, a line over 1 MB, or an `id` that is not a number or string) is answered with `"id": null` and an error. Methods without parameters also accept `"params": {}` or `null`.
+
+The first `listRepos` starts loading in the background and answers immediately with `{"repos": [...], "loading": true}`, listing what has loaded so far. Linux repos load first and repos under `/mnt/` after them. Repos arrive as `repoChanged` events as each phase finishes, and `{"event": "loadComplete"}` follows once everything is reported. After that, `loading` is `false`. A `getRepo` for a repo that has not loaded yet is answered once it has.
+
+Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
+
 The helper never writes anything else to standard output; logs go to standard error.
 
 ## Session state
