@@ -1,0 +1,32 @@
+# Agent and assistant files (kept local, never committed)
+.claude/
+.agents/
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+.mcp.json
+notes/
+
+# Secrets
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Build output
+target/
+node_modules/
+dist/
+app/src-tauri/gen/
+*.vsix
+coverage/
+playwright-report/
+test-results/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json

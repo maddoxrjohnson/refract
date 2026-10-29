@@ -1,0 +1,572 @@
+<title>Frozen Shatter Quality</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700&family=IBM+Plex+Sans:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: one large live stage with the quality switch above it and a per-tier spec sheet below. Single dark theme by choice: glass reads best on black. */
+  :root {
+    --bg: #0a0c12;
+    --surface: #10131b;
+    --line: #222737;
+    --fg: #e9eaf0;
+    --muted: #979db0;
+    --glass: #a9d8ff;
+    --amber: #ffb347;
+    --display: "Bricolage Grotesque", "Segoe UI", system-ui, sans-serif;
+    --body: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, Consolas, monospace;
+    color-scheme: dark;
+  }
+  html, body { background: var(--bg); color: var(--fg); }
+  body {
+    font-family: var(--body);
+    font-size: 15px;
+    line-height: 1.55;
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 40px 56px;
+  }
+  .wrap { max-width: 1280px; margin: 0 auto; display: grid; gap: 28px; }
+  header { display: grid; gap: 14px; max-width: 72ch; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .12em; text-transform: uppercase; color: var(--glass); }
+  h1 { font-family: var(--display); font-weight: 700; font-size: clamp(34px, 5vw, 56px); line-height: 1.02; margin: 0; letter-spacing: -.02em; text-wrap: balance; }
+  header p { margin: 0; color: var(--muted); }
+
+  .bar { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; justify-content: space-between; }
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 3px; background: var(--surface); }
+  .seg button { font: 500 13px var(--body); color: var(--muted); background: none; border: 0; border-radius: 999px; padding: 6px 14px; cursor: pointer; }
+  .seg button[aria-pressed="true"] { background: #1f2535; color: var(--fg); }
+  .seg.quality button { font-size: 14px; padding: 8px 20px; }
+  .seg.quality button[aria-pressed="true"] { background: var(--glass); color: #0a0c12; }
+  .seg button:focus-visible { outline: 2px solid var(--glass); outline-offset: 1px; }
+  .stats { font-family: var(--mono); font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+
+  .stage { position: relative; aspect-ratio: 16 / 8.2; max-width: 100%; border-radius: 16px; overflow: hidden; background: #07080c; border: 1px solid var(--line); }
+  @media (max-width: 700px) { .stage { aspect-ratio: 4 / 3.4; } }
+  .stage canvas { display: block; width: 100%; height: 100%; touch-action: pan-y; }
+  .tip { position: absolute; left: 0; top: 0; pointer-events: none; background: #0b0e16e6; border: 1px solid var(--line); border-radius: 10px; padding: 8px 11px; font-size: 12.5px; line-height: 1.4; white-space: nowrap; backdrop-filter: blur(6px); }
+  .tip b { font-family: var(--mono); font-weight: 500; font-size: 13px; display: block; color: var(--fg); }
+  .tip i { font-style: normal; color: var(--muted); }
+  .tip .st-dirty { color: #6fd3ff; } .tip .st-cut { color: var(--amber); } .tip .st-clean { color: var(--muted); }
+  .fail { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 13px; padding: 20px; text-align: center; }
+
+  .tiers { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 14px; }
+  .tier { border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; display: grid; gap: 8px; align-content: start; min-width: 0; }
+  .tier[data-active="true"] { border-color: var(--glass); background: #111724; }
+  .tier h2 { font-family: var(--display); font-weight: 600; font-size: 20px; margin: 0; display: flex; justify-content: space-between; align-items: baseline; gap: 10px; }
+  .tier h2 small { font-family: var(--mono); font-size: 11.5px; font-weight: 400; color: var(--muted); }
+  .tier ul { margin: 0; padding-left: 18px; color: var(--muted); display: grid; gap: 3px; }
+  .tier p { margin: 0; font-size: 13.5px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 22px; font-size: 13px; color: var(--muted); }
+  .legend span { display: inline-flex; align-items: center; gap: 8px; }
+  .sw { width: 14px; height: 14px; flex: none; clip-path: polygon(25% 0, 75% 0, 100% 35%, 50% 100%, 0 35%); }
+  .sw.size { background: linear-gradient(135deg, #fffa, #fff3); }
+  .sw.tint { background: linear-gradient(135deg, #3178c6, #f4c542, #e0763a, #a97bff); }
+  .sw.glow { background: #6fd3ff; filter: drop-shadow(0 0 4px #6fd3ff); }
+  .sw.ring { background: var(--amber); }
+  footer { color: var(--muted); font-size: 13px; border-top: 1px solid var(--line); padding-top: 16px; display: grid; gap: 6px; }
+  footer p { margin: 0; max-width: 92ch; }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Project launcher · Frozen shatter, round 4</div>
+    <h1>One scene, three quality levels</h1>
+    <p>The gems now use a custom glass shader. It bends whatever sits behind each gem, including that gem's own lit core, splits the light into a rainbow at the edges, and catches sharp glints on each facet. Switch the quality level to compare how each one looks and what it costs.</p>
+  </header>
+
+  <div class="bar">
+    <div class="controls">
+      <div class="seg quality" role="group" aria-label="Graphics quality">
+        <button id="q-low" type="button" aria-pressed="false">Low</button>
+        <button id="q-medium" type="button" aria-pressed="false">Medium</button>
+        <button id="q-high" type="button" aria-pressed="true">High</button>
+      </div>
+      <div class="seg" role="group" aria-label="Gem cut">
+        <button id="cut-brilliant" type="button" aria-pressed="true">Brilliant cut</button>
+        <button id="cut-rough" type="button" aria-pressed="false">Rough cut</button>
+      </div>
+      <div class="seg" role="group" aria-label="Number of repos">
+        <button id="count-12" type="button" aria-pressed="true">12 repos</button>
+        <button id="count-40" type="button" aria-pressed="false">40</button>
+      </div>
+      <div class="seg" role="group" aria-label="Motion">
+        <button id="motion-on" type="button" aria-pressed="true">Motion</button>
+        <button id="motion-off" type="button" aria-pressed="false">Paused</button>
+      </div>
+    </div>
+    <div class="stats" id="stats" aria-live="off">Starting…</div>
+  </div>
+
+  <div class="stage" id="stage"><canvas aria-label="Frozen shatter scene"></canvas></div>
+
+  <div class="legend" aria-label="Legend">
+    <span><i class="sw size"></i>Size = mass</span>
+    <span><i class="sw tint"></i>Tint = main language</span>
+    <span><i class="sw glow"></i>Blue halo = uncommitted work</span>
+    <span><i class="sw ring"></i>Pulsing amber edges = agent cut off</span>
+  </div>
+
+  <section class="tiers">
+    <article class="tier" data-tier="low">
+      <h2>Low <small>battery, older laptops</small></h2>
+      <ul>
+        <li>One refraction sample, no rainbow split</li>
+        <li>Background behind the glass drawn at half resolution</li>
+        <li>No glow, no depth of field</li>
+        <li>Standard resolution, up to 30 frames a second</li>
+      </ul>
+    </article>
+    <article class="tier" data-tier="medium">
+      <h2>Medium <small>the default</small></h2>
+      <ul>
+        <li>Rainbow split at the edges (3 samples)</li>
+        <li>Soft facet glints</li>
+        <li>Glow (bloom) on bright edges and cores</li>
+        <li>1.5× resolution, up to 30 frames a second</li>
+      </ul>
+    </article>
+    <article class="tier" data-tier="high">
+      <h2>High <small>desktop GPU</small></h2>
+      <ul>
+        <li>Smooth spectral dispersion (12 samples)</li>
+        <li>Bright star glints on every facet</li>
+        <li>Glow plus depth of field: near and far gems go soft</li>
+        <li>Full resolution, up to 60 frames a second</li>
+      </ul>
+    </article>
+  </section>
+
+  <footer>
+    <p>Sample data: every repo name, language, mass and status is made up to show each state. The 40-repo mode adds placeholder repos.</p>
+    <p>On every level, the app stops drawing when the window is hidden or in the tray. The numbers above the scene count frames actually drawn and the CPU time each one takes. GPU time isn't visible to a web page, so watch Task Manager's GPU column while switching levels for the real cost.</p>
+  </footer>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/shaders/CopyShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/shaders/LuminosityHighPassShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/shaders/ACESFilmicToneMappingShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/shaders/GammaCorrectionShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/shaders/BokehShader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/postprocessing/EffectComposer.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/postprocessing/RenderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/postprocessing/ShaderPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/postprocessing/UnrealBloomPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/postprocessing/BokehPass.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/math/ConvexHull.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.147.0/examples/js/geometries/ConvexGeometry.js"></script>
+<script>
+(() => {
+  const V3 = THREE.Vector3;
+  const stage = document.getElementById('stage');
+  const canvas = stage.querySelector('canvas');
+  const statsEl = document.getElementById('stats');
+  if (!THREE.EffectComposer || !THREE.ConvexGeometry) {
+    stage.insertAdjacentHTML('beforeend', '<div class="fail">The 3D add-ons did not load, so the scene cannot be drawn. Reload the page to try again.</div>');
+    statsEl.textContent = '';
+    return;
+  }
+
+  const LANG = {
+    TypeScript: 0x3178c6, Python: 0xf4c542, Rust: 0xe0763a, Go: 0x00add8, C: 0x9fb2c8,
+    Swift: 0xf05138, Kotlin: 0xa97bff, JavaScript: 0xf1e05a, 'C#': 0x9b4fd6, Shell: 0x89e051
+  };
+  const BASE = [
+    { name: 'atlas-api', host: 'GitHub', lang: 'TypeScript', mass: 0.92 },
+    { name: 'tidepool', host: 'GitHub', lang: 'TypeScript', mass: 0.74, cut: true },
+    { name: 'ledger-sync', host: 'GitHub', lang: 'Python', mass: 0.70, dirty: true },
+    { name: 'trailhead-ios', host: 'GitHub', lang: 'Swift', mass: 0.46 },
+    { name: 'quill', host: 'GitHub', lang: 'Go', mass: 0.40, dirty: true },
+    { name: 'dotfiles', host: 'GitHub', lang: 'Shell', mass: 0.28 },
+    { name: 'tessera', host: 'GitHub', lang: 'Rust', mass: 0.36 },
+    { name: 'sweep', host: 'GitHub', lang: 'C#', mass: 0.18 },
+    { name: 'harbor-android', host: 'GitHub', lang: 'Kotlin', mass: 0.52 },
+    { name: 'mailroom', host: 'GitHub', lang: 'JavaScript', mass: 0.56, cut: true },
+    { name: 'os-shell-lab', host: 'GitLab (school)', lang: 'C', mass: 0.62, dirty: true },
+    { name: 'ml-homework', host: 'GitLab (school)', lang: 'Python', mass: 0.24 }
+  ];
+  function rng(seed) {
+    return () => {
+      seed = (seed + 0x6D2B79F5) | 0;
+      let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const EXTRA = (() => {
+    const r = rng(99), langs = Object.keys(LANG), out = [];
+    for (let i = 1; i <= 28; i++) out.push({
+      name: `placeholder-${String(i).padStart(2, '0')}`, host: 'Placeholder', lang: langs[Math.floor(r() * langs.length)],
+      mass: 0.12 + r() * 0.7, dirty: r() < 0.12, cut: r() < 0.08
+    });
+    return out;
+  })();
+
+  const DPR = window.devicePixelRatio || 1;
+  const TIERS = {
+    low: { pr: 1, fps: 30, samples: 1, chroma: 0, bloom: false, dof: false, back: 0.5, sparkle: 0, irid: 0.4, facets: 18 },
+    medium: { pr: Math.min(DPR, 1.5), fps: 30, samples: 3, chroma: 0.6, bloom: true, dof: false, back: 0.75, sparkle: 0.45, irid: 0.8, facets: 28 },
+    high: { pr: Math.min(DPR, 2), fps: 60, samples: 12, chroma: 1, bloom: true, dof: true, back: 1, sparkle: 1, irid: 1, facets: 40 }
+  };
+  const state = { tier: 'high', cut: 'brilliant', count: 12, motion: !matchMedia('(prefers-reduced-motion: reduce)').matches };
+  const tier = () => TIERS[state.tier];
+
+  // ---------- gem shapes ----------
+  function brilliant(r, rand) {
+    const pts = [];
+    const ring = (n, rad, y, rot) => { for (let k = 0; k < n; k++) { const a = rot + (k / n) * Math.PI * 2; pts.push(new V3(Math.cos(a) * rad * r, y * r, Math.sin(a) * rad * r)); } };
+    ring(8, 0.56, 0.36, 0);
+    ring(8, 0.83, 0.2, Math.PI / 8);
+    ring(16, 1.0, 0.035, 0);
+    ring(16, 1.0, -0.035, 0);
+    ring(8, 0.6, -0.4, Math.PI / 8);
+    pts.push(new V3(0, -0.84 * r, 0));
+    return new THREE.ConvexGeometry(pts);
+  }
+  function rough(r, rand) {
+    const n = tier().facets, sy = 0.86 + rand() * 0.2, pts = [];
+    for (let i = 0; i < n; i++) {
+      const y = 1 - (2 * (i + 0.5)) / n, rad = Math.sqrt(1 - y * y);
+      const th = i * 2.39996 + (rand() - 0.5) * 0.7;
+      const k = r * (0.9 + rand() * 0.12);
+      pts.push(new V3(Math.cos(th) * rad * k, y * k * sy, Math.sin(th) * rad * k));
+    }
+    return new THREE.ConvexGeometry(pts);
+  }
+
+  // ---------- glass shader ----------
+  // Screen-space refraction: the scene minus the shells is drawn to `uBack` first, then each facet bends its lookup into that image,
+  // with red, green and blue bent by slightly different amounts (dispersion). Reflections come from a procedural studio of softboxes.
+  const gemVert = `
+    varying vec3 vWorldPos; varying vec3 vViewPos;
+    void main(){
+      vec4 wp = modelMatrix * vec4(position, 1.0);
+      vWorldPos = wp.xyz;
+      vec4 mv = viewMatrix * wp;
+      vViewPos = mv.xyz;
+      gl_Position = projectionMatrix * mv;
+    }`;
+  const gemFrag = `
+    uniform sampler2D uBack; uniform vec2 uRes; uniform vec3 uTint;
+    uniform float uChroma; uniform float uRefract; uniform float uFocus; uniform float uSparkle; uniform float uIrid;
+    varying vec3 vWorldPos; varying vec3 vViewPos;
+    vec3 studio(vec3 r){
+      vec3 c = vec3(0.012, 0.014, 0.022);
+      c += vec3(4.2) * smoothstep(0.93, 0.985, dot(r, normalize(vec3(-0.35, 0.85, 0.4))));
+      c += vec3(0.7, 0.95, 2.0) * smoothstep(0.86, 0.96, dot(r, normalize(vec3(0.75, 0.25, -0.6))));
+      c += vec3(2.0, 1.05, 0.55) * smoothstep(0.88, 0.975, dot(r, normalize(vec3(0.85, -0.1, 0.5))));
+      c += vec3(1.1) * smoothstep(0.975, 0.995, 1.0 - abs(r.y - 0.12)) * step(0.0, r.z);
+      return c;
+    }
+    void main(){
+      vec3 Nw = normalize(cross(dFdx(vWorldPos), dFdy(vWorldPos)));
+      vec3 V = normalize(cameraPosition - vWorldPos);
+      if (dot(Nw, V) < 0.0) Nw = -Nw;
+      vec3 eye = normalize(vViewPos);
+      vec3 Nv = normalize(cross(dFdx(vViewPos), dFdy(vViewPos)));
+      if (dot(Nv, -eye) < 0.0) Nv = -Nv;
+      vec2 uv = gl_FragCoord.xy / uRes;
+      float iR = mix(1.0 / 1.18, 1.0 / 1.13, uChroma);
+      float iG = 1.0 / 1.18;
+      float iB = mix(1.0 / 1.18, 1.0 / 1.24, uChroma);
+      vec3 col = vec3(0.0);
+      for (int i = 0; i < SAMPLES; i++) {
+        float s = SAMPLES > 1 ? float(i) / float(SAMPLES - 1) : 0.5;
+        float slide = (s - 0.5) * 0.12 * uChroma;
+        col.r += texture2D(uBack, uv + refract(eye, Nv, iR).xy * (uRefract + slide)).r;
+        col.g += texture2D(uBack, uv + refract(eye, Nv, iG).xy * (uRefract + slide * 1.6)).g;
+        col.b += texture2D(uBack, uv + refract(eye, Nv, iB).xy * (uRefract + slide * 2.2)).b;
+      }
+      col /= float(SAMPLES);
+      col *= mix(vec3(1.0), uTint, 0.62);
+      col += uTint * 0.05;
+      float fres = pow(1.0 - max(dot(Nw, V), 0.0), 3.0);
+      vec3 R = reflect(-V, Nw);
+      vec3 irid = 0.5 + 0.5 * cos(6.2832 * (fres * 1.3 + vec3(0.0, 0.33, 0.67)));
+      col = col * (1.0 - fres * 0.45) + studio(R) * (0.07 + fres * 0.9) + irid * fres * 0.3 * uIrid;
+      float g = pow(max(dot(R, normalize(vec3(-0.35, 0.85, 0.4))), 0.0), 260.0)
+              + pow(max(dot(R, normalize(vec3(0.6, 0.45, 0.65))), 0.0), 340.0)
+              + pow(max(dot(R, normalize(vec3(-0.7, -0.2, 0.7))), 0.0), 400.0);
+      col += vec3(7.0) * g * uSparkle;
+      col *= 1.0 + uFocus * 0.4;
+      gl_FragColor = vec4(col, 1.0);
+    }`;
+
+  const glowVert = `varying vec3 vN; varying vec3 vV;
+    void main(){ vN = normalize(normalMatrix*normal); vec4 mv = modelViewMatrix*vec4(position,1.0); vV = normalize(-mv.xyz); gl_Position = projectionMatrix*mv; }`;
+  const glowFrag = `uniform vec3 color; uniform float k; varying vec3 vN; varying vec3 vV;
+    void main(){ float f = pow(1.0 - abs(dot(vN, vV)), 1.8); gl_FragColor = vec4(color * k * f, f * k); }`;
+
+  // ---------- renderer and passes ----------
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  } catch (e) {
+    stage.insertAdjacentHTML('beforeend', '<div class="fail">This browser could not start WebGL, so the scene cannot be drawn.</div>');
+    statsEl.textContent = '';
+    return;
+  }
+  const camera = new THREE.PerspectiveCamera(36, 2, 0.1, 120);
+  const backRT = new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType });
+  const composer = new THREE.EffectComposer(renderer, new THREE.WebGLRenderTarget(2, 2, { type: THREE.HalfFloatType }));
+  const renderPass = new THREE.RenderPass(new THREE.Scene(), camera);
+  const bokeh = new THREE.BokehPass(renderPass.scene, camera, { focus: 10, aperture: 0.0016, maxblur: 0.007 });
+  const bloom = new THREE.UnrealBloomPass(new THREE.Vector2(256, 256), 0.7, 0.55, 0.85);
+  const tone = new THREE.ShaderPass(THREE.ACESFilmicToneMappingShader);
+  tone.uniforms.exposure.value = 1.1;
+  composer.addPass(renderPass);
+  composer.addPass(bokeh);
+  composer.addPass(bloom);
+  composer.addPass(tone);
+  composer.addPass(new THREE.ShaderPass(THREE.GammaCorrectionShader));
+  const resV = new THREE.Vector2();
+
+  let scene = null, gems = [], extras = [], dust = null, fitDist = 10, maxX = 1, maxY = 1;
+  const ptr = { x: 0, y: 0 }, ptrTarget = { x: 0, y: 0 };
+  let mouse = null, focus = null, W = 1, H = 1, dirty = true;
+
+  function makeBackdrop() {
+    const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 512;
+    const g = cv.getContext('2d');
+    const base = g.createRadialGradient(512, 250, 0, 512, 256, 620);
+    base.addColorStop(0, '#1d2747'); base.addColorStop(0.45, '#0e1222'); base.addColorStop(1, '#040509');
+    g.fillStyle = base; g.fillRect(0, 0, 1024, 512);
+    g.globalCompositeOperation = 'lighter';
+    const blob = (x, y, r, c) => { const gr = g.createRadialGradient(x, y, 0, x, y, r); gr.addColorStop(0, c); gr.addColorStop(1, 'rgba(0,0,0,0)'); g.fillStyle = gr; g.fillRect(x - r, y - r, r * 2, r * 2); };
+    blob(300, 200, 260, 'rgba(70,120,255,0.35)');
+    blob(760, 300, 240, 'rgba(200,70,200,0.25)');
+    blob(560, 120, 180, 'rgba(255,170,90,0.22)');
+    blob(180, 380, 160, 'rgba(60,220,210,0.18)');
+    blob(880, 120, 140, 'rgba(140,110,255,0.25)');
+    g.filter = 'blur(4px)';
+    g.strokeStyle = 'rgba(220,235,255,0.55)';
+    [[120, 470, 520, 40, 3], [480, 500, 980, 70, 2], [40, 300, 400, -20, 1.5], [620, 512, 1010, 230, 2.5]].forEach(([x1, y1, x2, y2, w]) => {
+      g.lineWidth = w; g.beginPath(); g.moveTo(x1, y1); g.lineTo(x2, y2); g.stroke();
+    });
+    g.filter = 'blur(2px)';
+    const r = rng(3);
+    for (let i = 0; i < 70; i++) {
+      g.fillStyle = `rgba(${200 + r() * 55},${200 + r() * 55},255,${0.08 + r() * 0.25})`;
+      g.beginPath(); g.arc(r() * 1024, r() * 512, 2 + r() * 9, 0, 6.283); g.fill();
+    }
+    const tex = new THREE.CanvasTexture(cv); tex.encoding = THREE.sRGBEncoding;
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(76, 38), new THREE.MeshBasicMaterial({ map: tex, color: new THREE.Color(1.5, 1.5, 1.6) }));
+    m.position.z = -10;
+    return m;
+  }
+
+  function makeGem(repo, r, rand) {
+    const t = tier();
+    const c = new THREE.Color(LANG[repo.lang]);
+    const geo = state.cut === 'brilliant' ? brilliant(r, rand) : rough(r, rand);
+    const mat = new THREE.ShaderMaterial({
+      vertexShader: gemVert, fragmentShader: gemFrag,
+      defines: { SAMPLES: t.samples },
+      uniforms: {
+        uBack: { value: backRT.texture }, uRes: { value: resV }, uTint: { value: c.clone().lerp(new THREE.Color(1, 1, 1), 0.25) },
+        uChroma: { value: t.chroma }, uRefract: { value: 0.32 }, uFocus: { value: 0 }, uSparkle: { value: t.sparkle }, uIrid: { value: t.irid }
+      }
+    });
+    const outer = new THREE.Group(), spinner = new THREE.Group();
+    outer.add(spinner);
+    const shell = new THREE.Mesh(geo, mat);
+    const core = new THREE.Mesh(new THREE.IcosahedronGeometry(r * 0.3, 0), new THREE.MeshBasicMaterial({ color: c.clone().multiplyScalar(2.6) }));
+    spinner.add(shell, core);
+    let glow = null, edges = null;
+    if (repo.dirty) {
+      glow = new THREE.Mesh(new THREE.IcosahedronGeometry(r * 1.32, 3), new THREE.ShaderMaterial({
+        vertexShader: glowVert, fragmentShader: glowFrag,
+        uniforms: { color: { value: new THREE.Color(0.35, 0.8, 1.6) }, k: { value: 0.9 } },
+        transparent: true, blending: THREE.AdditiveBlending, depthWrite: false
+      }));
+      outer.add(glow);
+    }
+    if (repo.cut) {
+      edges = new THREE.LineSegments(new THREE.EdgesGeometry(geo, 1), new THREE.LineBasicMaterial({ color: new THREE.Color(2.2, 1.25, 0.35), transparent: true }));
+      edges.scale.setScalar(1.006);
+      spinner.add(edges);
+    }
+    spinner.rotation.set(-0.5 + rand() * 1.0, rand() * 6.28, rand() * 0.6);
+    outer.userData = { repo, r, shell, mat, spinner, glow, edges, f: 0, ph: rand() * 6.28, spin: 0.1 + rand() * 0.16 };
+    return outer;
+  }
+
+  function build() {
+    if (scene) scene.traverse((o) => { o.geometry?.dispose(); if (o.material) { o.material.map?.dispose(); o.material.dispose(); } });
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x040509);
+    scene.add(makeBackdrop());
+    renderPass.scene = scene;
+    bokeh.scene = scene;
+    const repos = state.count === 12 ? BASE : BASE.concat(EXTRA);
+    const sorted = [...repos].sort((a, b) => b.mass - a.mass);
+    const s = Math.min(1, Math.sqrt(14 / sorted.length));
+    const rand = rng(11);
+    maxX = 0; maxY = 0; focus = null;
+    gems = sorted.map((repo, i) => {
+      const rr = 0.72 * Math.sqrt(i + 0.35), a = i * 2.39996;
+      const base = new V3(Math.cos(a) * rr * 1.6, Math.sin(a) * rr * 0.95, (rand() - 0.5) * 1.6 - rr * 0.2);
+      const o = makeGem(repo, (0.32 + 0.45 * Math.sqrt(repo.mass)) * s, rand);
+      o.userData.base = base;
+      o.position.copy(base);
+      maxX = Math.max(maxX, Math.abs(base.x) + o.userData.r); maxY = Math.max(maxY, Math.abs(base.y) + o.userData.r);
+      scene.add(o); return o;
+    });
+    const n = 420, dp = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { const r = Math.sqrt(rand()) * (maxX + 2), a = rand() * 6.28; dp[i * 3] = Math.cos(a) * r; dp[i * 3 + 1] = Math.sin(a) * r * 0.65; dp[i * 3 + 2] = (rand() - 0.5) * 4; }
+    dust = new THREE.Points(new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(dp, 3)),
+      new THREE.PointsMaterial({ color: new THREE.Color(1.1, 1.25, 1.5), size: 0.03, transparent: true, opacity: 0.8 }));
+    scene.add(dust);
+    fit();
+    dirty = true;
+  }
+
+  function fit() {
+    const tv = Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+    fitDist = Math.max((maxY + 0.5) / tv, (maxX + 0.5) / (tv * camera.aspect)) + 1.0;
+  }
+
+  function applyTier() {
+    const t = tier();
+    renderer.setPixelRatio(t.pr);
+    composer.setPixelRatio(t.pr);
+    bloom.enabled = t.bloom;
+    bloom.strength = state.tier === 'high' ? 0.8 : 0.6;
+    bokeh.enabled = t.dof;
+    resize();
+    build();
+    document.querySelectorAll('.tier').forEach((el) => el.dataset.active = String(el.dataset.tier === state.tier));
+  }
+
+  function resize() {
+    W = stage.clientWidth; H = stage.clientHeight;
+    if (!W || !H) return;
+    renderer.setSize(W, H, false);
+    composer.setSize(W, H);
+    camera.aspect = W / H;
+    camera.updateProjectionMatrix();
+    renderer.getDrawingBufferSize(resV);
+    const k = tier().back;
+    backRT.setSize(Math.max(2, Math.round(resV.x * k)), Math.max(2, Math.round(resV.y * k)));
+    bokeh.uniforms.aspect.value = camera.aspect;
+    fit();
+    dirty = true;
+  }
+  new ResizeObserver(resize).observe(stage);
+  let visible = true;
+  new IntersectionObserver(([e]) => { visible = e.isIntersecting; dirty = true; }).observe(stage);
+
+  // ---------- interaction ----------
+  const tip = document.createElement('div');
+  tip.className = 'tip'; tip.hidden = true; stage.appendChild(tip);
+  canvas.addEventListener('pointermove', (ev) => {
+    const b = canvas.getBoundingClientRect();
+    mouse = [ev.clientX - b.left, ev.clientY - b.top];
+    ptrTarget.x = (mouse[0] / b.width) * 2 - 1;
+    ptrTarget.y = (mouse[1] / b.height) * 2 - 1;
+  });
+  canvas.addEventListener('pointerleave', () => { mouse = null; ptrTarget.x = 0; ptrTarget.y = 0; focus = null; tip.hidden = true; });
+
+  const tmp = new V3();
+  const screenPos = (o) => { o.getWorldPosition(tmp).project(camera); return [(tmp.x * 0.5 + 0.5) * W, (-tmp.y * 0.5 + 0.5) * H, tmp.z]; };
+  function updateFocus() {
+    if (!mouse) { focus = null; return; }
+    let best = null, bd = 130;
+    for (const o of gems) {
+      const [x, y, z] = screenPos(o);
+      if (z > 1) continue;
+      const d = Math.hypot(x - mouse[0], y - mouse[1]);
+      if (d < bd) { bd = d; best = o; }
+    }
+    focus = best;
+  }
+  function stateLabel(repo) {
+    if (repo.cut) return '<span class="st-cut">Agent cut off · click opens a picker</span>';
+    if (repo.dirty) return '<span class="st-dirty">Uncommitted work · click opens a picker</span>';
+    return '<span class="st-clean">Clean · click starts a new agent</span>';
+  }
+  function placeTip() {
+    if (!focus) { tip.hidden = true; return; }
+    const r = focus.userData.repo;
+    if (tip.dataset.name !== r.name) { tip.innerHTML = `<b>${r.name}</b><i>${r.host} · ${r.lang}</i><br>${stateLabel(r)}`; tip.dataset.name = r.name; }
+    const [x, y] = screenPos(focus);
+    tip.hidden = false;
+    const tw = tip.offsetWidth, th = tip.offsetHeight;
+    tip.style.transform = `translate(${Math.max(8, Math.min(W - tw - 8, x + 28))}px, ${Math.max(8, Math.min(H - th - 8, y - th / 2))}px)`;
+  }
+
+  // ---------- loop ----------
+  let T = 0, last = performance.now(), frames = 0, cpu = 0, statT = performance.now();
+  const camGoal = new V3();
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const t = tier();
+    if (now - last < 1000 / t.fps - 1) return;
+    const rdt = Math.min((now - last) / 1000, 0.1);
+    last = now;
+    if (!visible || document.hidden) return;
+    const settling = Math.abs(ptr.x - ptrTarget.x) + Math.abs(ptr.y - ptrTarget.y) > 0.002 || gems.some((o) => Math.abs(o.userData.f - (o === focus ? 1 : 0)) > 0.01);
+    if (!(state.motion || dirty || settling || mouse)) return;
+    const t0 = performance.now();
+    const dt = state.motion ? rdt : 0;
+    T += dt;
+    const k = Math.min(1, rdt * 6);
+    ptr.x += (ptrTarget.x - ptr.x) * k; ptr.y += (ptrTarget.y - ptr.y) * k;
+    camGoal.set(ptr.x * 1.6, -ptr.y * 1.0, fitDist);
+    camera.position.lerp(camGoal, Math.min(1, rdt * 3));
+    camera.lookAt(0, 0, 0);
+    const breathe = 1 + 0.022 * Math.sin(T * 0.5);
+    dust.scale.setScalar(breathe);
+    for (const o of gems) {
+      const u = o.userData;
+      o.position.copy(u.base).multiplyScalar(breathe);
+      u.f += ((o === focus ? 1 : 0) - u.f) * Math.min(1, rdt * 9);
+      u.spinner.rotation.y += u.spin * dt;
+      u.spinner.scale.setScalar(1 + 0.18 * u.f);
+      u.mat.uniforms.uFocus.value = u.f;
+      if (u.glow) u.glow.material.uniforms.k.value = 0.55 + 0.3 * Math.sin(T * 1.5 + u.ph);
+      if (u.edges) u.edges.material.opacity = 0.25 + 0.75 * (0.5 + 0.5 * Math.sin(T * 2.6 + u.ph));
+    }
+    scene.updateMatrixWorld();
+    updateFocus();
+    bokeh.uniforms.focus.value = camera.position.length();
+
+    // Pass 1: everything except the glass shells, into the texture the shells refract.
+    for (const o of gems) { o.userData.shell.visible = false; if (o.userData.glow) o.userData.glow.visible = false; if (o.userData.edges) o.userData.edges.visible = false; }
+    renderer.setRenderTarget(backRT);
+    renderer.render(scene, camera);
+    renderer.setRenderTarget(null);
+    for (const o of gems) { o.userData.shell.visible = true; if (o.userData.glow) o.userData.glow.visible = true; if (o.userData.edges) o.userData.edges.visible = true; }
+    // Pass 2: the full scene through glow, depth of field, tone mapping.
+    composer.render();
+    placeTip();
+    dirty = false;
+
+    frames++; cpu += performance.now() - t0;
+    if (now - statT > 1000) {
+      const fps = Math.round(frames * 1000 / (now - statT));
+      statsEl.textContent = `${fps} fps drawn · ${(cpu / Math.max(frames, 1)).toFixed(1)} ms CPU per frame · ${resV.x}×${resV.y} px`;
+      frames = 0; cpu = 0; statT = now;
+    }
+  }
+
+  // ---------- controls ----------
+  function group(ids, onPick) {
+    const btns = ids.map((id) => document.getElementById(id));
+    const pick = (i) => { btns.forEach((b, j) => b.setAttribute('aria-pressed', String(i === j))); onPick(i); };
+    btns.forEach((b, i) => b.addEventListener('click', () => pick(i)));
+    return pick;
+  }
+  group(['q-low', 'q-medium', 'q-high'], (i) => { state.tier = ['low', 'medium', 'high'][i]; applyTier(); });
+  group(['cut-brilliant', 'cut-rough'], (i) => { state.cut = i ? 'rough' : 'brilliant'; build(); });
+  group(['count-12', 'count-40'], (i) => { state.count = i ? 40 : 12; build(); });
+  const pickMotion = group(['motion-on', 'motion-off'], (i) => { state.motion = !i; dirty = true; });
+  pickMotion(state.motion ? 0 : 1);
+
+  applyTier();
+  requestAnimationFrame(frame);
+})();
+</script>
