@@ -31,7 +31,7 @@ Each repo is a rough-cut glass gem, frozen mid-burst. The heaviest repos sit nea
 - **Type to filter** by name; arrow keys move between gems.
 - **GitHub and GitLab** repos you haven't cloned appear dimmed; launching one clones it into `~/projects` first.
 - **Status hook (optional).** One small script added to Claude Code's settings tells Refract when an agent is working or waiting on you. Removing it restores your settings byte for byte if nothing else changed them since it was installed; otherwise it removes only Refract's entries and leaves the rest alone.
-- **Widgets:** system load (with Refract's own share) and Claude Code token use today, this week and in the last 5 hours, added up from Claude Code's local session files.
+- **Widgets:** system load (with Refract's own share) and Claude Code token use today, over the last 7 days and in the last 5 hours, added up from Claude Code's local session files.
 - **Graphics levels** (Low, Medium, High) chosen automatically from frame times and how busy the GPU is with other programs.
 
 ## How it works
@@ -59,7 +59,7 @@ cd app
 npm ci
 npm test && npm run lint         # interface tests and type checks
 npm run test:e2e                 # browser tests of the web demo (Playwright)
-npm run tauri:build              # the Windows app
+npm run tauri:build              # the Windows app (exe only; tagged releases build the installer)
 ```
 
 The Windows app bundles the Linux helper and installs it into WSL on first run, so build the helper first (in WSL), as a static musl binary, and copy it into the app's resources:
