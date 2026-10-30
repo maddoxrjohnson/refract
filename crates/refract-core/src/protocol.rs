@@ -123,7 +123,7 @@ pub enum Method {
     /// [`Event::MigrateReady`].
     MigrateResync(MigrateIdParams),
     /// The migrations whose reports wait for `migrateFinish`, including those from
-    /// before the helper restarted: answered with [`PendingMigrations`].
+    /// before the helper restarted: answered with a list of [`PendingMigration`].
     MigratePending,
     /// Stops (SIGTERM) the `claude` process of a live session, unless it is working on
     /// a turn: answered with `null`. See [`StopAgentParams`].
@@ -176,8 +176,8 @@ pub enum Reply {
     Migration(MigrationTicket),
     /// The result of `migrateRecheck`.
     Recheck(Recheck),
-    /// The result of `migratePending`.
-    PendingMigrations(PendingMigrations),
+    /// The result of `migratePending`: the pending migrations, oldest first.
+    PendingMigrations(Vec<PendingMigration>),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -367,25 +367,9 @@ pub enum FinishAction {
 pub struct Recheck {
     /// Paths relative to the original, changed, added or removed, sorted.
     pub changed: Vec<String>,
-    pub busy_agents: Vec<BusyAgent>,
-}
-
-/// A `claude` process whose working directory is the original or inside it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BusyAgent {
-    pub pid: u32,
-    pub cwd: String,
-    /// When the command line names it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
-}
-
-/// The result of `migratePending`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingMigrations {
-    pub migrations: Vec<PendingMigration>,
+    /// One sentence per `claude` process whose working directory is the original or
+    /// inside it, naming its pid, folder and session when known.
+    pub busy_agents: Vec<String>,
 }
 
 /// A migration whose report waits for `migrateFinish`.
@@ -1191,7 +1175,7 @@ mod tests {
                 changed: vec![],
                 busy_agents: vec![],
             }),
-            Reply::PendingMigrations(PendingMigrations { migrations: vec![] }),
+            Reply::PendingMigrations(vec![]),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
@@ -1516,17 +1500,15 @@ mod tests {
             5,
             Reply::Recheck(Recheck {
                 changed: vec!["notes.txt".into()],
-                busy_agents: vec![BusyAgent {
-                    pid: 4242,
-                    cwd: "/mnt/c/dev/aurora-notes".into(),
-                    session_id: Some("s-1".into()),
-                }],
+                busy_agents: vec![
+                    "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes.".into()
+                ],
             }),
         ));
         assert_eq!(
             round_trip(&recheck),
             json!({"id": 5, "result": {"changed": ["notes.txt"], "busyAgents": [
-                {"pid": 4242, "cwd": "/mnt/c/dev/aurora-notes", "sessionId": "s-1"}]}})
+                "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes."]}})
         );
         let empty = Message::Response(Response::ok(
             6,
@@ -1562,12 +1544,9 @@ mod tests {
                 report: Box::new(report),
             }],
         ] {
-            let pending = Message::Response(Response::ok(
-                7,
-                Reply::PendingMigrations(PendingMigrations { migrations }),
-            ));
+            let pending = Message::Response(Response::ok(7, Reply::PendingMigrations(migrations)));
             let value = round_trip(&pending);
-            assert!(value["result"]["migrations"].is_array());
+            assert!(value["result"].is_array());
         }
     }
 

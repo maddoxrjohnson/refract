@@ -93,11 +93,11 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `uninstallHook` | none | the same | Removes it and restores `settings.json` |
 | `shutdown` | none | `null` | Answers, then the helper exits |
 | `migrate` | `{path, dest, snapshot}` | `{id}` | Moves a repo from a Windows drive into WSL in the background ([Move to WSL](#move-to-wsl)); a preflight refusal is error `6` with one message per line |
-| `migrateRecheck` | `{id}` | `{changed, busyAgents}` | Check 4 again, right before the app deletes the original: paths changed since the last check, and `claude` processes (`{pid, cwd, sessionId?}`) running in the original; both empty means safe |
+| `migrateRecheck` | `{id}` | `{changed, busyAgents}` | Check 4 again, right before the app deletes the original: paths changed since the last check, and a sentence per `claude` process running in the original; both empty means safe |
 | `migrateResync` | `{id}` | `null` | Copies what changed into the placed copy and checks again; `migrateProgress` and a fresh `migrateReady` follow |
 | `migrateFinish` | `{id, action}` | `null` | Ends a migration whose report is ready: `delete` (the app has already recycled the original), `keep` or `discard` |
 | `migrateCancel` | `{id}` | `null` | Stops a migration before its report and deletes the temporary copy |
-| `migratePending` | none | `{migrations: [{id, report}]}` | Reports waiting for `migrateFinish`, including those from before a restart |
+| `migratePending` | none | `[{id, report}]` | Reports waiting for `migrateFinish`, including those from before a restart |
 | `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` process, unless it is working (error `7`) |
 
 ### Events

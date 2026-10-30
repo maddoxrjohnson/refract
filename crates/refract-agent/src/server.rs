@@ -32,8 +32,8 @@ use refract_core::classify::{classify_report, LiveState, SessionState};
 use refract_core::launch::wsl_path;
 use refract_core::protocol::{
     code, parse_request, ErrorBody, Event, FinishAction, Hello, HookInfo, Id, LaunchMode, Method,
-    Outcome, PendingMigration, PendingMigrations, Reply, RepoList, RepoSnapshot, Response,
-    StopAgentParams, PROTOCOL_VERSION,
+    Outcome, PendingMigration, Reply, RepoList, RepoSnapshot, Response, StopAgentParams,
+    PROTOCOL_VERSION,
 };
 use refract_core::sessions::{is_windows_mount, paths_match, project_dir_matches};
 use serde::Serialize;
@@ -737,10 +737,7 @@ impl<W: Write> Server<W> {
                     })
                     .collect();
                 migrations.sort_by_key(|m| m.report.started_at);
-                Response::ok(
-                    id,
-                    Reply::PendingMigrations(PendingMigrations { migrations }),
-                )
+                Response::ok(id, Reply::PendingMigrations(migrations))
             }
             Method::StopAgent(params) => self.stop_agent(id, &params)?,
             Method::Shutdown => {

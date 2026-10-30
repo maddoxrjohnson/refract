@@ -439,7 +439,7 @@ fn a_repo_moves_as_a_linux_checkout_and_finishing_deletes_the_old_history() {
 
     // Pending until finished.
     let pending = agent.request("migratePending", json!(null));
-    assert_eq!(pending["result"]["migrations"][0]["id"], id.as_str());
+    assert_eq!(pending["result"][0]["id"], id.as_str());
 
     // Nothing changed since: safe to delete.
     let recheck = agent.request("migrateRecheck", json!({"id": id}));
@@ -474,7 +474,7 @@ fn a_repo_moves_as_a_linux_checkout_and_finishing_deletes_the_old_history() {
     assert!(config.contains(dest.to_str().unwrap()), "{config}");
     assert!(!config.contains(src.to_str().unwrap()), "{config}");
     let pending = agent.request("migratePending", json!(null));
-    assert_eq!(pending["result"]["migrations"], json!([]));
+    assert_eq!(pending["result"], json!([]));
     let again = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
     assert_eq!(again["error"]["code"], 6);
 }
@@ -539,7 +539,7 @@ fn a_placed_migration_comes_back_after_a_restart() {
     let report = agent.ready();
     assert_eq!(report["id"], id.as_str());
     let pending = agent.request("migratePending", json!(null));
-    assert_eq!(pending["result"]["migrations"][0]["id"], id.as_str());
+    assert_eq!(pending["result"][0]["id"], id.as_str());
     let recheck = agent.request("migrateRecheck", json!({"id": id}));
     assert_eq!(recheck["result"]["changed"], json!([]), "{recheck}");
     let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));

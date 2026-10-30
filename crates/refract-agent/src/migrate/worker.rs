@@ -31,8 +31,8 @@ use refract_core::migrate::report::{
 };
 use refract_core::migrate::{SourceSnapshot, SOURCE_SNAPSHOT_VERSION};
 use refract_core::protocol::{
-    code, BusyAgent, Event, FinishAction, Id, MigrateParams, MigrateProgress, MigrateStep,
-    MigrationTicket, Recheck, Reply, Response,
+    code, Event, FinishAction, Id, MigrateParams, MigrateProgress, MigrateStep, MigrationTicket,
+    Recheck, Reply, Response,
 };
 use refract_core::sessions::{is_windows_mount, path_within};
 
@@ -819,25 +819,28 @@ impl Worker {
     fn busy_problems(&self) -> Vec<Problem> {
         self.busy_agents()
             .into_iter()
-            .map(|agent| Problem {
+            .map(|message| Problem {
                 path: None,
-                message: format!(
-                    "An agent (pid {}) is running in {}. Stop it first.",
-                    agent.pid, agent.cwd
-                ),
+                message,
             })
             .collect()
     }
 
-    fn busy_agents(&self) -> Vec<BusyAgent> {
+    /// A sentence per `claude` process running in the source.
+    fn busy_agents(&self) -> Vec<String> {
         let source = self.source_str();
         procs::scan()
             .into_iter()
             .filter(|p| path_within(&p.cwd, &source))
-            .map(|p| BusyAgent {
-                pid: p.pid,
-                cwd: p.cwd,
-                session_id: p.session_id,
+            .map(|p| match p.session_id {
+                Some(session) => format!(
+                    "An agent (pid {}, session {session}) is running in {}. Stop it first.",
+                    p.pid, p.cwd
+                ),
+                None => format!(
+                    "An agent (pid {}) is running in {}. Stop it first.",
+                    p.pid, p.cwd
+                ),
             })
             .collect()
     }
