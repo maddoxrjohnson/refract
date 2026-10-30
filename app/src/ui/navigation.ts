@@ -1,4 +1,5 @@
 import type { LaunchMode, RepoSnapshot, SessionInfo } from "../backend/types";
+import { isRemoteKey, remoteKey } from "../projects";
 import { DIRTY_REPO_PROMPT, unfinishedSessions } from "../repoStatus";
 
 // Finding and choosing a project (spec §3.3, §4.3) as a pure state machine. Inputs are
@@ -25,9 +26,17 @@ export interface NavState {
   /** Typed text; gems whose name contains it (any case) match. */
   filter: string;
   picker: PickerState | null;
+  /** A cloned gem's new key, waiting for its repo to appear; focus and zoom then move to it. */
+  follow: { from: string; to: string } | null;
 }
 
-export const initialNavState: NavState = { focused: null, zoomed: null, filter: "", picker: null };
+export const initialNavState: NavState = {
+  focused: null,
+  zoomed: null,
+  filter: "",
+  picker: null,
+  follow: null,
+};
 
 /** A key press, reduced to what navigation needs. */
 export interface NavKey {
@@ -53,7 +62,9 @@ export type NavInput =
   | { type: "pickerClose" }
   | { type: "clearFilter" }
   /** Repos changed: forget paths that are gone. */
-  | { type: "sync" };
+  | { type: "sync" }
+  /** A remote-only gem was cloned to `to`: focus and zoom follow it once `to` is a repo. */
+  | { type: "rekey"; from: string; to: string };
 
 export type NavEffect =
   | { kind: "launch"; path: string; mode: LaunchMode }
@@ -277,14 +288,42 @@ function onKey(state: NavState, k: NavKey, ctx: NavContext): NavResult {
   return unhandled(state);
 }
 
-/** Forgets focus, zoom and picker for repos that are gone; same object when nothing is. */
+/** The local repo cloned from a remote key's repo, if one is listed. */
+function localClone(key: string, ctx: NavContext): string | null {
+  for (const r of ctx.repos.values()) {
+    if (r.remote && remoteKey(r.remote) === key && !ctx.remoteOnly?.has(r.path)) return r.path;
+  }
+  return null;
+}
+
+/**
+ * Forgets focus, zoom and picker for repos that are gone; same object when nothing is.
+ * A remote-only gem that went away because its clone appeared hands them to the clone.
+ */
 function sync(state: NavState, ctx: NavContext): NavState {
-  const keep = (p: string | null) => (p && ctx.repos.has(p) ? p : null);
+  const follow = state.follow && ctx.repos.has(state.follow.to) ? state.follow : null;
+  const keep = (p: string | null) => {
+    if (follow && p === follow.from) return follow.to;
+    if (!p || ctx.repos.has(p)) return p;
+    return isRemoteKey(p) ? localClone(p, ctx) : null;
+  };
   const focused = keep(state.focused);
   const zoomed = keep(state.zoomed);
   const picker = state.picker && ctx.repos.has(state.picker.path) ? state.picker : null;
-  if (focused === state.focused && zoomed === state.zoomed && picker === state.picker) return state;
-  return { ...state, focused, zoomed, picker };
+  // A pending follow lasts while its gem is still focused or zoomed and has not arrived.
+  const waiting =
+    !follow && state.follow && (focused === state.follow.from || zoomed === state.follow.from)
+      ? state.follow
+      : null;
+  if (
+    focused === state.focused &&
+    zoomed === state.zoomed &&
+    picker === state.picker &&
+    waiting === state.follow
+  ) {
+    return state;
+  }
+  return { ...state, focused, zoomed, picker, follow: waiting };
 }
 
 export function navigate(current: NavState, input: NavInput, ctx: NavContext): NavResult {
@@ -292,6 +331,9 @@ export function navigate(current: NavState, input: NavInput, ctx: NavContext): N
   switch (input.type) {
     case "sync":
       return result(state);
+    case "rekey":
+      if (state.focused !== input.from && state.zoomed !== input.from) return unhandled(state);
+      return result(sync({ ...state, follow: { from: input.from, to: input.to } }, ctx));
     case "pointerFocus":
       return result(state.focused === input.path ? state : { ...state, focused: input.path });
     case "select":

@@ -367,6 +367,7 @@ describe("sync", () => {
       zoomed: "/p/gone",
       filter: "",
       picker: { path: "/p/gone", options: [{ kind: "new" }], index: 0 },
+      follow: null,
     };
     expect(run([{ type: "sync" }], state).state).toEqual(initialNavState);
   });
@@ -374,5 +375,55 @@ describe("sync", () => {
   it("returns the same state object when nothing changed", () => {
     const state: NavState = { ...initialNavState, focused: "/p/east" };
     expect(navigate(state, { type: "sync" }, ctx).state).toBe(state);
+  });
+});
+
+describe("following a clone", () => {
+  const remote = { host: "github.com", owner: "demo-user", name: "kelp-cli" };
+  const remoteGem = { ...repo("kelp-cli"), path: "remote:github.com/demo-user/kelp-cli", remote };
+  const cloned = { ...repo("kelp-cli"), path: "/home/demo/projects/kelp-cli", remote };
+  const context = (gems: RepoSnapshot[], remoteOnly: string[] = []): NavContext => ({
+    repos: new Map(gems.map((r) => [r.path, r])),
+    positions: new Map(gems.map((r, i) => [r.path, { x: i, y: 0 }])),
+    remoteOnly: new Set(remoteOnly),
+  });
+  const before = context([...repos, remoteGem], [remoteGem.path]);
+  const after = context([...repos, cloned]);
+  const zoomed: NavState = { ...initialNavState, focused: remoteGem.path, zoomed: remoteGem.path };
+
+  it("moves focus and zoom to the clone when its repo is already listed", () => {
+    const r = navigate(zoomed, { type: "rekey", from: remoteGem.path, to: cloned.path }, after);
+    expect(r.state).toEqual({ ...zoomed, focused: cloned.path, zoomed: cloned.path });
+  });
+
+  it("waits for the clone's repo when it is not listed yet, then follows on sync", () => {
+    const both = context([...repos, remoteGem, { ...cloned, remote: null }], [remoteGem.path]);
+    let r = navigate(zoomed, { type: "rekey", from: remoteGem.path, to: cloned.path }, before);
+    expect(r.state.zoomed).toBe(remoteGem.path);
+    r = navigate(r.state, { type: "sync" }, before);
+    expect(r.state.zoomed).toBe(remoteGem.path);
+    // Even a clone whose origin did not match the listing (so both gems show) is followed.
+    r = navigate(r.state, { type: "sync" }, both);
+    expect(r.state).toEqual({ ...zoomed, focused: cloned.path, zoomed: cloned.path });
+  });
+
+  it("follows a clone that shows up before the clone call answers", () => {
+    const r = navigate(zoomed, { type: "sync" }, after);
+    expect(r.state).toEqual({ ...zoomed, focused: cloned.path, zoomed: cloned.path });
+    const late = navigate(r.state, { type: "rekey", from: remoteGem.path, to: cloned.path }, after);
+    expect(late.state).toEqual(r.state);
+  });
+
+  it("does nothing once the user has moved on", () => {
+    const elsewhere: NavState = { ...initialNavState, focused: "/p/east", zoomed: "/p/east" };
+    const r = navigate(elsewhere, { type: "rekey", from: remoteGem.path, to: cloned.path }, before);
+    expect(r.handled).toBe(false);
+    expect(navigate(r.state, { type: "sync" }, after).state).toBe(r.state);
+  });
+
+  it("drops a waiting follow when the remote gem goes away without a clone", () => {
+    let r = navigate(zoomed, { type: "rekey", from: remoteGem.path, to: cloned.path }, before);
+    r = navigate(r.state, { type: "sync" }, ctx);
+    expect(r.state).toEqual(initialNavState);
   });
 });

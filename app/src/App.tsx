@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { Backend } from "./backend/Backend";
 import type {
   AgentStatus,
@@ -18,7 +18,7 @@ import { createQualityController } from "./quality/controller";
 import type { QualityLevel, QualitySetting } from "./quality/tiers";
 import { initialRepoState, repoReducer } from "./repoState";
 import { layoutGems } from "./scene/layout";
-import { Scene } from "./scene/Scene";
+import { SceneBoundary } from "./scene/SceneBoundary";
 import { DetailPanel } from "./ui/DetailPanel";
 import { FilterBar } from "./ui/FilterBar";
 import { FocusLabel } from "./ui/FocusLabel";
@@ -39,6 +39,12 @@ import { SettingsPanel } from "./ui/SettingsPanel";
 import { describeError, StatusToast, type LaunchProgress } from "./ui/StatusToast";
 import { SystemWidget } from "./ui/SystemWidget";
 import { UsageWidget } from "./ui/UsageWidget";
+
+// The scene (three.js and its effects, most of the bundle) loads in its own chunk, so the
+// overlays and the data requests start without waiting for it. A chunk that fails to load
+// is asked for once more before SceneBoundary gives up on it.
+const loadScene = () => import("./scene/Scene").then((m) => ({ default: m.Scene }));
+const Scene = lazy(() => loadScene().catch(loadScene));
 
 /** How long a finished launch stays on screen. */
 const LAUNCH_TOAST_MS = 4000;
@@ -312,7 +318,9 @@ export function App({ backend }: { backend: Backend }) {
     [backend, repos],
   );
 
-  // Clone and launch (spec §4.4): one job with the launch, under the same guard.
+  // Clone and launch (spec §4.4): one job with the launch, under the same guard. The zoom
+  // follows the gem to its new path once the clone shows up as a local repo.
+  const sendRef = useRef<(input: NavInput) => boolean>(() => false);
   const startClone = useCallback(
     (key: string) => {
       const remote = projects.remotes.get(key);
@@ -324,6 +332,7 @@ export function App({ backend }: { backend: Backend }) {
       backend
         .cloneRepo(remote)
         .then((path) => {
+          sendRef.current({ type: "rekey", from: key, to: path });
           setLaunch({ repoName, step: "starting" });
           return backend.launch(path, newAgentMode(gem));
         })
@@ -381,6 +390,7 @@ export function App({ backend }: { backend: Backend }) {
     runEffects.current(result.effects);
     return result.handled;
   }, []);
+  sendRef.current = send;
 
   useEffect(() => {
     send({ type: "sync" });
@@ -431,7 +441,7 @@ export function App({ backend }: { backend: Backend }) {
   const detailsRef: RemoteRef | null =
     zoomedRemote ??
     (origin && (origin.host === "github.com" || origin.host === gitlabHost) ? origin : null);
-  const details = useRemoteDetails(backend, detailsRef);
+  const details = useRemoteDetails(backend, detailsRef, visible);
   const pickerRepo = nav.picker ? repos.get(nav.picker.path) : undefined;
   const now = Date.now();
   const showOffer =
@@ -456,21 +466,26 @@ export function App({ backend }: { backend: Backend }) {
 
   return (
     <main className="app">
-      <Scene
-        repos={repoList}
-        remoteOnly={projects.remoteOnly}
-        visible={visible}
-        quality={quality.level}
-        reducedMotion={reducedMotion}
-        matches={matches}
-        focused={nav.focused}
-        zoomed={nav.zoomed}
-        focusLabel={focusLabel}
-        onPointerFocus={onPointerFocus}
-        onSelect={onSelect}
-        onBackgroundClick={onBackgroundClick}
-        onFrameInterval={quality.onFrameInterval}
-      />
+      {/* Until the scene's chunk arrives, its empty dark backdrop, without a spinner. */}
+      <SceneBoundary>
+        <Suspense fallback={<div className="scene" />}>
+          <Scene
+            repos={repoList}
+            remoteOnly={projects.remoteOnly}
+            visible={visible}
+            quality={quality.level}
+            reducedMotion={reducedMotion}
+            matches={matches}
+            focused={nav.focused}
+            zoomed={nav.zoomed}
+            focusLabel={focusLabel}
+            onPointerFocus={onPointerFocus}
+            onSelect={onSelect}
+            onBackgroundClick={onBackgroundClick}
+            onFrameInterval={quality.onFrameInterval}
+          />
+        </Suspense>
+      </SceneBoundary>
       <FilterBar
         filter={nav.filter}
         matches={matches?.size ?? repoList.length}

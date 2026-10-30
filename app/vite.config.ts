@@ -15,6 +15,9 @@ export default defineConfig({
   },
   build: {
     target: "es2022",
+    // The lazily loaded scene chunk is mostly three.js (about 745 kB on its own) and loads
+    // from local disk in the app, so a split would only add requests.
+    chunkSizeWarningLimit: 1100,
   },
   test: {
     environment: "jsdom",

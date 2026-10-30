@@ -8,6 +8,11 @@ import { LEVELS, TIERS, type QualityLevel, type QualitySetting } from "./tiers";
 // process), so the scene reports the interval between consecutive frames of continuous
 // animation instead. Frames that arrive late mean the level cannot keep its frame cap.
 // Stepping up also needs GPU samples showing headroom; without them the level only falls.
+// Low draws only on change, so after a game forces it there may be no frames to judge;
+// once the GPU has been calm for 10 s (others under 45% throughout), GPU readings alone
+// lift it back to Medium. A game that then turns busy again within a minute doubles that
+// wait, up to 2 minutes, so a game hovering near the threshold does not flip the level
+// (and rebuild the effects) every few seconds.
 // Samples live in fixed-size rings so a frame allocates nothing.
 
 /** Other programs above this share of the GPU (a game, a render) force Low. */
@@ -20,6 +25,12 @@ const UP_AFTER_MS = 10_000;
 const LATE = 1.25;
 /** On time: the median interval is within the level's budget by this factor. */
 const ON_TIME = 1.1;
+/** Lifting Low on GPU readings alone needs other programs under this share throughout. */
+const GPU_CALM_PERCENT = 45;
+/** The calm wait doubles, up to this, each time the GPU turns busy soon after such a lift. */
+const MAX_CALM_WAIT_MS = 120_000;
+/** Busy again within this long after such a lift counts as soon; calm for this long resets the wait. */
+const LIFT_SETTLE_MS = 60_000;
 /** Stepping up needs Refract's own GPU use under this share throughout. */
 const OWN_HEADROOM_PERCENT = 35;
 /** After stepping down for late frames, the level just left stays out of reach this long. */
@@ -35,7 +46,8 @@ const MIN_UP_GPU_SAMPLES = 3;
 
 /** 10 s at 60 fps with room to spare; older samples are overwritten. */
 const FRAME_RING = 1024;
-const GPU_RING = 32;
+/** Two minutes of readings, the longest calm wait. */
+const GPU_RING = 64;
 
 export interface QualityController {
   readonly setting: QualitySetting;
@@ -90,8 +102,14 @@ export function createQualityController(initial: QualitySetting): QualityControl
   /** When the current level began; `null` until the first sample after a change. */
   let levelSince: number | null = null;
   let gpuHeavy = false;
-  /** First calm GPU sample after a busy one; stepping up waits UP_AFTER_MS from here. */
+  /** The level is Low because other programs were busy on the GPU, not for late frames. */
+  let lowForGpu = false;
+  /** First calm GPU sample after a busy one; stepping up waits `calmWaitMs` from here. */
   let gpuCalmSince = -Infinity;
+  /** How long the GPU must stay calm before GPU readings alone lift Low; backs off. */
+  let calmWaitMs = UP_AFTER_MS;
+  /** When GPU readings last lifted Low, until a busy reading or a long calm settles it. */
+  let liftedAt: number | null = null;
   /** The level that late frames pushed us off, and until when it stays out of reach. */
   let blockedLevel: QualityLevel | null = null;
   let blockedUntil = 0;
@@ -112,6 +130,7 @@ export function createQualityController(initial: QualitySetting): QualityControl
 
   const setLevel = (next: QualityLevel, now: number | null) => {
     level = next;
+    lowForGpu = false;
     levelSince = now;
     frameCount = 0;
   };
@@ -132,13 +151,16 @@ export function createQualityController(initial: QualitySetting): QualityControl
     return n >= MIN_FRAMES && covered >= MIN_COVERED * windowMs ? n : 0;
   };
 
-  /** Enough GPU readings from `since` on, all with room for Refract to draw more. */
-  const gpuHeadroom = (since: number) => {
+  /**
+   * Enough GPU readings from `since` on, all with room for Refract to draw more and other
+   * programs under `maxOther`.
+   */
+  const gpuHeadroom = (since: number, maxOther = GPU_HEAVY_PERCENT) => {
     let n = 0;
     for (let k = 0; k < gpuCount; k++) {
       const i = (gpuHead - 1 - k + GPU_RING) % GPU_RING;
       if (gpuT[i] < since) break;
-      if (gpuOwn[i] >= OWN_HEADROOM_PERCENT || gpuOther[i] >= GPU_HEAVY_PERCENT) return false;
+      if (gpuOwn[i] >= OWN_HEADROOM_PERCENT || gpuOther[i] >= maxOther) return false;
       n++;
     }
     return n >= MIN_UP_GPU_SAMPLES;
@@ -198,14 +220,34 @@ export function createQualityController(initial: QualitySetting): QualityControl
       const heavy = other > GPU_HEAVY_PERCENT;
       if (gpuHeavy && !heavy) gpuCalmSince = now;
       gpuHeavy = heavy;
-      if (heavy && setting === "auto" && level !== "low") setLevel("low", now);
+      if (liftedAt !== null) {
+        if (now - liftedAt >= LIFT_SETTLE_MS) calmWaitMs = UP_AFTER_MS;
+        else if (heavy) calmWaitMs = Math.min(calmWaitMs * 2, MAX_CALM_WAIT_MS);
+        if (heavy || now - liftedAt >= LIFT_SETTLE_MS) liftedAt = null;
+      }
+      if (heavy && setting === "auto" && level !== "low") {
+        setLevel("low", now);
+        lowForGpu = true;
+      } else if (
+        lowForGpu &&
+        setting === "auto" &&
+        !heavy &&
+        now - gpuCalmSince >= calmWaitMs &&
+        gpuHeadroom(now - calmWaitMs, GPU_CALM_PERCENT)
+      ) {
+        setLevel("medium", now);
+        liftedAt = now;
+      }
       return level;
     },
 
     setSetting(next) {
       setting = next;
       blockedLevel = null;
+      calmWaitMs = UP_AFTER_MS;
+      liftedAt = null;
       setLevel(next === "auto" ? (gpuHeavy ? "low" : "medium") : next, null);
+      lowForGpu = next === "auto" && gpuHeavy;
       return level;
     },
   };

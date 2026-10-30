@@ -71,10 +71,34 @@ pub fn windows_folder(path: &str, distro: Option<&str>) -> Result<String, OpenEr
     Ok(format!(r"\\wsl.localhost\{distro}\{}", segments.join("\\")))
 }
 
+/// The part of `url` between `://` and the first `/`, `?` or `#`, or none without `://`.
+fn authority(url: &str) -> &str {
+    let rest = url.split_once("://").map_or("", |(_, rest)| rest);
+    rest.split(['/', '?', '#']).next().unwrap_or("")
+}
+
+/// `url` for an error message, with any user info (`user:token@`) left out.
+fn redacted(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..end].rfind('@') {
+        Some(at) => format!("{scheme}://{}", &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Checks that `url` is an `https://` URL with a host and no spaces or control
 /// characters, and returns it as it is.
 pub fn check_url(url: &str) -> Result<&str, OpenError> {
-    let invalid = |why: &str| OpenError::new(OpenErrorKind::Invalid, format!("{why}: {url}"));
+    let invalid =
+        |why: &str| OpenError::new(OpenErrorKind::Invalid, format!("{why}: {}", redacted(url)));
+    // User info can hide the real host (`https://github.com@evil.example`) or carry a
+    // token, so it is refused first, whatever else is wrong, without repeating it.
+    if authority(url).contains('@') {
+        return Err(invalid("Cannot open a link with a user name in it"));
+    }
     let scheme = url.get(..8).filter(|s| s.eq_ignore_ascii_case("https://"));
     if scheme.is_none() {
         return Err(invalid("Only https links can be opened"));
@@ -82,9 +106,7 @@ pub fn check_url(url: &str) -> Result<&str, OpenError> {
     if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(invalid("Cannot open a link with spaces in it"));
     }
-    let host = url[8..].split(['/', '?', '#']).next().unwrap_or("");
-    let host = host.rsplit('@').next().unwrap_or("");
-    if host.is_empty() || host.starts_with(':') {
+    if authority(url).is_empty() || authority(url).starts_with(':') {
         return Err(invalid("The link has no host"));
     }
     Ok(url)
@@ -277,7 +299,7 @@ mod tests {
             "https://github.com/example/tidepool-api",
             "HTTPS://example.com",
             "https://example.com:8443/a?b=c#d",
-            "https://user@example.com/",
+            "https://example.com/@group?q=a@b#c@d",
         ] {
             assert_eq!(check_url(good), Ok(good));
         }
@@ -293,10 +315,40 @@ mod tests {
             "https://example.com/\n",
             "C:\\Windows\\notepad.exe",
             "https:/example.com",
+            "https://user@example.com/",
+            "https://user:token@example.com",
+            "https://github.com@evil.example/",
+            "https://@example.com",
         ] {
             let err = check_url(bad).unwrap_err();
             assert_eq!(err.kind, OpenErrorKind::Invalid, "{bad}");
         }
+    }
+
+    #[test]
+    fn refusals_never_repeat_user_info() {
+        for bad in [
+            "https://user:s3cret@example.com/",
+            "http://user:s3cret@example.com/",
+            "http://user:s3cret@example.com/a b",
+            "https://user:s3cret@example.com/a b",
+            "ftp://s3cret@example.com",
+            "https://:s3cret@/path",
+            "https://u:s3cret@host@evil.example/",
+        ] {
+            let err = check_url(bad).unwrap_err();
+            assert_eq!(err.kind, OpenErrorKind::Invalid, "{bad}");
+            assert!(!err.message.contains("s3cret"), "{bad}: {}", err.message);
+        }
+        // The host is still shown, and a link that does not carry user info is shown whole.
+        let err = check_url("http://user:s3cret@example.com/").unwrap_err();
+        assert!(err.message.contains("example.com"), "{}", err.message);
+        let err = check_url("https://example.com/@group?a b").unwrap_err();
+        assert!(
+            err.message.ends_with("https://example.com/@group?a b"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
