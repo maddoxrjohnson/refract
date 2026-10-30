@@ -625,7 +625,7 @@ impl<W: Write> Server<W> {
         let walk = scan::walk_roots(&config);
         if let Some(watcher) = &mut self.watcher {
             watcher.watch_projects_root(&config.claude_projects);
-            watcher.watch_scan_dirs(&walk.dirs);
+            watcher.watch_scan_dirs(&walk.dirs, &[]);
             for repo in &walk.repos {
                 let git_dir = scan::git_dir(repo);
                 let common = git_dir.as_deref().and_then(scan::common_dir);
@@ -723,6 +723,7 @@ impl<W: Write> Server<W> {
                 .collect();
             self.forget_repos(&gone);
             self.forget_repos(&unloaded);
+            self.watch_search();
             if let Some(watcher) = &self.watcher {
                 eprintln!(
                     "refract-agent: {} repos, {} watches",
@@ -747,6 +748,27 @@ impl<W: Write> Server<W> {
         }
         self.schedule_live();
         Ok(())
+    }
+
+    /// Watches the directories the repo search walks, and the git directories of repos
+    /// it finds that git could not read (`git init` or a copy may still be writing
+    /// them), so that a change in either searches again. When that adds a watch, searches
+    /// once more: what changed in the directory before it was watched was not seen.
+    fn watch_search(&mut self) {
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
+        let walk = scan::walk_roots(self.agent.config());
+        let unread: Vec<PathBuf> = walk
+            .repos
+            .iter()
+            .filter(|repo| self.agent.repo(repo).is_none())
+            .filter_map(|repo| scan::git_dir(repo))
+            .collect();
+        if watcher.watch_scan_dirs(&walk.dirs, &unread) {
+            self.pending.rescan = true;
+            self.pending.touch(Instant::now());
+        }
     }
 
     /// Watches the status hook's directory, when there is one.
@@ -832,9 +854,7 @@ impl<W: Write> Server<W> {
                 self.watch_repo(path);
                 refresh.remove(path);
             }
-            if let Some(watcher) = &mut self.watcher {
-                watcher.watch_scan_dirs(&scan::walk_roots(self.agent.config()).dirs);
-            }
+            self.watch_search();
         }
         if pending.reload && !loading {
             for path in self.agent.repo_paths() {

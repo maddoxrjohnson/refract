@@ -83,7 +83,9 @@ impl Agent {
         list
     }
 
-    /// Next line on stdout, which must be valid JSON.
+    /// Next line on stdout, which must be valid JSON. A timeout is reported at the line
+    /// of the test that waited.
+    #[track_caller]
     fn next(&self, timeout: Duration) -> Value {
         let line = self
             .lines
@@ -93,6 +95,7 @@ impl Agent {
     }
 
     /// Next message that is a response (skipping events).
+    #[track_caller]
     fn response(&self) -> Value {
         loop {
             let message = self.next(Duration::from_secs(20));
@@ -103,6 +106,7 @@ impl Agent {
     }
 
     /// Waits for an event matching `pred`.
+    #[track_caller]
     fn event(&self, pred: impl Fn(&Value) -> bool) -> Value {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -297,6 +301,38 @@ fn repos_appearing_later_or_deeper_are_found() {
         removed["data"]["path"],
         root.join("kelp-cli").to_str().unwrap()
     );
+}
+
+#[test]
+fn a_repo_git_cannot_read_yet_is_found_once_it_can() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let repos = ["kelp-cli", "group/aurora-notes", "group/team/reef-maps"];
+    for repo in repos {
+        std::fs::create_dir_all(root.join(repo)).unwrap();
+    }
+    let mut agent = Agent::spawn(&home, &config);
+    agent.list_when_loaded(1);
+
+    // A `.git` that is not a repo yet, as while `git init` or a copy is still writing
+    // it, at each depth. The search finds it and git cannot read it.
+    for repo in repos {
+        std::fs::create_dir(root.join(repo).join(".git")).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(1200));
+
+    for repo in repos {
+        init_repo(&root.join(repo));
+    }
+    let mut missing: Vec<&str> = repos
+        .iter()
+        .map(|r| r.rsplit('/').next().unwrap())
+        .collect();
+    while !missing.is_empty() {
+        let changed = agent.event(|e| e["event"] == "repoChanged");
+        let name = changed["data"]["name"].as_str().unwrap();
+        missing.retain(|m| *m != name);
+    }
 }
 
 #[test]

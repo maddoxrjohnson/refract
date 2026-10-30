@@ -12,8 +12,9 @@
 //! `refs/remotes` with their subdirectories (in the common git directory for linked
 //! worktrees), and every working-tree directory that holds tracked files. Also watched:
 //! Claude Code's `projects` directory, the project directory of each repo, every
-//! directory the repo search walks (for repos appearing or vanishing), and the status
-//! hook's directory of status files.
+//! directory the repo search walks (for repos appearing or vanishing), the git directory
+//! of each repo the search found but git could not read yet (for it becoming readable),
+//! and the status hook's directory of status files.
 //!
 //! Re-watching a repo only adds and removes the directories that differ, so events
 //! already queued for unchanged watches still map to their repo. When the kernel drops a
@@ -60,6 +61,9 @@ pub enum Target {
     ScanDir {
         descend: bool,
     },
+    /// The git directory of a repo the search found but git could not read yet, such as
+    /// one `git init` or a copy is still writing. Any change in it searches again.
+    UnreadGitDir,
     /// The status hook's directory of `<session id>.json` files.
     HookDir,
 }
@@ -246,18 +250,36 @@ impl Watcher {
     }
 
     /// Watches the directories the repo search walked (see [`crate::scan::Walk`]) for
-    /// directories and `.git` appearing or vanishing, replacing the previous set.
-    pub fn watch_scan_dirs(&mut self, dirs: &[(PathBuf, bool)]) {
+    /// directories and `.git` appearing or vanishing, and the git directories of repos it
+    /// found but git could not read (`unread`), replacing the previous sets.
+    ///
+    /// Returns true when it watched a directory that was not watched before. What changed
+    /// there between the search and the watch was not seen, so the caller searches again.
+    pub fn watch_scan_dirs(&mut self, dirs: &[(PathBuf, bool)], unread: &[PathBuf]) -> bool {
         let mask = WatchMask::CREATE
             | WatchMask::DELETE
             | WatchMask::MOVED_FROM
             | WatchMask::MOVED_TO
             | WatchMask::ONLYDIR;
-        let wanted = dirs
+        let mut wanted: Vec<_> = dirs
             .iter()
             .map(|(dir, descend)| (dir.clone(), mask, Target::ScanDir { descend: *descend }))
             .collect();
-        self.sync(|t| matches!(t, Target::ScanDir { .. }), wanted);
+        let mask = WatchMask::CREATE
+            | WatchMask::CLOSE_WRITE
+            | WatchMask::MOVED_TO
+            | WatchMask::DELETE_SELF
+            | WatchMask::MOVE_SELF
+            | WatchMask::ONLYDIR;
+        wanted.extend(
+            unread
+                .iter()
+                .map(|dir| (dir.clone(), mask, Target::UnreadGitDir)),
+        );
+        self.sync(
+            |t| matches!(t, Target::ScanDir { .. } | Target::UnreadGitDir),
+            wanted,
+        )
     }
 
     /// Watches the status hook's directory for status files being written or removed.
@@ -303,11 +325,14 @@ impl Watcher {
         }
     }
 
-    fn add(&mut self, path: &Path, mask: WatchMask, target: Target) {
+    /// Adds `target` to the watch on `path`. Returns true when that is a new watch, not
+    /// one the directory already had.
+    fn add(&mut self, path: &Path, mask: WatchMask, target: Target) -> bool {
         let mask = mask | WatchMask::MASK_ADD | WatchMask::DONT_FOLLOW;
         match self.watches.add(path, mask) {
             Ok(wd) => {
                 let id = wd.get_watch_descriptor_id();
+                let new = !self.targets.contains_key(&id);
                 let entry = self.targets.entry(id).or_insert_with(|| Entry {
                     wd,
                     path: path.to_owned(),
@@ -316,15 +341,24 @@ impl Watcher {
                 if !entry.targets.contains(&target) {
                     entry.targets.push(target);
                 }
+                new
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("refract-agent: cannot watch {}: {e}", path.display()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                eprintln!("refract-agent: cannot watch {}: {e}", path.display());
+                false
+            }
         }
     }
 
     /// Makes the targets matching `owned` exactly `wanted`: removes the others and adds
     /// only the missing ones, leaving unchanged watches (and their descriptors) alone.
-    fn sync(&mut self, owned: impl Fn(&Target) -> bool, wanted: Vec<(PathBuf, WatchMask, Target)>) {
+    /// Returns true when a directory got a new watch.
+    fn sync(
+        &mut self,
+        owned: impl Fn(&Target) -> bool,
+        wanted: Vec<(PathBuf, WatchMask, Target)>,
+    ) -> bool {
         let keep: HashSet<(&Path, &Target)> =
             wanted.iter().map(|(p, _, t)| (p.as_path(), t)).collect();
         let mut have: HashSet<(PathBuf, Target)> = HashSet::new();
@@ -346,11 +380,13 @@ impl Watcher {
             }
         }
         self.drop_watches(emptied);
+        let mut added = false;
         for (path, mask, target) in wanted {
             if !have.contains(&(path.clone(), target.clone())) {
-                self.add(&path, mask, target);
+                added |= self.add(&path, mask, target);
             }
         }
+        added
     }
 
     fn remove_where(&mut self, remove: impl Fn(&Target) -> bool) {
@@ -450,6 +486,7 @@ pub fn change_for(
                 *descend && mask.contains(EventMask::ISDIR) && !crate::scan::is_skipped(name);
             (new_repo || new_dir).then_some(Change::Rescan)
         }
+        Target::UnreadGitDir => (gone || name.is_some()).then_some(Change::Rescan),
         // The script writes a temporary file and renames it, so only `.json` names
         // matter; a name that is no session id is skipped when read.
         Target::HookDir => name
@@ -602,6 +639,18 @@ mod tests {
             change(leaf, EventMask::CREATE, ".git"),
             Some(Change::Rescan)
         );
+        // In a git directory git could not read yet, anything written searches again.
+        let unread = Target::UnreadGitDir;
+        assert_eq!(
+            change(unread.clone(), EventMask::MOVED_TO, "HEAD"),
+            Some(Change::Rescan)
+        );
+        assert_eq!(change(unread.clone(), dir, "objects"), Some(Change::Rescan));
+        assert_eq!(
+            change_for(&unread, EventMask::DELETE_SELF, None),
+            Some(Change::Rescan)
+        );
+        assert_eq!(change_for(&unread, EventMask::IGNORED, None), None);
     }
 
     #[test]
@@ -695,5 +744,29 @@ mod tests {
         assert_eq!(watcher.project_dirs(), ["-home-dev-projects-tidepool-api"]);
         watcher.unwatch_project_dir("-home-dev-projects-tidepool-api");
         assert!(watcher.is_empty());
+    }
+
+    #[test]
+    fn scan_dirs_report_only_new_watches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_owned();
+        let group = root.join("group");
+        let git = root.join("kelp-cli/.git");
+        fs::create_dir_all(&group).unwrap();
+        fs::create_dir_all(&git).unwrap();
+        let mut watcher = start(|_| true).unwrap();
+        let dirs = vec![(root.clone(), true)];
+        assert!(watcher.watch_scan_dirs(&dirs, &[]));
+        assert!(!watcher.watch_scan_dirs(&dirs, &[]));
+
+        // A directory already watched for something else is not new.
+        watcher.watch_repo(&group, None, None, &[String::new()]);
+        let dirs = vec![(root.clone(), true), (group.clone(), true)];
+        assert!(!watcher.watch_scan_dirs(&dirs, &[]));
+
+        assert!(watcher.watch_scan_dirs(&dirs, std::slice::from_ref(&git)));
+        assert!(!watcher.watch_scan_dirs(&dirs, std::slice::from_ref(&git)));
+        assert!(!watcher.watch_scan_dirs(&dirs, &[root.join("missing/.git")]));
+        assert_eq!(watcher.len(), 2);
     }
 }
