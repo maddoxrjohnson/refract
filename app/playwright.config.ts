@@ -6,7 +6,9 @@ import { defineConfig, devices } from "@playwright/test";
 export default defineConfig({
   testDir: "e2e",
   timeout: 60_000,
-  expect: { timeout: 10_000 },
+  // SwiftShader can stall the page for several seconds the first time a shader is
+  // needed (one CI trace shows 9 s without a paint), so allow that before failing.
+  expect: { timeout: 25_000 },
   fullyParallel: false,
   workers: 1,
   retries: 0,
