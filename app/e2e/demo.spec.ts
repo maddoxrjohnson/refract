@@ -221,6 +221,51 @@ test.describe("at 1280×800", () => {
   });
 });
 
+test.describe("Move to WSL at 1280×800", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("moves the demo's Windows repo through the report to the Recycle Bin", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.keyboard.type("marigold");
+    // The focus label explains the gem's Windows-drive marker.
+    await expect(page.locator(".rf-focus-label__drive")).toHaveText(
+      "On a Windows drive: git and agents are slower here.",
+    );
+    await expect(page.locator(".rf-drive-mark")).toBeVisible();
+    await page.keyboard.press("Enter");
+    const panel = page.getByRole("complementary", { name: "marigold-site details" });
+    await panel.getByRole("button", { name: "Move to WSL…" }).click();
+
+    const dialog = page.getByRole("dialog", { name: "Move marigold-site to WSL" });
+    await expect(dialog.getByLabel("Destination in WSL")).toHaveValue("/home/demo/projects/marigold-site");
+    const start = dialog.getByRole("button", { name: "Start" });
+    await expect(start).toBeDisabled();
+    await dialog.getByRole("button", { name: /Close VS Code window/ }).click();
+    await expect(start).toBeEnabled();
+    await start.click();
+
+    // The ring sits on the gem, clear of the dialog and the corner controls.
+    await expect(page.locator(".rf-move-ring")).toBeVisible();
+    await expect(dialog.getByText(/^Copying [\d.]+ \/ 1\.3 GB$/)).toBeVisible({ timeout: 30_000 });
+    const ring = (await page.locator(".rf-move-ring").boundingBox())!;
+    const box = (await dialog.boundingBox())!;
+    expect(ring.x + ring.width).toBeLessThan(box.x);
+
+    await expect(dialog.getByRole("button", { name: "Delete original" })).toBeVisible({ timeout: 60_000 });
+    await expect(dialog.getByRole("button", { name: "Delete original" })).toBeFocused();
+    await expect(dialog.locator(".rf-move-check--passed")).toHaveCount(5);
+    await dialog.getByRole("button", { name: "Delete original" }).click();
+
+    const done = page.getByRole("dialog", { name: "Moved marigold-site to WSL" });
+    await expect(done.getByText("The original is in the Recycle Bin.")).toBeVisible({ timeout: 30_000 });
+    await done.getByRole("button", { name: "Done" }).click();
+    await expect(done).toBeHidden();
+    // The zoom followed the gem to its new place, which has no Windows marker.
+    await expect(page.getByRole("complementary", { name: "marigold-site details" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Move to WSL…" })).toBeHidden();
+  });
+});
+
 test.describe("at 1280×480", () => {
   test.use({ viewport: { width: 1280, height: 480 } });
 

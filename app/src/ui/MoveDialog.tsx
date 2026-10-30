@@ -636,9 +636,33 @@ const STATUS_LABEL = { passed: "Passed", failed: "Failed", notRun: "Not run" } a
 /** The report and the final OK (spec §2.4, §6). */
 function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded, onDeleted }: ReportViewProps) {
   const ok = canDelete(report);
+  const changes = report.installChanges;
+  const installChanges: [string, string][] = changes
+    ? [
+        ...changes.created.map((p): [string, string] => ["created", p]),
+        ...changes.changed.map((p): [string, string] => ["changed", p]),
+        ...changes.removed.map((p): [string, string] => ["removed", p]),
+      ]
+    : [];
   const [pending, setPending] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<DeleteState>(null);
   const [error, setError] = useState<string | null>(null);
+  // The default answer (Delete original, or No, …) takes focus when it appears, and again
+  // when an answer in flight disabled the focused button.
+  const defaultAction = useRef<HTMLButtonElement>(null);
+  const outcomeKind = outcome?.kind ?? null;
+  useEffect(() => {
+    if (pending) return;
+    const active = document.activeElement as HTMLButtonElement | null;
+    if (!active || active === document.body || active.disabled || active.classList.contains("rf-move")) {
+      defaultAction.current?.focus();
+    }
+  }, [pending, outcomeKind]);
+  const lastKind = useRef(outcomeKind);
+  useEffect(() => {
+    if (lastKind.current !== outcomeKind) defaultAction.current?.focus();
+    lastKind.current = outcomeKind;
+  }, [outcomeKind]);
 
   /** Runs one answer at a time; Escape and the other buttons wait for it. */
   const act = async (label: string, work: () => Promise<void>) => {
@@ -684,7 +708,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
         {outcome.reason && <p className="rf-move-note rf-muted">{outcome.reason}</p>}
         <p className="rf-move-note rf-muted">No keeps both copies.</p>
         <div className="rf-row">
-          <button type="button" className="rf-button rf-button--accent" autoFocus disabled={disabled} onClick={keep}>
+          <button type="button" className="rf-button rf-button--accent" ref={defaultAction} disabled={disabled} onClick={keep}>
             No
           </button>
           <button type="button" className="rf-button rf-button--danger" disabled={disabled} onClick={() => void deleteOriginal(true)}>
@@ -703,14 +727,13 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
             {outcome.changed.length > MAX_PROBLEMS && `\nand ${outcome.changed.length - MAX_PROBLEMS} more`}
           </div>
         )}
-        {outcome.busyAgents.length > 0 && (
-          <p className="rf-move-note">
-            {plural(outcome.busyAgents.length, "agent is", "agents are")} still running in it. Stop{" "}
-            {outcome.busyAgents.length === 1 ? "it" : "them"} first.
+        {outcome.busyAgents.map((sentence) => (
+          <p key={sentence} className="rf-move-note">
+            {sentence}
           </p>
-        )}
+        ))}
         <div className="rf-row">
-          <button type="button" className="rf-button rf-button--accent" autoFocus disabled={disabled} onClick={resync}>
+          <button type="button" className="rf-button rf-button--accent" ref={defaultAction} disabled={disabled} onClick={resync}>
             Re-sync
           </button>
           <button type="button" className="rf-button" disabled={disabled} onClick={keep}>
@@ -759,7 +782,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
         <button
           type="button"
           className="rf-button rf-button--accent"
-          autoFocus
+          ref={defaultAction}
           disabled={disabled}
           onClick={() => void deleteOriginal(false)}
         >
@@ -776,7 +799,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
   } else {
     actions = (
       <div className="rf-row">
-        <button type="button" className="rf-button rf-button--accent" autoFocus disabled={disabled} onClick={discard}>
+        <button type="button" className="rf-button rf-button--accent" ref={defaultAction} disabled={disabled} onClick={discard}>
           Discard the copy
         </button>
         <button type="button" className="rf-button" disabled={disabled} onClick={retry}>
@@ -868,6 +891,20 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
                 </li>
               ))}
             </ul>
+            {installChanges.length > 0 && (
+              <>
+                <p className="rf-move-note rf-muted">
+                  Changed by install (this doesn't block deleting the original):
+                </p>
+                <div className="rf-mono rf-muted rf-move-paths">
+                  {installChanges
+                    .slice(0, MAX_PROBLEMS)
+                    .map(([what, path]) => `${what} ${path}`)
+                    .join("\n")}
+                  {installChanges.length > MAX_PROBLEMS && `\nand ${installChanges.length - MAX_PROBLEMS} more`}
+                </div>
+              </>
+            )}
           </section>
         )}
 

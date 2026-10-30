@@ -932,6 +932,7 @@ function demoMoveReport(move: DemoMove): MigrationReport {
     newObjects: 312,
     sourceTotals: DEMO_MOVE_TOTALS,
     copyTotals: DEMO_MOVE_TOTALS,
+    installChanges: { created: [], changed: [], removed: [] },
     install: [
       {
         step: DEMO_MOVE_INSTALL,

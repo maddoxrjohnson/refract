@@ -489,6 +489,8 @@ export interface MigrationReport {
   sourceTotals: MigrateTotals;
   copyTotals: MigrateTotals;
   install: MigrateInstallResult[];
+  /** Repo-relative paths the install created, changed or removed; they don't block delete. */
+  installChanges?: { created: string[]; changed: string[]; removed: string[] };
   history: { sessions: number; fromDirs: string[]; toDirs: string[] };
   linuxGit: boolean;
   warnings: string[];
@@ -503,7 +505,12 @@ export interface PendingMigration {
 /** What Delete original did; only `deleted` removed anything. */
 export type DeleteOutcome =
   /** The source changed or agents still run in it: offer Re-sync. */
-  | { kind: "changed"; changed: string[]; busyAgents: string[] }
+  | {
+      kind: "changed";
+      changed: string[];
+      /** Sentences to show as they are, one per agent still running in the folder. */
+      busyAgents: string[];
+    }
   /** Close these first. */
   | { kind: "windowsOpen"; windows: VsCodeWindow[] }
   /** Ask "Delete permanently?" (default No, which is Keep both). */
