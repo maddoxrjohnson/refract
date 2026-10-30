@@ -570,6 +570,20 @@ export interface Recheck {
 }
 
 /**
+ * The copy changes the user saw and answered Delete the rest anyway for, by how each changed in the copy. The helper
+ * skips a path only while it still changed that way.
+ */
+export interface Forced {
+  /** Of `copyChanged`, those not in `copyRemoved`: edited or added in the copy. */
+  changed: string[];
+  /** Of `copyRemoved`: deleted in the copy. */
+  removed: string[];
+}
+
+/** Nothing forced. */
+export const NO_FORCE: Forced = { changed: [], removed: [] };
+
+/**
  * What Delete original did. `deleting` says the delete has begun (the helper's deleting
  * state): from then on only finishing it is offered (or, with the copy gone, ending the move),
  * never Re-sync, Keep both or Discard.

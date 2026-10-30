@@ -27,6 +27,7 @@ import type {
 } from "./types";
 import type {
   DeleteOutcome,
+  Forced,
   FinishAction,
   InstallStep,
   MigrateError,
@@ -39,6 +40,7 @@ import type {
   SkippedFolder,
   VsCodeWindow,
 } from "./types";
+import { NO_FORCE } from "./types";
 import { DEFAULT_PRICES } from "../usage/cost";
 
 // Invented repos covering every state a gem can show, for running the interface in a
@@ -872,7 +874,7 @@ export class DemoBackend implements Backend {
     void this.runMove(move, [["rechecking", 12]], true);
   }
 
-  async migrateDelete(id: string, permanent: boolean, _force: string[] = []): Promise<DeleteOutcome> {
+  async migrateDelete(id: string, permanent: boolean, _force: Forced = NO_FORCE): Promise<DeleteOutcome> {
     const move = this.readyMove(id);
     await sleep(700);
     if (this.moveOutcome === "wontFit" && !permanent && !move.deleting) {

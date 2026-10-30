@@ -2,6 +2,7 @@ import { useCallback, useEffect, useId, useRef, useState, type KeyboardEvent, ty
 import type { Backend } from "../backend/Backend";
 import type {
   DeleteOutcome,
+  Forced,
   MigrateError,
   MigratePreflight,
   MigrateSnapshotProgress,
@@ -10,6 +11,7 @@ import type {
   RepoSnapshot,
   VsCodeWindow,
 } from "../backend/types";
+import { NO_FORCE } from "../backend/types";
 import { isCancelled, type MigrationControls } from "../hooks/useMigrations";
 import {
   BLOCKING_CHECKS,
@@ -781,7 +783,7 @@ function ReportView(props: ReportViewProps) {
   // Asked before ending a move whose copy went while deleting.
   const [confirmEnd, setConfirmEnd] = useState(false);
   // The copy changes the user answered Delete the rest anyway for, carried to Yes, delete permanently.
-  const [forced, setForced] = useState<string[]>([]);
+  const [forced, setForced] = useState<Forced>(NO_FORCE);
   // The original folder is gone (deleted by hand): the move only needs finishing.
   const [sourceGone, setSourceGone] = useState(false);
   const deleting = props.deleting || outcome?.kind === "unfinished" || (outcome !== null && "deleting" in outcome && outcome.deleting);
@@ -836,11 +838,11 @@ function ReportView(props: ReportViewProps) {
     }
   };
 
-  const deleteOriginal = (permanent: boolean, force: string[] = []) =>
+  const deleteOriginal = (permanent: boolean, force: Forced = NO_FORCE) =>
     act(
       permanent
         ? "Deleting permanently…"
-        : force.length > 0
+        : force.changed.length + force.removed.length > 0
           ? "Deleting the rest…"
           : deleting
             ? "Finishing the delete…"
@@ -1111,7 +1113,7 @@ function ReportView(props: ReportViewProps) {
                   type="button"
                   className="rf-button rf-button--danger"
                   disabled={disabled}
-                  onClick={() => void deleteOriginal(false, outcome.copyChanged)}
+                  onClick={() => void deleteOriginal(false, { changed: copyEdited, removed: copyRemoved })}
                 >
                   Delete the rest anyway
                 </button>

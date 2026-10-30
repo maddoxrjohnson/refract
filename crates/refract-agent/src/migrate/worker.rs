@@ -48,8 +48,8 @@ use refract_core::migrate::report::{
 };
 use refract_core::migrate::{SourceSnapshot, SOURCE_SNAPSHOT_VERSION};
 use refract_core::protocol::{
-    code, BeginDelete, CancelOutcome, Event, FinishAction, Id, MigrateParams, MigrateProgress,
-    MigrateStep, MigrationTicket, Recheck, Reply, Response,
+    code, BeginDelete, CancelOutcome, Event, FinishAction, Forced, Id, MigrateParams,
+    MigrateProgress, MigrateStep, MigrationTicket, Recheck, Reply, Response,
 };
 use refract_core::sessions::{is_windows_mount, path_within};
 
@@ -94,7 +94,7 @@ pub enum Command {
     BeginDelete {
         request: Id,
         source_gone: bool,
-        force: Vec<String>,
+        force: Forced,
     },
     Resync(Id),
     Finish(Id, FinishAction),
@@ -1884,10 +1884,10 @@ impl Worker {
     /// `migrateBeginDelete`: the recheck, and the deleting state when it passes. In the
     /// deleting state, and when the original is gone on both sides, a change to the
     /// copy only blocks for a path the original still has ([`Worker::recheck`]), and
-    /// in the deleting state `force` skips those it names (never one that could not be
-    /// read, nor a copy that is gone). A source only the helper can't see
-    /// (`source_gone` false) never passes: nothing of it was checked.
-    fn begin_delete(&mut self, request: Id, source_gone: bool, force: Vec<String>) {
+    /// in the deleting state `force` skips those it names under how they changed now
+    /// (never one that could not be read, nor a copy that is gone). A source only the
+    /// helper can't see (`source_gone` false) never passes: nothing of it was checked.
+    fn begin_delete(&mut self, request: Id, source_gone: bool, force: Forced) {
         if let Some(why) = self.recheck_refusal() {
             let command = Command::BeginDelete {
                 request,
@@ -1901,10 +1901,15 @@ impl Worker {
         let recheck = self.recheck(relax);
         let hidden = recheck.source_missing && !source_gone;
         let forced = |path: &String| {
+            let named = if recheck.copy_removed.contains(path) {
+                &force.removed
+            } else {
+                &force.changed
+            };
             self.deleting
                 && !recheck.copy_missing
                 && !recheck.copy_unreadable.contains(path)
-                && force.contains(path)
+                && named.contains(path)
         };
         let copy_ok = recheck.copy_changed.iter().all(forced);
         let ok = recheck.changed.is_empty()
@@ -2090,7 +2095,17 @@ impl Worker {
     /// only repeats that.
     fn finish(&mut self, request: Id, action: FinishAction) {
         if let Some(done) = self.finished {
-            if done != action {
+            // Finishing a delete whose copy then went: End the move only forgets it.
+            let forget = done == FinishAction::Delete
+                && action == FinishAction::Discard
+                && self.placed
+                && self.copy_missing();
+            if forget {
+                if let Err(why) = self.finish_here(action) {
+                    self.refuse(Command::Finish(request, action), &why);
+                    return;
+                }
+            } else if done != action {
                 let why = format!(
                     "the migration is finishing ({}); send that migrateFinish again",
                     action_name(done)
@@ -2133,13 +2148,23 @@ impl Worker {
                     ));
                 }
                 let report = self.report.clone();
-                if let (Some(record), Some(report)) = (&self.record, &report) {
+                let (source, dest) = (self.source_str(), self.dest_str());
+                if let (Some(record), Some(report)) = (&mut self.record, &report) {
                     if report.history_ok() {
+                        // Saved first: from here the copies may be the only transcripts
+                        // left, so a later discard must not delete them.
+                        if !record.originals_removed {
+                            record.originals_removed = true;
+                            if let Err(e) = store::save_record(record) {
+                                record.originals_removed = false;
+                                return Err(e);
+                            }
+                        }
                         let kept = history::remove_originals(
                             &self.ctx.claude_projects,
                             &record.history,
-                            &self.source_str(),
-                            &self.dest_str(),
+                            &source,
+                            &dest,
                         );
                         if !kept.is_empty() {
                             let mut report = report.clone();
@@ -2171,10 +2196,15 @@ impl Worker {
             }
             FinishAction::Discard if copy_gone => {
                 // Nothing left to delete: only forgotten. The transcript copies made for
-                // it go (their originals stay); the install backup stays unless the
-                // original is there untouched, since it may hold the only version left
-                // of what the install changed.
-                self.remove_history_copies();
+                // it go (their originals stay), unless the delete began removing the
+                // originals; the install backup stays unless the original is there
+                // untouched, since it may hold the only version left of what the
+                // install changed.
+                let originals_removed = self.finished == Some(FinishAction::Delete)
+                    || self.record.as_ref().is_some_and(|r| r.originals_removed);
+                if !originals_removed {
+                    self.remove_history_copies();
+                }
                 if self.install_backup.is_some() && !self.deleting && !self.source_missing() {
                     let _ = fsx::remove_any(&store::backup_dir(&self.report_path));
                 }

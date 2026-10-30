@@ -380,11 +380,24 @@ pub struct MigrateBeginDeleteParams {
     /// Only in the deleting state: the paths of `copyChanged` the user saw and agreed
     /// to delete the rest anyway for, though the copy's version differs from the
     /// original's (the copy keeps its version; for one in `copyRemoved` the original's
-    /// is then gone for good). Only these are skipped: any other copy change still
-    /// blocks. Never skips `changed`, `unreadable`, `busyAgents`, `copyUnreadable`, a
-    /// hidden original or a copy that is gone. Missing means none.
+    /// is then gone for good), each under how it changed as the user saw it. Only
+    /// these are skipped: any other copy change still blocks, as does one that has
+    /// since changed the other way. Never skips `changed`, `unreadable`, `busyAgents`,
+    /// `copyUnreadable`, a hidden original or a copy that is gone. Missing means none.
     #[serde(default)]
-    pub force: Vec<String>,
+    pub force: Forced,
+}
+
+/// The copy changes `migrateBeginDelete` may skip ([`MigrateBeginDeleteParams::force`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Forced {
+    /// Paths of `copyChanged` not in `copyRemoved` (edited or added in the copy).
+    #[serde(default)]
+    pub changed: Vec<String>,
+    /// Paths of `copyRemoved` (deleted in the copy).
+    #[serde(default)]
+    pub removed: Vec<String>,
 }
 
 /// The result of `migrateCancel`.
@@ -1639,18 +1652,31 @@ mod tests {
             Method::MigrateBeginDelete(MigrateBeginDeleteParams {
                 id: "m-1".into(),
                 source_gone: false,
-                force: vec![],
+                force: Forced::default(),
             })
         );
         let begin = MigrateBeginDeleteParams {
             id: "m-1".into(),
             source_gone: true,
-            force: vec!["README.md".into()],
+            force: Forced {
+                changed: vec!["README.md".into()],
+                removed: vec!["notes.txt".into()],
+            },
         };
         assert_eq!(
             round_trip(&begin),
-            json!({"id": "m-1", "sourceGone": true, "force": ["README.md"]})
+            json!({"id": "m-1", "sourceGone": true,
+                   "force": {"changed": ["README.md"], "removed": ["notes.txt"]}})
         );
+        // Either list may be left out.
+        let begin = parse_request(
+            r#"{"id":1,"method":"migrateBeginDelete","params":{"id":"m-1","force":{"removed":["a"]}}}"#,
+        );
+        let Method::MigrateBeginDelete(params) = begin.unwrap().method else {
+            panic!("not migrateBeginDelete");
+        };
+        assert_eq!(params.force.changed, Vec::<String>::new());
+        assert_eq!(params.force.removed, vec!["a".to_owned()]);
         let cancelled = Message::Response(Response::ok(
             4,
             Reply::Cancelled(CancelOutcome { ended: false }),

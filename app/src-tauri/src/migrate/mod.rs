@@ -18,7 +18,7 @@
 //! | `migrate_close_window` | `path`, `id` | `true` when asked to close, `false` when gone |
 //! | `migrate_stop_agent` | `path`, `sessionId` | `null` |
 //! | `migrate_resync` | `id` | `null`; progress and a new `migrateReady` follow |
-//! | `migrate_delete` | `id`, `permanent`, `force?` (paths) | [`DeleteOutcome`] |
+//! | `migrate_delete` | `id`, `permanent`, `force?` (`{changed, removed}` paths) | [`DeleteOutcome`] |
 //! | `migrate_finish` | `id`, `action` (`keep` or `discard`) | `null` |
 //! | `migrate_pending` | | [`PendingMigration`]`[]`, after a restart |
 //! | `migrate_source_exists` | `id` | `false` once the original folder is gone |
@@ -42,8 +42,10 @@
 //!   discard`) when the copy is gone (`copyMissing`), **Stop** for idle agents, then
 //!   try again. Deleting: **Finish deleting** once fixed; for `copyChanged` (then only
 //!   paths the original still has, none unreadable) **Delete the rest anyway**,
-//!   `migrate_delete {id, permanent: false, force: [those paths]}`, after listing them
-//!   (those in `copyRemoved` apart: the original's version of them goes for good); for
+//!   `migrate_delete {id, permanent: false, force: {changed, removed}}`, after listing
+//!   them (those in `copyRemoved` apart, in `removed`: the original's version of them
+//!   goes for good; the others in `changed`). A path that changed the other way since
+//!   still blocks, so it is listed again; for
 //!   a copy that is gone, **End the move** (`migrate_finish discard`) after asking,
 //!   pointing to the Recycle Bin;
 //! - `windowsOpen {windows}`: offer **Close** for each, then try again;
@@ -126,7 +128,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::agent::{distro_args, wsl_command, Agent};
 use crate::open::windows_folder;
 use crate::process::output_with_deadline;
-use flow::{delete_original, AgentHelper, CancelOutcome, DeleteTarget, MigrateHelper, WindowsOps};
+use flow::{
+    delete_original, AgentHelper, CancelOutcome, DeleteTarget, Forced, MigrateHelper, WindowsOps,
+};
 pub use flow::{DeleteOutcome, MigrateError, MigrateErrorKind, PendingMigration};
 use git::{find_git_exe, GitExe, GitRun, WslGit};
 use snapshot::{
@@ -949,13 +953,14 @@ pub async fn migrate_resync(app: AppHandle, id: String) -> Result<(), MigrateErr
 }
 
 /// **Delete original** (see the module docs). `force`: the copy changes the user saw
-/// and answered **Delete the rest anyway** for, while deleting.
+/// and answered **Delete the rest anyway** for, while deleting: those edited in the copy
+/// in `changed`, those deleted there in `removed`.
 #[tauri::command]
 pub async fn migrate_delete(
     app: AppHandle,
     id: String,
     permanent: bool,
-    force: Option<Vec<String>>,
+    force: Option<Forced>,
 ) -> Result<DeleteOutcome, MigrateError> {
     blocking(move || {
         let _one_at_a_time = lock(&DELETES);

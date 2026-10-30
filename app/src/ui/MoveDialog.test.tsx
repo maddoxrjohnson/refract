@@ -448,7 +448,7 @@ describe("MoveDialog states with a way forward", () => {
     }
     fireEvent.click(button("Delete the rest anyway"));
     await act(async () => {});
-    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, ["README.md"]);
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, { changed: ["README.md"], removed: [] });
     expect(dialog.textContent).toContain("The original is in the Recycle Bin.");
   });
 
@@ -463,10 +463,10 @@ describe("MoveDialog states with a way forward", () => {
     await act(async () => {});
     fireEvent.click(button("Delete the rest anyway"));
     await act(async () => {});
-    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, ["README.md"]);
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, { changed: ["README.md"], removed: [] });
     fireEvent.click(button("Yes, delete permanently"));
     await act(async () => {});
-    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", true, ["README.md"]);
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", true, { changed: ["README.md"], removed: [] });
     expect(dialog.textContent).not.toContain("differs from what's left");
   });
 
@@ -488,7 +488,34 @@ describe("MoveDialog states with a way forward", () => {
     expect(dialog.textContent).toContain("Deleted in the copy. Deleting the original removes these for good:notes.txt");
     fireEvent.click(button("Delete the rest anyway"));
     await act(async () => {});
-    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, ["README.md", "notes.txt"]);
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, { changed: ["README.md"], removed: ["notes.txt"] });
+  });
+
+  it("review 4: sends the edited and the deleted copy paths apart, also on to Yes, delete permanently", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete
+      .mockResolvedValueOnce({
+        ...RECHECK,
+        kind: "changed",
+        copyChanged: ["README.md", "notes.txt"],
+        copyRemoved: ["notes.txt"],
+        copyUnreadable: [],
+        copyMissing: false,
+        deleting: true,
+      })
+      .mockResolvedValueOnce({ kind: "wontFit", reason: "The bin is full.", deleting: true })
+      .mockResolvedValueOnce({ kind: "deleted", permanent: true, alreadyGone: false });
+    await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    fireEvent.click(button("Delete the rest anyway"));
+    await act(async () => {});
+    fireEvent.click(button("Yes, delete permanently"));
+    await act(async () => {});
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", true, {
+      changed: ["README.md"],
+      removed: ["notes.txt"],
+    });
   });
 
   it("review 3 F: a copy that can't be read is explained, not taken for gone, and Keep both is offered", async () => {

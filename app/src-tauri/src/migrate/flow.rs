@@ -16,7 +16,8 @@
 //! it, so a removal that stops halfway can only be finished, never "re-synced" from a
 //! half-deleted original. While deleting, a change to the copy only blocks for paths
 //! the original still has, and **Delete the rest anyway** (`force`, the paths the user
-//! saw) skips exactly those.
+//! saw, under how each changed in the copy) skips exactly those while each still
+//! changed that way.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,7 +28,7 @@ use refract_core::protocol::{
     code, FinishAction, Method, MigrateBeginDeleteParams, MigrateCancelParams, MigrateFinishParams,
     MigrateIdParams, MigrateParams, Reply, StopAgentParams,
 };
-pub use refract_core::protocol::{BeginDelete, CancelOutcome, PendingMigration, Recheck};
+pub use refract_core::protocol::{BeginDelete, CancelOutcome, Forced, PendingMigration, Recheck};
 use serde::Serialize;
 
 use super::snapshot::RefusalView;
@@ -166,12 +167,13 @@ pub trait MigrateHelper: Send + Sync {
     /// `migrateBeginDelete`: the recheck, and the deleting state when it passes.
     /// `source_gone`: Windows no longer sees the original. `force`: while deleting,
     /// the paths of `copyChanged` the user saw and agreed to delete the rest anyway
-    /// for, though the copy's version differs.
+    /// for, though the copy's version differs, as edited (`changed`) or deleted in the
+    /// copy (`removed`).
     fn begin_delete(
         &self,
         id: &str,
         source_gone: bool,
-        force: &[String],
+        force: &Forced,
     ) -> Result<BeginDelete, RequestError>;
     /// `migrateResync`: re-copies what changed; progress and a new `migrateReady` follow.
     fn resync(&self, id: &str) -> Result<(), RequestError>;
@@ -208,12 +210,12 @@ impl MigrateHelper for AgentHelper<'_> {
         &self,
         id: &str,
         source_gone: bool,
-        force: &[String],
+        force: &Forced,
     ) -> Result<BeginDelete, RequestError> {
         let params = MigrateBeginDeleteParams {
             id: id.to_owned(),
             source_gone,
-            force: force.to_vec(),
+            force: force.clone(),
         };
         match self
             .0
@@ -356,7 +358,7 @@ pub enum DeleteOutcome {
     /// copy, **End the move** for a copy that is gone and **Stop** for agents. In it,
     /// **Finish deleting** once fixed; for copy changes (only paths the original
     /// still has are listed then; `copyRemoved` apart, as the original's version of
-    /// those goes for good) **Delete the rest anyway** (`force`, those paths); for a
+    /// those goes for good) **Delete the rest anyway** (`force`, those paths in two lists); for a
     /// copy
     /// that is gone, **End the move** after asking, pointing to the Recycle Bin.
     Changed {
@@ -448,7 +450,7 @@ pub fn delete_original(
     os: &dyn WindowsOps,
     target: &DeleteTarget,
     permanent: bool,
-    force: &[String],
+    force: &Forced,
 ) -> Result<DeleteOutcome, MigrateError> {
     let deleting = target.deleting;
     let was_present = os.exists(&target.source);
@@ -570,7 +572,7 @@ mod tests {
         finish_fails: bool,
         log: Mutex<Vec<String>>,
         /// `(source_gone, force)` of each `migrateBeginDelete`.
-        begin_args: Mutex<Vec<(bool, Vec<String>)>>,
+        begin_args: Mutex<Vec<(bool, Forced)>>,
     }
 
     impl MigrateHelper for FakeHelper {
@@ -585,13 +587,13 @@ mod tests {
             &self,
             id: &str,
             source_gone: bool,
-            force: &[String],
+            force: &Forced,
         ) -> Result<BeginDelete, RequestError> {
             self.log.lock().unwrap().push(format!("begin {id}"));
             self.begin_args
                 .lock()
                 .unwrap()
-                .push((source_gone, force.to_vec()));
+                .push((source_gone, force.clone()));
             let mut begin = self
                 .begin
                 .clone()
@@ -717,7 +719,7 @@ mod tests {
     fn deletes_in_order_and_leaves_a_shortcut() {
         let helper = safe_helper();
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert_eq!(
             outcome,
             DeleteOutcome::Deleted {
@@ -759,7 +761,7 @@ mod tests {
             ..FakeHelper::default()
         };
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Changed { recheck, deleting: false }
                 if recheck.changed == ["notes.txt"] && recheck.busy_agents.len() == 1)
@@ -771,7 +773,14 @@ mod tests {
     #[test]
     fn a_helper_without_begin_delete_refuses_to_delete() {
         let os = FakeOs::with_source();
-        let err = delete_original(&FakeHelper::default(), &os, &target(), false, &[]).unwrap_err();
+        let err = delete_original(
+            &FakeHelper::default(),
+            &os,
+            &target(),
+            false,
+            &Forced::default(),
+        )
+        .unwrap_err();
         assert_eq!(err.kind, MigrateErrorKind::Agent);
         assert!(err.message.contains("migrateBeginDelete"));
         assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
@@ -787,7 +796,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         let helper = safe_helper();
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert!(
             matches!(outcome, DeleteOutcome::WindowsOpen { ref windows, deleting: false } if windows[0].id == 7)
         );
@@ -797,7 +806,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         assert_eq!(
-            delete_original(&helper, &os, &target(), false, &[]).unwrap(),
+            delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap(),
             DeleteOutcome::WontFit {
                 reason: "too large".into(),
                 deleting: false,
@@ -817,7 +826,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         assert!(matches!(
-            delete_original(&helper, &os, &target(), false, &[]).unwrap(),
+            delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap(),
             DeleteOutcome::WontFit { deleting: true, .. }
         ));
         assert!(os.exists(Path::new(r"C:\dev\aurora-notes")));
@@ -826,7 +835,7 @@ mod tests {
             fit: Some(Fit::WontFit("too large".into())),
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&helper, &os, &target(), true, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), true, &Forced::default()).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -845,7 +854,7 @@ mod tests {
             partial: true,
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Unfinished { reason } if reason.contains("in use"))
         );
@@ -865,7 +874,7 @@ mod tests {
             deleting: true,
             ..target()
         };
-        let outcome = delete_original(&helper, &os, &resume, false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &resume, false, &Forced::default()).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -895,7 +904,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         assert!(matches!(
-            delete_original(&safe_helper(), &os, &resume, false, &[]).unwrap(),
+            delete_original(&safe_helper(), &os, &resume, false, &Forced::default()).unwrap(),
             DeleteOutcome::WindowsOpen { deleting: true, .. }
         ));
     }
@@ -917,7 +926,7 @@ mod tests {
             deleting: true,
             ..target()
         };
-        let outcome = delete_original(&helper, &os, &resume, false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &resume, false, &Forced::default()).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Changed { deleting: true, .. }
@@ -938,12 +947,15 @@ mod tests {
             ..FakeHelper::default()
         };
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         // The helper is told Windows still sees it, so it doesn't enter the deleting
         // state: Keep both is still open.
         assert_eq!(outcome, DeleteOutcome::DriveHidden { deleting: false });
         assert!(!outcome.deleting());
-        assert_eq!(*helper.begin_args.lock().unwrap(), [(false, vec![])]);
+        assert_eq!(
+            *helper.begin_args.lock().unwrap(),
+            [(false, Forced::default())]
+        );
         assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
         assert!(!helper
             .log
@@ -957,14 +969,14 @@ mod tests {
             ..target()
         };
         assert_eq!(
-            delete_original(&helper, &os, &resume, false, &[]).unwrap(),
+            delete_original(&helper, &os, &resume, false, &Forced::default()).unwrap(),
             DeleteOutcome::DriveHidden { deleting: true }
         );
         assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
         // Gone on Windows too: the helper is told so, and the move only needs finishing.
         let os = FakeOs::default();
         assert!(matches!(
-            delete_original(&helper, &os, &target(), false, &[]).unwrap(),
+            delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap(),
             DeleteOutcome::Deleted {
                 already_gone: true,
                 ..
@@ -972,7 +984,7 @@ mod tests {
         ));
         assert_eq!(
             helper.begin_args.lock().unwrap().last(),
-            Some(&(true, vec![]))
+            Some(&(true, Forced::default()))
         );
     }
 
@@ -984,7 +996,10 @@ mod tests {
             deleting: true,
             ..target()
         };
-        let force = vec!["README.md".to_owned()];
+        let force = Forced {
+            changed: vec!["README.md".to_owned()],
+            removed: vec!["notes.txt".to_owned()],
+        };
         let outcome = delete_original(&helper, &os, &resume, false, &force).unwrap();
         assert!(matches!(outcome, DeleteOutcome::Deleted { .. }));
         assert_eq!(*helper.begin_args.lock().unwrap(), [(false, force)]);
@@ -997,7 +1012,7 @@ mod tests {
             sticky: true,
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert!(matches!(outcome, DeleteOutcome::Unfinished { .. }));
         assert!(!helper
             .log
@@ -1014,7 +1029,7 @@ mod tests {
             ..safe_helper()
         };
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Unfinished { reason } if reason.contains("could not finish"))
         );
@@ -1025,7 +1040,7 @@ mod tests {
             ..target()
         };
         os.log.borrow_mut().clear();
-        let outcome = delete_original(&helper, &os, &retry, false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &retry, false, &Forced::default()).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -1055,7 +1070,7 @@ mod tests {
             deleting: true,
             ..target()
         };
-        let outcome = delete_original(&helper, &os, &resume, false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &resume, false, &Forced::default()).unwrap();
         assert!(matches!(outcome, DeleteOutcome::Unfinished { .. }));
         let helper = FakeHelper {
             begin: Some(BeginDelete {
@@ -1069,7 +1084,7 @@ mod tests {
             }),
             ..FakeHelper::default()
         };
-        let outcome = delete_original(&helper, &os, &resume, false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &resume, false, &Forced::default()).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Changed { recheck, deleting: true } if recheck.copy_missing),
             "{outcome:?}"
@@ -1081,7 +1096,7 @@ mod tests {
     fn an_original_deleted_by_hand_is_finished_without_removing() {
         let helper = safe_helper();
         let os = FakeOs::default();
-        let outcome = delete_original(&helper, &os, &target(), false, &[]).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, &Forced::default()).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -1112,7 +1127,7 @@ mod tests {
                 ..target()
             },
             false,
-            &[],
+            &Forced::default(),
         )
         .unwrap();
         assert!(matches!(

@@ -362,12 +362,20 @@ pub fn remove_originals(
 }
 
 /// Deletes the copies in `files` that nobody wrote to since (a session resumed in the
-/// new path appends to its copy, which must then stay). Returns the copies kept.
+/// new path appends to its copy, which must then stay) and whose original is still
+/// there (otherwise the copy is the only one left). Returns the copies kept.
 pub fn remove_copies(projects: &Path, files: &[HistoryFile]) -> Vec<Problem> {
     let mut kept = Vec::new();
     let mut gone = Vec::new();
     for file in files {
         if fs::symlink_metadata(&file.copy).is_err() {
+            continue;
+        }
+        if fs::symlink_metadata(&file.original).is_err() {
+            kept.push(Problem {
+                path: Some(file.copy.to_string_lossy().into_owned()),
+                message: "Its original is gone, so it was kept.".into(),
+            });
             continue;
         }
         if !holds(&file.copy, &file.copy_sha256) {
@@ -463,8 +471,8 @@ mod tests {
         assert_eq!(remove_originals(&projects, &copied.files, old, new), vec![]);
         assert!(!top.exists() && !sub.exists());
         assert!(other.exists() && new_top.exists());
-        assert_eq!(remove_copies(&projects, &copied.files), vec![]);
-        assert!(!new_top.exists() && !new_sub.exists());
-        assert!(projects.exists());
+        // With their originals gone the copies are the only ones left: they stay.
+        assert_eq!(remove_copies(&projects, &copied.files).len(), 3);
+        assert!(new_top.join("s.jsonl").exists() && new_sub.join("s.jsonl").exists());
     }
 }

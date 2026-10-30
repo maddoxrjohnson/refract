@@ -6,6 +6,7 @@ import type {
   AgentStatus,
   Credentials,
   DeleteOutcome,
+  Forced,
   FinishAction,
   GpuUsage,
   HookInfo,
@@ -28,6 +29,7 @@ import type {
   UsageSummary,
   VsCodeWindow,
 } from "./types";
+import { NO_FORCE } from "./types";
 
 /** Event names the Rust side emits. */
 export const EVENTS = {
@@ -208,7 +210,7 @@ export class TauriBackend implements Backend {
     return invoke<void>("migrate_resync", { id });
   }
 
-  migrateDelete(id: string, permanent: boolean, force: string[] = []): Promise<DeleteOutcome> {
+  migrateDelete(id: string, permanent: boolean, force: Forced = NO_FORCE): Promise<DeleteOutcome> {
     return invoke<DeleteOutcome>("migrate_delete", { id, permanent, force });
   }
 

@@ -1584,7 +1584,7 @@ fn deleting_ignores_what_the_rest_cannot_lose_and_force_deletes_the_rest() {
     );
     let forced = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md"]}),
+        json!({"id": id, "force": {"changed": ["README.md"]}}),
     );
     assert_eq!(forced["result"]["ok"], true, "{forced}");
     fs::remove_dir_all(&world.src).unwrap();
@@ -1605,7 +1605,7 @@ fn force_only_skips_copy_changes_while_deleting() {
     write(&world.dest.join("README.md"), "my edit in the copy\n");
     let forced = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md", "notes.txt", "."]}),
+        json!({"id": id, "force": {"changed": ["README.md", "notes.txt", "."], "removed": ["README.md", "notes.txt", "."]}}),
     );
     assert_eq!(forced["result"]["ok"], false, "{forced}");
     write(
@@ -1623,7 +1623,7 @@ fn force_only_skips_copy_changes_while_deleting() {
     write(&world.src.join("notes.txt"), "edited while deleting\n");
     let forced = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md", "notes.txt", "."]}),
+        json!({"id": id, "force": {"changed": ["README.md", "notes.txt", "."], "removed": ["README.md", "notes.txt", "."]}}),
     );
     assert_eq!(forced["result"]["ok"], false, "{forced}");
     assert_eq!(
@@ -1693,7 +1693,7 @@ fn a_copy_that_is_gone_can_always_be_forgotten() {
     fs::remove_dir_all(&world.dest).unwrap();
     let forced = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md", "notes.txt", "."]}),
+        json!({"id": id, "force": {"changed": ["README.md", "notes.txt", "."], "removed": ["README.md", "notes.txt", "."]}}),
     );
     assert_eq!(forced["result"]["ok"], false, "{forced}");
     assert_eq!(
@@ -1923,7 +1923,7 @@ fn force_skips_only_the_copy_changes_it_names() {
     assert_eq!(recheck["copyRemoved"], json!(["notes.txt"]), "{blocked}");
     let some = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md"]}),
+        json!({"id": id, "force": {"changed": ["README.md"]}}),
     );
     assert_eq!(some["result"]["ok"], false, "{some}");
     // A copy path that can't be read is never forced.
@@ -1931,7 +1931,7 @@ fn force_skips_only_the_copy_changes_it_names() {
     fs::set_permissions(&scripts, fs::Permissions::from_mode(0o000)).unwrap();
     let unreadable = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md", "notes.txt", "scripts"]}),
+        json!({"id": id, "force": {"changed": ["README.md", "scripts"], "removed": ["notes.txt"]}}),
     );
     fs::set_permissions(&scripts, fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(unreadable["result"]["ok"], false, "{unreadable}");
@@ -1940,9 +1940,15 @@ fn force_skips_only_the_copy_changes_it_names() {
         json!(["scripts"]),
         "{unreadable}"
     );
+    // Each path only under how it changed.
+    let swapped = agent.request(
+        "migrateBeginDelete",
+        json!({"id": id, "force": {"changed": ["notes.txt"], "removed": ["README.md"]}}),
+    );
+    assert_eq!(swapped["result"]["ok"], false, "{swapped}");
     let all = agent.request(
         "migrateBeginDelete",
-        json!({"id": id, "force": ["README.md", "notes.txt"]}),
+        json!({"id": id, "force": {"changed": ["README.md"], "removed": ["notes.txt"]}}),
     );
     assert_eq!(all["result"]["ok"], true, "{all}");
 }
@@ -2010,4 +2016,123 @@ fn a_finish_delete_with_the_copy_gone_is_refused() {
     assert_eq!(begin["result"]["recheck"]["copyMissing"], true, "{begin}");
     let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
     assert_eq!(discard["result"], Value::Null, "{discard}");
+}
+
+/// Review 4: finish delete removes the old transcripts, its config write fails, the
+/// helper restarts and the copy goes. Ending the move then only forgets it: the
+/// transcript copies, now the only ones, stay.
+#[test]
+fn ending_the_move_after_a_half_finished_delete_keeps_the_history() {
+    let world = World::new();
+    let src = world.src.clone();
+    let old = project_dir(&world.projects(), &src).join(format!("{SESSION_ID}.jsonl"));
+    write(
+        &old,
+        &transcript(
+            SESSION_ID,
+            &src,
+            &src.join("README.md"),
+            Utc::now() - TimeDelta::days(2),
+            true,
+        ),
+    );
+    let (mut agent, id) = placed_migration(&world, None);
+    let new = project_dir(&world.projects(), &world.dest).join(format!("{SESSION_ID}.jsonl"));
+    assert!(new.exists());
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    fs::remove_dir_all(&world.src).unwrap();
+    let saved = fs::read_to_string(&world.config).unwrap();
+    fs::remove_file(&world.config).unwrap();
+    fs::create_dir(&world.config).unwrap();
+    let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert!(finish["error"].is_object(), "{finish}");
+    assert!(!old.exists() && new.exists());
+    fs::remove_dir(&world.config).unwrap();
+    write(&world.config, &saved);
+    drop(agent);
+    fs::remove_dir_all(&world.dest).unwrap();
+    let mut agent = world.agent(None);
+    agent.ready();
+    let begin = agent.request("migrateBeginDelete", json!({"id": id, "sourceGone": true}));
+    assert_eq!(begin["result"]["recheck"]["copyMissing"], true, "{begin}");
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(new.exists(), "the only transcript was deleted");
+}
+
+/// Review 4: the config write of finish delete fails, then the copy goes. End the
+/// move (discard) is accepted, as a forget, without a restart.
+#[test]
+fn ending_the_move_while_finishing_a_delete_whose_copy_went() {
+    let world = World::new();
+    let src = world.src.clone();
+    let old = project_dir(&world.projects(), &src).join(format!("{SESSION_ID}.jsonl"));
+    write(
+        &old,
+        &transcript(
+            SESSION_ID,
+            &src,
+            &src.join("README.md"),
+            Utc::now() - TimeDelta::days(2),
+            true,
+        ),
+    );
+    let (mut agent, id) = placed_migration(&world, None);
+    let new = project_dir(&world.projects(), &world.dest).join(format!("{SESSION_ID}.jsonl"));
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    fs::remove_dir_all(&world.src).unwrap();
+    let saved = fs::read_to_string(&world.config).unwrap();
+    fs::remove_file(&world.config).unwrap();
+    fs::create_dir(&world.config).unwrap();
+    let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert!(finish["error"].is_object(), "{finish}");
+    fs::remove_dir(&world.config).unwrap();
+    write(&world.config, &saved);
+    fs::remove_dir_all(&world.dest).unwrap();
+    let begin = agent.request("migrateBeginDelete", json!({"id": id, "sourceGone": true}));
+    assert_eq!(begin["result"]["recheck"]["copyMissing"], true, "{begin}");
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(
+        discard["result"],
+        Value::Null,
+        "End the move refused: {discard}"
+    );
+    assert!(new.exists(), "the only transcript was deleted");
+    let pending = agent.request("migratePending", json!(null));
+    assert!(!pending.to_string().contains(&id), "{pending}");
+}
+
+/// Review 4: a path the user saw edited in the copy and forced, deleted in the copy
+/// since, still blocks: forcing it again needs the user to see it as removed.
+#[test]
+fn force_of_an_edit_does_not_skip_it_once_removed() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    write(&world.dest.join("README.md"), "my edit in the copy\n");
+    let seen = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(
+        seen["result"]["recheck"]["copyRemoved"],
+        json!([]),
+        "{seen}"
+    );
+    fs::remove_file(world.dest.join("README.md")).unwrap();
+    let forced = agent.request(
+        "migrateBeginDelete",
+        json!({"id": id, "force": {"changed": ["README.md"]}}),
+    );
+    assert_eq!(forced["result"]["ok"], false, "{forced}");
+    assert_eq!(
+        forced["result"]["recheck"]["copyRemoved"],
+        json!(["README.md"]),
+        "{forced}"
+    );
+    let forced = agent.request(
+        "migrateBeginDelete",
+        json!({"id": id, "force": {"removed": ["README.md"]}}),
+    );
+    assert_eq!(forced["result"]["ok"], true, "{forced}");
 }

@@ -76,6 +76,10 @@ pub struct Record {
     /// `migrateBeginDelete` passed: the app may be deleting the original.
     #[serde(default)]
     pub deleting: bool,
+    /// `migrateFinish delete` began deleting the old transcripts (saved before it
+    /// does): the copies may be the only ones left, so they are never discarded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub originals_removed: bool,
     /// A step that changes the placed copy (or the history) and has begun, saved
     /// before it touches anything, cleared once its result is saved: a helper that
     /// finds it set after a restart knows the step was cut short.
@@ -132,6 +136,7 @@ impl Record {
             copy_errors: Vec::new(),
             kept: Vec::new(),
             deleting: false,
+            originals_removed: false,
             running: None,
             resync_written: Vec::new(),
             history_planned: Vec::new(),
