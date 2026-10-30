@@ -19,7 +19,7 @@ Refract (Windows)                 refract-agent (WSL)                VS Code win
 
 `code` can only open or focus a folder; it cannot pass a message to the window it opens. The helper therefore leaves a request file in WSL. The extension runs in the WSL extension host, so it reads that file with ordinary Node file access and watches the directory for later requests.
 
-VS Code focuses an existing window when it is given a folder that is already open. A later request for the same folder therefore reaches the window that is already running, which opens a new terminal tab.
+VS Code focuses an existing window when it is given a folder that is already open. A later request for the same folder therefore reaches the window that is already running, which opens a new terminal tab. A focus request (see below) reaches it the same way, and shows a terminal that is already there instead.
 
 ## Request file
 
@@ -41,10 +41,25 @@ Directory: `$XDG_STATE_HOME/refract/launch/`, defaulting to `~/.local/state/refr
 - `folder` is the repo's absolute Linux path, with no trailing slash.
 - `argv` is the command to run in the terminal. For a new agent it is `claude --session-id <uuid>`, followed by `--` and an opening prompt if there is one. The `--` ends `claude`'s options, so a prompt that starts with `-` is not read as a flag. For a resume it is `claude --resume <session-id>`.
 - `title` names the terminal tab.
+- `focus`, present only on a focus request, names a running agent whose terminal to show. `argv` is then empty and nothing is started:
+
+```json
+{
+  "version": 1,
+  "requestId": "6f1c…",
+  "folder": "/home/me/projects/example",
+  "argv": [],
+  "title": "Running agent",
+  "createdAt": "2026-10-29T17:54:44Z",
+  "focus": {"sessionId": "0b7e…", "pids": [8123, 8090, 7311]}
+}
+```
+
+  `pids` is the session's `claude` process followed by its ancestors, nearest first, read from field 4 (`ppid`) of `/proc/<pid>/stat`: the `claude` process, the shell that started it, and so on. The chain stops before pid 1 and holds at most 16 entries. The extension accepts 1 to 32 positive integers. A VS Code terminal's `processId` is its shell's pid, so the terminal running the agent is the one whose `processId` is in the chain, however many processes (such as `npx` or a wrapper script) sit between the shell and `claude`.
 
 A window **claims** a request by renaming `<requestId>.json` to `<requestId>.claimed`. If the rename fails because the file has gone, another window took it. After starting the terminal, the window deletes the `.claimed` file.
 
-A window ignores requests for other folders, requests with an unknown `version` or that cannot be parsed, requests older than one hour, and requests dated more than a minute in the future. A request between two minutes and one hour old is claimed but not started on its own; see "In the window". The helper deletes request, claimed and leftover temporary files older than one hour each time it writes a new one.
+A window ignores requests for other folders, requests with an unknown `version` or that cannot be parsed, requests older than one hour, and requests dated more than a minute in the future. A request between two minutes and one hour old is claimed but not started on its own; see "In the window". A focus request of that age is deleted without being claimed. The helper deletes request, claimed and leftover temporary files older than one hour each time it writes a new one.
 
 ## Protocol
 
@@ -53,6 +68,7 @@ A window ignores requests for other folders, requests with an unknown `version` 
 ```json
 {"path": "/home/me/projects/example", "mode": {"kind": "new", "prompt": "optional"}}
 {"path": "/home/me/projects/example", "mode": {"kind": "resume", "sessionId": "0b7e…"}}
+{"path": "/home/me/projects/example", "mode": {"kind": "focus", "sessionId": "0b7e…"}}
 ```
 
 Result:
@@ -61,7 +77,8 @@ Result:
 {"requestId": "6f1c…", "sessionId": "0b7e…", "folderUri": "vscode-remote://wsl+Ubuntu/home/me/projects/example"}
 ```
 
-- For a new agent, the helper generates `sessionId` (a random UUID v4). For a resume, it echoes the given one back. A resume `sessionId` that is not a hyphenated UUID is rejected with `INVALID_PARAMS`.
+- For a new agent, the helper generates `sessionId` (a random UUID v4). For a resume or a focus, it echoes the given one back. A resume or focus `sessionId` that is not a hyphenated UUID is rejected with `INVALID_PARAMS`.
+- A focus names a live session of the repo whose process runs in a terminal of the Refract window on exactly that folder: its environment has `REFRACT_FOLDER` equal to the repo path, ignoring a trailing slash (and ASCII case under `/mnt/`). The snapshot marks such sessions `focusable`. The helper takes the process from its last liveness check, which records a pid only when certain: the process names the session id, or it is the only process in the repo naming none. Before reading the ancestors it confirms the pid still runs `claude` and that its start time in `/proc/<pid>/stat` is the one recorded, so a pid reused by a later process is not followed. When the session is not live, its process is unknown or has exited, or it runs anywhere else, the error code is `NOT_RUNNING` (5) with a message such as "that agent is no longer running" or "that agent is not running in a Refract VS Code window on this folder", which the app shows as it is.
 - `folderUri` uses the distro from `WSL_DISTRO_NAME`. Path segments are percent-encoded.
 - The path must be an existing directory. Otherwise the error code is `REPO_NOT_FOUND`.
 
@@ -114,6 +131,8 @@ Folders remember the profile they were last opened with (`profileAssociations` i
 
 It declares `capabilities.untrustedWorkspaces.supported: true`, so it also runs in Restricted Mode, before the folder is trusted.
 
+In a window with a single folder it sets `REFRACT_FOLDER` to that folder's path through its environment variable collection, so every terminal the window starts carries it: the ones the extension opens and ones opened by hand. The helper reads it from a `claude` process's environment to tell which window the process runs in. Windows with no folder, a multi-root workspace or a parent folder of the repo get no value, or a different one, so their agents are not offered. Neither are agents in other editors (VS Code Insiders, Cursor, VSCodium), whose WSL servers do not have the extension. A terminal only gets the variable when it starts, so agents started before extension 0.1.3 was active in the window are not offered until they are restarted in a new terminal.
+
 Extensions in the WSL server belong to one profile, like extensions on Windows. The exception is an entry marked application-scoped ("Apply Extension to all Profiles"), which every profile gets. Refract marks its own entry this way, so the extension reaches Refract windows.
 
 ## First-run setup
@@ -149,9 +168,16 @@ On activation the extension scans the launch directory for requests matching its
 2. Types the command into it. Arguments that are plain tokens, such as `claude`, flags and UUIDs, are typed as they are. Any other argument, such as an opening prompt, is passed in the terminal's environment as `REFRACT_ARG_<n>` and typed as `"$REFRACT_ARG_<n>"`. The typed line therefore stays short, and tabs, quotes or a long prompt cannot be misread by the shell. The shell stays open after `claude` exits.
 3. On a request found during activation (that is, the window was opened for it), sets up the bare layout. It closes the sidebar, panel and secondary sidebar, then closes every tab that is not a terminal and has no unsaved changes. Requests that arrive later only add a terminal tab, so an existing window's layout is left alone.
 
+A focus request is handled differently. The window reads each open terminal's `processId` in turn and calls `show()` on the first one whose pid is in `focus.pids`. It never creates a terminal and never sets up the bare layout. When no terminal matches, for example because the agent runs in another window or was started in a terminal that has since been closed, it logs that to the Refract output channel and does nothing else. The window itself is brought to the front by the same `code --folder-uri` call as any launch.
+
 A request is fresh for two minutes after `createdAt`. A window can take longer than that to connect, for example while VS Code's server downloads after an update, so a request between two minutes and one hour old is not dropped. The window claims it, then shows a message: `Refract asked to start "<title>" here <N> minutes ago, but the window took too long to open. Start it now?` with **Start** and **Dismiss**.
 
 - **Start** runs the request exactly as a fresh one, including the bare layout if it was found during activation.
 - **Dismiss**, or closing the message, deletes the claimed file and starts nothing.
 - If several such requests are found at once, such as after a held key, only the newest gets a message. The older ones are deleted.
 - The message is not modal, so a fresh request that arrives while it is open still starts at once.
+- A focus request that old is deleted without a message: showing a terminal minutes after it was asked for would only surprise.
+
+The extension reads every terminal's `processId` at once, each with a one-second limit, so a terminal that never answers cannot hold up the queue. One that times out or has no process id counts as no match.
+
+A window that is already open with extension 0.1.2 or older ignores focus requests, because their `argv` is empty, until it is reloaded. Until then, going to a running agent brings the window forward without switching tabs.

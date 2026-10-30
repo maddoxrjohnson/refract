@@ -111,6 +111,28 @@ describe("claimRequests", () => {
   });
 });
 
+describe("focus requests", () => {
+  const focus = (id: string, createdAt: string) =>
+    req(id, { argv: [], title: "Running agent", createdAt, focus: { sessionId: "s", pids: [812, 640] } });
+
+  it("claims a fresh focus request", async () => {
+    write("f", focus("f", "2026-10-29T17:59:50Z"));
+    const got = await claimRequests(nodeFs, dir, folder, now);
+    expect(got.map((c) => [c.request.requestId, c.request.focus?.pids, c.late])).toEqual([["f", [812, 640], false]]);
+    expect(fs.readdirSync(dir)).toEqual(["f.claimed"]);
+  });
+
+  it("deletes a late focus request without claiming it or asking", async () => {
+    write("f", focus("f", "2026-10-29T17:53:00Z"));
+    write("a", req("a", { createdAt: "2026-10-29T17:53:00Z" }));
+    const logs: string[] = [];
+    const got = await claimRequests(nodeFs, dir, folder, now, (m) => logs.push(m));
+    expect(got.map((c) => c.request.requestId)).toEqual(["a"]);
+    expect(fs.readdirSync(dir)).toEqual(["a.claimed"]);
+    expect(logs).toContain("dropped f.json: a late focus request");
+  });
+});
+
 describe("Scanner", () => {
   it("never handles a request twice across overlapping scans", async () => {
     write("a", req("a"));

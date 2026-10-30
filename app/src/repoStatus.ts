@@ -33,6 +33,13 @@ export function unfinishedSessions(repo: RepoSnapshot): SessionInfo[] {
     .sort((a, b) => (b.lastTimestamp ?? "").localeCompare(a.lastTimestamp ?? ""));
 }
 
+/** Live sessions in the Refract window on this repo, which the picker offers to go to, newest first. */
+export function focusableSessions(repo: RepoSnapshot): SessionInfo[] {
+  return repo.sessions
+    .filter((s) => s.focusable && s.state.kind === "live")
+    .sort((a, b) => (b.lastTimestamp ?? "").localeCompare(a.lastTimestamp ?? ""));
+}
+
 /** "GitHub", "GitLab", another host name, or "Local" without a recognised remote. */
 export function hostLabel(repo: RepoSnapshot): string {
   const host = repo.remote?.host;

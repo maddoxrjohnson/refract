@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as vscode from "vscode";
 import { claimRequests, promptLate, release, Scanner, type ClaimedRequest, type ClaimFs } from "./claim";
+import { FOLDER_VAR, findTerminal } from "./focus";
 import { tabsToClose } from "./layout";
 import { launchDir, terminalCommand } from "./request";
 
@@ -25,6 +26,11 @@ export function activate(context: vscode.ExtensionContext): void {
   }
   const folder = folders[0]!.uri.path;
   const dir = launchDir(process.env, os.homedir());
+
+  // Every terminal this window starts names its folder, so the helper can tell which
+  // Refract window a running agent is in (see docs/launch.md).
+  context.environmentVariableCollection.description = "Names this folder for Refract's Go to the running agent";
+  context.environmentVariableCollection.replace(FOLDER_VAR, folder);
 
   const output = vscode.window.createOutputChannel("Refract");
   context.subscriptions.push(output);
@@ -75,9 +81,27 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  // Shows the terminal already running the session. Never creates a terminal and
+  // never applies the bare layout; `code` has already brought the window forward.
+  async function focusTerminal(claimed: ClaimedRequest): Promise<void> {
+    const { request } = claimed;
+    const pids = request.focus?.pids ?? [];
+    const terminal = await findTerminal(vscode.window.terminals, (t) => t.processId, pids);
+    if (terminal) {
+      terminal.show();
+      log(`showed the terminal of ${request.focus?.sessionId} for ${request.requestId}`);
+    } else {
+      log(`no terminal runs ${request.focus?.sessionId} (pids ${pids.join(", ")}) for ${request.requestId}`);
+    }
+    await release(nodeFs, claimed, log);
+  }
+
   // A late request waits for an answer, so the prompt must not hold up the scan
   // queue: a fresh request that arrives meanwhile still starts at once.
   async function handle(claimed: ClaimedRequest, first: boolean): Promise<void> {
+    if (claimed.request.focus) {
+      return focusTerminal(claimed);
+    }
     if (!claimed.late) {
       return start(claimed, first);
     }

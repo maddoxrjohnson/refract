@@ -1,12 +1,14 @@
 import type { LaunchMode, RepoSnapshot, SessionInfo } from "../backend/types";
 import { isRemoteKey, remoteKey } from "../projects";
-import { DIRTY_REPO_PROMPT, unfinishedSessions } from "../repoStatus";
+import { DIRTY_REPO_PROMPT, focusableSessions, unfinishedSessions } from "../repoStatus";
 
 // Finding and choosing a project (spec §3.3, §4.3) as a pure state machine. Inputs are
 // pointer, click and key events; the result says what changed and which effects to run.
 
 /** One row of the launch picker. */
 export type PickerOption =
+  /** Go to the VS Code terminal already running a live session. */
+  | { kind: "focus"; session: SessionInfo }
   | { kind: "resume"; session: SessionInfo }
   | { kind: "new"; prompt?: string };
 
@@ -111,25 +113,48 @@ export function resumableSession(repo: RepoSnapshot): SessionInfo | null {
   return unfinished[0] ?? null;
 }
 
-/** Unfinished sessions, newest first, then New agent. */
+/** The running agent a Go to agent button shows: the preselected one, else the newest. */
+export function focusableSession(repo: RepoSnapshot): SessionInfo | null {
+  const running = focusableSessions(repo);
+  const pre = repo.preselect;
+  if (pre.kind === "focus") {
+    const s = running.find((r) => r.id === pre.sessionId);
+    if (s) return s;
+  }
+  return running[0] ?? null;
+}
+
+/** Running agents to go to, then unfinished sessions, each newest first, then New agent. */
 export function pickerOptions(repo: RepoSnapshot): PickerOption[] {
   const fresh: PickerOption =
     repo.changedFiles > 0 ? { kind: "new", prompt: DIRTY_REPO_PROMPT } : { kind: "new" };
-  return [...unfinishedSessions(repo).map((session): PickerOption => ({ kind: "resume", session })), fresh];
+  return [
+    ...focusableSessions(repo).map((session): PickerOption => ({ kind: "focus", session })),
+    ...unfinishedSessions(repo).map((session): PickerOption => ({ kind: "resume", session })),
+    fresh,
+  ];
 }
 
 /** The launch an option starts. */
 export function optionMode(option: PickerOption): LaunchMode {
+  if (option.kind === "focus") return { kind: "focus", sessionId: option.session.id };
   if (option.kind === "resume") return { kind: "resume", sessionId: option.session.id };
   return option.prompt ? { kind: "new", prompt: option.prompt } : { kind: "new" };
+}
+
+/** A stable React key for an option, unique within one picker. */
+export function optionKey(option: PickerOption): string {
+  return option.kind === "new" ? "new" : `${option.kind}:${option.session.id}`;
 }
 
 function openPicker(repo: RepoSnapshot): PickerState {
   const options = pickerOptions(repo);
   const pre = repo.preselect;
   let index = options.length - 1;
-  if (pre.kind === "resume") {
-    const i = options.findIndex((o) => o.kind === "resume" && o.session.id === pre.sessionId);
+  if (pre.kind === "resume" || pre.kind === "focus") {
+    const i = options.findIndex(
+      (o) => o.kind !== "new" && o.kind === pre.kind && o.session.id === pre.sessionId,
+    );
     if (i >= 0) index = i;
   }
   return { path: repo.path, options, index };

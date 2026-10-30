@@ -4,7 +4,7 @@
 //! VS Code on it and adds the bare layout to the Refract profile.
 //!
 //! ```text
-//! refract-launch <repo-path> [--resume <id>] [--prompt <text>]
+//! refract-launch <repo-path> [--resume <id> | --focus <id>] [--prompt <text>]
 //!                [--agent <refract-agent>] [--code <code>] [--user-dir <dir>]
 //!                [--vsix <refract.vsix>] [--profile-name <name>]
 //! ```
@@ -28,7 +28,8 @@ use refract_launch::windows::{
 };
 use refract_launch::{ensure_profile_settings, vscode_args, PROFILE};
 
-const USAGE: &str = "usage: refract-launch <repo-path> [--resume <id>] [--prompt <text>] \
+const USAGE: &str =
+    "usage: refract-launch <repo-path> [--resume <id> | --focus <id>] [--prompt <text>] \
                      [--agent <path>] [--code <path>] [--user-dir <path>] [--vsix <path>] \
                      [--profile-name <name>]";
 
@@ -45,6 +46,7 @@ const PROFILE_WAIT: Duration = Duration::from_secs(15);
 struct Args {
     repo: Option<String>,
     resume: Option<String>,
+    focus: Option<String>,
     prompt: Option<String>,
     agent: Option<PathBuf>,
     code: Option<PathBuf>,
@@ -66,10 +68,11 @@ fn main() -> ExitCode {
 fn run() -> Result<(), String> {
     let args = parse_args(std::env::args().skip(1))?;
     let repo = args.repo.ok_or(USAGE)?;
-    let mode = match (args.resume, args.prompt) {
-        (Some(_), Some(_)) => return Err("--resume and --prompt cannot be combined".into()),
-        (Some(session_id), None) => LaunchMode::Resume { session_id },
-        (None, prompt) => LaunchMode::New { prompt },
+    let mode = match (args.resume, args.focus, args.prompt) {
+        (None, None, prompt) => LaunchMode::New { prompt },
+        (Some(session_id), None, None) => LaunchMode::Resume { session_id },
+        (None, Some(session_id), None) => LaunchMode::Focus { session_id },
+        _ => return Err("--resume, --focus and --prompt cannot be combined".into()),
     };
     let agent = match args.agent {
         Some(path) => path,
@@ -147,6 +150,7 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
         let mut value = || args.next().ok_or_else(|| format!("{arg} needs a value"));
         match arg.as_str() {
             "--resume" => parsed.resume = Some(value()?),
+            "--focus" => parsed.focus = Some(value()?),
             "--prompt" => parsed.prompt = Some(value()?),
             "--agent" => parsed.agent = Some(value()?.into()),
             "--code" => parsed.code = Some(value()?.into()),

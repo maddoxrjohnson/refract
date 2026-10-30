@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
-import type { Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
+import type { LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
 import {
   initialNavState,
   matchingPaths,
   navigate,
   newAgentMode,
+  optionKey,
+  optionMode,
   pickerOptions,
   resumableSession,
   type NavContext,
@@ -21,7 +23,12 @@ function session(id: string, hoursAgo: number, kind: "interrupted" | "finished" 
     lastTimestamp: new Date(Date.UTC(2026, 9, 30, 12) - hoursAgo * 3_600_000).toISOString(),
     lastAssistantText: `text of ${id}`,
     byteSize: 1000,
+    focusable: false,
   };
+}
+
+function running(id: string, hoursAgo: number, detail: LiveState, focusable = true): SessionInfo {
+  return { ...session(id, hoursAgo), state: { kind: "live", detail }, focusable };
 }
 
 function repo(
@@ -327,6 +334,56 @@ describe("Enter and launching", () => {
     expect(resumableSession(busy({ kind: "resume", sessionId: "old" }))).toBe(old);
     expect(resumableSession(repo("clean"))).toBeNull();
     expect(pickerOptions(repo("clean"))).toEqual([{ kind: "new" }]);
+  });
+});
+
+describe("going to a running agent", () => {
+  const waiting = running("waiting", 1, "waitingOnUser");
+  const working = running("working", 0.5, "working");
+  const outside = running("outside", 0.2, "working", false);
+  const stopped = session("stopped", 3);
+  const live = (preselect: Preselect) =>
+    repo("live", { sessions: [stopped, waiting, outside, working], preselect });
+  const ctxFor = (r: RepoSnapshot): NavContext => ({ repos: new Map([[r.path, r]]), positions: new Map() });
+
+  it("lists focusable running agents newest first, then resumes, then New agent", () => {
+    expect(pickerOptions(live({ kind: "newAgent" }))).toEqual([
+      { kind: "focus", session: working },
+      { kind: "focus", session: waiting },
+      { kind: "resume", session: stopped },
+      { kind: "new" },
+    ]);
+  });
+
+  it("preselects the named running agent and goes to it on Enter", () => {
+    const r = live({ kind: "focus", sessionId: "waiting" });
+    const c = ctxFor(r);
+    let res = run([{ type: "launch", path: r.path }], initialNavState, c);
+    expect(res.state.picker?.index).toBe(1);
+    res = run([key("Enter")], res.state, c);
+    expect(res.effects).toEqual([
+      { kind: "launch", path: r.path, mode: { kind: "focus", sessionId: "waiting" } },
+    ]);
+  });
+
+  it("falls back to New agent when the named agent is not listed", () => {
+    const r = live({ kind: "focus", sessionId: "outside" });
+    expect(run([{ type: "launch", path: r.path }], initialNavState, ctxFor(r)).state.picker?.index).toBe(3);
+  });
+
+  it("maps each option to its mode, with keys unique across kinds", () => {
+    const same = { ...stopped, id: "same" };
+    const options = [
+      { kind: "focus" as const, session: { ...waiting, id: "same" } },
+      { kind: "resume" as const, session: same },
+      { kind: "new" as const },
+    ];
+    expect(options.map(optionMode)).toEqual([
+      { kind: "focus", sessionId: "same" },
+      { kind: "resume", sessionId: "same" },
+      { kind: "new" },
+    ]);
+    expect(new Set(options.map(optionKey)).size).toBe(3);
   });
 });
 

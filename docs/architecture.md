@@ -106,7 +106,7 @@ Usage totals are not pushed. The app asks for them with `usage`.
 
 ### Errors
 
-Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed.
+Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder.
 
 ### Rules of the line protocol
 
@@ -148,6 +148,7 @@ Claude Code writes one JSON-lines file per conversation under `~/.claude/project
 |---|---|
 | Live | A `claude` process is running with that session id, or in that working directory (read from `/proc`) |
 | Working / waiting on you / idle | Live, plus the [status hook's](#the-status-hook) most recent report. Without the hook a live session has no detail |
+| Focusable | Live, the process running it is known for certain, and its environment (`/proc/<pid>/environ`) has `REFRACT_FOLDER` equal to the repo path, so it runs in a terminal of the Refract window on exactly this folder, which the picker can go to. Sent as `focusable` on each session. The process is known when it names the session id, or when it is the only process in the repo naming none; a session matched to one of several such processes is live but not focusable |
 | Finished | Not live, and the last entry is a complete assistant reply (or a user interrupt) |
 | Interrupted | Not live, and the last entry is an unanswered user message, a tool call without a result, tool results the assistant never answered, or an API error |
 
@@ -180,14 +181,14 @@ Finding and choosing a project is a pure state machine in `ui/navigation.ts`. In
 
 Launching a gem depends on what it is:
 - Not cloned: the `clone` effect, which clones and then launches.
-- The helper's preselect is `noPicker` (clean repo, nothing unfinished): launch a new agent at once.
+- The helper's preselect is `noPicker` (clean repo, nothing unfinished, no focusable session): launch a new agent at once.
 - Otherwise open the picker.
 
-A new agent in a repo with uncommitted changes starts with a short opening prompt asking Claude to review `git diff`. The picker lists unfinished sessions newest first, then New agent, and highlights the session the helper preselected or else New agent. Keys with Ctrl, Meta or Alt are ignored, a held Enter does not repeat, and the settings dialog takes all keys while it is open.
+A new agent in a repo with uncommitted changes starts with a short opening prompt asking Claude to review `git diff`. The picker lists "Go to the running agent" for each focusable live session, then unfinished sessions to resume, each newest first, then New agent. It highlights the option the helper preselected (`focus` or `resume`, each with a `sessionId`), or else New agent. Going to a running agent launches with mode `{"kind": "focus", "sessionId": …}`, which starts nothing and shows that agent's terminal ([launch.md](launch.md)). Keys with Ctrl, Meta or Alt are ignored, a held Enter does not repeat, and the settings dialog takes all keys while it is open.
 
 ### Panels and widgets
 
-- **Detail panel.** Branch, upstream, changed files, last commit, last agent session, and for repos with a GitHub or GitLab remote the open pull or merge requests and CI state. Actions: launch (or Clone and launch), Resume, New agent, Open folder, Open on the host, Hide. Remote details are fetched when a gem is zoomed, again 15 minutes after they were fetched while the same gem stays zoomed and the window is shown, and on Refresh.
+- **Detail panel.** Branch, upstream, changed files, last commit, last agent session, and for repos with a GitHub or GitLab remote the open pull or merge requests and CI state. Actions: launch (or Clone and launch), Go to agent (when a session is focusable), Resume, New agent, Open folder, Open on the host, Hide. Remote details are fetched when a gem is zoomed, again 15 minutes after they were fetched while the same gem stays zoomed and the window is shown, and on Refresh.
 - **Picker, filter bar, focus label.** Presentation for the navigation state above.
 - **Settings.** GitLab address and token, GitHub token (the GitHub CLI login is used otherwise), show forks, show archived, refresh remotes, the hidden list with Unhide, adding a folder, the cost estimate (on or off, and its price table with Add row, remove, Reset to defaults and Save prices), the status hook's install and remove, and Open log folder. Changes are saved one after another; if saving fails the old values come back. Price table edits stay a draft until Save prices, which checks every row first and marks the bad cells (`aria-invalid`, described by the message); the Windows side checks them again (a match of 1 to 100 characters, prices from 0 to 10,000, at most 50 rows) and refuses the save otherwise. Edits made while a save is under way are kept. A row that an earlier, shorter match always wins gets a warning under the table. A price table in `settings.json` that is the wrong shape or fails those checks is replaced by the defaults when the file is read, leaving every other setting as it was.
 - **Status hook offer.** Once the repos are in, a small card offers to install the hook, with "Show what changes" revealing the diff of `settings.json`. "Not now" is remembered.

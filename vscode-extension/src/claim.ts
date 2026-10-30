@@ -28,6 +28,8 @@ function isErrno(err: unknown, code: string): boolean {
  * Claim every request in `dir` addressed to `folder` that is fresh or late (see
  * `classifyAge`). When several late requests are found at once, only the newest
  * is kept; the older ones are deleted, so a held key cannot stack up prompts.
+ * A late focus request is deleted without being claimed: showing a terminal
+ * minutes after it was asked for would only surprise.
  */
 export async function claimRequests(
   fs: ClaimFs,
@@ -70,6 +72,17 @@ export async function claimRequests(
     const freshness = classifyAge(request.createdAt, now);
     if (freshness === "ignore") {
       log(`skip ${name}: expired`);
+      continue;
+    }
+    if (request.focus && freshness === "ask") {
+      try {
+        await fs.unlink(file);
+        log(`dropped ${name}: a late focus request`);
+      } catch (err) {
+        if (!isErrno(err, "ENOENT")) {
+          log(`skip ${name}: cannot remove a late focus request: ${String(err)}`);
+        }
+      }
       continue;
     }
     const claimedPath = path.join(dir, name.slice(0, -".json".length) + ".claimed");

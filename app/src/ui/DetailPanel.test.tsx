@@ -86,6 +86,17 @@ describe("DetailPanel", () => {
     expect(props.onLaunch).toHaveBeenLastCalledWith({ kind: "new", prompt: DIRTY_REPO_PROMPT });
   });
 
+  it("with a running agent in its Refract window offers to go to it", () => {
+    const running = { ...testSession("s2", { kind: "live", detail: "waitingOnUser" }, 1, "Shall I?"), focusable: true };
+    const { panel, props } = setup(testRepo({ sessions: [running], preselect: { kind: "focus", sessionId: "s2" } }));
+    expect(panel.textContent).toContain("go to the running agent");
+    fireEvent.click(screen.getByRole("button", { name: /Launch/ }));
+    expect(props.onPrimary).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Go to agent" }));
+    expect(props.onLaunch).toHaveBeenLastCalledWith({ kind: "focus", sessionId: "s2" });
+    expect(screen.queryByRole("button", { name: "Resume" })).toBeNull();
+  });
+
   it("opens the folder, the remote and closes", () => {
     const { props } = setup();
     fireEvent.click(screen.getByRole("button", { name: "Open folder" }));

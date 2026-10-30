@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef } from "react";
 import { firstLine, formatSize, relativeTime } from "./format";
-import type { PickerOption } from "./navigation";
+import type { SessionInfo } from "../backend/types";
+import { optionKey, type PickerOption } from "./navigation";
 import "./ui.css";
 
 export interface PickerProps {
@@ -17,8 +18,23 @@ export interface PickerProps {
   onClose(): void;
 }
 
+/** What a running agent is doing, for its "Go to the running agent" row. */
+export function liveStatus(session: SessionInfo): string {
+  if (session.state.kind !== "live") return "running";
+  switch (session.state.detail) {
+    case "waitingOnUser":
+      return "waiting on you";
+    case "working":
+      return "working";
+    case "idle":
+      return "idle";
+    default:
+      return "running";
+  }
+}
+
 /**
- * Resume a session or start fresh (spec §4.3). Keys are handled by the window-level
+ * Go to a running agent, resume a session or start fresh (spec §4.3). Keys are handled by the window-level
  * navigation handler; the list takes focus so screen readers follow the highlight.
  */
 export function Picker({ repoName, options, index, now, onMove, onAccept, onClose }: PickerProps) {
@@ -48,7 +64,7 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
       >
         {options.map((option, i) => (
           <li
-            key={option.kind === "resume" ? option.session.id : "new"}
+            key={optionKey(option)}
             id={optionId(i)}
             className="rf-option"
             role="option"
@@ -56,7 +72,22 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
             onMouseEnter={() => onMove(i)}
             onClick={() => onAccept(i)}
           >
-            {option.kind === "resume" ? (
+            {option.kind === "focus" ? (
+              <>
+                <div className="rf-option__head">
+                  <span>Go to the running agent</span>
+                  <span className="rf-option__meta rf-mono">
+                    {liveStatus(option.session)}
+                    {option.session.lastTimestamp
+                      ? ` · ${relativeTime(Date.parse(option.session.lastTimestamp), now)}`
+                      : ""}
+                  </span>
+                </div>
+                <div className="rf-option__text">
+                  {firstLine(option.session.lastAssistantText) ?? "No reply yet"}
+                </div>
+              </>
+            ) : option.kind === "resume" ? (
               <>
                 <div className="rf-option__head">
                   <span>Resume</span>

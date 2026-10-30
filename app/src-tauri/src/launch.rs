@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use refract_client::RequestError;
-use refract_core::protocol::{LaunchMode, LaunchTicket, Method, Reply};
+use refract_core::protocol::{code, LaunchMode, LaunchTicket, Method, Reply};
 use refract_launch::setup::{
     ensure_profile, windows_code_commit, CliCommand, CodeCli, RunOutput, Runner, WindowCloser,
     WindowMatch,
@@ -102,6 +102,21 @@ impl LaunchError {
     /// A failed helper request, made while `doing` something.
     fn agent(doing: &str, err: RequestError) -> LaunchError {
         LaunchError::new(LaunchErrorKind::Agent, format!("{doing}: {err}"))
+    }
+
+    /// A failed `prepareLaunch`. The helper's message for an agent that stopped
+    /// running is meant to be shown as it is.
+    fn prepare(err: RequestError) -> LaunchError {
+        match err {
+            RequestError::Agent {
+                code: code::NOT_RUNNING,
+                message,
+            } => LaunchError::new(
+                LaunchErrorKind::Agent,
+                format!("Cannot go to the running agent: {message}."),
+            ),
+            err => LaunchError::agent("Cannot prepare the launch", err),
+        }
     }
 }
 
@@ -355,7 +370,7 @@ fn run(app: &AppHandle, path: &str, mode: &LaunchMode) -> Result<LaunchTicket, L
                 format!("The helper sent an unexpected answer to prepareLaunch: {other:?}"),
             ))
         }
-        Err(err) => return Err(LaunchError::agent("Cannot prepare the launch", err)),
+        Err(err) => return Err(LaunchError::prepare(err)),
     };
 
     progress(app, Step::Opening);
@@ -601,6 +616,34 @@ mod tests {
             LaunchMode::Resume {
                 session_id: "abc".into()
             }
+        );
+        let focus: LaunchMode =
+            serde_json::from_value(json!({"kind": "focus", "sessionId": "abc"})).unwrap();
+        assert_eq!(
+            focus,
+            LaunchMode::Focus {
+                session_id: "abc".into()
+            }
+        );
+    }
+
+    #[test]
+    fn an_agent_that_stopped_running_is_reported_plainly() {
+        let err = LaunchError::prepare(RequestError::Agent {
+            code: code::NOT_RUNNING,
+            message: "that agent is no longer running".into(),
+        });
+        assert_eq!(
+            err.message,
+            "Cannot go to the running agent: that agent is no longer running."
+        );
+        let err = LaunchError::prepare(RequestError::Agent {
+            code: code::INVALID_PARAMS,
+            message: "bad".into(),
+        });
+        assert_eq!(
+            err.message,
+            "Cannot prepare the launch: the helper answered with error -32602: bad"
         );
     }
 }

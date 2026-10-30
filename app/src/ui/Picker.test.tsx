@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
 import type { PickerOption } from "./navigation";
-import { Picker } from "./Picker";
+import { liveStatus, Picker } from "./Picker";
 import { NOW, testSession } from "./testRepo";
 
 afterEach(cleanup);
@@ -74,6 +74,34 @@ describe("Picker", () => {
     } finally {
       delete (Element.prototype as Partial<Element>).scrollIntoView;
     }
+  });
+
+  it("offers to go to a running agent with its status, age and last reply", () => {
+    const running = {
+      ...testSession("s2", { kind: "live", detail: "waitingOnUser" }, 1, "Shall I run the tide import?\nMore"),
+      focusable: true,
+    };
+    const withFocus: PickerOption[] = [{ kind: "focus", session: running }, ...options];
+    render(
+      <Picker repoName="tidepool" options={withFocus} index={0} now={NOW} onMove={vi.fn()} onAccept={vi.fn()} onClose={vi.fn()} />,
+    );
+    const [focus, resume] = screen.getAllByRole("option");
+    expect(focus.textContent).toContain("Go to the running agent");
+    expect(focus.textContent).toContain("waiting on you · 1 hour ago");
+    expect(focus.textContent).toContain("Shall I run the tide import?");
+    expect(focus.textContent).not.toContain("More");
+    expect(resume.textContent).toContain("Resume");
+  });
+
+  it("names each live status", () => {
+    const at = (detail: "working" | "waitingOnUser" | "idle" | "unknown") =>
+      liveStatus(testSession("s", { kind: "live", detail }, 1));
+    expect([at("waitingOnUser"), at("working"), at("idle"), at("unknown")]).toEqual([
+      "waiting on you",
+      "working",
+      "idle",
+      "running",
+    ]);
   });
 
   it("is labelled by the repo name", () => {

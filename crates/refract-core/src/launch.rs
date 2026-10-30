@@ -6,7 +6,8 @@ use crate::protocol::LaunchMode;
 
 /// The command to run in the new terminal. `session_id` is the ticket's session id,
 /// which for a resume is the one being resumed. A prompt follows `--`, which ends
-/// `claude`'s options, so a prompt starting with `-` is not read as a flag.
+/// `claude`'s options, so a prompt starting with `-` is not read as a flag. A focus
+/// starts nothing, so its command is empty.
 pub fn launch_argv(mode: &LaunchMode, session_id: &str) -> Vec<String> {
     match mode {
         LaunchMode::New { prompt } => {
@@ -20,6 +21,7 @@ pub fn launch_argv(mode: &LaunchMode, session_id: &str) -> Vec<String> {
         LaunchMode::Resume { .. } => {
             vec!["claude".into(), "--resume".into(), session_id.into()]
         }
+        LaunchMode::Focus { .. } => Vec::new(),
     }
 }
 
@@ -28,6 +30,7 @@ pub fn launch_title(mode: &LaunchMode) -> &'static str {
     match mode {
         LaunchMode::New { .. } => "New agent",
         LaunchMode::Resume { .. } => "Resume",
+        LaunchMode::Focus { .. } => "Running agent",
     }
 }
 
@@ -171,6 +174,10 @@ mod tests {
             session_id: ID.into(),
         };
         assert_eq!(launch_argv(&resume, ID), ["claude", "--resume", ID]);
+        let focus = LaunchMode::Focus {
+            session_id: ID.into(),
+        };
+        assert!(launch_argv(&focus, ID).is_empty());
     }
 
     #[test]
@@ -180,6 +187,10 @@ mod tests {
             session_id: ID.into(),
         };
         assert_eq!(launch_title(&resume), "Resume");
+        let focus = LaunchMode::Focus {
+            session_id: ID.into(),
+        };
+        assert_eq!(launch_title(&focus), "Running agent");
     }
 
     #[test]

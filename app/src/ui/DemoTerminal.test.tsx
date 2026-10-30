@@ -35,6 +35,7 @@ describe("demoCommand", () => {
     expect(demoCommand(launch({ kind: "new", prompt: "it's dirty" }))).toBe(
       `claude --session-id ${ID} 'it'\\''s dirty'`,
     );
+    expect(demoCommand(launch({ kind: "focus", sessionId: ID }))).toBe("");
   });
 });
 
@@ -64,5 +65,17 @@ describe("DemoTerminal", () => {
     window.removeEventListener("keydown", scene);
     expect(scene).not.toHaveBeenCalled();
     expect(screen.queryByRole("dialog")).toBeNull();
+  });
+
+  it("going to a running agent types no command, only a note that nothing started", () => {
+    vi.useFakeTimers();
+    const { backend, fire } = demoBackend();
+    render(<DemoTerminal backend={backend} />);
+    fire(launch({ kind: "focus", sessionId: ID }));
+    for (let i = 0; i < 20; i++) act(() => vi.advanceTimersByTime(600));
+    const screenText = screen.getByTestId("demo-terminal").textContent ?? "";
+    expect(screenText).toContain("Switched to the agent already running in atlas-api.");
+    expect(screenText).not.toContain("demo@refract");
+    expect(screenText).not.toContain("claude --");
   });
 });

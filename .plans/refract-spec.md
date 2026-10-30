@@ -106,18 +106,20 @@ The profile keeps this bare layout away from your normal VS Code setup.
 
 ### 4.2 If the repo is already open
 
-If a VS Code window already has that folder open, Refract brings it to the front instead of opening another. If you asked for a new agent, a new terminal tab opens in that window.
+If a VS Code window already has that folder open, Refract brings it to the front instead of opening another. If you asked for a new agent, a new terminal tab opens in that window. If you chose "Go to the running agent", no terminal opens: the window comes to the front and shows the terminal tab that agent is running in.
 
 ### 4.3 Choosing between resuming and starting fresh
 
-A launch goes straight to a new agent when the repo is clean and has no unfinished sessions. Otherwise a small picker lists:
+A launch goes straight to a new agent when the repo is clean, has no unfinished sessions and has no agent running in its Refract VS Code window. Otherwise a small picker lists:
 
+- "Go to the running agent" for each agent still running in a terminal of the Refract window on this repo (what it is doing: waiting on you, working, idle or just running; when it last wrote; the first line of its last reply),
 - each unfinished session (when it ran, the first line of its last message, how large it is), and
 - New agent.
 
 One option is preselected so that Enter accepts it:
 
-- **Resume** the most recent session when it ended less than about 2 days ago, edited the files that are currently uncommitted, and its transcript is below a size limit. Resuming a very long conversation reloads all of it, which costs more than starting fresh.
+- **Go to the running agent** when the most recent such agent is waiting on you. Nothing new starts; the existing window comes to the front with that agent's terminal shown.
+- Otherwise **Resume** the most recent session when it ended less than about 2 days ago, edited the files that are currently uncommitted, and its transcript is below a size limit. Resuming a very long conversation reloads all of it, which costs more than starting fresh.
 - Otherwise **New agent**, started with a short opening prompt: "This repo has uncommitted changes. Review `git diff` and help me finish or commit them."
 
 ### 4.4 Repos that aren't cloned yet

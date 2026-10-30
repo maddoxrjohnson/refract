@@ -5,10 +5,23 @@ export interface LaunchRequest {
   version: 1;
   requestId: string;
   folder: string;
+  /** Empty for a focus request, which starts nothing. */
   argv: string[];
   title: string;
   createdAt: string;
+  /** Show the terminal already running a session instead of starting one. */
+  focus?: FocusTarget;
 }
+
+/** Which terminal a focus request shows: the one whose shell is among `pids`. */
+export interface FocusTarget {
+  sessionId: string;
+  /** The session's `claude` process and its ancestors, nearest first. */
+  pids: number[];
+}
+
+/** The most pids a focus request may list. */
+export const MAX_FOCUS_PIDS = 32;
 
 export type ParseResult =
   | { ok: true; request: LaunchRequest }
@@ -37,30 +50,63 @@ export function parseRequest(text: string): ParseResult {
       return { ok: false, reason: `missing or invalid ${key}` };
     }
   }
+  let focus: FocusTarget | undefined;
+  if (o.focus !== undefined) {
+    const parsed = parseFocus(o.focus);
+    if (typeof parsed === "string") {
+      return { ok: false, reason: parsed };
+    }
+    focus = parsed;
+  }
   const argv = o.argv;
-  if (
-    !Array.isArray(argv) ||
-    argv.length === 0 ||
-    !argv.every((a) => typeof a === "string")
-  ) {
+  if (!Array.isArray(argv) || !argv.every((a) => typeof a === "string")) {
+    return { ok: false, reason: "argv must be an array of strings" };
+  }
+  if (focus) {
+    if (argv.length !== 0) {
+      return { ok: false, reason: "a focus request must have an empty argv" };
+    }
+  } else if (argv.length === 0) {
     return { ok: false, reason: "argv must be a non-empty array of strings" };
+  } else {
+    try {
+      terminalCommand(argv as string[]);
+    } catch (err) {
+      return { ok: false, reason: (err as Error).message };
+    }
   }
-  try {
-    terminalCommand(argv as string[]);
-  } catch (err) {
-    return { ok: false, reason: (err as Error).message };
-  }
-  return {
-    ok: true,
-    request: {
-      version: 1,
-      requestId: o.requestId as string,
-      folder: o.folder as string,
-      argv: argv as string[],
-      title: o.title as string,
-      createdAt: o.createdAt as string,
-    },
+  const request: LaunchRequest = {
+    version: 1,
+    requestId: o.requestId as string,
+    folder: o.folder as string,
+    argv: argv as string[],
+    title: o.title as string,
+    createdAt: o.createdAt as string,
   };
+  if (focus) {
+    request.focus = focus;
+  }
+  return { ok: true, request };
+}
+
+/** A valid `focus` object, or why it is not one. */
+function parseFocus(raw: unknown): FocusTarget | string {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return "focus must be an object";
+  }
+  const { sessionId, pids } = raw as Record<string, unknown>;
+  if (typeof sessionId !== "string" || sessionId === "") {
+    return "missing or invalid focus.sessionId";
+  }
+  if (
+    !Array.isArray(pids) ||
+    pids.length === 0 ||
+    pids.length > MAX_FOCUS_PIDS ||
+    !pids.every((p) => Number.isSafeInteger(p) && (p as number) > 0)
+  ) {
+    return `focus.pids must be 1 to ${MAX_FOCUS_PIDS} positive integers`;
+  }
+  return { sessionId, pids: pids as number[] };
 }
 
 function stripTrailingSlashes(p: string): string {

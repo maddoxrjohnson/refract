@@ -15,7 +15,7 @@ export function testSession(
   text: string | null = null,
   byteSize = 100_000,
 ): SessionInfo {
-  return { id, state, lastTimestamp: hoursAgo(hours), lastAssistantText: text, byteSize };
+  return { id, state, lastTimestamp: hoursAgo(hours), lastAssistantText: text, byteSize, focusable: false };
 }
 
 export function testRepo(extra: Partial<RepoSnapshot> = {}): RepoSnapshot {

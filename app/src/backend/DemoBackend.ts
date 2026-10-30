@@ -53,7 +53,8 @@ const session = (
   secondsAgo: number,
   text: string | null,
   byteSize: number,
-): SessionInfo => ({ id, state, lastTimestamp: iso(secondsAgo), lastAssistantText: text, byteSize });
+  focusable = false,
+): SessionInfo => ({ id, state, lastTimestamp: iso(secondsAgo), lastAssistantText: text, byteSize, focusable });
 
 const SEEDS: Seed[] = [
   {
@@ -111,8 +112,9 @@ const SEEDS: Seed[] = [
     mass: 0.36,
     commit: ["Tile cache eviction", 2 * 24 * HOUR],
     sessions: [
-      session("5f0c2a1e-0000-4000-8000-000000000005", { kind: "live", detail: "waitingOnUser" }, 120, "Should I also update the benchmarks?", 140_000),
+      session("5f0c2a1e-0000-4000-8000-000000000005", { kind: "live", detail: "waitingOnUser" }, 120, "Should I also update the benchmarks?", 140_000, true),
     ],
+    preselect: { kind: "focus", sessionId: "5f0c2a1e-0000-4000-8000-000000000005" },
   },
   { name: "sweep", host: "github.com", language: "C#", mass: 0.18, commit: ["Initial commit", 60 * 24 * HOUR] },
   { name: "harbor-android", host: "github.com", language: "Kotlin", mass: 0.52, commit: ["Offline mode for the map", 6 * 24 * HOUR] },
@@ -409,7 +411,7 @@ export class DemoBackend implements Backend {
       await sleep(400);
       for (const cb of this.progress) cb(step);
     }
-    const sessionId = mode.kind === "resume" ? mode.sessionId : crypto.randomUUID();
+    const sessionId = mode.kind === "new" ? crypto.randomUUID() : mode.sessionId;
     const repoName = this.repos.find((r) => r.path === path)?.name ?? path.split("/").pop() ?? path;
     for (const cb of this.demoLaunches) cb({ repoName, path, mode, sessionId });
     return {

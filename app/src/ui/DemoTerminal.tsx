@@ -7,8 +7,12 @@ const TYPE_MS = 28;
 /** Pause between the command and each line of the reply. */
 const LINE_MS = 260;
 
-/** The command the VS Code extension would run, quoted the way a shell would show it. */
+/**
+ * The command the VS Code extension would run, quoted the way a shell would show it.
+ * Going to a running agent runs nothing, so its command is empty.
+ */
 export function demoCommand(launch: DemoLaunch): string {
+  if (launch.mode.kind === "focus") return "";
   if (launch.mode.kind === "resume") return `claude --resume ${launch.sessionId}`;
   const prompt = launch.mode.prompt ? ` '${launch.mode.prompt.replace(/'/g, "'\\''")}'` : "";
   return `claude --session-id ${launch.sessionId}${prompt}`;
@@ -17,6 +21,13 @@ export function demoCommand(launch: DemoLaunch): string {
 /** An invented reply; nothing here comes from a real agent. */
 function demoReply(launch: DemoLaunch): string[] {
   const header = ["✻ Claude Code (demo)", `  cwd: ~/projects/${launch.repoName}`, ""];
+  if (launch.mode.kind === "focus") {
+    return [
+      ...header,
+      `● Switched to the agent already running in ${launch.repoName}.`,
+      "  Nothing new was started; it is where you left it.",
+    ];
+  }
   if (launch.mode.kind === "resume") {
     return [
       ...header,
@@ -113,10 +124,14 @@ export function DemoTerminal({ backend }: { backend: Backend }) {
           </button>
         </header>
         <pre className="rf-term__screen rf-mono" data-testid="demo-terminal">
-          <span className="rf-term__prompt">demo@refract:~/projects/{launch.repoName}$ </span>
-          {command.slice(0, typed)}
-          {!done && <span className="rf-term__cursor" aria-hidden="true" />}
-          {"\n"}
+          {command && (
+            <>
+              <span className="rf-term__prompt">demo@refract:~/projects/{launch.repoName}$ </span>
+              {command.slice(0, typed)}
+              {!done && <span className="rf-term__cursor" aria-hidden="true" />}
+              {"\n"}
+            </>
+          )}
           {reply.slice(0, lines).join("\n")}
           {done && lines >= reply.length && (
             <>

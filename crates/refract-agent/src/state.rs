@@ -1,6 +1,6 @@
 //! The agent's picture of every repo, and the events that keep the app in step with it.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -14,7 +14,7 @@ use refract_core::transcript::SessionSummary;
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
-use crate::procs::{self, ClaudeProcess};
+use crate::procs::{self, ClaudeProcess, LiveProcess};
 use crate::scan;
 use crate::sessions::SessionReader;
 
@@ -59,7 +59,8 @@ pub struct RepoState {
     pub status: Status,
     pub head: HeadInfo,
     pub sessions: Vec<SessionSummary>,
-    pub live: HashSet<String>,
+    /// Live sessions by id, with the process running each when that is certain.
+    pub live: HashMap<String, Option<LiveProcess>>,
     /// Status hook statuses of this repo's sessions, by session id.
     pub hooks: HashMap<String, HookReport>,
     pub snapshot: RepoSnapshot,
@@ -75,6 +76,7 @@ impl RepoState {
     /// answering `listRepos` or `getRepo`.
     pub fn refresh_preselect(&mut self, now: DateTime<Utc>) -> bool {
         let fresh = repo_preselect(
+            &self.snapshot.path,
             &self.snapshot.dirty_paths,
             &self.sessions,
             &self.live,
@@ -183,6 +185,15 @@ impl Agent {
 
     pub fn repo(&self, path: &Path) -> Option<&RepoState> {
         self.repos.get(path)
+    }
+
+    /// The process running session `id` of the repo at `path`, from a fresh look at
+    /// `/proc` and the repo's transcripts, so it works before the first load reaches
+    /// the repo and for sessions started since the last liveness check.
+    pub fn live_process(&mut self, path: &Path, id: &str) -> Option<LiveProcess> {
+        self.procs = procs::scan();
+        let sessions = self.reader.read_repo(&path_str(path));
+        live_set(&self.procs, path, &sessions).remove(id)?
     }
 
     /// All snapshots, sorted by path.
@@ -383,7 +394,7 @@ impl Agent {
         status: Status,
         head: HeadInfo,
         sessions: Vec<SessionSummary>,
-        live: HashSet<String>,
+        live: HashMap<String, Option<LiveProcess>>,
     ) {
         let old = self.repos.get(&path);
         let mass = old.map_or(0.0, |r| r.snapshot.mass);
@@ -540,7 +551,11 @@ pub fn read_git_each(
     });
 }
 
-fn live_set(procs: &[ClaudeProcess], repo: &Path, sessions: &[SessionSummary]) -> HashSet<String> {
+fn live_set(
+    procs: &[ClaudeProcess],
+    repo: &Path,
+    sessions: &[SessionSummary],
+) -> HashMap<String, Option<LiveProcess>> {
     let pairs: Vec<(&str, Option<DateTime<Utc>>)> = sessions
         .iter()
         .filter_map(|s| Some((s.session_id.as_deref()?, s.modified.or(s.last_timestamp))))
@@ -569,7 +584,7 @@ pub fn build_snapshot(
     status: &Status,
     head: &HeadInfo,
     sessions: &[SessionSummary],
-    live: &HashSet<String>,
+    live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
     now: DateTime<Utc>,
 ) -> RepoSnapshot {
@@ -580,7 +595,7 @@ pub fn build_snapshot(
         .map(|p| format!("{}/{p}", root.trim_end_matches('/')))
         .collect();
     let states = session_states(sessions, live, hooks);
-    let preselect = repo_preselect(&dirty_paths, sessions, live, hooks, now);
+    let preselect = repo_preselect(&root, &dirty_paths, sessions, live, hooks, now);
     let sessions = sessions
         .iter()
         .zip(&states)
@@ -590,6 +605,7 @@ pub fn build_snapshot(
             last_timestamp: s.last_timestamp,
             last_assistant_text: s.last_assistant_text.clone(),
             byte_size: s.byte_size.unwrap_or(0),
+            focusable: is_focusable(&root, s, state, live),
         })
         .collect();
     let (ahead, behind) = match status.ahead_behind {
@@ -620,23 +636,24 @@ pub fn build_snapshot(
 
 fn session_states(
     sessions: &[SessionSummary],
-    live: &HashSet<String>,
+    live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
 ) -> Vec<SessionState> {
     sessions
         .iter()
         .map(|s| {
             let id = s.session_id.as_ref();
-            let is_live = id.is_some_and(|id| live.contains(id));
+            let is_live = id.is_some_and(|id| live.contains_key(id));
             classify_report(s, is_live, id.and_then(|id| hooks.get(id).copied()))
         })
         .collect()
 }
 
 fn repo_preselect(
+    repo: &str,
     dirty_paths: &[String],
     sessions: &[SessionSummary],
-    live: &HashSet<String>,
+    live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
     now: DateTime<Utc>,
 ) -> Preselect {
@@ -648,9 +665,26 @@ fn repo_preselect(
             summary,
             state,
             byte_size: summary.byte_size.unwrap_or(0),
+            focusable: is_focusable(repo, summary, state, live),
         })
         .collect();
     preselect(&candidates, dirty_paths, now)
+}
+
+/// True when the session is live and its process is known and runs in a terminal of
+/// the Refract window on exactly `repo`.
+fn is_focusable(
+    repo: &str,
+    summary: &SessionSummary,
+    state: SessionState,
+    live: &HashMap<String, Option<LiveProcess>>,
+) -> bool {
+    matches!(state, SessionState::Live(_))
+        && summary
+            .session_id
+            .as_ref()
+            .and_then(|id| live.get(id)?.as_ref())
+            .is_some_and(|p| p.in_refract_window(repo))
 }
 
 /// Events that take a client from `old` to `new`: a `sessionChanged` per changed session
@@ -712,6 +746,7 @@ mod tests {
             last_timestamp: None,
             last_assistant_text: None,
             byte_size: 10,
+            focusable: false,
         }
     }
 
@@ -721,10 +756,49 @@ mod tests {
             &Status::default(),
             &HeadInfo::default(),
             &[],
-            &HashSet::new(),
+            &HashMap::new(),
             &HashMap::new(),
             Utc::now(),
         )
+    }
+
+    #[test]
+    fn only_a_known_process_in_the_window_on_this_repo_is_focusable() {
+        const REPO: &str = "/home/dev/projects/tidepool-api";
+        let ids = ["a", "b", "c", "d"];
+        let sessions: Vec<SessionSummary> = ids
+            .iter()
+            .map(|id| SessionSummary {
+                session_id: Some((*id).into()),
+                ..SessionSummary::default()
+            })
+            .collect();
+        let process = |folder: &str| {
+            Some(LiveProcess {
+                pid: 812,
+                started: None,
+                refract_folder: Some(folder.into()),
+            })
+        };
+        let live: HashMap<String, Option<LiveProcess>> = [
+            ("a".to_owned(), process(REPO)),
+            ("b".to_owned(), process("/home/dev/projects")),
+            ("c".to_owned(), None),
+        ]
+        .into();
+        let snapshot = build_snapshot(
+            Path::new(REPO),
+            &Status::default(),
+            &HeadInfo::default(),
+            &sessions,
+            &live,
+            &HashMap::new(),
+            Utc::now(),
+        );
+        let focusable: Vec<bool> = snapshot.sessions.iter().map(|s| s.focusable).collect();
+        assert_eq!(focusable, [true, false, false, false]);
+        assert!(matches!(snapshot.sessions[2].state, SessionState::Live(_)));
+        assert_eq!(snapshot.preselect, Preselect::NewAgent);
     }
 
     #[test]

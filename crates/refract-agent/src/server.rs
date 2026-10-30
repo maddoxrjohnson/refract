@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use refract_core::launch::wsl_path;
 use refract_core::protocol::{
-    code, parse_request, ErrorBody, Event, Hello, HookInfo, Id, Method, Outcome, Reply, RepoList,
-    RepoSnapshot, Response, PROTOCOL_VERSION,
+    code, parse_request, ErrorBody, Event, Hello, HookInfo, Id, LaunchMode, Method, Outcome, Reply,
+    RepoList, RepoSnapshot, Response, PROTOCOL_VERSION,
 };
 use refract_core::sessions::{is_windows_mount, paths_match, project_dir_matches};
 use serde::Serialize;
@@ -533,7 +533,14 @@ impl<W: Write> Server<W> {
             Method::PrepareLaunch { path, mode } => {
                 let distro = std::env::var("WSL_DISTRO_NAME").ok();
                 let dir = launch::launch_dir();
-                match launch::prepare(&path, &mode, &dir, distro.as_deref(), Utc::now()) {
+                let running = match &mode {
+                    LaunchMode::Focus { session_id } => {
+                        let repo = Path::new(path.trim_end_matches('/'));
+                        self.agent.live_process(repo, session_id)
+                    }
+                    _ => None,
+                };
+                match launch::prepare(&path, &mode, running, &dir, distro.as_deref(), Utc::now()) {
                     Ok(ticket) => Response::ok(id, Reply::Launch(ticket)),
                     Err(e) => Response::err(id, e.code, e.message),
                 }

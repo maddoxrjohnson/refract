@@ -112,6 +112,25 @@ test("a repo with unfinished sessions offers the picker, preselecting Resume", a
   await expect(terminal).toBeHidden();
 });
 
+test("a repo with an agent waiting on you preselects going to it", async ({ page }) => {
+  await page.keyboard.type("tessera");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("complementary", { name: "tessera details" })).toBeVisible();
+  await page.keyboard.press("Enter");
+  const picker = page.getByRole("dialog", { name: "Start an agent in tessera" });
+  const options = picker.getByRole("option");
+  await expect(options).toHaveCount(2);
+  await expect(options.first()).toContainText("Go to the running agent");
+  await expect(options.first()).toContainText("waiting on you");
+  await expect(options.first()).toHaveAttribute("aria-selected", "true");
+  await page.keyboard.press("Enter");
+  const terminal = page.getByRole("dialog", { name: "Simulated terminal for tessera" });
+  await expect(terminal.getByTestId("demo-terminal")).toContainText("Switched to the agent already running in tessera.");
+  await expect(terminal.getByTestId("demo-terminal")).not.toContainText("claude --");
+  await terminal.getByRole("button", { name: "Close terminal (Escape)" }).click();
+  await expect(terminal).toBeHidden();
+});
+
 test("the settings panel opens and closes", async ({ page }) => {
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   const settings = page.getByRole("dialog", { name: "Settings", exact: true });

@@ -21,5 +21,6 @@ Format: a title, a status line, then **Context**, **Decision** and **Consequence
 | 0013 | [The web demo runs the real interface over invented data](0013-demo-backend-and-simulated-launch.md) | M7 |
 | 0014 | [The app bundles the helper and installs it into WSL by version match](0014-bundled-helper-installed-by-version.md) | M7 |
 | 0015 | [CI and release are read-only by default and pin what they run](0015-ci-and-release-hardening.md) | M7 |
+| 0016 | [Go to the running agent, found by its window's folder and process ancestry](0016-go-to-the-running-agent.md) | Post-M7 |
 
 See also [architecture.md](../architecture.md) for how the pieces fit together.

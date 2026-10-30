@@ -43,6 +43,9 @@ pub mod code {
     /// `hookInfo`, `installHook` or `uninstallHook` could not read or change Claude
     /// Code's `settings.json` or Refract's hook files.
     pub const HOOK_FAILED: i32 = 4;
+    /// `prepareLaunch` asked to focus a session that no process runs any more, or
+    /// whose process does not run in the Refract window on that folder.
+    pub const NOT_RUNNING: i32 = 5;
 }
 
 /// A request from the app.
@@ -189,6 +192,8 @@ pub enum LaunchMode {
     },
     /// Resume an existing session.
     Resume { session_id: String },
+    /// Bring the VS Code terminal running a live session to the front, starting nothing.
+    Focus { session_id: String },
 }
 
 /// The result of `prepareLaunch`.
@@ -196,7 +201,7 @@ pub enum LaunchMode {
 #[serde(rename_all = "camelCase")]
 pub struct LaunchTicket {
     pub request_id: String,
-    /// Generated for a new agent; the given one for a resume.
+    /// Generated for a new agent; the given one for a resume or a focus.
     pub session_id: String,
     /// What to pass to `code --folder-uri`.
     pub folder_uri: String,
@@ -236,11 +241,23 @@ pub struct LaunchRequest {
     pub request_id: String,
     /// Absolute Linux path of the repo, with no trailing slash.
     pub folder: String,
-    /// The command to run in the terminal.
+    /// The command to run in the terminal; empty for a focus request.
     pub argv: Vec<String>,
     /// The terminal tab's name.
     pub title: String,
     pub created_at: DateTime<Utc>,
+    /// Set when the request shows an existing terminal instead of starting one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<FocusTarget>,
+}
+
+/// Which terminal a focus request shows: the one whose shell is among `pids`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FocusTarget {
+    pub session_id: String,
+    /// The session's `claude` process and its ancestors, nearest first, without pid 1.
+    pub pids: Vec<u32>,
 }
 
 /// An unsolicited message from the helper.
@@ -334,6 +351,10 @@ pub struct SessionInfo {
     pub last_assistant_text: Option<String>,
     /// Transcript size in bytes.
     pub byte_size: u64,
+    /// Live, and its process is known and runs in a terminal of the Refract VS Code
+    /// window on exactly this repo, so the picker can go to it.
+    #[serde(default)]
+    pub focusable: bool,
 }
 
 /// A hosted repo named by its remote URL, such as `github.com` / `dev` / `tidepool-api`.
@@ -551,6 +572,7 @@ mod tests {
                 last_timestamp: Some("2026-03-14T12:00:00Z".parse().unwrap()),
                 last_assistant_text: Some("Tide tables are wired up.".into()),
                 byte_size: 20_480,
+                focusable: false,
             }],
             preselect: Preselect::Resume("3f6c1a52-0000-4000-8000-000000000001".into()),
         }
@@ -689,6 +711,7 @@ mod tests {
             argv: vec!["claude".into(), "--resume".into(), "abc".into()],
             title: "Resume".into(),
             created_at: "2026-10-29T17:54:44Z".parse().unwrap(),
+            focus: None,
         };
         assert_eq!(
             round_trip(&file),
@@ -699,6 +722,41 @@ mod tests {
                 "argv": ["claude", "--resume", "abc"],
                 "title": "Resume",
                 "createdAt": "2026-10-29T17:54:44Z"
+            })
+        );
+
+        let req = parse_request(
+            r#"{"id":9,"method":"prepareLaunch","params":{"path":"/x","mode":{"kind":"focus","sessionId":"abc"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            req.method,
+            Method::PrepareLaunch {
+                path: "/x".into(),
+                mode: LaunchMode::Focus {
+                    session_id: "abc".into()
+                }
+            }
+        );
+        let focus = LaunchRequest {
+            argv: vec![],
+            title: "Running agent".into(),
+            focus: Some(FocusTarget {
+                session_id: "abc".into(),
+                pids: vec![812, 640],
+            }),
+            ..file
+        };
+        assert_eq!(
+            round_trip(&focus),
+            json!({
+                "version": 1,
+                "requestId": "6f1c0000-0000-4000-8000-000000000001",
+                "folder": "/home/dev/projects/tidepool-api",
+                "argv": [],
+                "title": "Running agent",
+                "createdAt": "2026-10-29T17:54:44Z",
+                "focus": {"sessionId": "abc", "pids": [812, 640]}
             })
         );
     }
@@ -1119,8 +1177,9 @@ mod tests {
                 last_timestamp: None,
                 last_assistant_text: None,
                 byte_size: 0,
+                focusable: true,
             },
-            preselect: Preselect::NewAgent,
+            preselect: Preselect::Focus("3f6c1a52-0000-4000-8000-000000000002".into()),
         });
         let value = round_trip(&session);
         assert_eq!(value["event"], "sessionChanged");
@@ -1128,7 +1187,11 @@ mod tests {
             value["data"]["session"]["state"],
             json!({"kind": "live", "detail": "unknown"})
         );
-        assert_eq!(value["data"]["preselect"], json!({"kind": "newAgent"}));
+        assert_eq!(value["data"]["session"]["focusable"], true);
+        assert_eq!(
+            value["data"]["preselect"],
+            json!({"kind": "focus", "sessionId": "3f6c1a52-0000-4000-8000-000000000002"})
+        );
 
         assert_eq!(
             round_trip(&Event::LoadComplete),

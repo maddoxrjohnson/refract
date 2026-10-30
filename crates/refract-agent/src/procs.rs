@@ -9,9 +9,15 @@
 //! A process's start time is `btime` from `/proc/stat` (boot time, whole seconds) plus
 //! field 22 of `/proc/<pid>/stat` (clock ticks since boot). Ticks are taken as 100 per
 //! second: `USER_HZ` is 100 on every Linux architecture WSL runs.
+//!
+//! A process runs in a terminal of a Refract VS Code window when its environment has
+//! `REFRACT_FOLDER`: the Refract extension sets it, to the window's single folder, on
+//! every terminal the window opens, and every child inherits it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Read;
+use std::path::Path;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use refract_core::sessions::paths_match;
@@ -41,6 +47,28 @@ pub struct ClaudeProcess {
     pub session_id: Option<String>,
     /// When the process started, when `/proc` says.
     pub started: Option<DateTime<Utc>>,
+    /// `REFRACT_FOLDER` from its environment: the folder of the Refract window whose
+    /// terminal it runs in.
+    pub refract_folder: Option<String>,
+}
+
+/// The process running a live session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProcess {
+    pub pid: u32,
+    /// When it started, to tell it from a later process given the same pid.
+    pub started: Option<DateTime<Utc>>,
+    /// See [`ClaudeProcess::refract_folder`].
+    pub refract_folder: Option<String>,
+}
+
+impl LiveProcess {
+    /// True when it runs in a terminal of the Refract window on exactly `repo`.
+    pub fn in_refract_window(&self, repo: &str) -> bool {
+        self.refract_folder
+            .as_deref()
+            .is_some_and(|folder| paths_match(folder, repo))
+    }
 }
 
 /// What a command line says, if it is a Claude Code session.
@@ -131,6 +159,95 @@ pub fn parse_stat_start_ticks(stat: &str) -> Option<u64> {
     rest.split_whitespace().nth(19)?.parse().ok()
 }
 
+/// Field 4 (`ppid`) of a `/proc/<pid>/stat` line, counted from the last `)` as in
+/// [`parse_stat_start_ticks`].
+pub fn parse_stat_ppid(stat: &str) -> Option<u32> {
+    let (_, rest) = stat.rsplit_once(')')?;
+    rest.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// The most `/proc/<pid>/environ` that is read. An environment is usually a few KB.
+const MAX_ENVIRON_BYTES: u64 = 256 * 1024;
+
+/// The variable the Refract extension sets on its windows' terminals.
+pub const FOLDER_VAR: &str = "REFRACT_FOLDER";
+
+/// The value of `name` in a NUL-separated `/proc/<pid>/environ`, if it is set and not
+/// empty.
+pub fn environ_value(raw: &[u8], name: &str) -> Option<String> {
+    raw.split(|&b| b == 0).find_map(|entry| {
+        let value = entry.strip_prefix(name.as_bytes())?.strip_prefix(b"=")?;
+        (!value.is_empty()).then(|| String::from_utf8_lossy(value).into_owned())
+    })
+}
+
+/// `REFRACT_FOLDER` of the process. An environment that cannot be read (another
+/// user's process, exited) gives none.
+pub fn refract_folder(pid: u32) -> Option<String> {
+    read_bounded(&Path::new("/proc").join(pid.to_string()).join("environ"))
+        .and_then(|raw| environ_value(&raw, FOLDER_VAR))
+}
+
+fn read_bounded(path: &Path) -> Option<Vec<u8>> {
+    let mut raw = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(MAX_ENVIRON_BYTES)
+        .read_to_end(&mut raw)
+        .ok()?;
+    Some(raw)
+}
+
+/// The most processes [`ancestors`] lists.
+pub const MAX_ANCESTORS: usize = 16;
+
+/// `pid` and its ancestors, nearest first, by following `parent`. Stops before pid 1
+/// (init, or WSL's own init), at a pid already listed, at an unknown parent, or after
+/// [`MAX_ANCESTORS`].
+pub fn ancestors(pid: u32, parent: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
+    let mut chain = Vec::new();
+    let mut next = Some(pid);
+    while let Some(pid) = next {
+        if pid <= 1 || chain.contains(&pid) || chain.len() == MAX_ANCESTORS {
+            break;
+        }
+        chain.push(pid);
+        next = parent(pid);
+    }
+    chain
+}
+
+/// [`ancestors`] from `/proc/<pid>/stat`.
+pub fn proc_ancestors(pid: u32) -> Vec<u32> {
+    ancestors(pid, |pid| {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| parse_stat_ppid(&stat))
+    })
+}
+
+/// True when `pid` still runs a Claude Code session.
+pub fn is_claude(pid: u32) -> bool {
+    fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| parse_cmdline(&raw).is_some())
+}
+
+/// When `pid` started, from `/proc`.
+pub fn process_started(pid: u32) -> Option<DateTime<Utc>> {
+    let btime = fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|s| parse_btime(&s))?;
+    let ticks = fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| parse_stat_start_ticks(&stat))?;
+    start_time(btime, ticks)
+}
+
+/// True when a process started at `now_started` is the one recorded as starting at
+/// `recorded`. An unknown start time on either side is no proof, so it says no.
+pub fn same_process(recorded: Option<DateTime<Utc>>, now_started: Option<DateTime<Utc>>) -> bool {
+    recorded.is_some() && recorded == now_started
+}
+
 /// The `btime` line of `/proc/stat`: boot time in seconds since the epoch.
 pub fn parse_btime(stat: &str) -> Option<i64> {
     stat.lines()
@@ -174,12 +291,14 @@ pub fn scan() -> Vec<ClaudeProcess> {
                 cwd: cwd.to_string_lossy().into_owned(),
                 session_id: command.session_id,
                 started,
+                refract_folder: refract_folder(pid),
             })
         })
         .collect()
 }
 
-/// Decides which of a working directory's sessions are live.
+/// Decides which of a working directory's sessions are live, and which process runs
+/// each when that is certain.
 ///
 /// A session is live when a process names its id. Each process in `cwd` that names no
 /// id is matched to the most recent session no other process claimed and that was
@@ -188,38 +307,57 @@ pub fn scan() -> Vec<ClaudeProcess> {
 /// A process whose start time is unknown may take any session. A process naming an id
 /// that is not on disk yet (a fresh `--session-id`) marks nothing. `sessions` holds
 /// (id, when its transcript was last written) pairs.
+///
+/// The process is known for certain when it names the session id (of two naming the
+/// same id, the first listed is kept), or when it is the only process in `cwd` naming
+/// no id. A session matched to one of several such processes is live with no process:
+/// the match decides liveness well enough, but not which terminal it runs in.
 pub fn live_sessions(
     procs: &[ClaudeProcess],
     cwd: &str,
     sessions: &[(&str, Option<DateTime<Utc>>)],
-) -> HashSet<String> {
+) -> HashMap<String, Option<LiveProcess>> {
     let known: HashSet<&str> = sessions.iter().map(|(id, _)| *id).collect();
-    let mut live: HashSet<String> = procs
-        .iter()
-        .filter_map(|p| p.session_id.as_deref())
-        .filter(|id| known.contains(id))
-        .map(str::to_owned)
-        .collect();
+    let mut live: HashMap<String, Option<LiveProcess>> = HashMap::new();
+    for process in procs {
+        if let Some(id) = process
+            .session_id
+            .as_deref()
+            .filter(|id| known.contains(id))
+        {
+            live.entry(id.to_owned())
+                .or_insert_with(|| Some(live_process(process)));
+        }
+    }
     let mut unnamed: Vec<&ClaudeProcess> = procs
         .iter()
         .filter(|p| p.session_id.is_none() && paths_match(&p.cwd, cwd))
         .collect();
+    let certain = unnamed.len() == 1;
     // `None` sorts first, so reversed the unknown start times come last.
     unnamed.sort_by_key(|p| std::cmp::Reverse(p.started));
     let mut recent: Vec<_> = sessions.iter().collect();
     recent.sort_by_key(|s| std::cmp::Reverse(s.1));
     for process in unnamed {
         let claim = recent.iter().find(|(id, written)| {
-            !live.contains(*id)
+            !live.contains_key(*id)
                 && process
                     .started
                     .is_none_or(|started| written.is_some_and(|w| w >= started))
         });
         if let Some((id, _)) = claim {
-            live.insert((*id).to_owned());
+            live.insert((*id).to_owned(), certain.then(|| live_process(process)));
         }
     }
     live
+}
+
+fn live_process(process: &ClaudeProcess) -> LiveProcess {
+    LiveProcess {
+        pid: process.pid,
+        started: process.started,
+        refract_folder: process.refract_folder.clone(),
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +454,7 @@ mod tests {
             cwd: cwd.into(),
             session_id: id.map(str::to_owned),
             started: None,
+            refract_folder: None,
         }
     }
 
@@ -330,8 +469,8 @@ mod tests {
         Some(format!("2026-03-14T{hour:02}:00:00Z").parse().unwrap())
     }
 
-    fn sorted(set: HashSet<String>) -> Vec<String> {
-        let mut v: Vec<_> = set.into_iter().collect();
+    fn sorted(live: HashMap<String, Option<LiveProcess>>) -> Vec<String> {
+        let mut v: Vec<_> = live.into_keys().collect();
         v.sort();
         v
     }
@@ -395,6 +534,155 @@ mod tests {
         let sessions = [(ID, at(1)), (ID2, at(5))];
         let procs = [started_at(REPO, 0), started_at(REPO, 4)];
         assert_eq!(sorted(live_sessions(&procs, REPO, &sessions)), [ID, ID2]);
+    }
+
+    #[test]
+    fn live_sessions_keep_the_process_running_each() {
+        let sessions = [(ID, at(1)), (ID2, at(5))];
+        let named = ClaudeProcess {
+            pid: 812,
+            refract_folder: Some(REPO.into()),
+            ..started_at(REPO, 0)
+        };
+        let named = ClaudeProcess {
+            session_id: Some(ID.into()),
+            ..named
+        };
+        let unnamed = ClaudeProcess {
+            pid: 907,
+            ..proc(REPO, None)
+        };
+        let live = live_sessions(&[named, unnamed], REPO, &sessions);
+        assert_eq!(
+            live[ID],
+            Some(LiveProcess {
+                pid: 812,
+                started: at(0),
+                refract_folder: Some(REPO.into()),
+            })
+        );
+        // The only process naming no id in the repo is certain too.
+        assert_eq!(live[ID2].as_ref().map(|p| p.pid), Some(907));
+    }
+
+    #[test]
+    fn a_guess_among_several_unnamed_processes_records_no_process() {
+        let sessions = [(ID, at(1)), (ID2, at(5))];
+        let procs = [
+            ClaudeProcess {
+                pid: 812,
+                ..started_at(REPO, 0)
+            },
+            ClaudeProcess {
+                pid: 907,
+                ..started_at(REPO, 4)
+            },
+        ];
+        let live = live_sessions(&procs, REPO, &sessions);
+        assert_eq!(sorted(live.clone()), [ID, ID2]);
+        assert_eq!(live[ID], None);
+        assert_eq!(live[ID2], None);
+        // A process naming its id stays certain beside an unnamed one, which is then
+        // the only unnamed one.
+        let procs = [
+            ClaudeProcess {
+                pid: 812,
+                ..proc(REPO, Some(ID))
+            },
+            ClaudeProcess {
+                pid: 907,
+                ..proc(REPO, None)
+            },
+        ];
+        let live = live_sessions(&procs, REPO, &sessions);
+        assert_eq!(live[ID].as_ref().map(|p| p.pid), Some(812));
+        assert_eq!(live[ID2].as_ref().map(|p| p.pid), Some(907));
+    }
+
+    #[test]
+    fn unnamed_processes_elsewhere_do_not_make_a_guess_uncertain() {
+        let sessions = [(ID, at(1))];
+        let procs = [
+            ClaudeProcess {
+                pid: 812,
+                ..proc(REPO, None)
+            },
+            proc("/home/dev/projects/aurora-notes", None),
+        ];
+        let live = live_sessions(&procs, REPO, &sessions);
+        assert_eq!(live[ID].as_ref().map(|p| p.pid), Some(812));
+    }
+
+    #[test]
+    fn refract_folder_is_read_from_the_environment() {
+        let raw = b"HOME=/home/dev\0REFRACT_FOLDER=/home/dev/projects/tidepool-api\0TERM=xterm\0";
+        assert_eq!(
+            environ_value(raw, FOLDER_VAR).as_deref(),
+            Some("/home/dev/projects/tidepool-api")
+        );
+        assert_eq!(
+            environ_value(b"REFRACT_FOLDER=/x", FOLDER_VAR).as_deref(),
+            Some("/x")
+        );
+        assert_eq!(environ_value(b"REFRACT_FOLDER=\0", FOLDER_VAR), None);
+        assert_eq!(environ_value(b"XREFRACT_FOLDER=/x\0", FOLDER_VAR), None);
+        assert_eq!(environ_value(b"REFRACT_FOLDERS=/x\0", FOLDER_VAR), None);
+        assert_eq!(environ_value(b"", FOLDER_VAR), None);
+    }
+
+    #[test]
+    fn only_the_window_on_exactly_this_repo_counts() {
+        let process = |folder: Option<&str>| LiveProcess {
+            pid: 812,
+            started: None,
+            refract_folder: folder.map(str::to_owned),
+        };
+        assert!(process(Some(REPO)).in_refract_window(REPO));
+        assert!(process(Some(&format!("{REPO}/"))).in_refract_window(REPO));
+        assert!(!process(Some("/home/dev/projects")).in_refract_window(REPO));
+        assert!(!process(Some(&format!("{REPO}/src"))).in_refract_window(REPO));
+        assert!(!process(None).in_refract_window(REPO));
+        let mnt = process(Some("/mnt/c/Users/dev/Tidepool"));
+        assert!(mnt.in_refract_window("/mnt/c/users/dev/tidepool/"));
+    }
+
+    #[test]
+    fn same_process_needs_a_known_unchanged_start() {
+        assert!(same_process(at(3), at(3)));
+        assert!(!same_process(at(3), at(4)));
+        assert!(!same_process(at(3), None));
+        assert!(!same_process(None, None));
+    }
+
+    #[test]
+    fn stat_ppid_parses_after_the_command_name() {
+        assert_eq!(parse_stat_ppid("812 (claude) S 640 812 640 0"), Some(640));
+        assert_eq!(parse_stat_ppid("812 (my (odd) name) R 7 1 1"), Some(7));
+        assert_eq!(parse_stat_ppid("812 (claude) S"), None);
+        assert_eq!(parse_stat_ppid("garbage"), None);
+    }
+
+    #[test]
+    fn ancestors_stop_before_init_at_loops_and_at_the_cap() {
+        let parents: HashMap<u32, u32> = [(812, 640), (640, 600), (600, 1)].into();
+        let parent = |pid| parents.get(&pid).copied();
+        assert_eq!(ancestors(812, parent), [812, 640, 600]);
+        // An unknown parent ends the chain.
+        assert_eq!(ancestors(900, parent), [900]);
+        assert!(ancestors(1, parent).is_empty());
+        let looped: HashMap<u32, u32> = [(5, 6), (6, 5)].into();
+        assert_eq!(ancestors(5, |pid| looped.get(&pid).copied()), [5, 6]);
+        let long = ancestors(1000, |pid| Some(pid + 1));
+        assert_eq!(long.len(), MAX_ANCESTORS);
+        assert_eq!(long[0], 1000);
+    }
+
+    #[test]
+    fn this_process_has_ancestors_in_proc() {
+        let me = std::process::id();
+        assert_eq!(proc_ancestors(me).first(), Some(&me));
+        assert!(!is_claude(me));
+        assert!(process_started(me).is_some());
     }
 
     #[test]

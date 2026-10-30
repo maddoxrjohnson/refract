@@ -2,7 +2,7 @@
   "name": "refract",
   "displayName": "Refract",
   "description": "Opens a terminal running an agent when Refract launches this folder.",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "publisher": "refract",
   "license": "MIT",
   "repository": {

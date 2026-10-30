@@ -31,7 +31,9 @@ export type SessionState =
 export type Preselect =
   | { kind: "noPicker" }
   | { kind: "resume"; sessionId: string }
-  | { kind: "newAgent" };
+  | { kind: "newAgent" }
+  /** Preselect "Go to the running agent" for this live session. */
+  | { kind: "focus"; sessionId: string };
 
 export interface SessionInfo {
   id: string;
@@ -40,6 +42,8 @@ export interface SessionInfo {
   lastTimestamp: string | null;
   lastAssistantText: string | null;
   byteSize: number;
+  /** Live, in a terminal of the Refract window on this repo: the picker can go to it. */
+  focusable: boolean;
 }
 
 export interface RemoteId {
@@ -93,7 +97,9 @@ export type AgentEvent =
 /** How to start the agent, from refract-core's `LaunchMode`. */
 export type LaunchMode =
   | { kind: "new"; prompt?: string }
-  | { kind: "resume"; sessionId: string };
+  | { kind: "resume"; sessionId: string }
+  /** Show the VS Code terminal already running this live session; starts nothing. */
+  | { kind: "focus"; sessionId: string };
 
 /** What a launch returns, from refract-core's `LaunchTicket`. */
 export interface LaunchTicket {

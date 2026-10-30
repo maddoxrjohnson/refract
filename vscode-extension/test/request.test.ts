@@ -36,6 +36,40 @@ describe("parseRequest", () => {
       expect(parseRequest(JSON.stringify({ ...valid, argv })).ok).toBe(false);
     }
   });
+
+  const focus = {
+    ...valid,
+    argv: [],
+    title: "Running agent",
+    focus: { sessionId: "0b7e5c1a-1111-4222-8333-444455556666", pids: [812, 640, 600] },
+  };
+  it("accepts a focus request with an empty argv", () => {
+    expect(parseRequest(JSON.stringify(focus))).toEqual({ ok: true, request: focus });
+  });
+  it("rejects a focus request that also has a command", () => {
+    expect(parseRequest(JSON.stringify({ ...focus, argv: valid.argv })).ok).toBe(false);
+  });
+  it("validates focus", () => {
+    const tooMany = Array.from({ length: 33 }, (_, i) => i + 2);
+    const bad = [
+      null,
+      [],
+      "x",
+      { pids: [812] },
+      { sessionId: "", pids: [812] },
+      { sessionId: "s", pids: [] },
+      { sessionId: "s", pids: [0] },
+      { sessionId: "s", pids: [-4] },
+      { sessionId: "s", pids: [1.5] },
+      { sessionId: "s", pids: ["812"] },
+      { sessionId: "s", pids: tooMany },
+    ];
+    for (const f of bad) {
+      expect(parseRequest(JSON.stringify({ ...focus, focus: f })).ok, JSON.stringify(f)).toBe(false);
+    }
+    const most = Array.from({ length: 32 }, (_, i) => i + 2);
+    expect(parseRequest(JSON.stringify({ ...focus, focus: { sessionId: "s", pids: most } })).ok).toBe(true);
+  });
 });
 
 describe("matchesFolder", () => {
@@ -132,6 +166,27 @@ describe("terminalCommand", () => {
   it("makes parseRequest reject such requests", () => {
     expect(parseRequest(JSON.stringify({ ...valid, argv: ["a b"] })).ok).toBe(false);
     expect(parseRequest(JSON.stringify({ ...valid, argv: ["claude", "a\u0000b"] })).ok).toBe(false);
+  });
+});
+
+describe("shared launch_request_focus_v1 fixture", () => {
+  const text = fs.readFileSync(
+    fileURLToPath(new URL("../../crates/refract-core/tests/fixtures/launch_request_focus_v1.json", import.meta.url)),
+    "utf8",
+  );
+  it("parses with the exact fields", () => {
+    expect(parseRequest(text)).toEqual({
+      ok: true,
+      request: {
+        version: 1,
+        requestId: "6f1c2a7e-1b8d-4c3e-9a5f-2d4b6e8f0a1d",
+        folder: "/home/example/projects/demo-repo",
+        argv: [],
+        title: "Running agent",
+        createdAt: "2026-10-29T17:54:44Z",
+        focus: { sessionId: "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e", pids: [8123, 8090, 7311] },
+      },
+    });
   });
 });
 

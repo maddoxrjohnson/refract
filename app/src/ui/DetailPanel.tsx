@@ -10,7 +10,7 @@ import type {
 import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
 import { hostLabel, remoteUrl } from "../repoStatus";
 import { firstLine, relativeTime, sessionStateLabel } from "./format";
-import { newAgentMode, resumableSession } from "./navigation";
+import { focusableSession, newAgentMode, resumableSession } from "./navigation";
 import "./ui.css";
 
 export interface DetailPanelProps {
@@ -161,6 +161,7 @@ export function DetailPanel({
   const hintId = useId();
   const direct = repo.preselect.kind === "noPicker";
   const resume = resumableSession(repo);
+  const running = focusableSession(repo);
   const session = lastSession(repo);
   const sessionLine = session ? firstLine(session.lastAssistantText) : null;
   const url = remote?.webUrl ?? remoteUrl(repo);
@@ -328,10 +329,21 @@ export function DetailPanel({
         <p id={hintId} className="rf-hint">
           {direct
             ? "Enter starts a new agent in VS Code."
-            : "Enter opens a picker: resume a session or start fresh."}
+            : running
+              ? "Enter opens a picker: go to the running agent, resume a session or start fresh."
+              : "Enter opens a picker: resume a session or start fresh."}
         </p>
         {!direct && (
           <div className="rf-row">
+            {running && (
+              <button
+                type="button"
+                className="rf-button"
+                onClick={() => onLaunch({ kind: "focus", sessionId: running.id })}
+              >
+                Go to agent
+              </button>
+            )}
             {resume && (
               <button
                 type="button"
