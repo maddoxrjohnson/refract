@@ -761,6 +761,49 @@ fn repos_on_a_slow_drive_are_reported_one_at_a_time() {
 }
 
 #[test]
+fn repos_appearing_on_either_drive_while_slow_repos_load_are_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    init_repo(&root.join("aurora-notes"));
+    std::fs::create_dir_all(root.join("group")).unwrap();
+    // Searched and loaded as if under `/mnt/`.
+    let drive = tmp.path().join("drive");
+    init_repo(&drive.join("kelp-cli"));
+    std::fs::create_dir_all(drive.join("group")).unwrap();
+    write(
+        &config,
+        &format!(
+            "roots = [{:?}, {:?}]\ndepth = 3\n",
+            root.to_str().unwrap(),
+            drive.to_str().unwrap()
+        ),
+    );
+    let gate = tmp.path().join("gate");
+    write(&gate, "");
+    let path = shim_git(
+        tmp.path(),
+        &[("*kelp-cli*\" status \"*", Shim::HoldWhile(&gate))],
+    );
+    let mut agent = spawn_on_drive(&home, &config, &drive, &path);
+
+    agent.send(json!({"id": 1, "method": "listRepos"}));
+    assert_eq!(agent.response()["result"]["loading"], true);
+    agent.event(|e| e["event"] == "repoChanged" && e["data"]["name"] == "aurora-notes");
+    // While kelp-cli is still loading.
+    init_repo(&root.join("group/reef-maps"));
+    init_repo(&drive.join("group/tidepool-api"));
+    std::thread::sleep(Duration::from_millis(500));
+    std::fs::remove_file(&gate).unwrap();
+    agent.event(|e| e["event"] == "loadComplete");
+    let mut missing = vec!["reef-maps", "tidepool-api"];
+    while !missing.is_empty() {
+        let event = agent.event_within(Duration::from_secs(20), |e| e["event"] == "repoChanged");
+        missing.retain(|name| event["data"]["name"] != *name);
+    }
+    assert_no_more_load_complete(&mut agent, 2);
+}
+
+#[test]
 fn a_held_get_repo_is_answered_when_its_slow_repo_arrives() {
     let tmp = tempfile::tempdir().unwrap();
     let (home, drive, config) = setup_drive(tmp.path());

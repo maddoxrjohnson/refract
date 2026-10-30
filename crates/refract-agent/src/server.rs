@@ -91,6 +91,13 @@ enum Msg {
     Line(Line),
     Eof,
     Fs(Vec<FsEvent>),
+    /// The loading thread found the repos under `/mnt/` and searched `dirs`; it reads
+    /// them once `go` is answered, after they are watched.
+    Found {
+        repos: Vec<PathBuf>,
+        dirs: Vec<(PathBuf, bool)>,
+        go: Sender<()>,
+    },
     /// The loading thread read some repos; `last` when it has read them all.
     Loaded {
         repos: Vec<(PathBuf, GitResult)>,
@@ -279,6 +286,8 @@ struct Server<W: Write> {
     waiting: Vec<(Id, String)>,
     /// Repos watched before the load, so watches of ones that failed to load can go.
     prewatched: Vec<PathBuf>,
+    /// Directories the first load has searched so far, all watched.
+    load_dirs: Vec<(PathBuf, bool)>,
     /// A rescan or reload asked for during the load, run once it is done.
     deferred_rescan: bool,
     deferred_reload: bool,
@@ -340,6 +349,7 @@ where
             }
             Ok(Msg::Eof) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Ok(Msg::Fs(batch)) => server.queue(&batch),
+            Ok(Msg::Found { repos, dirs, go }) => server.found(repos, dirs, go),
             Ok(Msg::Loaded { repos, last }) => server.loaded(repos, last)?,
             Ok(Msg::Answer(response)) => server.send(&response)?,
             Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
@@ -415,6 +425,29 @@ fn is_slow(repo: &Path) -> bool {
     is_windows_mount(&path_str(repo)) || state::under_test_slow_prefix(repo)
 }
 
+/// Splits `config` into one searching only the roots and extra repos under `/mnt/`,
+/// and one searching the rest.
+fn split_slow(config: &Config) -> (Config, Config) {
+    let mut slow = config.clone();
+    let mut fast = config.clone();
+    (slow.roots, fast.roots) = config.roots.iter().cloned().partition(|p| is_slow(p));
+    (slow.extra, fast.extra) = config.extra.iter().cloned().partition(|p| is_slow(p));
+    (slow, fast)
+}
+
+/// Watches a repo's root and git directory, before git reads it.
+fn prewatch(watcher: &mut Watcher, repo: &Path) {
+    let git_dir = scan::git_dir(repo);
+    let common = git_dir.as_deref().and_then(scan::common_dir);
+    // The root only for now; the tracked directories once git has listed them.
+    watcher.watch_repo(
+        repo,
+        git_dir.as_deref(),
+        common.as_deref(),
+        &[String::new()],
+    );
+}
+
 /// Ends the first load when dropped, also when the loading thread panics, so the main
 /// thread always sends `loadComplete` and answers the `getRepo` requests it holds.
 struct LoadDone(SyncSender<Msg>);
@@ -463,6 +496,7 @@ impl<W: Write> Server<W> {
             touched: HashMap::new(),
             waiting: Vec::new(),
             prewatched: Vec::new(),
+            load_dirs: Vec::new(),
             deferred_rescan: false,
             deferred_reload: false,
             unread: HashMap::new(),
@@ -753,63 +787,111 @@ impl<W: Write> Server<W> {
         Ok(())
     }
 
-    /// Starts the first load in the background, after watching every directory it will
-    /// read, so changes made while it runs are not lost.
+    /// Starts the first load in the background. Every directory it reads is watched
+    /// first, so changes made while it runs are not lost. Only the search outside
+    /// `/mnt/` and its watches happen here, before `listRepos` is answered: the loading
+    /// thread searches `/mnt/` while git reads the Linux repos, and the repos there are
+    /// watched (see [`Server::found`]) once the Linux repos are reported, since both
+    /// take long on Windows drives.
     fn ensure_loaded(&mut self) -> io::Result<()> {
         if self.load != Load::NotStarted {
             return Ok(());
         }
         self.load = Load::Running;
-        let config = self.agent.config().clone();
-        let walk = scan::walk_roots(&config);
+        let (slow_config, fast_config) = split_slow(self.agent.config());
+        let walk = scan::walk_roots(&fast_config);
+        // Only a test puts a slow repo under a Linux root.
+        let (slow_found, fast): (Vec<PathBuf>, Vec<PathBuf>) =
+            walk.repos.into_iter().partition(|p| is_slow(p));
         if let Some(watcher) = &mut self.watcher {
-            watcher.watch_projects_root(&config.claude_projects);
+            watcher.watch_projects_root(&fast_config.claude_projects);
             watcher.watch_scan_dirs(&walk.dirs, &[]);
-            for repo in &walk.repos {
-                let git_dir = scan::git_dir(repo);
-                let common = git_dir.as_deref().and_then(scan::common_dir);
-                // The root only for now; the tracked directories once git has listed them.
-                watcher.watch_repo(
-                    repo,
-                    git_dir.as_deref(),
-                    common.as_deref(),
-                    &[String::new()],
-                );
+            for repo in &fast {
+                prewatch(watcher, repo);
             }
         }
-        self.prewatched = walk.repos.clone();
+        self.load_dirs = walk.dirs;
+        self.prewatched = fast.clone();
         self.watch_hook_dir();
         self.agent
             .set_hooks(hook::statuses(&hook::Paths::from_env()));
-        let (slow, fast): (Vec<PathBuf>, Vec<PathBuf>) =
-            walk.repos.into_iter().partition(|p| is_slow(p));
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
                 let done = LoadDone(tx);
                 let tx = &done.0;
-                // Linux repos in one report, so their masses settle at once.
-                if !fast.is_empty() {
-                    let read = state::read_git_parallel(&fast);
-                    let msg = Msg::Loaded {
-                        repos: fast.into_iter().zip(read).collect(),
-                        last: false,
+                std::thread::scope(|scope| {
+                    // `/mnt/` is searched while git reads the Linux repos.
+                    let search = std::thread::Builder::new()
+                        .name("search".into())
+                        .spawn_scoped(scope, || scan::walk_roots(&slow_config))
+                        .ok();
+                    // Linux repos in one report, so their masses settle at once.
+                    if !fast.is_empty() {
+                        let read = state::read_git_parallel(&fast);
+                        let msg = Msg::Loaded {
+                            repos: fast.into_iter().zip(read).collect(),
+                            last: false,
+                        };
+                        if tx.send(msg).is_err() {
+                            return;
+                        }
+                    }
+                    let walk = match search {
+                        Some(search) => match search.join() {
+                            Ok(walk) => walk,
+                            Err(_) => return,
+                        },
+                        None => scan::walk_roots(&slow_config),
                     };
-                    if tx.send(msg).is_err() {
+                    let mut slow = slow_found;
+                    slow.extend(walk.repos);
+                    slow.sort();
+                    slow.dedup();
+                    if slow.is_empty() && walk.dirs.is_empty() {
                         return;
                     }
-                }
-                // Each slow repo as soon as it is read.
-                state::read_git_each(&slow, SLOW_READERS, |i, result| {
-                    let msg = Msg::Loaded {
-                        repos: vec![(slow[i].clone(), result)],
-                        last: false,
+                    // Read only once the main thread has watched them.
+                    let (go, ready) = mpsc::channel();
+                    let msg = Msg::Found {
+                        repos: slow.clone(),
+                        dirs: walk.dirs,
+                        go,
                     };
-                    tx.send(msg).is_ok()
+                    if tx.send(msg).is_err() || ready.recv().is_err() {
+                        return;
+                    }
+                    // Each slow repo as soon as it is read.
+                    state::read_git_each(&slow, SLOW_READERS, |i, result| {
+                        let msg = Msg::Loaded {
+                            repos: vec![(slow[i].clone(), result)],
+                            last: false,
+                        };
+                        tx.send(msg).is_ok()
+                    });
                 });
             })?;
         Ok(())
+    }
+
+    /// Watches what the loading thread found under `/mnt/`, as [`Server::ensure_loaded`]
+    /// does for the rest, then lets it read the repos.
+    fn found(&mut self, repos: Vec<PathBuf>, dirs: Vec<(PathBuf, bool)>, go: Sender<()>) {
+        if let Some(watcher) = &mut self.watcher {
+            for repo in &repos {
+                prewatch(watcher, repo);
+            }
+        }
+        self.prewatched.extend(repos);
+        // Fails only when the thread panicked, and then its guard ends the load.
+        let _ = go.send(());
+        // The directories searched are watched while git reads: a repo appearing in
+        // one before then is found by the search at the end of the load.
+        self.load_dirs.extend(dirs);
+        if let Some(watcher) = &mut self.watcher {
+            watcher.watch_scan_dirs(&self.load_dirs, &[]);
+        }
     }
 
     /// Takes in repos the load read: reports them and the repos whose snapshots they
@@ -853,6 +935,7 @@ impl<W: Write> Server<W> {
         if last {
             self.load = Load::Done;
             self.touched.clear();
+            self.load_dirs.clear();
             let unloaded: Vec<PathBuf> = std::mem::take(&mut self.prewatched)
                 .into_iter()
                 .filter(|p| self.agent.repo(p).is_none())
@@ -1380,5 +1463,29 @@ mod tests {
         assert!(is_slow(Path::new("/mnt/d/aurora-notes")));
         assert!(!is_slow(Path::new("/home/dev/projects/kelp-cli")));
         assert!(!is_slow(Path::new("/home/dev/mnt/kelp-cli")));
+    }
+
+    #[test]
+    fn the_first_load_searches_windows_drives_apart() {
+        let config = Config {
+            roots: vec![
+                "/home/dev/projects".into(),
+                "/mnt/c/Users/dev/Desktop".into(),
+            ],
+            extra: vec!["/mnt/d/aurora-notes".into(), "/home/dev/kelp-cli".into()],
+            hidden: vec!["/home/dev/projects/reef-maps".into()],
+            depth: 2,
+            claude_projects: "/home/dev/.claude/projects".into(),
+            limits_file: "/home/dev/.claude/usage-state.json".into(),
+        };
+        let (slow, fast) = split_slow(&config);
+        assert_eq!(slow.roots, [PathBuf::from("/mnt/c/Users/dev/Desktop")]);
+        assert_eq!(slow.extra, [PathBuf::from("/mnt/d/aurora-notes")]);
+        assert_eq!(fast.roots, [PathBuf::from("/home/dev/projects")]);
+        assert_eq!(fast.extra, [PathBuf::from("/home/dev/kelp-cli")]);
+        for half in [&slow, &fast] {
+            assert_eq!(half.hidden, config.hidden);
+            assert_eq!(half.depth, 2);
+        }
     }
 }
