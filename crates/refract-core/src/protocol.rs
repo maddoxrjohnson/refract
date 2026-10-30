@@ -104,6 +104,14 @@ pub enum Method {
     UninstallHook,
     /// Answered with `null`, then the helper exits.
     Shutdown,
+    /// Starts moving a Windows-drive repo into WSL: answered with a
+    /// [`MigrationTicket`], then [`Event::MigrateProgress`] and one
+    /// [`Event::MigrateReady`]. See [`crate::migrate`].
+    Migrate(MigrateParams),
+    /// Ends a migration that is ready (see [`FinishAction`]): answered with `null`.
+    MigrateFinish(MigrateFinishParams),
+    /// Stops a migration before it is ready and deletes its copy: answered with `null`.
+    MigrateCancel(MigrateCancelParams),
 }
 
 /// A request id: any JSON number or string, echoed back unchanged.
@@ -581,7 +589,8 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         ));
     };
     let takes_params = match method {
-        "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" => true,
+        "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
+        | "migrateFinish" | "migrateCancel" => true,
         "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
         | "shutdown" => false,
         _ => {

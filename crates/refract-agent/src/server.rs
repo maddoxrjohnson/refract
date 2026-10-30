@@ -635,6 +635,13 @@ impl<W: Write> Server<W> {
                 self.send_all(&events)?;
                 return Ok(true);
             }
+            Method::Migrate(_) | Method::MigrateFinish(_) | Method::MigrateCancel(_) => {
+                Response::err(
+                    id,
+                    code::METHOD_NOT_FOUND,
+                    "migration is not implemented yet",
+                )
+            }
             Method::Shutdown => {
                 self.send(&Response::ok(id, Reply::Done))?;
                 return Ok(false);
