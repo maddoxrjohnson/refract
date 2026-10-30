@@ -14,8 +14,12 @@
 //! 2. **Copy** into `<dest parent>/.refract-migrate-<name>-<id>`, everything but the
 //!    skipped build folders ([`tree::copy_tree`]). The source is statted just before;
 //!    paths whose size or time differ from S0 changed after the snapshot and are read
-//!    again ([`source::refresh`]).
-//! 3. **Normalise** each repo ([`gitx::normalise`]).
+//!    again ([`source::refresh`]). drvfs cannot tell the Windows executable bit, so
+//!    files get mode 644, except hooks (files right in a git folder's `hooks`, not
+//!    ending in `.sample`) and files outside git folders starting with `#!`, which get
+//!    755.
+//! 3. **Normalise** each repo ([`gitx::normalise`]). Tracked files take their index
+//!    mode; skip-worktree, assume-unchanged and intent-to-add entries keep their flags.
 //! 4. **Verify**: the copy's manifest and git state against the snapshot, checks 1 to
 //!    3; then the source is statted again, and what changed is copied, normalised and
 //!    checked again, up to three rounds (check 4). No `claude` process may run in the
@@ -23,6 +27,10 @@
 //! 5. **Place**: only when checks 1 to 4 pass, the temporary folder is renamed to the
 //!    destination (`RENAME_NOREPLACE`). Then the install ([`install`]) and the history
 //!    ([`history`]) run, the report is saved ([`store`]) and sent as `migrateReady`.
+//!    The copy is statted around the install; what it created, changed or removed
+//!    outside the build folders is listed in the report (`installChanges`), and later
+//!    checks of the placed copy allow those paths' differences until a re-sync copies
+//!    the original's version over them.
 //!    A failed report deletes the temporary folder at once.
 //!
 //! After the report: `migrateRecheck` stats the source against the last check's stat,

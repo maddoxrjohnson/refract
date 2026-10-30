@@ -10,7 +10,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use refract_core::migrate::build::{install_plan, InstallStep, RootFiles, SkippedFolder};
-use refract_core::migrate::report::{InstallResult, InstallStatus};
+use refract_core::migrate::manifest::{RelPath, StatChanges};
+use refract_core::migrate::report::{InstallChanges, InstallResult, InstallStatus};
 
 use super::tree::Cancel;
 
@@ -39,6 +40,34 @@ pub fn plan(dest: &Path, skipped: &[SkippedFolder]) -> Vec<InstallStep> {
         skipped,
         &RootFiles::new(names, package_json.as_deref(), yarn_lock.as_deref()),
     )
+}
+
+/// What the install did to the copy at `dest`, from the stat changes of its tree
+/// (skipped folders left out) over the install. A folder whose time alone changed is
+/// not a change, and neither is a git index (check 2 compares its entries).
+pub fn changes(dest: &Path, stats: &StatChanges) -> InstallChanges {
+    let keep = |path: &&RelPath| {
+        let parts: Vec<&str> = path.as_str().split('/').collect();
+        !(parts.contains(&".git") && parts.last() == Some(&"index"))
+    };
+    let list = |paths: &[RelPath]| -> Vec<String> {
+        paths
+            .iter()
+            .filter(keep)
+            .map(|p| p.as_str().to_owned())
+            .collect()
+    };
+    InstallChanges {
+        created: list(&stats.added),
+        changed: stats
+            .changed
+            .iter()
+            .filter(keep)
+            .filter(|p| !fs::symlink_metadata(dest.join(p.as_str())).is_ok_and(|m| m.is_dir()))
+            .map(|p| p.as_str().to_owned())
+            .collect(),
+        removed: list(&stats.removed),
+    }
 }
 
 /// Runs `steps` in `dest`, appending their output to `log`. `progress` gets the steps
@@ -151,7 +180,6 @@ fn run_step(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use refract_core::migrate::manifest::RelPath;
     use std::sync::atomic::AtomicBool;
 
     fn step(tool: &str, command: &str) -> InstallStep {

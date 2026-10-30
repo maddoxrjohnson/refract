@@ -175,6 +175,43 @@ pub struct InstallResult {
     pub log_path: Option<String>,
 }
 
+/// What the install did to the placed copy outside the reinstalled build folders (spec
+/// §3.5), against the copy as checked: paths it created, and paths from the original it
+/// changed or removed (such as `npm install` writing `package-lock.json` or rewriting
+/// `package.json`). The copy's git index is left out, as check 2 compares its entries.
+/// Later checks of the copy allow these differences; the report lists them.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InstallChanges {
+    #[serde(default)]
+    pub created: Vec<String>,
+    #[serde(default)]
+    pub changed: Vec<String>,
+    #[serde(default)]
+    pub removed: Vec<String>,
+}
+
+impl InstallChanges {
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    /// True when a difference at `path` (a trailing `/` ignored) is the install's.
+    pub fn allows(&self, path: &str) -> bool {
+        let path = path.trim_end_matches('/');
+        [&self.created, &self.changed, &self.removed]
+            .iter()
+            .any(|list| list.iter().any(|p| p == path))
+    }
+
+    /// Forgets `paths`: the original's version was copied over them again.
+    pub fn forget(&mut self, paths: &[String]) {
+        for list in [&mut self.created, &mut self.changed, &mut self.removed] {
+            list.retain(|p| !paths.contains(p));
+        }
+    }
+}
+
 /// The session history that moved (spec §3.4).
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +249,9 @@ pub struct Report {
     /// Empty when nothing needed installing, or the checks failed first.
     #[serde(default)]
     pub install: Vec<InstallResult>,
+    /// What the install created, changed or removed outside the build folders.
+    #[serde(default)]
+    pub install_changes: InstallChanges,
     #[serde(default)]
     pub history: HistoryMoved,
     /// Linux git read the source because `git.exe` was missing.
@@ -273,6 +313,7 @@ mod tests {
             source_totals: Totals::default(),
             copy_totals: Totals::default(),
             install: vec![],
+            install_changes: InstallChanges::default(),
             history: HistoryMoved::default(),
             linux_git: false,
             warnings: vec![],
@@ -350,6 +391,21 @@ mod tests {
     }
 
     #[test]
+    fn install_changes_allow_and_forget_paths() {
+        let mut changes = InstallChanges {
+            created: vec!["package-lock.json".into(), ".husky".into()],
+            changed: vec!["package.json".into()],
+            removed: vec![],
+        };
+        assert!(changes.allows("package.json"));
+        assert!(changes.allows(".husky/"));
+        assert!(!changes.allows("package"));
+        changes.forget(&["package.json".into()]);
+        assert!(!changes.allows("package.json"));
+        assert!(!changes.is_empty());
+    }
+
+    #[test]
     fn reports_round_trip_in_camel_case() {
         let mut checks = all(CheckStatus::Passed);
         checks[3] = CheckResult::from_problems(
@@ -370,6 +426,10 @@ mod tests {
         );
         assert_eq!(value["startedAt"], "2026-10-30T10:00:00Z");
         assert_eq!(value["newObjects"], 3);
+        assert_eq!(
+            value["installChanges"],
+            json!({"created": [], "changed": [], "removed": []})
+        );
         let back: Report = serde_json::from_value(value).unwrap();
         assert_eq!(back, r);
     }

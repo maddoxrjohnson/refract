@@ -43,7 +43,7 @@ Reports are saved to `~/.local/share/refract/migrations/<timestamp>-<name>.json`
 
 ### 3.1 Everything, byte for byte, except build folders
 - All files and folders, including `.git` (byte for byte; §3.3), untracked files and ignored files such as `.env`.
-- mtimes are preserved. Files get mode 644 and folders 755. Tracked files get their executable bit from the git index during re-checkout (§3.3).
+- mtimes are preserved. Folders get mode 755. drvfs can't report the Windows side's executable bit reliably, so files get 644 except: tracked files take their mode from the git index during re-checkout (§3.3); hooks (files directly in a git folder's `hooks/` not ending in `.sample`) and untracked or ignored files starting with `#!` get 755.
 - Alternate data streams (for example `Zone.Identifier`) are not copied. Each one dropped is listed in the report. They never block the migration.
 
 ### 3.2 Skipped build folders
@@ -59,7 +59,7 @@ Windows git usually checks files out with CRLF (`core.autocrlf=true`) and `core.
 1. Copy `.git` byte for byte.
 2. For each tracked file, compute the blob Windows git would store for it (the "clean" form, using the Windows settings) and write it into the copy's object store. These are new loose objects; nothing existing changes.
 3. Rewrite the working-tree file as Linux git checks that blob out (`git cat-file --filters`, using the repo's `.gitattributes`, `core.autocrlf` unset). That gives LF unless `.gitattributes` asks for otherwise.
-4. In the copy's local config, remove the Windows-only keys (`core.autocrlf`, `core.filemode=false`, `core.symlinks=false`, `core.ignorecase=true`) and set `core.filemode=true`. Then run `git update-index --refresh`.
+4. In the copy's local config, remove the Windows-only keys (`core.autocrlf`, `core.filemode=false`, `core.symlinks=false`, `core.ignorecase=true`) and set `core.filemode=true`. Then run `git update-index --refresh`. Rewritten entries keep their skip-worktree and assume-unchanged flags, and intent-to-add entries stay intent-to-add.
 
 Uncommitted edits carry over as the same diffs, because they're compared as blobs (§5, check 1). Staged changes survive because the index is copied, not rebuilt.
 
@@ -73,6 +73,7 @@ The install runs after the checks pass, inside the destination, through a login 
 - `node_modules` → `npm ci` / `pnpm install --frozen-lockfile` / `yarn install --immutable` (Berry) or `--frozen-lockfile` (v1) / `bun install`, picked by the lockfile
 - `.venv` → `uv sync` (`uv.lock`) / `poetry install` (`poetry.lock`) / `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 - If the tool is missing in WSL, the report gives the command to install it. If the install fails or runs past 15 minutes, the log is shown, but the migration doesn't fail.
+- The copy is statted before and after the install (skipped folders left out). Files it created, and files from the original it changed or removed (for example `package-lock.json` written, `package.json` rewritten), are listed in the report as changed by install. Later re-syncs allow exactly those differences, until the original's own version is copied over them again.
 
 ## 4. Steps
 
@@ -88,20 +89,21 @@ The install runs after the checks pass, inside the destination, through a login 
 Busy windows and agents don't refuse. They block **Start** (§2.2).
 
 ### 4.2 Snapshot (Windows side, native NTFS)
-The app (Windows side) builds the source manifest **S0**: for every file and folder outside skipped folders, including `.git`, it records the relative path, type, size, mtime, attributes and SHA-256. For each tracked file it also records the clean blob id, from `git.exe hash-object --stdin-paths`.
+The app (Windows side) builds the whole snapshot before it sends `migrate`; nothing is hashed in parallel with the copy. It builds the source manifest **S0**: for every file and folder outside skipped folders, including `.git`, it records the relative path, type, size, mtime, attributes and SHA-256. For each tracked file it also records the clean blob id, from `git.exe hash-object --stdin-paths`.
 
 Git snapshot **G0**, also from `git.exe`:
 - `rev-parse HEAD`
 - `for-each-ref` (every ref, including `refs/stash`), the stash list, remotes and upstreams
 - `config --local -l`
 - `status --porcelain=v2 -z --untracked-files=all --ignored=matching`
+- `ls-files -s -z` (index entries) and `ls-files -v -z` (skip-worktree and assume-unchanged flags)
 - `submodule status --recursive`
 - `fsck --full` result
 
 If `git.exe` is missing, the helper's Linux git is used on the `/mnt` path with `-c core.autocrlf=true -c core.filemode=false`, and the report says so.
 
 ### 4.3 Copy and normalise (helper, WSL)
-The helper copies into `<dest parent>/.refract-migrate-<name>-<id>` on the same filesystem as the destination, then normalises per §3.3. Submodules are handled recursively (`.git/modules`, nested working trees). LFS objects in `.git/lfs` are copied. Hashing the destination runs in the helper while the app hashes the source, so each side reads its own disk natively.
+The helper copies into `<dest parent>/.refract-migrate-<name>-<id>` on the same filesystem as the destination, then normalises per §3.3. Submodules are handled recursively (`.git/modules`, nested working trees). LFS objects in `.git/lfs` are copied. The helper hashes only the copy, after normalising; the source was hashed by the app before `migrate` (§4.2).
 
 ### 4.4 Verify (§5), then put it in place
 The temporary folder is renamed to the destination only after every check passes. The rename is atomic because both are on the same filesystem. Install (§3.5) and history (§3.4) follow, then the report (§2.4).
@@ -112,7 +114,7 @@ If the app, the helper or WSL stops mid-migration, the helper deletes any leftov
 ## 5. Checks (all required before Delete original)
 
 1. **Every file matches.** Every S0 path exists in the copy with the same type. Untracked and ignored files must match in SHA-256 and size. Tracked files must match by blob id: Linux `git hash-object --path` of the copy equals the Windows clean blob id in S0. File counts and total sizes match. The copy has no extra files except the new loose objects from §3.3, which must all pass fsck.
-2. **Git state is identical.** Every `.git` file is byte-identical except `index` (whose `ls-files -s --stage` output must be identical), `config` (only the expected key changes from §3.3) and the new loose objects. HEAD, all refs and the stash match G0. `git status --porcelain=v2` in the copy equals G0's (the ignored set excludes the skipped folders). `fsck --full` reports no new problems compared with G0. Submodules are checked recursively. With LFS, `git lfs fsck` must pass.
+2. **Git state is identical.** Every `.git` file is byte-identical except `index` (whose `ls-files -s` output and `ls-files -v` flags must be identical), `config` (only the expected key changes from §3.3) and the new loose objects. HEAD, all refs and the stash match G0. `git status --porcelain=v2` in the copy equals G0's (the ignored set excludes the skipped folders). `fsck --full` reports no new problems compared with G0. Submodules are checked recursively. With LFS, `git lfs fsck` must pass.
 3. **Nothing skipped without you knowing.** Any copy error fails this check, and so does any path that couldn't be represented. The only things allowed to be missing are the listed skipped folders and the listed alternate data streams.
 4. **Nothing touched it during the copy.** After verifying, the source is snapshotted again (stat of every file, plus refs and the index hashed). Changed files are re-copied and checked again, up to 3 rounds; after that the check fails with "the folder keeps changing". No VS Code window or agent may have the folder open at the end.
 5. **History copied** (§3.4 rules). This doesn't block deletion of the repo, but if it fails, the old transcripts are not deleted.
@@ -126,7 +128,14 @@ If the app, the helper or WSL stops mid-migration, the helper deletes any leftov
 
 ## 7. Where the code goes
 - `refract-core`: build-folder rules, manifest diffing, the `cwd` rewrite, refusal rules, report types (unit tests with fixtures).
-- Helper: preflight (Linux side), copy, normalise, hash, git checks, install, history, temp cleanup, state file. Protocol: `migrate {path, dest}` → `migrateProgress` events → `migrateReady {report}`; `migrateFinish {id, action: delete|keep|discard}`; `migrateCancel {id}`.
+- Helper: preflight (Linux side), copy, normalise, hash, git checks, install, history, temp cleanup, state file. Protocol (details in `docs/architecture.md`):
+  - `migrate {path, dest, snapshot}` → `{id}`, then `migrateProgress` events and `migrateReady {id, report}`
+  - `migrateRecheck {id}` → `{changed, busyAgents}` (check 4 again before deleting)
+  - `migrateResync {id}` → `null`, then progress and a fresh `migrateReady`
+  - `migrateFinish {id, action: delete|keep|discard}`; `migrateCancel {id}`
+  - `migratePending` → `[{id, report}]` (reports waiting, including after a restart)
+  - `stopAgent {path, sessionId}` → `null` (SIGTERM an idle session)
+  - Errors: `6` a migration could not start, or is unknown or not at that step; `7` `stopAgent` named a working session.
 - App (Windows): S0/G0 snapshot with `git.exe`, reparse-point and lock checks, Recycle Bin, `.lnk`, closing VS Code windows, stopping idle agents, notifications, dialog, gem ring and report UI. DemoBackend simulates a migration for the demo site.
 
 ## 8. Testing

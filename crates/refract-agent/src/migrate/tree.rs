@@ -21,6 +21,8 @@ use super::gitx;
 
 /// Copied files' mode.
 const FILE_MODE: u32 = 0o644;
+/// Copied files' mode when they look executable ([`executable`]).
+const EXEC_MODE: u32 = 0o755;
 /// Copied folders' mode.
 const DIR_MODE: u32 = 0o755;
 
@@ -226,9 +228,25 @@ pub fn manifest_stats(manifest: &Manifest) -> Vec<StatEntry> {
         .collect()
 }
 
+/// True when a copied file at `rel` that starts with `head` gets mode 755 rather than
+/// 644 (spec §3.1): drvfs cannot tell the Windows side's executable bit reliably, so a
+/// hook (a file right in a git folder's `hooks`, not ending in `.sample`) and any file
+/// outside git folders starting with `#!` count as executable. Tracked files get their
+/// index mode afterwards when normalised.
+fn executable(rel: &Path, head: &[u8]) -> bool {
+    let parts: Vec<&[u8]> = rel.as_os_str().as_bytes().split(|b| *b == b'/').collect();
+    match parts.iter().position(|p| *p == b".git") {
+        Some(git) => {
+            let n = parts.len();
+            n >= git + 3 && parts[n - 2] == b"hooks" && !parts[n - 1].ends_with(b".sample")
+        }
+        None => head.starts_with(b"#!"),
+    }
+}
+
 /// Copies the tree under `from` into the existing folder `to` (spec §3.1): everything
-/// outside `skipped`, files as mode 644 and folders as 755 with their modification
-/// times, symlinks as they are. Special files and anything that fails are reported as
+/// outside `skipped`, files as mode 644 (755 when [`executable`]) and folders as 755
+/// with their modification times, symlinks as they are. Special files and anything that fails are reported as
 /// problems, and the copy goes on. `progress` gets the bytes copied so far.
 pub fn copy_tree(
     from: &Path,
@@ -247,7 +265,9 @@ pub fn copy_tree(
         match visit {
             Visit::Entry { rel, abs, meta } => {
                 let dest = to.join(rel);
-                if let Err(e) = copy_entry(abs, &dest, meta, &mut bytes, &mut *progress, cancel) {
+                if let Err(e) =
+                    copy_entry(abs, rel, &dest, meta, &mut bytes, &mut *progress, cancel)
+                {
                     problems.push(problem(rel, &e));
                 }
             }
@@ -272,9 +292,11 @@ fn problem(rel: &Path, error: &io::Error) -> Problem {
     }
 }
 
-/// Copies one entry, replacing what is at `dest` unless it is a folder already.
+/// Copies one entry (at `rel` in the tree), replacing what is at `dest` unless it is a
+/// folder already.
 fn copy_entry(
     src: &Path,
+    rel: &Path,
     dest: &Path,
     meta: &fs::Metadata,
     bytes: &mut u64,
@@ -326,6 +348,7 @@ fn copy_entry(
         .mode(FILE_MODE)
         .open(dest)?;
     let mut buf = vec![0; 1 << 20];
+    let mut head = Vec::with_capacity(2);
     loop {
         if cancel.cancelled() {
             return Ok(());
@@ -337,11 +360,18 @@ fn copy_entry(
             Err(e) => return Err(e),
         };
         output.write_all(&buf[..n])?;
+        let want = 2usize.saturating_sub(head.len()).min(n);
+        head.extend_from_slice(&buf[..want]);
         *bytes += n as u64;
         progress(*bytes);
     }
     drop(output);
-    fs::set_permissions(dest, fs::Permissions::from_mode(FILE_MODE))?;
+    let mode = if executable(rel, &head) {
+        EXEC_MODE
+    } else {
+        FILE_MODE
+    };
+    fs::set_permissions(dest, fs::Permissions::from_mode(mode))?;
     fsx::set_mtime(dest, fsx::mtime_ns(meta))
 }
 
@@ -377,7 +407,8 @@ pub fn recopy(
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            copy_entry(&src, &dest, &meta, &mut bytes, &mut |_| {}, cancel)
+            let rel = Path::new(path.as_str());
+            copy_entry(&src, rel, &dest, &meta, &mut bytes, &mut |_| {}, cancel)
         });
         match result {
             // Removed again since it was statted: removed here too.
@@ -417,6 +448,20 @@ mod tests {
     }
 
     #[test]
+    fn hooks_and_scripts_are_executable() {
+        let exec = |rel: &str, head: &[u8]| executable(Path::new(rel), head);
+        assert!(exec(".git/hooks/pre-commit", b""));
+        assert!(exec(".git/modules/libs/kelp/hooks/post-checkout", b""));
+        assert!(!exec(".git/hooks/pre-commit.sample", b"#!"));
+        assert!(!exec(".git/config", b"#!"));
+        assert!(!exec(".git/hooks", b""));
+        assert!(exec("tools/build", b"#!"));
+        assert!(exec("hooks/x", b"#!"));
+        assert!(!exec("hooks/x", b"# "));
+        assert!(!exec("notes.txt", b"#"));
+    }
+
+    #[test]
     fn copies_modes_times_and_links_and_skips() {
         let tmp = tempfile::tempdir().unwrap();
         let (from, to) = (tmp.path().join("from"), tmp.path().join("to"));
@@ -436,7 +481,11 @@ mod tests {
         assert_eq!(last, 11);
         assert!(!to.join("node_modules").exists());
         let meta = fs::metadata(to.join("src/run.sh")).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o755,
+            "a script starting with #!"
+        );
         assert_eq!(fsx::mtime_ns(&meta), 1_500_000_000_000_000_001);
         let dir = fs::metadata(to.join("src")).unwrap();
         assert_eq!(dir.permissions().mode() & 0o777, 0o755);

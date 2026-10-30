@@ -17,8 +17,8 @@ use std::process::{Command, Output, Stdio};
 
 use refract_core::migrate::gitconfig::{config_changes, parse_config, ConfigEntry};
 use refract_core::migrate::gitstate::{
-    parse_fsck, parse_head, parse_lines, parse_nul_records, parse_refs, parse_status,
-    parse_submodules, GitSnapshot, FOR_EACH_REF_FORMAT,
+    parse_fsck, parse_head, parse_index_flags, parse_lines, parse_nul_records, parse_refs,
+    parse_status, parse_submodules, GitSnapshot, FOR_EACH_REF_FORMAT,
 };
 
 use super::fsx;
@@ -115,6 +115,7 @@ pub fn snapshot(dir: &Path, config: &[String]) -> Result<GitSnapshot, String> {
         ],
     )?;
     let index = text(dir, config, &["ls-files", "-s", "-z"])?;
+    let index_flags = text(dir, config, &["ls-files", "-v", "-z"])?;
     let submodules = text(dir, config, &["submodule", "status", "--recursive"])?;
     let fsck =
         run(dir, config, &["fsck", "--full"], None).map_err(|e| format!("cannot run git: {e}"))?;
@@ -127,6 +128,7 @@ pub fn snapshot(dir: &Path, config: &[String]) -> Result<GitSnapshot, String> {
         config: parse_config(&utf8(local.stdout, &["config"])?),
         status: parse_status(&status)?,
         index: parse_nul_records(&index),
+        index_flags: parse_index_flags(&index_flags),
         submodules: parse_submodules(&submodules)?,
         fsck: parse_fsck(&String::from_utf8_lossy(&fsck_text)),
     })
@@ -179,6 +181,62 @@ pub fn index(dir: &Path) -> Result<BTreeMap<String, IndexEntry>, String> {
         );
     }
     Ok(entries)
+}
+
+/// The paths of `dir`'s index entries marked skip-worktree, and of those marked
+/// assume-unchanged (`git ls-files -v`).
+fn flagged(dir: &Path) -> Result<(BTreeSet<String>, BTreeSet<String>), String> {
+    let out = text(dir, &[], &["ls-files", "-v", "-z"])?;
+    let (mut skip, mut assume) = (BTreeSet::new(), BTreeSet::new());
+    for record in parse_index_flags(&out) {
+        let Some((tag, path)) = record.split_once(' ') else {
+            continue;
+        };
+        if tag.eq_ignore_ascii_case("S") {
+            skip.insert(path.to_owned());
+        }
+        if tag.chars().all(|c| c.is_ascii_lowercase()) {
+            assume.insert(path.to_owned());
+        }
+    }
+    Ok((skip, assume))
+}
+
+/// The paths of `dir`'s intent-to-add entries (`git add -N`), which `diff-files` shows
+/// as added.
+fn intent_to_add(dir: &Path) -> Result<BTreeSet<String>, String> {
+    let out = text(
+        dir,
+        &[],
+        &["diff-files", "--name-only", "-z", "--diff-filter=A"],
+    )?;
+    Ok(parse_nul_records(&out).into_iter().collect())
+}
+
+/// Sets `flag` (an `update-index` option such as `--skip-worktree`) on `paths`.
+fn set_flag(dir: &Path, flag: &str, paths: &[&String]) -> Result<(), String> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut input = Vec::new();
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+    }
+    let out = run(
+        dir,
+        &[],
+        &["update-index", "-z", flag, "--stdin"],
+        Some(&input),
+    )
+    .map_err(|e| format!("cannot run git: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git update-index {flag} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(())
 }
 
 /// The paths git tracks in `dir`, any stage.
@@ -320,7 +378,10 @@ pub fn windows_config(local: &[ConfigEntry]) -> Vec<String> {
 /// size differs from the recorded one for modified without reading it. So the entries
 /// of rewritten files are first written again with the same mode and object
 /// (`update-index --index-info`), which clears their recorded stat, and the refresh
-/// then compares their content.
+/// then compares their content. Writing an entry again drops its skip-worktree and
+/// assume-unchanged flags, so they are read first and set again after the refresh;
+/// intent-to-add entries are not written again at all, since that would stage them as
+/// empty files (their recorded stat is empty anyway).
 /// `progress` is called with each file done. Returns per-path failures.
 pub fn normalise(
     dir: &Path,
@@ -368,6 +429,16 @@ pub fn normalise(
         ));
     }
     let rewritten = smudge(dir, &want, &index, &mut problems, progress)?;
+    let (skip, assume) = flagged(dir)?;
+    let intent = if rewritten.is_empty() {
+        BTreeSet::new()
+    } else {
+        intent_to_add(dir)?
+    };
+    let rewritten: Vec<String> = rewritten
+        .into_iter()
+        .filter(|p| !intent.contains(p))
+        .collect();
     if !rewritten.is_empty() {
         let mut input = Vec::new();
         for entry in rewritten.iter().filter_map(|p| index.get(p)) {
@@ -391,6 +462,11 @@ pub fn normalise(
     }
     // Exits 1 when some file differs from the index, as unstaged edits do.
     let _ = run(dir, &[], &["update-index", "-q", "--refresh"], None);
+    let lost = |flags: &BTreeSet<String>| -> Vec<&String> {
+        rewritten.iter().filter(|p| flags.contains(*p)).collect()
+    };
+    set_flag(dir, "--skip-worktree", &lost(&skip))?;
+    set_flag(dir, "--assume-unchanged", &lost(&assume))?;
     Ok(problems)
 }
 

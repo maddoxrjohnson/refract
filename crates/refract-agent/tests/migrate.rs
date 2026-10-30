@@ -747,6 +747,164 @@ fn a_folder_that_keeps_changing_fails_check_4() {
         .contains("keeps changing"));
 }
 
+#[test]
+fn hooks_and_untracked_scripts_stay_executable() {
+    let world = World::new();
+    let src = &world.src;
+    write(&src.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
+    write(&src.join(".git/hooks/pre-push.sample"), "#!/bin/sh\n");
+    write(
+        &src.join("tools/deploy"),
+        "#!/usr/bin/env bash\necho deploy\n",
+    );
+    write(&src.join(".env.sh"), "#!/bin/sh\n");
+    let mut agent = world.agent(None);
+    world.migrate(&mut agent, &world.dest);
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    let mode = |p: &str| {
+        fs::metadata(world.dest.join(p))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode(".git/hooks/pre-commit"), 0o755);
+    assert_eq!(mode(".git/hooks/pre-push.sample"), 0o644);
+    assert_eq!(mode("tools/deploy"), 0o755);
+    assert_eq!(mode(".env.sh"), 0o755, "an ignored script");
+    assert_eq!(mode("notes.txt"), 0o644);
+    // Tracked files take the index's mode.
+    assert_eq!(mode("scripts/run.sh"), 0o755);
+    assert_eq!(mode("README.md"), 0o644);
+}
+
+/// Marks `.gitignore` skip-worktree, `scripts/run.sh` assume-unchanged and `notes.txt`
+/// intent-to-add in the source; all three are CRLF, so normalising rewrites them.
+fn flag_index_entries(src: &Path) {
+    git(src, &["update-index", "--skip-worktree", ".gitignore"]);
+    git(
+        src,
+        &["update-index", "--assume-unchanged", "scripts/run.sh"],
+    );
+    git(src, &["add", "-N", "notes.txt"]);
+}
+
+#[test]
+fn index_flags_and_intent_to_add_survive() {
+    let world = World::new();
+    flag_index_entries(&world.src);
+    let mut agent = world.agent(None);
+    world.migrate(&mut agent, &world.dest);
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    let flags = |dir: &Path| {
+        git(dir, &["ls-files", "-v"])
+            .lines()
+            .filter(|l| !l.starts_with("H "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(flags(&world.dest), ["S .gitignore", "h scripts/run.sh"]);
+    assert_eq!(flags(&world.dest), flags(&world.src));
+    let status = status(&world.dest, &[]);
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("1 .A ") && l.ends_with(" notes.txt")),
+        "{status}"
+    );
+    assert_eq!(
+        fs::read_to_string(world.dest.join(".gitignore")).unwrap(),
+        "node_modules/\n.env\n"
+    );
+}
+
+#[test]
+fn a_dropped_index_flag_fails_git_state() {
+    let world = World::new();
+    flag_index_entries(&world.src);
+    let hook = world.hook(
+        "[ \"$1\" = copied ] || exit 0\ngit -C \"$3\" update-index --no-skip-worktree .gitignore\n",
+    );
+    let report = failed_migration(&world, Some(&hook));
+    let git_state = check(&report, "gitState");
+    assert_eq!(git_state["status"], "failed", "{report:#}");
+    let problems = git_state["problems"].as_array().unwrap();
+    assert!(
+        problems.iter().any(|p| p["path"] == ".gitignore"
+            && p["message"].as_str().unwrap().contains("skip-worktree")),
+        "{report:#}"
+    );
+}
+
+#[test]
+fn what_the_install_changes_is_listed_and_allowed_in_a_resync() {
+    let world = World::new();
+    let src = &world.src;
+    write(&src.join("package.json"), "{\"name\": \"aurora-notes\"}\n");
+    git(src, &["add", "package.json"]);
+    git(
+        src,
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "Add package.json",
+            "--",
+            "package.json",
+        ],
+    );
+    // A fake npm, found through the login shell's profile, that writes a lockfile and
+    // rewrites package.json as `npm install` can.
+    let bin = world.home.join("bin");
+    write(
+        &bin.join("npm"),
+        "#!/bin/sh\nmkdir -p node_modules/left-pad\nprintf '{}\\n' > package-lock.json\n\
+         printf '{\"name\": \"aurora-notes\", \"version\": \"1.0.0\"}\\n' > package.json\n",
+    );
+    fs::set_permissions(bin.join("npm"), fs::Permissions::from_mode(0o755)).unwrap();
+    write(
+        &world.home.join(".profile"),
+        &format!("export PATH=\"{}:$PATH\"\n", bin.display()),
+    );
+
+    let mut agent = world.agent(None);
+    let ticket = world.migrate(&mut agent, &world.dest);
+    let id = ticket["result"]["id"].as_str().expect("an id").to_owned();
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(report["install"][0]["status"], "succeeded", "{report:#}");
+    let expected = json!({
+        "created": ["package-lock.json"],
+        "changed": ["package.json"],
+        "removed": [],
+    });
+    assert_eq!(report["installChanges"], expected, "{report:#}");
+    assert!(world.dest.join("node_modules/left-pad").is_dir());
+
+    // A re-sync checks the copy again: the install's files are allowed, and listed.
+    write(&src.join("notes.txt"), "edited after the report\n");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(report["installChanges"], expected, "{report:#}");
+    assert!(fs::read_to_string(world.dest.join("package.json"))
+        .unwrap()
+        .contains("1.0.0"));
+
+    // Once the original's package.json changes, its version is copied over npm's.
+    write(
+        &src.join("package.json"),
+        "{\"name\": \"aurora-notes-2\"}\n",
+    );
+    agent.request("migrateResync", json!({"id": id}));
+    let report = agent.ready();
+    assert_eq!(report["installChanges"]["changed"], json!([]), "{report:#}");
+    assert!(can_delete(&report), "{report:#}");
+}
+
 /// A process that looks like `claude --session-id <id>` running in `cwd`, until its
 /// stdin closes or it is stopped.
 fn fake_claude(cwd: &Path, id: &str) -> Child {

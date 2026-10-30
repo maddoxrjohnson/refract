@@ -12,11 +12,15 @@
 //! | `config` | `git config --local -l` | [`super::gitconfig::parse_config`] |
 //! | `status` | `git status --porcelain=v2 -z --untracked-files=all --ignored=matching` | [`parse_status`] |
 //! | `index` | `git ls-files -s -z` | [`parse_nul_records`] |
+//! | `index_flags` | `git ls-files -v -z` | [`parse_index_flags`] |
 //! | `submodules` | `git submodule status --recursive` | [`parse_submodules`] |
 //! | `fsck` | `git fsck --full` (stdout and stderr together) | [`parse_fsck`] |
 //!
 //! Outputs are taken as text: git writes paths as UTF-8 on both sides, and output that
 //! is not UTF-8 means a path the migration cannot represent.
+//!
+//! `index_flags` keeps the index flags `ls-files -s` does not show: skip-worktree (`S`)
+//! and assume-unchanged (lowercase tag). Intent-to-add entries show in `status` (`.A`).
 //!
 //! `refs` covers every ref, `refs/stash` and remote-tracking refs included, with each
 //! branch's upstream. Remotes themselves are compared through `config`.
@@ -53,6 +57,10 @@ pub struct GitSnapshot {
     /// `ls-files -s` records: `<mode> <object> <stage>\t<path>`.
     #[serde(default)]
     pub index: Vec<String>,
+    /// `ls-files -v` records whose tag is not `H`: `<tag> <path>`, the tag `S` for
+    /// skip-worktree, lowercase for assume-unchanged (`h`, `s`).
+    #[serde(default)]
+    pub index_flags: Vec<String>,
     #[serde(default)]
     pub submodules: Vec<SubmoduleEntry>,
     /// fsck's problem lines (dangling objects and progress are not problems).
@@ -198,6 +206,15 @@ pub fn parse_nul_records(text: &str) -> Vec<String> {
     text.split('\0')
         .filter(|record| !record.is_empty())
         .map(str::to_owned)
+        .collect()
+}
+
+/// Reads `git ls-files -v -z`, keeping the records of entries with a flag: those
+/// whose tag is not `H` (a plain cached entry).
+pub fn parse_index_flags(text: &str) -> Vec<String> {
+    parse_nul_records(text)
+        .into_iter()
+        .filter(|record| !record.starts_with("H "))
         .collect()
 }
 
@@ -367,6 +384,15 @@ pub fn compare(source: &GitSnapshot, copy: &GitSnapshot, skipped: &[RelPath]) ->
         fail(Some(path), "The index entry differs in the copy.".into());
     }
 
+    let (missing, extra) = multiset_diff(&source.index_flags, &copy.index_flags);
+    for record in missing.iter().chain(&extra) {
+        let path = record.split_once(' ').map_or(record.as_str(), |(_, p)| p);
+        fail(
+            Some(path),
+            "The index entry's skip-worktree or assume-unchanged flag differs in the copy.".into(),
+        );
+    }
+
     let (missing, extra) = multiset_diff(&source.submodules, &copy.submodules);
     for entry in missing.iter().chain(&extra) {
         fail(
@@ -451,6 +477,9 @@ mod tests {
             index: parse_nul_records(&format!(
                 "100644 {MAIN} 0\tREADME.md\0100755 {FEAT} 0\tscripts/run.sh\0"
             )),
+            index_flags: parse_index_flags(
+                "H README.md\0S docs/big.csv\0h scripts/run.sh\0s vendor/blob.bin\0",
+            ),
             submodules: parse_submodules(&format!(
                 " {FEAT} libs/kelp (v1.2.0)\n-{MAIN} libs/reef\n"
             ))
@@ -609,6 +638,24 @@ mod tests {
             ]
         );
         assert!(problems[0].message.contains("unborn"));
+    }
+
+    #[test]
+    fn index_flags_are_compared() {
+        assert_eq!(
+            snapshot().index_flags,
+            vec!["S docs/big.csv", "h scripts/run.sh", "s vendor/blob.bin"]
+        );
+        let mut copy = copy();
+        copy.index_flags.retain(|r| r != "S docs/big.csv");
+        copy.index_flags[0] = "H scripts/run.sh".into();
+        let problems = compare(&snapshot(), &copy, &skipped());
+        let paths: Vec<_> = problems.iter().filter_map(|p| p.path.as_deref()).collect();
+        assert_eq!(
+            paths,
+            vec!["docs/big.csv", "scripts/run.sh", "scripts/run.sh"]
+        );
+        assert!(problems[0].message.contains("skip-worktree"));
     }
 
     #[test]

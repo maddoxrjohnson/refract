@@ -26,8 +26,8 @@ use refract_core::migrate::manifest::{
 };
 use refract_core::migrate::preflight::{self, GitOperation, PreflightFacts};
 use refract_core::migrate::report::{
-    manifest_checks, Check, CheckResult, CheckStatus, InstallResult, Problem, Report,
-    REPORT_VERSION,
+    manifest_checks, Check, CheckResult, CheckStatus, InstallChanges, InstallResult, Problem,
+    Report, REPORT_VERSION,
 };
 use refract_core::migrate::{SourceSnapshot, SOURCE_SNAPSHOT_VERSION};
 use refract_core::protocol::{
@@ -191,6 +191,7 @@ pub fn resume(record: Record, ctx: Context, sink: Sink) -> io::Result<Handle> {
             worker.started_at = record.report.started_at;
             worker.report_path = record.report_path.clone();
             worker.placed = true;
+            worker.install_changes = record.report.install_changes.clone();
             let report = record.report.clone();
             worker.record = Some(record);
             worker.ready(report);
@@ -276,6 +277,8 @@ struct Worker {
     /// Copy problems by path (`""` for none), replaced when a path is copied again.
     copy_errors: BTreeMap<String, Problem>,
     warnings: Vec<String>,
+    /// What the install did to the placed copy, allowed in later checks.
+    install_changes: InstallChanges,
 }
 
 impl Worker {
@@ -310,6 +313,7 @@ impl Worker {
             report: None,
             copy_errors: BTreeMap::new(),
             warnings: Vec::new(),
+            install_changes: InstallChanges::default(),
         }
     }
 
@@ -708,6 +712,7 @@ impl Worker {
             }
             let errors = tree::recopy(&self.source, copy, &changes, &*self.cancel)?;
             self.add_copy_errors(&changes, errors);
+            self.install_changes.forget(&changed_paths(&changes));
             let touched: BTreeSet<String> = changes
                 .added
                 .iter()
@@ -736,10 +741,13 @@ impl Worker {
             &mut |done, total| progress.report(MigrateStep::Hashing, done, total),
         )?;
         let snapshot = self.snapshot().clone();
-        let (diff, manifest_error) = match built {
+        let (mut diff, manifest_error) = match built {
             Ok(manifest) => (diff(&snapshot.manifest, &manifest), None),
             Err(e) => (ManifestDiff::default(), Some(e)),
         };
+        // What the install did is listed in the report, not failed on.
+        diff.problems
+            .retain(|p| !self.install_changes.allows(p.path()));
         let copy_errors: Vec<Problem> = self.copy_errors.values().cloned().collect();
         let [mut files, nothing_skipped] = manifest_checks(&diff, &copy_errors);
         if let Some(message) = manifest_error {
@@ -789,6 +797,13 @@ impl Worker {
                     for mut problem in gitstate::compare(&repo.snapshot, &theirs, &skipped_here) {
                         if let Some(path) = &problem.path {
                             problem.path = Some(format!("{prefix}{path}"));
+                        }
+                        if problem
+                            .path
+                            .as_deref()
+                            .is_some_and(|p| self.install_changes.allows(p))
+                        {
+                            continue;
                         }
                         problems.push(problem);
                     }
@@ -845,13 +860,16 @@ impl Worker {
             .collect()
     }
 
-    /// Runs the install steps in the placed copy.
+    /// Runs the install steps in the placed copy, and records what they did outside the
+    /// build folders in `install_changes` (the copy is statted before and after).
     fn install(&mut self) -> Result<Vec<InstallResult>, Stop> {
         let skipped = self.snapshot().manifest.skipped.clone();
         let steps = install::plan(&self.dest, &skipped);
         if steps.is_empty() {
             return Ok(Vec::new());
         }
+        let folders = self.skipped();
+        let before = tree::stats(&self.dest, &folders, &*self.cancel)?;
         let total = steps.len() as u64;
         let (_, log) = store::report_paths(self.started_at, &file_name(&self.source));
         self.progress.report(MigrateStep::Installing, 0, total);
@@ -865,6 +883,8 @@ impl Worker {
             &mut |done| progress.report(MigrateStep::Installing, done, total),
         );
         self.check_cancel()?;
+        let after = tree::stats(&self.dest, &folders, &*self.cancel)?;
+        self.install_changes = install::changes(&self.dest, &compare_stats(&before, &after));
         Ok(results)
     }
 
@@ -905,6 +925,7 @@ impl Worker {
             source_totals: diff.map_or_else(|| snapshot.manifest.totals(), |d| d.source_totals),
             copy_totals: diff.map_or_else(Default::default, |d| d.copy_totals),
             install,
+            install_changes: self.install_changes.clone(),
             history,
             linux_git: snapshot.linux_git,
             warnings,
@@ -1026,6 +1047,7 @@ impl Worker {
             self.progress.report(MigrateStep::Rechecking, 0, MAX_ROUNDS);
             let errors = tree::recopy(&self.source, &self.dest, &changes, &*self.cancel)?;
             self.add_copy_errors(&changes, errors);
+            self.install_changes.forget(&changed_paths(&changes));
             let touched: BTreeSet<String> = changes
                 .added
                 .iter()
