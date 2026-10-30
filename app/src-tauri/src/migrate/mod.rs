@@ -13,12 +13,12 @@
 //! | `migrate_preflight` | `path`, `dest?` | [`Preflight`] |
 //! | `migrate_start` | `path`, `dest` | `{id}` once the snapshot is taken and the helper started |
 //! | `migrate_cancel_snapshot` | `path` | `true` when a preflight or snapshot of `path` was stopped |
-//! | `migrate_cancel` | `id` | `null`: the helper deletes the partial copy |
+//! | `migrate_cancel` | `id` | `{ended}`: `true` when the helper deleted the partial copy; `false` once the copy was placed or during a re-sync, when the step stops and a report follows |
 //! | `migrate_windows` | `path` | [`VsCodeWindow`]`[]` that have the folder open |
 //! | `migrate_close_window` | `path`, `id` | `true` when asked to close, `false` when gone |
 //! | `migrate_stop_agent` | `path`, `sessionId` | `null` |
 //! | `migrate_resync` | `id` | `null`; progress and a new `migrateReady` follow |
-//! | `migrate_delete` | `id`, `permanent` | [`DeleteOutcome`] |
+//! | `migrate_delete` | `id`, `permanent`, `force?` | [`DeleteOutcome`] |
 //! | `migrate_finish` | `id`, `action` (`keep` or `discard`) | `null` |
 //! | `migrate_pending` | | [`PendingMigration`]`[]`, after a restart |
 //! | `migrate_source_exists` | `id` | `false` once the original folder is gone |
@@ -37,15 +37,21 @@
 //! `deleting` (the helper is in the deleting state):
 //! - `changed {changed, removed, unreadable, copyChanged, busyAgents, sourceMissing}`:
 //!   the recheck failed and nothing was deleted. Not deleting: offer **Re-sync**
-//!   (`migrate_resync`) for changed files, **Keep both** for a changed copy, **Stop**
-//!   for idle agents, then try again. Deleting: only **Finish deleting** once fixed;
+//!   (`migrate_resync`) for changed files, **Keep both** for a changed copy, **End the
+//!   move** (`migrate_finish discard`) when the copy is gone (`copyChanged: ["."]`),
+//!   **Stop** for idle agents, then try again. Deleting: **Finish deleting** once
+//!   fixed; for `copyChanged` (then only paths the original still has) **Delete the
+//!   rest anyway**, `migrate_delete {id, permanent: false, force: true}`, after listing
+//!   them; for a copy that is gone, **End the move** (`migrate_finish discard`) after
+//!   asking, pointing to the Recycle Bin;
 //! - `windowsOpen {windows}`: offer **Close** for each, then try again;
 //! - `wontFit {reason}`: ask "Delete permanently?" (default **No**, which is
 //!   `migrate_finish keep`, or, while deleting, leaving it), and on **Yes** call
 //!   `migrate_delete {id, permanent: true}`;
 //! - `driveHidden`: the original is there on Windows but not over `/mnt` (its drive
-//!   isn't mounted in WSL), so it could not be checked and nothing was deleted. Make
-//!   the drive visible in WSL, then try again (or finish deleting);
+//!   isn't mounted in WSL), so it could not be checked, nothing was deleted and the
+//!   deleting state was not entered. Make the drive visible in WSL, then try again (or
+//!   finish deleting); not deleting, **Keep both** too;
 //! - `unfinished {reason}`: the helper is in the deleting state but the original is not
 //!   all gone (a file was in use) or the helper did not finish. Offer only **Finish
 //!   deleting** (`migrate_delete` again), never Re-sync, Keep or Discard;
@@ -53,11 +59,14 @@
 //!   to `dest`. `alreadyGone` when the original had been deleted by hand.
 //!
 //! The deleting state is the helper's and survives restarts: `migrate_pending` marks it
-//! `deleting`. While in it, `migrate_resync`, `migrate_finish` and `migrate_cancel`
-//! refuse here too. **Keep both** is `migrate_finish keep` (the interface then hides
-//! the old gem); **Discard the copy** is `migrate_finish discard`, refused once the
-//! original is gone, as is `migrate_resync`. `migrate_cancel` works only while the copy
-//! runs. One command at a time runs per migration (`busy` otherwise).
+//! `deleting`. While in it, `migrate_resync`, `migrate_finish keep` and
+//! `migrate_cancel` refuse here too; `migrate_finish discard` goes to the helper, which
+//! allows it only when the copy is gone (`copyMissing` in `migrate_pending`). **Keep
+//! both** is `migrate_finish keep` (the interface then hides the old gem); **Discard
+//! the copy** is `migrate_finish discard`, refused by the helper once the original is
+//! gone (unless the copy is gone too, when it only forgets the move), as is
+//! `migrate_resync`. `migrate_cancel` works while the copy runs and during a re-sync.
+//! One command at a time runs per migration (`busy` otherwise).
 //!
 //! # Events
 //!
@@ -114,7 +123,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::agent::{distro_args, wsl_command, Agent};
 use crate::open::windows_folder;
 use crate::process::output_with_deadline;
-use flow::{delete_original, AgentHelper, DeleteTarget, MigrateHelper, WindowsOps};
+use flow::{delete_original, AgentHelper, CancelOutcome, DeleteTarget, MigrateHelper, WindowsOps};
 pub use flow::{DeleteOutcome, MigrateError, MigrateErrorKind, PendingMigration};
 use git::{find_git_exe, GitExe, GitRun, WslGit};
 use snapshot::{
@@ -792,10 +801,12 @@ pub fn migrate_cancel_snapshot(migrations: State<'_, Migrations>, path: String) 
     }
 }
 
-/// Cancels a migration before its report: the helper deletes the partial copy. Only
-/// while the copy runs; a ready one is answered with Keep both or Discard.
+/// Cancels a running migration. Before the copy is placed the helper deletes the
+/// partial copy and the move ends (`ended`); once placed, or during a re-sync, the
+/// step stops, the copy stays and a report follows. A ready one is answered with Keep
+/// both or Discard.
 #[tauri::command]
-pub async fn migrate_cancel(app: AppHandle, id: String) -> Result<(), MigrateError> {
+pub async fn migrate_cancel(app: AppHandle, id: String) -> Result<CancelOutcome, MigrateError> {
     blocking(move || {
         let migrations = app.state::<Migrations>();
         let _busy = migrations.claim(&id)?;
@@ -806,11 +817,13 @@ pub async fn migrate_cancel(app: AppHandle, id: String) -> Result<(), MigrateErr
             ));
         }
         let agent = app.state::<Agent>();
-        AgentHelper(&agent)
+        let outcome = AgentHelper(&agent)
             .cancel(&id)
             .map_err(|err| MigrateError::agent("Cannot cancel the move", err))?;
-        migrations.forget(&id);
-        Ok(())
+        if outcome.ended {
+            migrations.forget(&id);
+        }
+        Ok(outcome)
     })
     .await
 }
@@ -905,12 +918,14 @@ pub async fn migrate_resync(app: AppHandle, id: String) -> Result<(), MigrateErr
     .await
 }
 
-/// **Delete original** (see the module docs).
+/// **Delete original** (see the module docs). `force` only after the user answered
+/// **Delete the rest anyway** while deleting.
 #[tauri::command]
 pub async fn migrate_delete(
     app: AppHandle,
     id: String,
     permanent: bool,
+    force: Option<bool>,
 ) -> Result<DeleteOutcome, MigrateError> {
     blocking(move || {
         let _one_at_a_time = lock(&DELETES);
@@ -946,7 +961,8 @@ pub async fn migrate_delete(
             bytes: migration.bytes,
             deleting,
         };
-        let outcome = delete_original(&AgentHelper(&agent), &win::Os, &target, permanent)?;
+        let force = force.unwrap_or(false);
+        let outcome = delete_original(&AgentHelper(&agent), &win::Os, &target, permanent, force)?;
         if matches!(outcome, DeleteOutcome::Deleted { .. }) {
             migrations.forget(&id);
         } else if outcome.deleting() {
@@ -957,8 +973,9 @@ pub async fn migrate_delete(
     .await
 }
 
-/// **Keep both** (`keep`) or **Discard the copy** (`discard`). Neither once the delete
-/// has begun; discarding the copy also not once the original is gone.
+/// **Keep both** (`keep`) or **Discard the copy** (`discard`). Keep not once the delete
+/// has begun. Discard goes to the helper, which refuses it once the delete has begun or
+/// the original is gone, unless the copy is gone (it then only forgets the move).
 #[tauri::command]
 pub async fn migrate_finish(
     app: AppHandle,
@@ -977,6 +994,7 @@ pub async fn migrate_finish(
         let migration = migrations.get(&id)?;
         match migration.phase {
             Phase::Ready { .. } => {}
+            Phase::Deleting if action == FinishAction::Discard => {}
             Phase::Deleting => return Err(deleting_refused()),
             Phase::Running => {
                 return Err(MigrateError::new(
@@ -984,9 +1002,6 @@ pub async fn migrate_finish(
                     "The move hasn't finished its checks yet; cancel it instead.",
                 ))
             }
-        }
-        if action == FinishAction::Discard && !source_present(&migration)? {
-            return Err(source_gone_refused());
         }
         AgentHelper(&app.state::<Agent>())
             .finish(&id, action)
@@ -1108,6 +1123,7 @@ mod tests {
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
+            placed: true,
         }
     }
 

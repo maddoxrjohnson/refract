@@ -35,6 +35,7 @@ import type {
   MigrateStep,
   MigrationReport,
   PendingMigration,
+  CancelOutcome,
   SkippedFolder,
   VsCodeWindow,
 } from "./types";
@@ -770,23 +771,38 @@ export class DemoBackend implements Backend {
       throw error;
     }
     await this.demoSnapshot(path, ["git", "hashing", "blobs"], 120);
-    const move: DemoMove = { id: `demo-move-${++this.moveCount}`, source: path, dest, report: null, cancelled: false, deleting: false };
+    const move: DemoMove = {
+      id: `demo-move-${++this.moveCount}`,
+      source: path,
+      dest,
+      report: null,
+      cancelled: false,
+      deleting: false,
+      placed: false,
+      stopped: false,
+    };
     this.demoMoves.set(move.id, move);
     void this.runMove(move, DEMO_MOVE_STEPS);
     return { id: move.id };
   }
 
-  /** Walks `steps` with progress events, then sends a passing report. */
-  private async runMove(move: DemoMove, steps: [MigrateStep, number][]) {
-    for (const [step, total] of steps) {
+  /**
+   * Walks `steps` with progress events, then sends a passing report. Stopped once the copy is in place (install
+   * or history, or a re-sync), it sends a report saying so instead, as the helper does.
+   */
+  private async runMove(move: DemoMove, steps: [MigrateStep, number][], resync = false) {
+    move.stopped = false;
+    walk: for (const [step, total] of steps) {
+      if (step === "installing" || step === "movingHistory") move.placed = true;
       for (let i = 1; i <= DEMO_TICKS; i++) {
         await sleep(step === "copying" ? 260 : 130);
         if (move.cancelled) return;
+        if (move.stopped) break walk;
         const done = Math.round((total * i) / DEMO_TICKS);
         this.emit({ event: "migrateProgress", data: { id: move.id, source: move.source, dest: move.dest, step, done, total } });
       }
     }
-    move.report = demoMoveReport(move);
+    move.report = demoMoveReport(move, move.stopped ? (resync ? "resync" : "install") : null);
     this.emit({ event: "migrateReady", data: { id: move.id, report: move.report } });
   }
 
@@ -808,13 +824,20 @@ export class DemoBackend implements Backend {
     if (move.deleting) this.moveFail("notReady", "The original is being deleted; finish deleting it.");
   }
 
-  async migrateCancel(id: string): Promise<void> {
+  async migrateCancel(id: string): Promise<CancelOutcome> {
     const move = this.demoMoves.get(id);
     if (move) this.notDeleting(move);
     if (move?.report) this.moveFail("notReady", "The copy is no longer running; answer its report instead.");
+    if (move?.placed) {
+      // The copy is in place: it stays, and the report follows.
+      move.stopped = true;
+      await sleep(300);
+      return { ended: false };
+    }
     if (move) move.cancelled = true;
     this.demoMoves.delete(id);
     await sleep(300);
+    return { ended: true };
   }
 
   migrateWindows(_path: string): Promise<VsCodeWindow[]> {
@@ -846,10 +869,10 @@ export class DemoBackend implements Backend {
     const move: DemoMove = this.readyMove(id);
     this.notDeleting(move);
     move.report = null;
-    void this.runMove(move, [["rechecking", 12]]);
+    void this.runMove(move, [["rechecking", 12]], true);
   }
 
-  async migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome> {
+  async migrateDelete(id: string, permanent: boolean, _force = false): Promise<DeleteOutcome> {
     const move = this.readyMove(id);
     await sleep(700);
     if (this.moveOutcome === "wontFit" && !permanent && !move.deleting) {
@@ -924,8 +947,8 @@ const DEMO_MOVE_STEPS: [MigrateStep, number][] = [
   ["hashing", DEMO_MOVE_TOTALS.files],
   ["checkingGit", 6],
   ["rechecking", DEMO_MOVE_TOTALS.files],
-  ["movingHistory", 1],
   ["installing", 1],
+  ["movingHistory", 1],
 ];
 
 interface DemoMove {
@@ -937,6 +960,10 @@ interface DemoMove {
   cancelled: boolean;
   /** Delete original has begun (the helper's deleting state). */
   deleting: boolean;
+  /** The copy is at its destination: a cancel keeps it. */
+  placed: boolean;
+  /** Cancelled once placed: the step at hand stops, and a report says so. */
+  stopped: boolean;
 }
 
 /**
@@ -954,11 +981,14 @@ const DEMO_CHECKS = [
   ["history", "History copied"],
 ] as const;
 
-/** A report where every check passed and `npm ci` ran. */
-function demoMoveReport(move: DemoMove): MigrationReport {
+/**
+ * A report where every check passed and `npm ci` ran; or, `stopped` once the copy was in place, one where the
+ * install (and history) or the re-sync didn't finish.
+ */
+function demoMoveReport(move: DemoMove, stopped: "install" | "resync" | null = null): MigrationReport {
   const name = move.dest.split("/").pop() ?? "repo";
   const stamp = new Date();
-  return {
+  const report: MigrationReport = {
     version: 1,
     id: move.id,
     source: move.source,
@@ -992,5 +1022,42 @@ function demoMoveReport(move: DemoMove): MigrationReport {
     },
     linuxGit: false,
     warnings: [],
+    placed: true,
   };
+  if (stopped === "install") {
+    report.install = report.install.map((r) => ({ ...r, status: "cancelled", exitCode: undefined }));
+    report.history = { ...report.history, sessions: 0 };
+    report.checks = report.checks.map((c) =>
+      c.check === "history"
+        ? {
+            ...c,
+            status: "failed",
+            problems: [
+              { message: "You stopped the move before the session history was moved, so the old transcripts stay where they are." },
+            ],
+          }
+        : c,
+    );
+    report.warnings = [
+      "You stopped the move once the copy was in place, so the copy was kept and the rest of the install and history steps didn't run.",
+    ];
+  } else if (stopped === "resync") {
+    report.checks = report.checks.map((c) =>
+      c.check === "history"
+        ? c
+        : c.check === "unchanged"
+          ? {
+              ...c,
+              status: "failed",
+              problems: [
+                {
+                  message:
+                    "You stopped the re-sync. The copy is part way between the original as it was checked and as it is now. Re-sync again to finish it, or keep both, or discard the copy.",
+                },
+              ],
+            }
+          : { ...c, status: "notRun", problems: [] },
+    );
+  }
+  return report;
 }

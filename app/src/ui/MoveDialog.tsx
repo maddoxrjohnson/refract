@@ -149,6 +149,7 @@ export function MoveDialog(props: MoveDialogProps) {
         id={migration.id}
         report={migration.phase.report}
         deleting={migration.phase.deleting}
+        copyMissing={migration.phase.copyMissing}
         agents={busyAgents(props.repo)}
         resyncError={resyncError}
         onResyncError={setResyncError}
@@ -649,6 +650,8 @@ function ProgressView({
 }) {
   const [cancelling, setCancelling] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Once the copy is in place (install, history, or a re-sync), stopping keeps it.
+  const placed = migration.phase.kind === "running" && migration.phase.placed;
   const cancel = () => {
     setCancelling(true);
     setError(null);
@@ -680,12 +683,16 @@ function ProgressView({
       </div>
       <footer className="rf-move__actions">
         <button type="button" className="rf-button" data-primary onClick={cancel} disabled={cancelling}>
-          {cancelling ? "Cancelling…" : "Cancel the move"}
+          {placed ? (cancelling ? "Stopping…" : "Stop and keep the copy") : cancelling ? "Cancelling…" : "Cancel the move"}
         </button>
         <button type="button" className="rf-button" onClick={onClose}>
           Close
         </button>
-        <p className="rf-hint rf-move__hint">Cancelling deletes the partial copy. The original is untouched.</p>
+        <p className="rf-hint rf-move__hint">
+          {placed
+            ? "The copy is already in place, so stopping keeps it: the rest of this step is skipped, and the report shows so you can choose what to keep. The original is untouched."
+            : "Cancelling deletes the partial copy. The original is untouched."}
+        </p>
       </footer>
     </>
   );
@@ -698,8 +705,10 @@ interface ReportViewProps {
   backend: Backend;
   id: string;
   report: MigrationReport;
-  /** Delete original has begun: only finishing it is offered. */
+  /** Delete original has begun: only finishing it is offered (or ending the move once the copy is gone). */
   deleting: boolean;
+  /** The helper says the placed copy is gone. */
+  copyMissing: boolean;
   /** The repo's live agents, for Stop when the recheck finds them. */
   agents: BusyAgent[];
   /** Why the last Re-sync failed; the report shows again when it does. */
@@ -741,11 +750,18 @@ function ReportView(props: ReportViewProps) {
   const [outcome, setOutcome] = useState<DeleteState>(null);
   const [error, setError] = useState<string | null>(props.resyncError);
   const [note, setNote] = useState<string | null>(null);
+  // Asked before ending a move whose copy went while deleting.
+  const [confirmEnd, setConfirmEnd] = useState(false);
   // The original folder is gone (deleted by hand): the move only needs finishing.
   const [sourceGone, setSourceGone] = useState(false);
   const deleting = props.deleting || outcome?.kind === "unfinished" || (outcome !== null && "deleting" in outcome && outcome.deleting);
+  // An older report has no `placed`: one that passed was placed.
+  const placed = report.placed ?? ok;
+  const copyGone =
+    props.copyMissing ||
+    (outcome?.kind === "changed" && outcome.copyChanged.length === 1 && outcome.copyChanged[0] === ".");
   useEffect(() => {
-    if (!ok || props.deleting) return;
+    if (!placed || props.deleting) return;
     let live = true;
     backend.migrateSourceExists(id).then(
       (exists) => live && setSourceGone(!exists),
@@ -754,11 +770,11 @@ function ReportView(props: ReportViewProps) {
     return () => {
       live = false;
     };
-  }, [backend, id, ok, props.deleting]);
+  }, [backend, id, placed, props.deleting]);
   // The default answer (Delete original, or No, …) takes focus when it appears, and again
   // when an answer in flight disabled the focused button.
   const defaultAction = useRef<HTMLButtonElement>(null);
-  const outcomeKind = `${outcome?.kind ?? "none"}-${deleting}-${sourceGone}`;
+  const outcomeKind = `${outcome?.kind ?? "none"}-${deleting}-${sourceGone}-${copyGone}-${confirmEnd}`;
   useEffect(() => {
     if (pending) return;
     const active = document.activeElement as HTMLButtonElement | null;
@@ -787,14 +803,25 @@ function ReportView(props: ReportViewProps) {
     }
   };
 
-  const deleteOriginal = (permanent: boolean) =>
-    act(permanent ? "Deleting permanently…" : deleting ? "Finishing the delete…" : "Deleting the original…", async () => {
-      const answer = await moves.remove(id, permanent);
-      if (answer.kind === "deleted") onDeleted(answer);
-      else setOutcome(answer);
-    });
+  const deleteOriginal = (permanent: boolean, force = false) =>
+    act(
+      permanent
+        ? "Deleting permanently…"
+        : force
+          ? "Deleting the rest…"
+          : deleting
+            ? "Finishing the delete…"
+            : "Deleting the original…",
+      async () => {
+        const answer = await moves.remove(id, permanent, force);
+        if (answer.kind === "deleted") onDeleted(answer);
+        else setOutcome(answer);
+      },
+    );
   const keep = () => act("Keeping both…", () => moves.finish(id, "keep").then(onKeep));
   const discard = () => act("Discarding the copy…", () => moves.finish(id, "discard").then(onDiscarded));
+  // With the copy gone, discarding only forgets the move.
+  const endMove = () => act("Ending the move…", () => moves.finish(id, "discard").then(onDiscarded));
   // The dialog shows a fresh preflight once the entry is gone.
   const retry = () => act("Discarding the copy…", () => moves.finish(id, "discard"));
   // The report goes away while it runs, so a refusal is shown by the report that returns.
@@ -817,20 +844,69 @@ function ReportView(props: ReportViewProps) {
     );
 
   const disabled = pending !== null;
-  const finishButton = (
-    <button
-      type="button"
-      className="rf-button rf-button--accent"
-      ref={defaultAction}
-      data-primary
-      disabled={disabled}
-      onClick={() => void deleteOriginal(false)}
-    >
-      Finish deleting
+  const primary = (label: string, onClick: () => void) => (
+    <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={onClick}>
+      {label}
     </button>
   );
+  const secondary = (label: string, onClick: () => void) => (
+    <button type="button" className="rf-button" disabled={disabled} onClick={onClick}>
+      {label}
+    </button>
+  );
+  const finishButton = primary("Finish deleting", () => void deleteOriginal(false));
+  const keepLabel = sourceGone ? "Keep the copy" : "Keep both";
   let actions: ReactNode;
-  if (outcome?.kind === "wontFit") {
+  if (copyGone && deleting) {
+    // The rest of the original must never go now: the copy that held it is gone.
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-ask__question">The copy in WSL is gone, so nothing more of the original will be deleted.</p>
+        <p className="rf-move-note">
+          Deleting the original had already begun. What was deleted of it is in the Recycle Bin (unless you chose to
+          delete it permanently), and the rest is still at <span className="rf-mono">{windowsPath(report.source)}</span>.
+          Restore the deleted part from the Recycle Bin to put the folder back together.
+        </p>
+        {report.installBackup && (
+          <p className="rf-move-note rf-muted">
+            The original's version of each file the install changed is saved in{" "}
+            <span className="rf-mono">{report.installBackup}</span>.
+          </p>
+        )}
+        {confirmEnd ? (
+          <>
+            <p className="rf-move-note">
+              End the move? Refract stops tracking it and deletes nothing. Get the original back from the Recycle Bin
+              first if you need it.
+            </p>
+            <div className="rf-row">
+              {primary("Back", () => setConfirmEnd(false))}
+              <button type="button" className="rf-button rf-button--danger" disabled={disabled} onClick={endMove}>
+                Yes, end the move
+              </button>
+            </div>
+          </>
+        ) : (
+          <div className="rf-row">
+            {primary("End the move", () => setConfirmEnd(true))}
+            {secondary("Not now", props.onClose)}
+          </div>
+        )}
+      </div>
+    );
+  } else if (copyGone) {
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-ask__question">The copy in WSL is gone, so there's nothing to keep.</p>
+        <p className="rf-move-note rf-muted">
+          {sourceGone
+            ? "The original folder is gone too. Ending the move only forgets it; nothing is deleted."
+            : "The original is as it was. Ending the move only forgets it; nothing is deleted."}
+        </p>
+        <div className="rf-row">{primary("End the move", endMove)}</div>
+      </div>
+    );
+  } else if (outcome?.kind === "wontFit") {
     actions = (
       <div className="rf-move-ask" role="alertdialog" aria-label="Delete permanently?">
         <p className="rf-move-ask__question">
@@ -843,16 +919,7 @@ function ReportView(props: ReportViewProps) {
           {deleting ? "Not now leaves it as it is; the copy is safe." : "No keeps both copies."}
         </p>
         <div className="rf-row">
-          <button
-            type="button"
-            className="rf-button rf-button--accent"
-            ref={defaultAction}
-            data-primary
-            disabled={disabled}
-            onClick={deleting ? props.onClose : keep}
-          >
-            {deleting ? "Not now" : "No"}
-          </button>
+          {primary(deleting ? "Not now" : "No", deleting ? props.onClose : keep)}
           <button type="button" className="rf-button rf-button--danger" disabled={disabled} onClick={() => void deleteOriginal(true)}>
             Yes, delete permanently
           </button>
@@ -866,47 +933,62 @@ function ReportView(props: ReportViewProps) {
         <p className="rf-move-note rf-muted">
           The folder is still there on Windows, but not at {report.source}, so Refract couldn't check it for changes.
           Make the drive visible in WSL (for example, restart WSL or mount it), then{" "}
-          {deleting ? "finish deleting" : "try again"}.
+          {deleting
+            ? "finish deleting. Or delete what's left of it yourself on Windows; finishing then moves its history and settings over."
+            : "try again, or keep both."}
         </p>
         <div className="rf-row">
           {deleting ? (
             finishButton
           ) : (
-            <button
-              type="button"
-              className="rf-button rf-button--accent"
-              ref={defaultAction}
-              data-primary
-              disabled={disabled}
-              onClick={() => void deleteOriginal(false)}
-            >
-              Try again
-            </button>
+            <>
+              {primary("Try again", () => void deleteOriginal(false))}
+              {secondary("Keep both", keep)}
+            </>
           )}
         </div>
       </div>
     );
   } else if (outcome?.kind === "changed") {
-    // The copy is gone altogether: nothing to keep, and ending the move leaves the original as it is.
-    const copyGone = outcome.copyChanged.length === 1 && outcome.copyChanged[0] === ".";
-    const resyncable = outcome.changed.length > 0 && outcome.copyChanged.length === 0;
+    const originalChanged = outcome.changed.length > 0 || outcome.unreadable.length > 0;
+    const copyChanged = outcome.copyChanged.length > 0;
+    const resyncable = outcome.changed.length > 0 && !copyChanged;
+    // While deleting, a changed copy may be left behind on purpose: the copy keeps its version either way.
+    const canForce = deleting && copyChanged && !originalChanged && outcome.busyAgents.length === 0;
+    const question = deleting
+      ? originalChanged
+        ? "The original changed while it was being deleted, so nothing more was deleted."
+        : copyChanged
+          ? "The copy in WSL differs from what's left of the original, so nothing more was deleted."
+          : "Something is still using the original, so nothing more was deleted."
+      : originalChanged
+        ? "The original changed after the check, so nothing was deleted."
+        : copyChanged
+          ? "The copy in WSL changed after the check, so nothing was deleted."
+          : "Something is still using the original, so nothing was deleted.";
     actions = (
       <div className="rf-move-ask" role="alert">
-        <p className="rf-move-ask__question">
-          {deleting
-            ? "The original changed while it was being deleted, so nothing more was deleted."
-            : "Something changed after the check, so nothing was deleted."}
-        </p>
+        <p className="rf-move-ask__question">{question}</p>
         {outcome.changed.length > 0 && (
           <>
             <p className="rf-move-note">Changed or added in the original:</p>
             <PathList paths={outcome.changed} />
           </>
         )}
-        {copyGone ? (
-          <p className="rf-move-note">The copy in WSL is gone, so there's nothing to keep.</p>
-        ) : (
-          outcome.copyChanged.length > 0 && (
+        {copyChanged &&
+          (deleting ? (
+            <>
+              <p className="rf-move-note">
+                These were changed or removed in the copy, and the original still has its own version of them:
+              </p>
+              <PathList paths={outcome.copyChanged} />
+              <p className="rf-move-note rf-muted">
+                Your copy keeps its version either way. Delete the rest anyway sends the original's version of these,
+                and everything else left of the original at {windowsPath(report.source)}, to the Recycle Bin. Or undo
+                those changes in the copy, then finish deleting.
+              </p>
+            </>
+          ) : (
             <>
               <p className="rf-move-note">
                 The copy in WSL changed after it was checked, so it may hold work the original doesn't. Refract won't
@@ -914,8 +996,7 @@ function ReportView(props: ReportViewProps) {
               </p>
               <PathList paths={outcome.copyChanged} />
             </>
-          )
-        )}
+          ))}
         {outcome.unreadable.length > 0 && (
           <>
             <p className="rf-move-note">
@@ -943,40 +1024,37 @@ function ReportView(props: ReportViewProps) {
             <AgentRows backend={backend} source={report.source} agents={props.agents} onError={setNote} />
           </ul>
         )}
-        {deleting && (
+        {deleting && originalChanged && (
           <p className="rf-move-note rf-muted">
             Undo the change, or move those files out of the folder, then finish deleting.
           </p>
         )}
         <div className="rf-row">
           {deleting ? (
-            finishButton
-          ) : copyGone ? (
-            <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={discard}>
-              End the move
-            </button>
+            <>
+              {finishButton}
+              {canForce && (
+                <button
+                  type="button"
+                  className="rf-button rf-button--danger"
+                  disabled={disabled}
+                  onClick={() => void deleteOriginal(false, true)}
+                >
+                  Delete the rest anyway
+                </button>
+              )}
+            </>
           ) : resyncable ? (
-            <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={resync}>
-              Re-sync
-            </button>
-          ) : outcome.copyChanged.length === 0 ? (
-            <button
-              type="button"
-              className="rf-button rf-button--accent"
-              ref={defaultAction}
-              data-primary
-              disabled={disabled}
-              onClick={() => void deleteOriginal(false)}
-            >
-              Try again
-            </button>
+            primary("Re-sync", resync)
+          ) : !copyChanged ? (
+            primary("Try again", () => void deleteOriginal(false))
           ) : null}
-          {!deleting && !copyGone && (
+          {!deleting && (
             <button
               type="button"
-              className={`rf-button${outcome.copyChanged.length > 0 ? " rf-button--accent" : ""}`}
-              ref={outcome.copyChanged.length > 0 ? defaultAction : undefined}
-              data-primary={outcome.copyChanged.length > 0 || undefined}
+              className={`rf-button${copyChanged ? " rf-button--accent" : ""}`}
+              ref={copyChanged ? defaultAction : undefined}
+              data-primary={copyChanged || undefined}
               disabled={disabled}
               onClick={keep}
             >
@@ -1009,19 +1087,8 @@ function ReportView(props: ReportViewProps) {
           A WSL window on the new copy has the same name, so it's listed too.
         </p>
         <div className="rf-row">
-          <button
-            type="button"
-            className="rf-button rf-button--accent"
-            ref={defaultAction}
-            data-primary
-            disabled={disabled}
-            onClick={() => void deleteOriginal(false)}
-          >
-            {deleting ? "Finish deleting" : "Try again"}
-          </button>
-          <button type="button" className="rf-button" disabled={disabled} onClick={() => setOutcome(null)}>
-            Back
-          </button>
+          {primary(deleting ? "Finish deleting" : "Try again", () => void deleteOriginal(false))}
+          {secondary("Back", () => setOutcome(null))}
         </div>
       </div>
     );
@@ -1042,50 +1109,46 @@ function ReportView(props: ReportViewProps) {
       <div className="rf-move-ask" role="alert">
         <p className="rf-move-ask__question">The original folder is already gone.</p>
         <p className="rf-move-note rf-muted">The copy in WSL is complete. Finishing moves its history and settings over.</p>
-        <div className="rf-row">
-          <button
-            type="button"
-            className="rf-button rf-button--accent"
-            ref={defaultAction}
-            data-primary
-            disabled={disabled}
-            onClick={() => void deleteOriginal(false)}
-          >
-            Finish the move
-          </button>
-        </div>
+        <div className="rf-row">{primary("Finish the move", () => void deleteOriginal(false))}</div>
       </div>
     );
   } else if (ok) {
     actions = (
       <div className="rf-row">
-        <button
-          type="button"
-          className="rf-button rf-button--accent"
-          ref={defaultAction}
-          data-primary
-          disabled={disabled}
-          onClick={() => void deleteOriginal(false)}
-        >
-          Delete original
-        </button>
-        <button type="button" className="rf-button" disabled={disabled} onClick={keep}>
-          Keep both
-        </button>
-        <button type="button" className="rf-button" disabled={disabled} onClick={discard}>
-          Discard the copy
-        </button>
+        {primary("Delete original", () => void deleteOriginal(false))}
+        {secondary("Keep both", keep)}
+        {secondary("Discard the copy", discard)}
+      </div>
+    );
+  } else if (placed && sourceGone) {
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-ask__question">The original folder is gone, so the copy is the only one left.</p>
+        <p className="rf-move-note rf-muted">
+          A check failed, so look over the copy at {report.dest}. Keeping it makes it the repo Refract shows.
+        </p>
+        <div className="rf-row">{primary(keepLabel, keep)}</div>
+      </div>
+    );
+  } else if (placed) {
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-note rf-muted">
+          The copy is in place at {report.dest}. Re-sync copies what changed in the original again and checks it again;
+          or keep both, or discard the copy.
+        </p>
+        <div className="rf-row">
+          {primary("Re-sync", resync)}
+          {secondary("Keep both", keep)}
+          {secondary("Discard the copy", discard)}
+        </div>
       </div>
     );
   } else {
     actions = (
       <div className="rf-row">
-        <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={discard}>
-          Discard the copy
-        </button>
-        <button type="button" className="rf-button" disabled={disabled} onClick={retry}>
-          Retry
-        </button>
+        {primary("Discard the copy", discard)}
+        {secondary("Retry", retry)}
       </div>
     );
   }

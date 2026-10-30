@@ -29,7 +29,12 @@ const PREFLIGHT: MigratePreflight = {
 
 const RECHECK = { changed: [], removed: [], unreadable: [], copyChanged: [], busyAgents: [], sourceMissing: false };
 
-function fakeBackend(preflight: Partial<MigratePreflight> = {}, pending: MigrationReport[] = [], deleting = false) {
+function fakeBackend(
+  preflight: Partial<MigratePreflight> = {},
+  pending: MigrationReport[] = [],
+  deleting = false,
+  copyMissing = false,
+) {
   const listeners = new Set<(e: AgentEvent) => void>();
   return {
     onAgentEvent: vi.fn((cb: (e: AgentEvent) => void) => {
@@ -37,7 +42,7 @@ function fakeBackend(preflight: Partial<MigratePreflight> = {}, pending: Migrati
       return () => listeners.delete(cb);
     }),
     onMigrateSnapshot: vi.fn(() => () => {}),
-    migratePending: vi.fn().mockResolvedValue(pending.map((report) => ({ id: report.id, report, deleting }))),
+    migratePending: vi.fn().mockResolvedValue(pending.map((report) => ({ id: report.id, report, deleting, copyMissing }))),
     migrateSourceExists: vi.fn().mockResolvedValue(true),
     migratePreflight: vi.fn().mockResolvedValue({ ...PREFLIGHT, ...preflight }),
     migrateCancelSnapshot: vi.fn().mockResolvedValue(false),
@@ -46,9 +51,9 @@ function fakeBackend(preflight: Partial<MigratePreflight> = {}, pending: Migrati
     migrateCloseWindow: vi.fn().mockResolvedValue(true),
     migrateStopAgent: vi.fn().mockResolvedValue(undefined),
     migrateResync: vi.fn().mockResolvedValue(undefined),
-    migrateDelete: vi.fn<(id: string, permanent: boolean) => Promise<DeleteOutcome>>(),
+    migrateDelete: vi.fn<(id: string, permanent: boolean, force?: boolean) => Promise<DeleteOutcome>>(),
     migrateFinish: vi.fn().mockResolvedValue(undefined),
-    migrateCancel: vi.fn().mockResolvedValue(undefined),
+    migrateCancel: vi.fn().mockResolvedValue({ ended: true }),
     send: (e: AgentEvent) => listeners.forEach((cb) => cb(e)),
   };
 }
@@ -232,9 +237,11 @@ describe("MoveDialog report", () => {
     fireEvent.click(button("Re-sync"));
     await act(async () => {});
     expect(backend.migrateResync).toHaveBeenCalledWith("m-1");
-    expect(button("Cancel the move")).toBeTruthy();
+    // The copy is in place, so stopping the re-sync keeps it.
+    expect(button("Stop and keep the copy")).toBeTruthy();
+    expect(screen.getByText(/The copy is already in place, so stopping keeps it/)).toBeTruthy();
     // Focus follows the new view, so Escape still reaches the dialog.
-    expect(document.activeElement).toBe(button("Cancel the move"));
+    expect(document.activeElement).toBe(button("Stop and keep the copy"));
   });
 
   it("goes back to the report when Re-sync is refused", async () => {
@@ -246,7 +253,7 @@ describe("MoveDialog report", () => {
     await act(async () => {});
     fireEvent.click(button("Re-sync"));
     await act(async () => {});
-    expect(screen.queryByRole("button", { name: "Cancel the move" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop and keep the copy" })).toBeNull();
     expect(dialog.textContent).toContain("the helper said no");
     expect(button("Delete original")).toBeTruthy();
   });
@@ -375,5 +382,155 @@ describe("MoveDialog report", () => {
     const ev = new KeyboardEvent("keydown", { key: "Enter", repeat: true, bubbles: true, cancelable: true });
     button("Delete original").dispatchEvent(ev);
     expect(ev.defaultPrevented).toBe(true);
+  });
+});
+
+describe("MoveDialog states with a way forward", () => {
+  const failedPlaced = () =>
+    testReport({
+      placed: true,
+      checks: testReport().checks.map((c) =>
+        c.check === "unchanged" ? { ...c, status: "failed", problems: [{ message: "The re-sync didn't finish." }] } : c,
+      ),
+    });
+
+  it("stopping once the copy is placed keeps it and waits for the report", async () => {
+    const backend = fakeBackend();
+    backend.migrateCancel.mockResolvedValueOnce({ ended: false });
+    await setup(backend);
+    fireEvent.click(button("Start"));
+    await act(async () => {});
+    expect(button("Cancel the move")).toBeTruthy();
+    expect(screen.getByText(/Cancelling deletes the partial copy/)).toBeTruthy();
+    await act(async () =>
+      backend.send({
+        event: "migrateProgress",
+        data: { id: "m-1", source: TEST_SOURCE, dest: TEST_DEST, step: "installing", done: 0, total: 1 },
+      }),
+    );
+    expect(screen.queryByText(/deletes the partial copy/)).toBeNull();
+    fireEvent.click(button("Stop and keep the copy"));
+    await act(async () => {});
+    expect(backend.migrateCancel).toHaveBeenCalledWith("m-1");
+    // Still shown: the report follows.
+    expect(button("Stop and keep the copy")).toBeTruthy();
+    await act(async () => backend.send({ event: "migrateReady", data: { id: "m-1", report: testReport({ placed: true }) } }));
+    expect(button("Delete original")).toBeTruthy();
+  });
+
+  it("offers Try again and Keep both when WSL can't see the drive", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete.mockResolvedValueOnce({ kind: "driveHidden", deleting: false });
+    const { props } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(button("Try again")).toBeTruthy();
+    fireEvent.click(button("Keep both"));
+    await act(async () => {});
+    expect(backend.migrateFinish).toHaveBeenCalledWith("m-1", "keep");
+    expect(props.onKeep).toHaveBeenCalled();
+  });
+
+  it("while deleting, lists copy changes and offers Delete the rest anyway", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete
+      .mockResolvedValueOnce({ ...RECHECK, kind: "changed", copyChanged: ["README.md"], deleting: true })
+      .mockResolvedValueOnce({ kind: "deleted", permanent: false, alreadyGone: false });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("The copy in WSL differs from what's left of the original");
+    expect(dialog.textContent).not.toContain("The original changed");
+    expect(dialog.textContent).toContain("README.md");
+    expect(dialog.textContent).toContain("Your copy keeps its version either way");
+    for (const name of ["Keep both", "Re-sync", "Discard the copy"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    fireEvent.click(button("Delete the rest anyway"));
+    await act(async () => {});
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, true);
+    expect(dialog.textContent).toContain("The original is in the Recycle Bin.");
+  });
+
+  it("while deleting, never offers Delete the rest anyway when the original changed", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete.mockResolvedValueOnce({
+      ...RECHECK,
+      kind: "changed",
+      changed: ["notes.txt"],
+      copyChanged: ["README.md"],
+      deleting: true,
+    });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("The original changed while it was being deleted");
+    expect(screen.queryByRole("button", { name: "Delete the rest anyway" })).toBeNull();
+    expect(button("Finish deleting")).toBeTruthy();
+  });
+
+  it("while deleting with the copy gone, points to the Recycle Bin and ends the move after asking", async () => {
+    const backend = fakeBackend({}, [testReport()], true, true);
+    const { dialog, props } = await setup(backend);
+    expect(dialog.textContent).toContain("The copy in WSL is gone, so nothing more of the original will be deleted.");
+    expect(dialog.textContent).toContain("Recycle Bin");
+    expect(screen.queryByRole("button", { name: "Finish deleting" })).toBeNull();
+    fireEvent.click(button("End the move"));
+    expect(backend.migrateFinish).not.toHaveBeenCalled();
+    expect(document.activeElement).toBe(button("Back"));
+    fireEvent.click(button("Yes, end the move"));
+    await act(async () => {});
+    expect(backend.migrateFinish).toHaveBeenCalledWith("m-1", "discard");
+    expect(props.onClose).toHaveBeenCalled();
+  });
+
+  it("with the copy gone, only ends the move, even with the original gone too", async () => {
+    const backend = fakeBackend({}, [testReport({ placed: true })], false, true);
+    backend.migrateSourceExists.mockResolvedValue(false);
+    const { dialog } = await setup(backend);
+    expect(dialog.textContent).toContain("The copy in WSL is gone");
+    expect(dialog.textContent).toContain("The original folder is gone too");
+    for (const name of ["Keep both", "Delete original", "Finish the move", "Discard the copy"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    fireEvent.click(button("End the move"));
+    await act(async () => {});
+    expect(backend.migrateFinish).toHaveBeenCalledWith("m-1", "discard");
+  });
+
+  it("offers Re-sync, Keep both and Discard for a placed copy whose check failed", async () => {
+    const backend = fakeBackend({}, [failedPlaced()]);
+    await setup(backend);
+    expect(screen.queryByRole("button", { name: "Delete original" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(button("Keep both")).toBeTruthy();
+    expect(button("Discard the copy")).toBeTruthy();
+    fireEvent.click(button("Re-sync"));
+    await act(async () => {});
+    expect(backend.migrateResync).toHaveBeenCalledWith("m-1");
+  });
+
+  it("offers only keeping a placed copy whose check failed once the original is gone", async () => {
+    const backend = fakeBackend({}, [failedPlaced()]);
+    backend.migrateSourceExists.mockResolvedValue(false);
+    await setup(backend);
+    for (const name of ["Re-sync", "Discard the copy", "Retry"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    fireEvent.click(button("Keep the copy"));
+    await act(async () => {});
+    expect(backend.migrateFinish).toHaveBeenCalledWith("m-1", "keep");
+  });
+
+  it("asks for the pending reports again when an answer is refused", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateFinish.mockRejectedValueOnce({ kind: "notReady", message: "The copy is gone." });
+    await setup(backend);
+    expect(backend.migratePending).toHaveBeenCalledTimes(1);
+    backend.migratePending.mockResolvedValueOnce([{ id: "m-1", report: testReport(), copyMissing: true }]);
+    fireEvent.click(button("Discard the copy"));
+    await act(async () => {});
+    expect(backend.migratePending).toHaveBeenCalledTimes(2);
+    expect(button("End the move")).toBeTruthy();
   });
 });

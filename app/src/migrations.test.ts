@@ -45,10 +45,16 @@ describe("migrationsReducer", () => {
       ],
       s,
     );
-    expect(s.get(SOURCE)).toMatchObject({ id: "m-1", phase: { kind: "running", step: "copying" } });
+    expect(s.get(SOURCE)).toMatchObject({ id: "m-1", phase: { kind: "running", step: "copying", placed: false } });
+    // From the install on, the copy is in place.
+    s = run(
+      [{ type: "progress", progress: { id: "m-1", source: SOURCE, dest: DEST, step: "installing", done: 0, total: 1 } }],
+      s,
+    );
+    expect(s.get(SOURCE)?.phase).toMatchObject({ kind: "running", placed: true });
     const report = testReport();
     s = run([{ type: "ready", id: "m-1", report }], s);
-    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: false });
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: false, copyMissing: false });
     s = run([{ type: "gone", source: SOURCE }], s);
     expect(s.size).toBe(0);
   });
@@ -61,9 +67,9 @@ describe("migrationsReducer", () => {
       { type: "ready", id: "m-1", report },
       { type: "pending", list: [{ id: "m-1", report }] },
     ]);
-    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: true });
-    s = run([{ type: "pending", list: [{ id: "m-1", report, deleting: true }] }]);
-    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: true });
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: true, copyMissing: false });
+    s = run([{ type: "pending", list: [{ id: "m-1", report, deleting: true, copyMissing: true }] }]);
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: true, copyMissing: true });
     // Only a report can be marked; a running copy is left alone.
     expect(run([{ type: "deleting", id: "m-9" }])).toBe(initialMigrations);
   });
@@ -75,7 +81,7 @@ describe("migrationsReducer", () => {
       source: SOURCE,
       dest: DEST,
       id: "m-3",
-      phase: { kind: "running", step: "hashing", done: 1, total: 2 },
+      phase: { kind: "running", step: "hashing", done: 1, total: 2, placed: false },
     });
     // Started here: the progress takes the entry, and the late answer changes nothing.
     const t = run([
@@ -123,22 +129,28 @@ describe("migrationsReducer", () => {
     let s = run([{ type: "pending", list: [{ id: "m-7", report: testReport({ id: "m-7" }) }] }]);
     expect(s.get(SOURCE)).toMatchObject({ id: "m-7", dest: DEST, phase: { kind: "ready" } });
     s = run([{ type: "resyncing", id: "m-7" }], s);
-    expect(s.get(SOURCE)?.phase).toEqual({ kind: "running", step: "rechecking", done: 0, total: 0 });
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "running", step: "rechecking", done: 0, total: 0, placed: true });
+    // Its progress keeps it placed: a cancel then stops it to a report.
+    s = run(
+      [{ type: "progress", progress: { id: "m-7", source: SOURCE, dest: DEST, step: "copying", done: 1, total: 2 } }],
+      s,
+    );
+    expect(s.get(SOURCE)?.phase).toMatchObject({ kind: "running", step: "copying", placed: true });
   });
 });
 
 describe("the step line", () => {
   it("reads like the spec", () => {
-    expect(stepText({ kind: "running", step: "copying", done: 1.2 * GB, total: 3.4 * GB })).toBe(
+    expect(stepText({ kind: "running", step: "copying", done: 1.2 * GB, total: 3.4 * GB, placed: false })).toBe(
       "Copying 1.2 / 3.4 GB",
     );
-    expect(stepText({ kind: "running", step: "copying", done: 50 * 1024 ** 2, total: 200 * 1024 ** 2 })).toBe(
+    expect(stepText({ kind: "running", step: "copying", done: 50 * 1024 ** 2, total: 200 * 1024 ** 2, placed: false })).toBe(
       "Copying 50 / 200 MB",
     );
-    expect(stepText({ kind: "running", step: "hashing", done: 1, total: 2 })).toBe("Hashing");
-    expect(stepText({ kind: "running", step: "checkingGit", done: 1, total: 2 })).toBe("Checking git");
-    expect(stepText({ kind: "running", step: "installing", done: 0, total: 1 })).toBe("Installing");
-    expect(stepText({ kind: "running", step: null, done: 0, total: 0 })).toBe("Starting");
+    expect(stepText({ kind: "running", step: "hashing", done: 1, total: 2, placed: false })).toBe("Hashing");
+    expect(stepText({ kind: "running", step: "checkingGit", done: 1, total: 2, placed: false })).toBe("Checking git");
+    expect(stepText({ kind: "running", step: "installing", done: 0, total: 1, placed: false })).toBe("Installing");
+    expect(stepText({ kind: "running", step: null, done: 0, total: 0, placed: false })).toBe("Starting");
     expect(stepText({ kind: "snapshot", progress: null })).toBe("Reading the folder");
     expect(
       stepText({
@@ -150,29 +162,30 @@ describe("the step line", () => {
   });
 
   it("says whether the report waits for an OK", () => {
-    expect(stepText({ kind: "ready", report: testReport(), deleting: false })).toBe("Ready for your OK");
+    expect(stepText({ kind: "ready", report: testReport(), deleting: false, copyMissing: false })).toBe("Ready for your OK");
     const failed = testReport({
       checks: testReport().checks.map((c) => (c.check === "files" ? { ...c, status: "failed" } : c)),
     });
-    expect(stepText({ kind: "ready", report: failed, deleting: false })).toBe("A check failed");
-    expect(stepText({ kind: "ready", report: testReport(), deleting: true })).toBe("Deleting didn't finish");
+    expect(stepText({ kind: "ready", report: failed, deleting: false, copyMissing: false })).toBe("A check failed");
+    expect(stepText({ kind: "ready", report: testReport(), deleting: true, copyMissing: false })).toBe("Deleting didn't finish");
+    expect(stepText({ kind: "ready", report: testReport(), deleting: true, copyMissing: true })).toBe("The copy is gone");
   });
 
   it("only moves forward across the steps", () => {
-    const steps = ["copying", "normalising", "hashing", "checkingGit", "rechecking", "movingHistory", "installing"] as const;
+    const steps = ["copying", "normalising", "hashing", "checkingGit", "rechecking", "installing", "movingHistory"] as const;
     let last = overallProgress({
       kind: "snapshot",
       progress: { path: SOURCE, phase: "hashing", filesDone: 9, filesTotal: 10, bytesDone: 9, bytesTotal: 10 },
     });
     for (const step of steps) {
       for (const done of [0, 5, 10]) {
-        const p = overallProgress({ kind: "running", step, done, total: 10 });
+        const p = overallProgress({ kind: "running", step, done, total: 10, placed: false });
         expect(p).toBeGreaterThanOrEqual(last);
         last = p;
       }
     }
     expect(last).toBeLessThanOrEqual(1);
-    expect(overallProgress({ kind: "ready", report: testReport(), deleting: false })).toBe(1);
+    expect(overallProgress({ kind: "ready", report: testReport(), deleting: false, copyMissing: false })).toBe(1);
   });
 });
 

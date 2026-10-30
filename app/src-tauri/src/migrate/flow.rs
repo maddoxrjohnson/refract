@@ -9,10 +9,13 @@
 //! error codes to [`MigrateErrorKind`]s.
 //!
 //! `migrateBeginDelete` rechecks the original and, when that passes, puts the migration
-//! in the helper's *deleting* state in one step. From then on the helper refuses
-//! `migrateResync`, `migrateFinish keep`/`discard` and `migrateCancel`: only
-//! `migrateFinish delete` ends it, so a removal that stops halfway can only be
-//! finished, never "re-synced" from a half-deleted original.
+//! in the helper's *deleting* state in one step. It carries what Windows sees
+//! (`sourceGone`), so a drive WSL can't see is never taken for a deleted original. From
+//! then on the helper refuses `migrateResync`, `migrateFinish keep` and
+//! `migrateCancel`, and `discard` unless the copy is gone: `migrateFinish delete` ends
+//! it, so a removal that stops halfway can only be finished, never "re-synced" from a
+//! half-deleted original. While deleting, a change to the copy only blocks for paths
+//! the original still has, and **Delete the rest anyway** (`force`) skips those.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -20,10 +23,10 @@ use std::time::Duration;
 use refract_client::RequestError;
 use refract_core::migrate::preflight::Refusal;
 use refract_core::protocol::{
-    code, FinishAction, Method, MigrateCancelParams, MigrateFinishParams, MigrateIdParams,
-    MigrateParams, Reply, StopAgentParams,
+    code, FinishAction, Method, MigrateBeginDeleteParams, MigrateCancelParams, MigrateFinishParams,
+    MigrateIdParams, MigrateParams, Reply, StopAgentParams,
 };
-pub use refract_core::protocol::{BeginDelete, PendingMigration, Recheck};
+pub use refract_core::protocol::{BeginDelete, CancelOutcome, PendingMigration, Recheck};
 use serde::Serialize;
 
 use super::snapshot::RefusalView;
@@ -45,7 +48,8 @@ pub mod method {
 const START_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long `migrateFinish` waits: `discard` deletes the whole copy.
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-/// How long `migrateCancel` waits: it deletes the partial copy.
+/// How long `migrateCancel` waits: it deletes the partial copy, or lets a placed copy's
+/// install stop and its report go out.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long `migrateBeginDelete` waits: it stats every file of the source over `/mnt`.
 const BEGIN_DELETE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
@@ -159,13 +163,21 @@ pub trait MigrateHelper: Send + Sync {
     /// `migrate`: answers with the migration's id.
     fn start(&self, params: MigrateParams) -> Result<String, RequestError>;
     /// `migrateBeginDelete`: the recheck, and the deleting state when it passes.
-    fn begin_delete(&self, id: &str) -> Result<BeginDelete, RequestError>;
+    /// `source_gone`: Windows no longer sees the original. `force`: while deleting,
+    /// delete the rest even though the copy's version of some paths differs.
+    fn begin_delete(
+        &self,
+        id: &str,
+        source_gone: bool,
+        force: bool,
+    ) -> Result<BeginDelete, RequestError>;
     /// `migrateResync`: re-copies what changed; progress and a new `migrateReady` follow.
     fn resync(&self, id: &str) -> Result<(), RequestError>;
     /// `migrateFinish`.
     fn finish(&self, id: &str, action: FinishAction) -> Result<(), RequestError>;
-    /// `migrateCancel`.
-    fn cancel(&self, id: &str) -> Result<(), RequestError>;
+    /// `migrateCancel`: `ended` when the partial copy was deleted, otherwise a report
+    /// follows.
+    fn cancel(&self, id: &str) -> Result<CancelOutcome, RequestError>;
     /// `migratePending`: reports still waiting, after a restart.
     fn pending(&self) -> Result<Vec<PendingMigration>, RequestError>;
     /// `stopAgent`: stops an agent that is finished or waiting on the user.
@@ -190,8 +202,17 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    fn begin_delete(&self, id: &str) -> Result<BeginDelete, RequestError> {
-        let params = MigrateIdParams { id: id.to_owned() };
+    fn begin_delete(
+        &self,
+        id: &str,
+        source_gone: bool,
+        force: bool,
+    ) -> Result<BeginDelete, RequestError> {
+        let params = MigrateBeginDeleteParams {
+            id: id.to_owned(),
+            source_gone,
+            force,
+        };
         match self
             .0
             .request(Method::MigrateBeginDelete(params), BEGIN_DELETE_TIMEOUT)?
@@ -226,13 +247,13 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    fn cancel(&self, id: &str) -> Result<(), RequestError> {
+    fn cancel(&self, id: &str) -> Result<CancelOutcome, RequestError> {
         let params = MigrateCancelParams { id: id.to_owned() };
         match self
             .0
             .request(Method::MigrateCancel(params), CANCEL_TIMEOUT)?
         {
-            Reply::Done => Ok(()),
+            Reply::Cancelled(outcome) => Ok(outcome),
             other => Err(unexpected(method::CANCEL, &other)),
         }
     }
@@ -330,7 +351,10 @@ pub fn fits(bytes: u64, nuke: bool, max_bytes: Option<u64>, volume_bytes: Option
 pub enum DeleteOutcome {
     /// The recheck did not pass: nothing more was deleted. Before the deleting state
     /// the interface offers **Re-sync** for changed files, **Keep both** for a changed
-    /// copy and **Stop** for agents; in it, only **Finish deleting** once fixed.
+    /// copy, **End the move** for a copy that is gone and **Stop** for agents. In it,
+    /// **Finish deleting** once fixed; for copy changes (only paths the original
+    /// still has are listed then) **Delete the rest anyway** (`force`); for a copy
+    /// that is gone, **End the move** after asking, pointing to the Recycle Bin.
     Changed {
         #[serde(flatten)]
         recheck: Recheck,
@@ -348,7 +372,8 @@ pub enum DeleteOutcome {
     WontFit { reason: String, deleting: bool },
     /// The original is still there on Windows, but the helper can't see it over `/mnt`
     /// (its drive isn't mounted in WSL), so it could not be checked: nothing was
-    /// deleted. The interface asks to make the drive visible in WSL, then try again.
+    /// deleted, and the deleting state was not entered. The interface asks to make the
+    /// drive visible in WSL, then try again, or (not deleting) keep both.
     DriveHidden { deleting: bool },
     /// The helper is in the deleting state but the original is not (all) gone, or the
     /// helper did not finish: the interface offers only **Finish deleting**.
@@ -411,15 +436,17 @@ pub fn shortcut_path(source: &Path, name: &str) -> Option<PathBuf> {
 /// folder; skipped when it is already gone) and a check that it is gone, the shortcut,
 /// then `migrateFinish delete`; a failure there is [`DeleteOutcome::Unfinished`], and
 /// calling this again with `target.deleting` picks up where it stopped. Only a
-/// failure before the helper took the deleting state is an error.
+/// failure before the helper took the deleting state is an error. `force` is passed
+/// on to `migrateBeginDelete` (the user answered **Delete the rest anyway**).
 pub fn delete_original(
     helper: &dyn MigrateHelper,
     os: &dyn WindowsOps,
     target: &DeleteTarget,
     permanent: bool,
+    force: bool,
 ) -> Result<DeleteOutcome, MigrateError> {
     let deleting = target.deleting;
-    let present = os.exists(&target.source);
+    let was_present = os.exists(&target.source);
     // A window or a full bin stops here before the deleting state, so **Keep both**
     // is still open.
     let checks = |deleting: bool| -> Option<DeleteOutcome> {
@@ -435,17 +462,19 @@ pub fn delete_original(
         }
         None
     };
-    if present && !deleting {
+    if was_present && !deleting {
         if let Some(outcome) = checks(false) {
             return Ok(outcome);
         }
     }
+    let present = os.exists(&target.source);
     let begin = helper
-        .begin_delete(&target.id)
+        .begin_delete(&target.id, !present, force)
         .map_err(|err| MigrateError::agent("Cannot check the original again", err))?;
     // `sourceMissing` only says the `/mnt` path is absent. Still there on Windows, it is
-    // on a drive WSL doesn't see, so the recheck saw nothing of it.
-    if begin.recheck.source_missing && os.exists(&target.source) {
+    // on a drive WSL doesn't see, so the recheck saw nothing of it (the helper does not
+    // enter the deleting state then).
+    if begin.recheck.source_missing && present {
         return Ok(DeleteOutcome::DriveHidden {
             deleting: deleting || begin.ok,
         });
@@ -509,7 +538,7 @@ pub fn delete_original(
     }
     Ok(DeleteOutcome::Deleted {
         permanent,
-        already_gone: !present && !deleting,
+        already_gone: !was_present && !deleting,
         shortcut,
         shortcut_error,
     })
@@ -535,6 +564,8 @@ mod tests {
         begin: Option<BeginDelete>,
         finish_fails: bool,
         log: Mutex<Vec<String>>,
+        /// `(source_gone, force)` of each `migrateBeginDelete`.
+        begin_args: Mutex<Vec<(bool, bool)>>,
     }
 
     impl MigrateHelper for FakeHelper {
@@ -545,11 +576,23 @@ mod tests {
                 .push(format!("start {}", params.path));
             Ok("m-1".into())
         }
-        fn begin_delete(&self, id: &str) -> Result<BeginDelete, RequestError> {
+        fn begin_delete(
+            &self,
+            id: &str,
+            source_gone: bool,
+            force: bool,
+        ) -> Result<BeginDelete, RequestError> {
             self.log.lock().unwrap().push(format!("begin {id}"));
-            self.begin
+            self.begin_args.lock().unwrap().push((source_gone, force));
+            let mut begin = self
+                .begin
                 .clone()
-                .ok_or_else(|| not_supported(method::BEGIN_DELETE))
+                .ok_or_else(|| not_supported(method::BEGIN_DELETE))?;
+            // As the helper: a source only WSL can't see never passes.
+            if begin.recheck.source_missing && !source_gone {
+                begin.ok = false;
+            }
+            Ok(begin)
         }
         fn resync(&self, _: &str) -> Result<(), RequestError> {
             Ok(())
@@ -565,8 +608,8 @@ mod tests {
                 Ok(())
             }
         }
-        fn cancel(&self, _: &str) -> Result<(), RequestError> {
-            Ok(())
+        fn cancel(&self, _: &str) -> Result<CancelOutcome, RequestError> {
+            Ok(CancelOutcome { ended: true })
         }
         fn pending(&self) -> Result<Vec<PendingMigration>, RequestError> {
             Ok(Vec::new())
@@ -666,7 +709,7 @@ mod tests {
     fn deletes_in_order_and_leaves_a_shortcut() {
         let helper = safe_helper();
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert_eq!(
             outcome,
             DeleteOutcome::Deleted {
@@ -708,7 +751,7 @@ mod tests {
             ..FakeHelper::default()
         };
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Changed { recheck, deleting: false }
                 if recheck.changed == ["notes.txt"] && recheck.busy_agents.len() == 1)
@@ -720,7 +763,8 @@ mod tests {
     #[test]
     fn a_helper_without_begin_delete_refuses_to_delete() {
         let os = FakeOs::with_source();
-        let err = delete_original(&FakeHelper::default(), &os, &target(), false).unwrap_err();
+        let err =
+            delete_original(&FakeHelper::default(), &os, &target(), false, false).unwrap_err();
         assert_eq!(err.kind, MigrateErrorKind::Agent);
         assert!(err.message.contains("migrateBeginDelete"));
         assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
@@ -736,7 +780,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         let helper = safe_helper();
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert!(
             matches!(outcome, DeleteOutcome::WindowsOpen { ref windows, deleting: false } if windows[0].id == 7)
         );
@@ -746,7 +790,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         assert_eq!(
-            delete_original(&helper, &os, &target(), false).unwrap(),
+            delete_original(&helper, &os, &target(), false, false).unwrap(),
             DeleteOutcome::WontFit {
                 reason: "too large".into(),
                 deleting: false,
@@ -766,7 +810,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         assert!(matches!(
-            delete_original(&helper, &os, &target(), false).unwrap(),
+            delete_original(&helper, &os, &target(), false, false).unwrap(),
             DeleteOutcome::WontFit { deleting: true, .. }
         ));
         assert!(os.exists(Path::new(r"C:\dev\aurora-notes")));
@@ -775,7 +819,7 @@ mod tests {
             fit: Some(Fit::WontFit("too large".into())),
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&helper, &os, &target(), true).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), true, false).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -794,7 +838,7 @@ mod tests {
             partial: true,
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Unfinished { reason } if reason.contains("in use"))
         );
@@ -814,7 +858,7 @@ mod tests {
             deleting: true,
             ..target()
         };
-        let outcome = delete_original(&helper, &os, &resume, false).unwrap();
+        let outcome = delete_original(&helper, &os, &resume, false, false).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -844,7 +888,7 @@ mod tests {
             ..FakeOs::with_source()
         };
         assert!(matches!(
-            delete_original(&safe_helper(), &os, &resume, false).unwrap(),
+            delete_original(&safe_helper(), &os, &resume, false, false).unwrap(),
             DeleteOutcome::WindowsOpen { deleting: true, .. }
         ));
     }
@@ -866,7 +910,7 @@ mod tests {
             deleting: true,
             ..target()
         };
-        let outcome = delete_original(&helper, &os, &resume, false).unwrap();
+        let outcome = delete_original(&helper, &os, &resume, false, false).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Changed { deleting: true, .. }
@@ -887,8 +931,12 @@ mod tests {
             ..FakeHelper::default()
         };
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
-        assert_eq!(outcome, DeleteOutcome::DriveHidden { deleting: true });
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
+        // The helper is told Windows still sees it, so it doesn't enter the deleting
+        // state: Keep both is still open.
+        assert_eq!(outcome, DeleteOutcome::DriveHidden { deleting: false });
+        assert!(!outcome.deleting());
+        assert_eq!(*helper.begin_args.lock().unwrap(), [(false, false)]);
         assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
         assert!(!helper
             .log
@@ -896,15 +944,42 @@ mod tests {
             .unwrap()
             .iter()
             .any(|l| l.starts_with("finish")));
-        // Gone on Windows too: the move only needs finishing.
+        // Already deleting (an earlier attempt began): still nothing is removed.
+        let resume = DeleteTarget {
+            deleting: true,
+            ..target()
+        };
+        assert_eq!(
+            delete_original(&helper, &os, &resume, false, false).unwrap(),
+            DeleteOutcome::DriveHidden { deleting: true }
+        );
+        assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
+        // Gone on Windows too: the helper is told so, and the move only needs finishing.
         let os = FakeOs::default();
         assert!(matches!(
-            delete_original(&helper, &os, &target(), false).unwrap(),
+            delete_original(&helper, &os, &target(), false, false).unwrap(),
             DeleteOutcome::Deleted {
                 already_gone: true,
                 ..
             }
         ));
+        assert_eq!(
+            helper.begin_args.lock().unwrap().last(),
+            Some(&(true, false))
+        );
+    }
+
+    #[test]
+    fn delete_the_rest_anyway_passes_force_on() {
+        let helper = safe_helper();
+        let os = FakeOs::with_source();
+        let resume = DeleteTarget {
+            deleting: true,
+            ..target()
+        };
+        let outcome = delete_original(&helper, &os, &resume, false, true).unwrap();
+        assert!(matches!(outcome, DeleteOutcome::Deleted { .. }));
+        assert_eq!(*helper.begin_args.lock().unwrap(), [(false, true)]);
     }
 
     #[test]
@@ -914,7 +989,7 @@ mod tests {
             sticky: true,
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert!(matches!(outcome, DeleteOutcome::Unfinished { .. }));
         assert!(!helper
             .log
@@ -931,7 +1006,7 @@ mod tests {
             ..safe_helper()
         };
         let os = FakeOs::with_source();
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert!(
             matches!(&outcome, DeleteOutcome::Unfinished { reason } if reason.contains("could not finish"))
         );
@@ -942,7 +1017,7 @@ mod tests {
             ..target()
         };
         os.log.borrow_mut().clear();
-        let outcome = delete_original(&helper, &os, &retry, false).unwrap();
+        let outcome = delete_original(&helper, &os, &retry, false, false).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -963,7 +1038,7 @@ mod tests {
     fn an_original_deleted_by_hand_is_finished_without_removing() {
         let helper = safe_helper();
         let os = FakeOs::default();
-        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        let outcome = delete_original(&helper, &os, &target(), false, false).unwrap();
         assert!(matches!(
             outcome,
             DeleteOutcome::Deleted {
@@ -993,6 +1068,7 @@ mod tests {
                 dest: None,
                 ..target()
             },
+            false,
             false,
         )
         .unwrap();

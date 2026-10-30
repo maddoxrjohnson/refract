@@ -54,8 +54,8 @@ describe("DemoBackend's Move to WSL", () => {
       "hashing",
       "checkingGit",
       "rechecking",
-      "movingHistory",
       "installing",
+      "movingHistory",
     ]);
     const ready = events.find((e) => e.event === "migrateReady");
     expect(ready?.event === "migrateReady" && canDelete(ready.data.report)).toBe(true);

@@ -30,13 +30,18 @@ export function windowsPath(path: string): string {
 export type MigrationPhase =
   /** `migrateStart` is reading the source; `progress` is its last `migrate://snapshot`. */
   | { kind: "snapshot"; progress: MigrateSnapshotProgress | null }
-  /** The helper copies and checks; `step` is `null` until its first progress event. */
-  | { kind: "running"; step: MigrateStep | null; done: number; total: number }
+  /**
+   * The helper copies and checks; `step` is `null` until its first progress event. `placed` once the copy is at
+   * its destination (from the first `installing` event, or during a re-sync): cancelling then keeps it and a
+   * report follows, instead of deleting a partial copy.
+   */
+  | { kind: "running"; step: MigrateStep | null; done: number; total: number; placed: boolean }
   /**
    * The report waits for an answer. `deleting` once Delete original has begun (the helper's
-   * deleting state): then only finishing the delete is offered.
+   * deleting state): then only finishing the delete is offered, or ending the move once the
+   * copy is gone (`copyMissing`, from `migratePending`).
    */
-  | { kind: "ready"; report: MigrationReport; deleting: boolean };
+  | { kind: "ready"; report: MigrationReport; deleting: boolean; copyMissing: boolean };
 
 export interface Migration {
   /** The source's WSL path; the key. */
@@ -81,7 +86,13 @@ function byId(state: MigrationsState, id: string): Migration | undefined {
   return undefined;
 }
 
-function ready(state: MigrationsState, id: string, report: MigrationReport, deleting = false): MigrationsState {
+function ready(
+  state: MigrationsState,
+  id: string,
+  report: MigrationReport,
+  deleting = false,
+  copyMissing = false,
+): MigrationsState {
   // A delete that has begun stays begun: only the helper's finish ends it.
   const before = byId(state, id)?.phase;
   const stillDeleting = deleting || (before?.kind === "ready" && before.deleting);
@@ -89,9 +100,12 @@ function ready(state: MigrationsState, id: string, report: MigrationReport, dele
     source: report.source,
     dest: report.dest,
     id,
-    phase: { kind: "ready", report, deleting: stillDeleting },
+    phase: { kind: "ready", report, deleting: stillDeleting, copyMissing },
   });
 }
+
+/** Steps that run once the copy is in place at its destination. */
+const PLACED_STEPS: ReadonlySet<MigrateStep> = new Set(["installing", "movingHistory"]);
 
 export function migrationsReducer(state: MigrationsState, action: MigrationAction): MigrationsState {
   switch (action.type) {
@@ -111,23 +125,43 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
       const m = state.get(action.source);
       // A report that arrived first wins.
       if (m?.phase.kind !== "snapshot") return state;
-      return withEntry(state, { ...m, id: action.id, phase: { kind: "running", step: null, done: 0, total: 0 } });
+      return withEntry(state, {
+        ...m,
+        id: action.id,
+        phase: { kind: "running", step: null, done: 0, total: 0, placed: false },
+      });
     }
     case "progress": {
       const { id, source, dest, step, done, total } = action.progress;
       // A migration this window never started (a reload) is placed by its source.
       const m = byId(state, id) ?? (source ? { ...state.get(source), source, dest, id } : undefined);
       if (!m) return state;
-      return withEntry(state, { ...m, id, dest: m.dest || dest, phase: { kind: "running", step, done, total } });
+      const before = m.phase as MigrationPhase | undefined;
+      const placed =
+        PLACED_STEPS.has(step) ||
+        (before?.kind === "running" && before.placed) ||
+        (before?.kind === "ready" && (before.report.placed ?? true));
+      return withEntry(state, {
+        ...m,
+        id,
+        dest: m.dest || dest,
+        phase: { kind: "running", step, done, total, placed },
+      });
     }
     case "ready":
       return ready(state, action.id, action.report);
     case "pending":
-      return action.list.reduce((s, p) => ready(s, p.id, p.report, p.deleting ?? false), state);
+      return action.list.reduce(
+        (s, p) => ready(s, p.id, p.report, p.deleting ?? false, p.copyMissing ?? false),
+        state,
+      );
     case "resyncing": {
       const m = byId(state, action.id);
       if (!m) return state;
-      return withEntry(state, { ...m, phase: { kind: "running", step: "rechecking", done: 0, total: 0 } });
+      return withEntry(state, {
+        ...m,
+        phase: { kind: "running", step: "rechecking", done: 0, total: 0, placed: true },
+      });
     }
     case "deleting": {
       const m = byId(state, action.id);
@@ -200,6 +234,7 @@ export function stepText(phase: MigrationPhase): string {
       if (phase.step === "copying" && phase.total > 0) return `Copying ${byteRange(phase.done, phase.total)}`;
       return STEP_TEXT[phase.step];
     case "ready":
+      if (phase.copyMissing) return "The copy is gone";
       if (phase.deleting) return "Deleting didn't finish";
       return canDelete(phase.report) ? "Ready for your OK" : "A check failed";
   }
@@ -213,8 +248,8 @@ const STEP_SHARES: [MigrateStep, number][] = [
   ["hashing", 0.14],
   ["checkingGit", 0.06],
   ["rechecking", 0.04],
-  ["movingHistory", 0.03],
   ["installing", 0.05],
+  ["movingHistory", 0.03],
 ];
 
 /** How far the whole migration is, 0 to 1; a ready report is 1. */
@@ -260,6 +295,8 @@ export function installText(result: MigrateInstallResult): string {
       return "Stopped after 15 minutes";
     case "toolMissing":
       return `${result.step.tool} isn't installed in WSL`;
+    case "cancelled":
+      return "Stopped before it finished";
   }
 }
 

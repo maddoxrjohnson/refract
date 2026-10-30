@@ -6,6 +6,7 @@ import type {
   MigratePreflight,
   MigrateSnapshotProgress,
   PendingMigration,
+  CancelOutcome,
   VsCodeWindow,
   SystemStats,
   UsageSummary,
@@ -87,8 +88,11 @@ export interface Backend {
   migrateStart(path: string, dest: string): Promise<{ id: string }>;
   /** Stops a running preflight or snapshot of `path`; false when none runs. */
   migrateCancelSnapshot(path: string): Promise<boolean>;
-  /** Cancels a migration before its report; the partial copy is deleted. */
-  migrateCancel(id: string): Promise<void>;
+  /**
+   * Stops a running migration. Before the copy is placed the partial copy is deleted (`ended`); once it is placed,
+   * or during a re-sync, the step stops, the copy stays and a report follows.
+   */
+  migrateCancel(id: string): Promise<CancelOutcome>;
   /** VS Code windows that have the folder open. */
   migrateWindows(path: string): Promise<VsCodeWindow[]>;
   /** Asks one to close (its unsaved-file prompt still shows); false when it is gone. */
@@ -97,8 +101,11 @@ export interface Backend {
   migrateStopAgent(path: string, sessionId: string): Promise<void>;
   /** Re-copies what changed since the report; progress and a new `migrateReady` follow. */
   migrateResync(id: string): Promise<void>;
-  /** Delete original; `permanent` only after the user agreed to skip the Recycle Bin. */
-  migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome>;
+  /**
+   * Delete original; `permanent` only after the user agreed to skip the Recycle Bin, `force` only after they answered
+   * Delete the rest anyway while deleting.
+   */
+  migrateDelete(id: string, permanent: boolean, force?: boolean): Promise<DeleteOutcome>;
   /** Keep both, or discard the copy. */
   migrateFinish(id: string, action: FinishAction): Promise<void>;
   /** Reports still waiting for an answer, after a restart. */

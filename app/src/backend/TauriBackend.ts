@@ -15,6 +15,7 @@ import type {
   MigratePreflight,
   MigrateSnapshotProgress,
   PendingMigration,
+  CancelOutcome,
   RemoteDetails,
   RemoteKind,
   RemoteList,
@@ -187,8 +188,8 @@ export class TauriBackend implements Backend {
     return invoke<boolean>("migrate_cancel_snapshot", { path });
   }
 
-  migrateCancel(id: string): Promise<void> {
-    return invoke<void>("migrate_cancel", { id });
+  migrateCancel(id: string): Promise<CancelOutcome> {
+    return invoke<CancelOutcome>("migrate_cancel", { id });
   }
 
   migrateWindows(path: string): Promise<VsCodeWindow[]> {
@@ -207,8 +208,8 @@ export class TauriBackend implements Backend {
     return invoke<void>("migrate_resync", { id });
   }
 
-  migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome> {
-    return invoke<DeleteOutcome>("migrate_delete", { id, permanent });
+  migrateDelete(id: string, permanent: boolean, force = false): Promise<DeleteOutcome> {
+    return invoke<DeleteOutcome>("migrate_delete", { id, permanent, force });
   }
 
   migrateFinish(id: string, action: FinishAction): Promise<void> {

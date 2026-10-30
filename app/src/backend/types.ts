@@ -472,7 +472,8 @@ export interface MigrateCheckResult {
 
 export interface MigrateInstallResult {
   step: InstallStep;
-  status: "succeeded" | "failed" | "timedOut" | "toolMissing";
+  /** `cancelled`: stopped before it finished (the move was stopped once the copy was in place, or the helper stopped). */
+  status: "succeeded" | "failed" | "timedOut" | "toolMissing" | "cancelled";
   exitCode?: number;
   /** WSL path of the log. */
   logPath?: string;
@@ -516,14 +517,24 @@ export interface MigrationReport {
   history: { sessions: number; fromDirs: string[]; toDirs: string[] };
   linuxGit: boolean;
   warnings: string[];
+  /** The copy was put in place (a check that failed before that deleted it): Keep both is possible. */
+  placed?: boolean;
 }
 
 /** A report still waiting for an answer, from `migratePending`. */
 export interface PendingMigration {
   id: string;
   report: MigrationReport;
-  /** The delete has begun (the helper's deleting state): only finishing it is left. */
+  /** The delete has begun (the helper's deleting state): only finishing it is left, or ending it once the copy is gone. */
   deleting?: boolean;
+  /** The placed copy is gone (deleted by hand): discarding only forgets the move. */
+  copyMissing?: boolean;
+}
+
+/** What `migrateCancel` did. */
+export interface CancelOutcome {
+  /** The partial copy was deleted and the move is gone. False: the copy was already in place (or a re-sync ran), so it stays and a report follows. */
+  ended: boolean;
 }
 
 /** What the helper found checking the original again, right before deleting it. */
@@ -534,7 +545,10 @@ export interface Recheck {
   removed: string[];
   /** Couldn't be read, so whether they changed is unknown. */
   unreadable: string[];
-  /** Changed in the copy after it was checked; `["."]` when the copy is gone. */
+  /**
+   * Changed in the copy after it was checked; `["."]` when the copy is gone. While deleting, only paths whose
+   * original is still there (what Delete the rest anyway would delete a different version of).
+   */
   copyChanged: string[];
   /** Sentences to show as they are, one per agent still running in the folder. */
   busyAgents: string[];
@@ -544,7 +558,8 @@ export interface Recheck {
 
 /**
  * What Delete original did. `deleting` says the delete has begun (the helper's deleting
- * state): from then on only finishing it is offered, never Re-sync, Keep both or Discard.
+ * state): from then on only finishing it is offered (or, with the copy gone, ending the move),
+ * never Re-sync, Keep both or Discard.
  */
 export type DeleteOutcome =
   /** The recheck failed, so nothing (more) was deleted. */
@@ -553,7 +568,7 @@ export type DeleteOutcome =
   | { kind: "windowsOpen"; windows: VsCodeWindow[]; deleting: boolean }
   /** Ask "Delete permanently?" (default No: Keep both, or later while deleting). */
   | { kind: "wontFit"; reason: string; deleting: boolean }
-  /** The original is there on Windows, but its drive isn't visible from WSL, so it couldn't be checked. */
+  /** The original is there on Windows, but its drive isn't visible from WSL, so it couldn't be checked; the delete didn't begin unless it had already. */
   | { kind: "driveHidden"; deleting: boolean }
   /** The delete began but didn't finish (a file was in use, or the helper didn't answer). */
   | { kind: "unfinished"; reason: string }

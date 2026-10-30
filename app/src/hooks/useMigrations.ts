@@ -9,16 +9,22 @@ export interface MigrationControls {
   state: MigrationsState;
   /** Takes the snapshot and starts the copy; rejects with the backend's `MigrateError`. */
   start(source: string, dest: string): Promise<void>;
-  /** Stops a snapshot or a running copy of `source`; the original is untouched. */
+  /**
+   * Stops a snapshot or a running copy of `source`; the original is untouched. Once the copy is placed (or during
+   * a re-sync) it stays, and its report follows.
+   */
   cancel(source: string): Promise<void>;
   /** Shown as running from the moment it is asked for; back to the report if it fails. */
   resync(id: string): Promise<void>;
   /**
    * Delete original; the entry is dropped once it says `deleted`, and marked deleting once
-   * it says the delete has begun.
+   * it says the delete has begun. `force`: Delete the rest anyway, while deleting.
    */
-  remove(id: string, permanent: boolean): Promise<DeleteOutcome>;
-  /** Keep both or discard the copy; the entry is dropped once it answers. */
+  remove(id: string, permanent: boolean, force?: boolean): Promise<DeleteOutcome>;
+  /**
+   * Keep both or discard the copy; the entry is dropped once it answers. A refusal asks for the pending reports
+   * again, so the dialog learns what changed (a copy that went, say).
+   */
   finish(id: string, action: FinishAction): Promise<void>;
 }
 
@@ -83,8 +89,9 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
         await backend.migrateCancelSnapshot(source);
         return;
       }
-      await backend.migrateCancel(m.id);
-      dispatch({ type: "gone", source });
+      const outcome = await backend.migrateCancel(m.id);
+      // Not ended: the copy was in place, and its report comes as migrateReady.
+      if (outcome.ended) dispatch({ type: "gone", source });
     },
     [backend],
   );
@@ -106,8 +113,10 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
   const sourceOf = (id: string) => [...stateRef.current.values()].find((m) => m.id === id)?.source;
 
   const remove = useCallback(
-    async (id: string, permanent: boolean) => {
-      const outcome = await backend.migrateDelete(id, permanent);
+    async (id: string, permanent: boolean, force = false) => {
+      const outcome = force
+        ? await backend.migrateDelete(id, permanent, true)
+        : await backend.migrateDelete(id, permanent);
       const source = sourceOf(id);
       if (outcome.kind === "deleted") {
         if (source) dispatch({ type: "gone", source });
@@ -121,7 +130,15 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
 
   const finish = useCallback(
     async (id: string, action: FinishAction) => {
-      await backend.migrateFinish(id, action);
+      try {
+        await backend.migrateFinish(id, action);
+      } catch (err) {
+        backend.migratePending().then(
+          (list) => dispatch({ type: "pending", list }),
+          () => {},
+        );
+        throw err;
+      }
       const source = sourceOf(id);
       if (source) dispatch({ type: "gone", source });
     },

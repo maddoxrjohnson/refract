@@ -296,6 +296,30 @@ test.describe("Move to WSL at 1280×800", () => {
   });
 });
 
+test.describe("Move to WSL stopped once the copy is placed", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("keeps the copy and shows a report that says the install was stopped", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.keyboard.type("marigold");
+    await page.keyboard.press("Enter");
+    const panel = page.getByRole("complementary", { name: "marigold-site details" });
+    await panel.getByRole("button", { name: "Move to WSL…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Move marigold-site to WSL" });
+    await dialog.getByRole("button", { name: /Close VS Code window/ }).click();
+    await dialog.getByRole("button", { name: "Start" }).click();
+    await expect(dialog.getByText("Cancelling deletes the partial copy. The original is untouched.")).toBeVisible();
+    const stop = dialog.getByRole("button", { name: "Stop and keep the copy" });
+    await expect(stop).toBeVisible({ timeout: 60_000 });
+    await expect(dialog.getByText(/deletes the partial copy/)).toHaveCount(0);
+    await stop.click();
+    await expect(dialog.getByRole("button", { name: "Delete original" })).toBeVisible({ timeout: 30_000 });
+    await expect(dialog.getByText("Stopped before it finished")).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Keep both" })).toBeVisible();
+    await expect(dialog.getByRole("button", { name: "Discard the copy" })).toBeVisible();
+  });
+});
+
 test.describe("at 1280×480", () => {
   test.use({ viewport: { width: 1280, height: 480 } });
 
