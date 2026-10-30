@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::process::output_with_deadline;
@@ -207,20 +208,31 @@ pub fn wsl_args(helper: Option<&str>, distro: Option<&str>) -> Vec<String> {
     args
 }
 
+/// The helper's distro as [`pick_distro`] returned it, shared by the spawner and
+/// [`Agent::distro`]. `None` until the list was read.
+type DistroSlot = Arc<Mutex<Option<Option<String>>>>;
+
+/// The distro in `slot`, choosing it first if it is not known yet. The choice is kept
+/// once the list was read.
+fn chosen_distro(slot: &DistroSlot) -> Option<String> {
+    let mut slot = slot.lock().unwrap_or_else(PoisonError::into_inner);
+    if slot.is_none() {
+        *slot = pick_distro();
+    }
+    slot.clone().flatten()
+}
+
 /// Starts the helper through [`wsl_command`] with piped stdio. Runs on the client's
 /// supervisor thread, so choosing the distro there keeps `wsl.exe --list` off the
-/// main thread. The choice is kept once the list was read.
+/// main thread.
 struct WslSpawner {
     helper: Option<String>,
-    distro: Option<Option<String>>,
+    distro: DistroSlot,
 }
 
 impl Spawn for WslSpawner {
     fn spawn(&mut self) -> io::Result<Child> {
-        if self.distro.is_none() {
-            self.distro = pick_distro();
-        }
-        let distro = self.distro.clone().flatten();
+        let distro = chosen_distro(&self.distro);
         let args = wsl_args(self.helper.as_deref(), distro.as_deref());
         eprintln!("refract: starting the helper: wsl.exe {}", args.join(" "));
         wsl_command()
@@ -236,12 +248,19 @@ impl Spawn for WslSpawner {
 pub struct Agent {
     client: AgentClient,
     stopped: AtomicBool,
+    distro: DistroSlot,
 }
 
 impl Agent {
     /// Sends one request to the helper and waits up to `timeout` for its reply.
     pub fn request(&self, method: Method, timeout: Duration) -> Result<Reply, RequestError> {
         self.client.request(method, timeout)
+    }
+
+    /// The distro the helper runs in, or `None` when that is left to `wsl.exe`'s
+    /// default. May run `wsl.exe --list`, so not for the main thread.
+    pub fn distro(&self) -> Option<String> {
+        chosen_distro(&self.distro)
     }
 
     /// Stops the helper once; later calls do nothing.
@@ -256,10 +275,11 @@ impl Agent {
 pub fn start(app: &AppHandle) {
     let helper = std::env::var("REFRACT_AGENT").ok();
     let handle = app.clone();
+    let distro = DistroSlot::default();
     let client = AgentClient::start(
         WslSpawner {
             helper,
-            distro: None,
+            distro: distro.clone(),
         },
         move |event| {
             let result = match event {
@@ -275,6 +295,7 @@ pub fn start(app: &AppHandle) {
     app.manage(Agent {
         client,
         stopped: AtomicBool::new(false),
+        distro,
     });
 }
 

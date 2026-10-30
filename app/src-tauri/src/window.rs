@@ -129,7 +129,8 @@ pub fn window_visible(app: &AppHandle) -> bool {
 static REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// Reports the window's visibility if it changed since the last report: emits
-/// [`VISIBILITY_EVENT`], updates the tray menu and tells WebView2 whether it is shown.
+/// [`VISIBILITY_EVENT`], updates the tray menu, tells WebView2 whether it is shown and
+/// starts or stops the GPU sampler.
 /// Called after show and hide, and when the window is minimized or restored.
 pub fn sync_visibility(app: &AppHandle) {
     let visible = window_visible(app);
@@ -138,6 +139,7 @@ pub fn sync_visibility(app: &AppHandle) {
     }
     set_webview_visible(app, visible);
     crate::tray::set_shown(app, visible);
+    crate::gpu::set_sampling(app, visible);
     if let Err(err) = app.emit(VISIBILITY_EVENT, Visibility { visible }) {
         eprintln!("refract: emitting {VISIBILITY_EVENT}: {err}");
     }

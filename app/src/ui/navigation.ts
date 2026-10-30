@@ -1,0 +1,311 @@
+import type { LaunchMode, RepoSnapshot, SessionInfo } from "../backend/types";
+import { DIRTY_REPO_PROMPT, unfinishedSessions } from "../repoStatus";
+
+// Finding and choosing a project (spec §3.3, §4.3) as a pure state machine. Inputs are
+// pointer, click and key events; the result says what changed and which effects to run.
+
+/** One row of the launch picker. */
+export type PickerOption =
+  | { kind: "resume"; session: SessionInfo }
+  | { kind: "new"; prompt?: string };
+
+export interface PickerState {
+  /** The repo being launched. */
+  path: string;
+  options: PickerOption[];
+  /** The highlighted option; Enter accepts it. */
+  index: number;
+}
+
+export interface NavState {
+  /** Magnet or keyboard focus: the gem that shows a label. */
+  focused: string | null;
+  /** The gem the camera is on, with the detail panel open. */
+  zoomed: string | null;
+  /** Typed text; gems whose name contains it (any case) match. */
+  filter: string;
+  picker: PickerState | null;
+}
+
+export const initialNavState: NavState = { focused: null, zoomed: null, filter: "", picker: null };
+
+/** A key press, reduced to what navigation needs. */
+export interface NavKey {
+  key: string;
+  ctrl?: boolean;
+  meta?: boolean;
+  alt?: boolean;
+}
+
+export type NavInput =
+  /** Nearest gem to the pointer, or none. */
+  | { type: "pointerFocus"; path: string | null }
+  /** A click on a gem. */
+  | { type: "select"; path: string }
+  | { type: "backgroundClick" }
+  | { type: "key"; key: NavKey }
+  /** What Enter does on a zoomed gem: launch, or open the picker. `path` defaults to the zoomed gem. */
+  | { type: "launch"; path?: string }
+  /** Highlight a picker option (pointer hover). */
+  | { type: "pickerMove"; index: number }
+  /** Accept a picker option; `index` defaults to the highlighted one. */
+  | { type: "pickerAccept"; index?: number }
+  | { type: "pickerClose" }
+  | { type: "clearFilter" }
+  /** Repos changed: forget paths that are gone. */
+  | { type: "sync" };
+
+export type NavEffect = { kind: "launch"; path: string; mode: LaunchMode };
+
+export interface NavContext {
+  repos: ReadonlyMap<string, RepoSnapshot>;
+  /** Gem centres in world units, y up. */
+  positions: ReadonlyMap<string, { x: number; y: number }>;
+}
+
+export interface NavResult {
+  state: NavState;
+  effects: NavEffect[];
+  /** The input meant something here; for keys, the caller should preventDefault. */
+  handled: boolean;
+}
+
+/** Paths whose name contains `filter`, ignoring case; `null` when there is no filter. */
+export function matchingPaths(repos: Iterable<RepoSnapshot>, filter: string): Set<string> | null {
+  if (!filter) return null;
+  const needle = filter.toLowerCase();
+  const out = new Set<string>();
+  for (const r of repos) if (r.name.toLowerCase().includes(needle)) out.add(r.path);
+  return out;
+}
+
+/** How a new agent starts in this repo: with the review prompt when it has changes. */
+export function newAgentMode(repo: RepoSnapshot): LaunchMode {
+  return repo.changedFiles > 0 ? { kind: "new", prompt: DIRTY_REPO_PROMPT } : { kind: "new" };
+}
+
+/** The session a Resume button resumes: the preselected one, else the newest unfinished. */
+export function resumableSession(repo: RepoSnapshot): SessionInfo | null {
+  const unfinished = unfinishedSessions(repo);
+  const pre = repo.preselect;
+  if (pre.kind === "resume") {
+    const s = unfinished.find((u) => u.id === pre.sessionId);
+    if (s) return s;
+  }
+  return unfinished[0] ?? null;
+}
+
+/** Unfinished sessions, newest first, then New agent. */
+export function pickerOptions(repo: RepoSnapshot): PickerOption[] {
+  const fresh: PickerOption =
+    repo.changedFiles > 0 ? { kind: "new", prompt: DIRTY_REPO_PROMPT } : { kind: "new" };
+  return [...unfinishedSessions(repo).map((session): PickerOption => ({ kind: "resume", session })), fresh];
+}
+
+/** The launch an option starts. */
+export function optionMode(option: PickerOption): LaunchMode {
+  if (option.kind === "resume") return { kind: "resume", sessionId: option.session.id };
+  return option.prompt ? { kind: "new", prompt: option.prompt } : { kind: "new" };
+}
+
+function openPicker(repo: RepoSnapshot): PickerState {
+  const options = pickerOptions(repo);
+  const pre = repo.preselect;
+  let index = options.length - 1;
+  if (pre.kind === "resume") {
+    const i = options.findIndex((o) => o.kind === "resume" && o.session.id === pre.sessionId);
+    if (i >= 0) index = i;
+  }
+  return { path: repo.path, options, index };
+}
+
+const result = (state: NavState, effects: NavEffect[] = [], handled = true): NavResult => ({
+  state,
+  effects,
+  handled,
+});
+const unhandled = (state: NavState): NavResult => result(state, [], false);
+
+/** The best gem for a filter: names that start with it, then the heaviest, then by name. */
+function bestMatch(ctx: NavContext, matches: Set<string>, filter: string): string | null {
+  const needle = filter.toLowerCase();
+  let best: RepoSnapshot | null = null;
+  const rank = (r: RepoSnapshot) => (r.name.toLowerCase().startsWith(needle) ? 1 : 0);
+  for (const path of matches) {
+    const r = ctx.repos.get(path);
+    if (!r) continue;
+    if (
+      !best ||
+      rank(r) > rank(best) ||
+      (rank(r) === rank(best) &&
+        (r.mass > best.mass || (r.mass === best.mass && r.name.localeCompare(best.name) < 0)))
+    ) {
+      best = r;
+    }
+  }
+  return best?.path ?? null;
+}
+
+/** Applies a new filter: focus follows the best match, a zoom on a hidden gem ends. */
+function withFilter(state: NavState, filter: string, ctx: NavContext): NavState {
+  const matches = matchingPaths(ctx.repos.values(), filter);
+  if (!matches) return { ...state, filter };
+  const zoomed = state.zoomed && matches.has(state.zoomed) ? state.zoomed : null;
+  const focused =
+    state.focused && matches.has(state.focused) ? state.focused : bestMatch(ctx, matches, filter);
+  return { ...state, filter, zoomed, focused };
+}
+
+const DIRECTIONS: Record<string, { x: number; y: number }> = {
+  ArrowUp: { x: 0, y: 1 },
+  ArrowDown: { x: 0, y: -1 },
+  ArrowLeft: { x: -1, y: 0 },
+  ArrowRight: { x: 1, y: 0 },
+};
+
+/**
+ * Nearest matching gem in a direction, weighing sideways distance double. Starts from the
+ * zoomed gem when zoomed (the pointer may have focused another), else the focused one.
+ */
+function step(state: NavState, dir: { x: number; y: number }, ctx: NavContext): string | null {
+  const matches = matchingPaths(ctx.repos.values(), state.filter);
+  const candidates = [...ctx.positions].filter(
+    ([path]) => ctx.repos.has(path) && (!matches || matches.has(path)),
+  );
+  const origin = state.zoomed ?? state.focused;
+  const from = origin ? ctx.positions.get(origin) : undefined;
+  if (!from) {
+    // Nothing focused: start at the gem nearest the centre.
+    let best: string | null = null;
+    let bestD = Infinity;
+    for (const [path, p] of candidates) {
+      const d = Math.hypot(p.x, p.y);
+      if (d < bestD) [best, bestD] = [path, d];
+    }
+    return best;
+  }
+  let best = origin;
+  let bestScore = Infinity;
+  for (const [path, p] of candidates) {
+    if (path === origin) continue;
+    const dx = p.x - from.x;
+    const dy = p.y - from.y;
+    const along = dx * dir.x + dy * dir.y;
+    if (along <= 1e-6) continue;
+    const across = Math.abs(dx * dir.y - dy * dir.x);
+    const score = along + 2 * across;
+    if (score < bestScore) [best, bestScore] = [path, score];
+  }
+  return best;
+}
+
+function launch(state: NavState, path: string | null, ctx: NavContext): NavResult {
+  const repo = path ? ctx.repos.get(path) : undefined;
+  if (!repo) return unhandled(state);
+  if (repo.preselect.kind === "noPicker") {
+    return result({ ...state, picker: null }, [
+      { kind: "launch", path: repo.path, mode: newAgentMode(repo) },
+    ]);
+  }
+  return result({ ...state, picker: openPicker(repo) });
+}
+
+function accept(state: NavState, picker: PickerState, index: number): NavResult {
+  const option = picker.options[index];
+  if (!option) return unhandled(state);
+  return result({ ...state, picker: null }, [
+    { kind: "launch", path: picker.path, mode: optionMode(option) },
+  ]);
+}
+
+function pickerKey(state: NavState, picker: PickerState, key: string): NavResult {
+  const last = picker.options.length - 1;
+  const move = (index: number) =>
+    result({ ...state, picker: { ...picker, index: Math.max(0, Math.min(last, index)) } });
+  switch (key) {
+    case "ArrowUp":
+      return move(picker.index - 1);
+    case "ArrowDown":
+      return move(picker.index + 1);
+    case "Home":
+      return move(0);
+    case "End":
+      return move(last);
+    case "Enter":
+      return accept(state, picker, picker.index);
+    case "Escape":
+      return result({ ...state, picker: null });
+    default:
+      return unhandled(state);
+  }
+}
+
+function onKey(state: NavState, k: NavKey, ctx: NavContext): NavResult {
+  if (k.ctrl || k.meta || k.alt) return unhandled(state);
+  if (state.picker) return pickerKey(state, state.picker, k.key);
+
+  const dir = DIRECTIONS[k.key];
+  if (dir) {
+    const next = step(state, dir, ctx);
+    return result({ ...state, focused: next, zoomed: state.zoomed ? next : null });
+  }
+  switch (k.key) {
+    case "Enter":
+      if (state.zoomed) return launch(state, state.zoomed, ctx);
+      if (state.focused) return result({ ...state, zoomed: state.focused });
+      return unhandled(state);
+    case "Escape":
+      if (state.zoomed) return result({ ...state, zoomed: null, focused: state.zoomed });
+      if (state.filter) return result({ ...state, filter: "" });
+      return unhandled(state);
+    case "Backspace":
+      if (!state.filter) return unhandled(state);
+      return result(withFilter(state, state.filter.slice(0, -1), ctx));
+  }
+  // Printable characters other than space type into the filter.
+  if ([...k.key].length === 1 && k.key.trim() !== "") {
+    return result(withFilter(state, state.filter + k.key, ctx));
+  }
+  return unhandled(state);
+}
+
+/** Forgets focus, zoom and picker for repos that are gone; same object when nothing is. */
+function sync(state: NavState, ctx: NavContext): NavState {
+  const keep = (p: string | null) => (p && ctx.repos.has(p) ? p : null);
+  const focused = keep(state.focused);
+  const zoomed = keep(state.zoomed);
+  const picker = state.picker && ctx.repos.has(state.picker.path) ? state.picker : null;
+  if (focused === state.focused && zoomed === state.zoomed && picker === state.picker) return state;
+  return { ...state, focused, zoomed, picker };
+}
+
+export function navigate(current: NavState, input: NavInput, ctx: NavContext): NavResult {
+  const state = sync(current, ctx);
+  switch (input.type) {
+    case "sync":
+      return result(state);
+    case "pointerFocus":
+      return result(state.focused === input.path ? state : { ...state, focused: input.path });
+    case "select":
+      if (!ctx.repos.has(input.path)) return unhandled(state);
+      return result({ ...state, focused: input.path, zoomed: input.path, picker: null });
+    case "backgroundClick":
+      if (state.picker) return result({ ...state, picker: null });
+      if (state.zoomed) return result({ ...state, zoomed: null });
+      return unhandled(state);
+    case "key":
+      return onKey(state, input.key, ctx);
+    case "launch":
+      return launch(state, input.path ?? state.zoomed, ctx);
+    case "pickerMove":
+      if (!state.picker || !state.picker.options[input.index]) return unhandled(state);
+      return result({ ...state, picker: { ...state.picker, index: input.index } });
+    case "pickerAccept":
+      if (!state.picker) return unhandled(state);
+      return accept(state, state.picker, input.index ?? state.picker.index);
+    case "pickerClose":
+      return state.picker ? result({ ...state, picker: null }) : unhandled(state);
+    case "clearFilter":
+      return result(state.filter ? { ...state, filter: "" } : state);
+  }
+}

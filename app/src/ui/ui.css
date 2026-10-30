@@ -1,0 +1,576 @@
+/* Glass overlays over the scene. Every component imports this file. */
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/500.css";
+
+:root {
+  --bg: #0a0c12;
+  --fg: #e9eaf0;
+  --muted: #979db0;
+  --glass: #a9d8ff;
+  --amber: #ffb347;
+  --halo: #6fd3ff;
+  --danger: #ff8a8a;
+  --line: #222737;
+  --panel: rgb(16 19 28 / 0.72);
+  --panel-strong: rgb(16 19 28 / 0.86);
+  --sans: "IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", monospace;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+.rf-glass {
+  box-sizing: border-box;
+  color: var(--fg);
+  font-family: var(--sans);
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  box-shadow:
+    0 1px 0 rgb(255 255 255 / 0.04) inset,
+    0 18px 48px rgb(0 0 0 / 0.45);
+  backdrop-filter: blur(18px) saturate(1.2);
+  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+}
+
+.rf-glass *,
+.rf-glass *::before,
+.rf-glass *::after {
+  box-sizing: border-box;
+}
+
+.rf-mono {
+  font-family: var(--mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.rf-muted {
+  color: var(--muted);
+}
+
+.rf-kbd {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 1px 6px;
+  border: 1px solid rgb(169 216 255 / 0.28);
+  border-radius: 5px;
+  color: var(--glass);
+}
+
+/* Buttons */
+
+.rf-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 32px;
+  padding: 6px 12px;
+  font: 500 13px/1.2 var(--sans);
+  color: var(--fg);
+  background: rgb(255 255 255 / 0.04);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+  cursor: pointer;
+  transition:
+    background-color 140ms var(--ease-out),
+    border-color 140ms var(--ease-out),
+    transform 140ms var(--ease-out);
+}
+
+.rf-button:hover {
+  background: rgb(255 255 255 / 0.08);
+  border-color: #313850;
+}
+
+.rf-button:active {
+  transform: scale(0.97);
+}
+
+.rf-button--primary {
+  justify-content: space-between;
+  width: 100%;
+  min-height: 40px;
+  padding: 8px 14px;
+  color: #0a0c12;
+  background: var(--glass);
+  border-color: transparent;
+}
+
+.rf-button--primary:hover {
+  background: #c3e4ff;
+  border-color: transparent;
+}
+
+.rf-button--primary .rf-kbd {
+  color: #0a0c12;
+  border-color: rgb(10 12 18 / 0.3);
+}
+
+.rf-button--ghost {
+  background: transparent;
+  border-color: transparent;
+  color: var(--muted);
+}
+
+.rf-button--ghost:hover {
+  color: var(--fg);
+}
+
+.rf-icon-button {
+  width: 28px;
+  min-height: 28px;
+  padding: 0;
+  font-size: 16px;
+  line-height: 1;
+}
+
+.rf-glass :focus-visible {
+  outline: 2px solid var(--halo);
+  outline-offset: 2px;
+}
+
+/* Focus label: a small chip the scene positions beside the focused gem */
+
+.rf-focus-label {
+  padding: 8px 12px;
+  border-radius: 12px;
+  max-width: 260px;
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.rf-focus-label__name {
+  font: 500 14px/1.3 var(--mono);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rf-focus-label__meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.rf-state {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  margin-top: 2px;
+}
+
+.rf-state::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.rf-state--dirty::before {
+  background: var(--halo);
+  box-shadow: 0 0 6px var(--halo);
+}
+
+.rf-state--attention {
+  color: var(--amber);
+}
+
+.rf-state--attention::before {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
+/* Detail panel: docked on the right */
+
+.rf-detail {
+  position: fixed;
+  top: 16px;
+  right: 16px;
+  bottom: 16px;
+  width: min(360px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: var(--panel-strong);
+  overflow: hidden;
+  animation: rf-slide-in 220ms var(--ease-out);
+}
+
+.rf-detail__header {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rf-detail__title {
+  flex: 1;
+  min-width: 0;
+}
+
+.rf-detail__name {
+  margin: 0;
+  font: 500 17px/1.3 var(--mono);
+  overflow-wrap: anywhere;
+}
+
+.rf-detail__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px 18px 12px;
+}
+
+.rf-section {
+  padding: 12px 0;
+  border-bottom: 1px solid rgb(34 39 55 / 0.7);
+}
+
+.rf-section:last-child {
+  border-bottom: 0;
+}
+
+.rf-section__label {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.rf-facts {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 6px 14px;
+  margin: 0;
+}
+
+.rf-facts dt {
+  color: var(--muted);
+}
+
+.rf-facts dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rf-quote {
+  margin: 6px 0 0;
+  padding-left: 10px;
+  border-left: 2px solid rgb(169 216 255 / 0.35);
+  color: var(--fg);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.rf-detail__actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 18px 18px;
+  border-top: 1px solid var(--line);
+}
+
+.rf-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rf-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.rf-row > .rf-button {
+  flex: 1 1 auto;
+}
+
+/* Picker */
+
+/* Centred under the zoomed gem, in the space left of the detail panel. */
+.rf-picker {
+  position: fixed;
+  left: max(16px, calc((100vw - 392px) / 2));
+  bottom: 24px;
+  width: min(480px, calc(100vw - 424px));
+  min-width: min(320px, calc(100vw - 32px));
+  transform: translateX(-50%);
+  padding: 14px;
+  border-radius: 16px;
+  background: var(--panel-strong);
+  animation: rf-rise 200ms var(--ease-out);
+}
+
+.rf-picker__title {
+  margin: 2px 4px 10px;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.rf-picker__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: 10px;
+}
+
+.rf-picker__list:focus-visible {
+  outline: none;
+}
+
+.rf-option {
+  padding: 9px 12px;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  cursor: pointer;
+}
+
+.rf-option[aria-selected="true"] {
+  background: rgb(169 216 255 / 0.1);
+  border-color: rgb(169 216 255 / 0.35);
+}
+
+.rf-picker__list:focus-visible .rf-option[aria-selected="true"] {
+  outline: 2px solid var(--halo);
+  outline-offset: -1px;
+}
+
+.rf-option__head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-weight: 500;
+}
+
+.rf-option__meta {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.rf-option__text {
+  margin-top: 2px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rf-picker__footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 4px 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Filter bar */
+
+.rf-filter {
+  position: fixed;
+  top: 16px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 6px 6px 14px;
+  border-radius: 12px;
+  max-width: calc(100vw - 32px);
+}
+
+.rf-filter__text {
+  font: 500 15px/1.3 var(--mono);
+  color: var(--glass);
+  white-space: pre;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.rf-filter__count {
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.rf-filter__count--none {
+  color: var(--amber);
+}
+
+/* Quality control */
+
+/* A compact corner control, top left, clear of the filter bar and detail panel. */
+.rf-quality {
+  position: fixed;
+  top: 16px;
+  left: 16px;
+  min-width: 0;
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+}
+
+.rf-quality legend {
+  float: left;
+  margin: 0 0 8px;
+  padding: 0;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.rf-quality__options {
+  clear: both;
+  display: flex;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.rf-quality__option {
+  position: relative;
+  flex: 1;
+}
+
+.rf-quality__option input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.rf-quality__option span {
+  display: block;
+  padding: 5px 10px;
+  border-radius: 7px;
+  text-align: center;
+  white-space: nowrap;
+  color: var(--muted);
+  transition:
+    background-color 140ms var(--ease-out),
+    color 140ms var(--ease-out);
+}
+
+.rf-quality__option input:checked + span {
+  color: var(--fg);
+  background: rgb(169 216 255 / 0.14);
+}
+
+.rf-quality__option input:focus-visible + span {
+  outline: 2px solid var(--halo);
+  outline-offset: 1px;
+}
+
+/* Always laid out, so switching away from Auto doesn't change the control's height. */
+.rf-quality__active {
+  margin: 6px 2px 0;
+  min-height: 1.4em;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+/* Status toast */
+
+.rf-toast {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: min(420px, calc(100vw - 32px));
+  padding: 10px 14px;
+  border-radius: 12px;
+  animation: rf-rise 200ms var(--ease-out);
+}
+
+.rf-toast__line {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin: 0;
+}
+
+.rf-toast__repo {
+  font-family: var(--mono);
+  font-weight: 500;
+}
+
+.rf-toast__line--error {
+  color: var(--danger);
+}
+
+.rf-toast__line--done {
+  color: var(--glass);
+}
+
+.rf-toast--done {
+  animation: rf-fade-out 400ms ease-in 3600ms forwards;
+}
+
+@keyframes rf-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes rf-slide-in {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+}
+
+@keyframes rf-rise {
+  from {
+    opacity: 0;
+    translate: 0 8px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rf-detail,
+  .rf-picker,
+  .rf-toast {
+    animation: rf-fade 120ms linear;
+  }
+
+  .rf-toast--done {
+    animation: rf-fade-out 120ms linear 3880ms forwards;
+  }
+
+  .rf-button,
+  .rf-quality__option span {
+    transition: none;
+  }
+
+  .rf-button:active {
+    transform: none;
+  }
+}
+
+@keyframes rf-fade {
+  from {
+    opacity: 0;
+  }
+}

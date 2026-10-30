@@ -1,0 +1,94 @@
+import { useEffect, useId, useRef } from "react";
+import { firstLine, formatSize, relativeTime } from "./format";
+import type { PickerOption } from "./navigation";
+import "./ui.css";
+
+export interface PickerProps {
+  repoName: string;
+  options: PickerOption[];
+  /** The highlighted option, from navigation's picker state. */
+  index: number;
+  /** Current time in milliseconds, for relative times. */
+  now: number;
+  /** Pointer hover: dispatch `{ type: "pickerMove", index }`. */
+  onMove(index: number): void;
+  /** Click: dispatch `{ type: "pickerAccept", index }`. */
+  onAccept(index: number): void;
+  onClose(): void;
+}
+
+/**
+ * Resume a session or start fresh (spec §4.3). Keys are handled by the window-level
+ * navigation handler; the list takes focus so screen readers follow the highlight.
+ */
+export function Picker({ repoName, options, index, now, onMove, onAccept, onClose }: PickerProps) {
+  const base = useId();
+  const titleId = `${base}-title`;
+  const optionId = (i: number) => `${base}-option-${i}`;
+  const list = useRef<HTMLUListElement>(null);
+
+  useEffect(() => list.current?.focus(), []);
+
+  return (
+    <div className="rf-glass rf-picker" role="dialog" aria-labelledby={titleId}>
+      <h2 id={titleId} className="rf-picker__title">
+        Start an agent in <span className="rf-mono">{repoName}</span>
+      </h2>
+      <ul
+        ref={list}
+        className="rf-picker__list"
+        role="listbox"
+        tabIndex={0}
+        aria-labelledby={titleId}
+        aria-activedescendant={options[index] ? optionId(index) : undefined}
+      >
+        {options.map((option, i) => (
+          <li
+            key={option.kind === "resume" ? option.session.id : "new"}
+            id={optionId(i)}
+            className="rf-option"
+            role="option"
+            aria-selected={i === index}
+            onMouseEnter={() => onMove(i)}
+            onClick={() => onAccept(i)}
+          >
+            {option.kind === "resume" ? (
+              <>
+                <div className="rf-option__head">
+                  <span>Resume</span>
+                  <span className="rf-option__meta rf-mono">
+                    {option.session.lastTimestamp
+                      ? `${relativeTime(Date.parse(option.session.lastTimestamp), now)} · `
+                      : ""}
+                    {formatSize(option.session.byteSize)}
+                  </span>
+                </div>
+                <div className="rf-option__text">
+                  {firstLine(option.session.lastAssistantText) ?? "No reply yet"}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="rf-option__head">
+                  <span>New agent</span>
+                </div>
+                <div className="rf-option__text">
+                  {option.prompt ? "Starts by reviewing the uncommitted changes" : "A fresh session"}
+                </div>
+              </>
+            )}
+          </li>
+        ))}
+      </ul>
+      <div className="rf-picker__footer">
+        <span>
+          <kbd className="rf-kbd">↑</kbd> <kbd className="rf-kbd">↓</kbd> choose ·{" "}
+          <kbd className="rf-kbd">Enter</kbd> start
+        </span>
+        <button type="button" className="rf-button rf-button--ghost" onClick={onClose}>
+          Cancel <kbd className="rf-kbd">Esc</kbd>
+        </button>
+      </div>
+    </div>
+  );
+}

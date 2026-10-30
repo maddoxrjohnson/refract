@@ -110,3 +110,11 @@ export interface LaunchError {
   kind: "vscodeNotFound" | "setup" | "agent" | "vscode" | "internal";
   message: string;
 }
+
+/** GPU use from Windows' performance counters, sent as `system://gpu` events. */
+export interface GpuUsage {
+  /** Busiest engine across all processes, 0 to 100. */
+  totalPercent: number;
+  /** Refract's own share of that engine, 0 to 100. */
+  ownPercent: number;
+}

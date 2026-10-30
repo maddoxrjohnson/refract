@@ -1,6 +1,7 @@
 import type {
   AgentEvent,
   AgentStatus,
+  GpuUsage,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
@@ -27,4 +28,10 @@ export interface Backend {
   /** Whether the window is shown right now. */
   isVisible(): Promise<boolean>;
   onVisibility(cb: (visible: boolean) => void): Unsubscribe;
+  /** Opens a repo's folder (a WSL path) in the file manager. */
+  openFolder(path: string): Promise<void>;
+  /** Opens an `https://` URL in the default browser; other schemes are refused. */
+  openUrl(url: string): Promise<void>;
+  /** System GPU use, sampled about every 2 s while the window is visible. */
+  onGpuUsage(cb: (usage: GpuUsage) => void): Unsubscribe;
 }

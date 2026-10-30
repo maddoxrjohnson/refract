@@ -2,8 +2,10 @@
 //! the interface.
 
 mod agent;
+mod gpu;
 mod hotkey;
 mod launch;
+mod open;
 mod process;
 mod tray;
 mod window;
@@ -59,6 +61,8 @@ pub fn run() {
             agent::agent_status,
             agent::agent_request,
             launch::launch,
+            open::open_folder,
+            open::open_url,
         ])
         .build(tauri::generate_context!())
         .expect("building the Tauri app");

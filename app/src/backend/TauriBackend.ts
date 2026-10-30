@@ -4,6 +4,7 @@ import type { Backend, Unsubscribe } from "./Backend";
 import type {
   AgentEvent,
   AgentStatus,
+  GpuUsage,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
@@ -17,6 +18,7 @@ export const EVENTS = {
   agentStatus: "agent://status",
   agentEvent: "agent://event",
   launchProgress: "launch://progress",
+  gpu: "system://gpu",
 } as const;
 
 /**
@@ -76,5 +78,19 @@ export class TauriBackend implements Backend {
 
   onVisibility(cb: (visible: boolean) => void): Unsubscribe {
     return subscribe<{ visible: boolean }>(EVENTS.visibility, (e) => cb(e.payload.visible));
+  }
+
+  /** Rejects with `{kind, message}`, `kind` one of invalid, noDistro, failed, internal. */
+  openFolder(path: string): Promise<void> {
+    return invoke<void>("open_folder", { path });
+  }
+
+  /** Rejects with `{kind, message}` as `openFolder` does. */
+  openUrl(url: string): Promise<void> {
+    return invoke<void>("open_url", { url });
+  }
+
+  onGpuUsage(cb: (usage: GpuUsage) => void): Unsubscribe {
+    return subscribe<GpuUsage>(EVENTS.gpu, (e) => cb(e.payload));
   }
 }

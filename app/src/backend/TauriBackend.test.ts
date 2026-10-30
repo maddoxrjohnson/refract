@@ -2,7 +2,7 @@ import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
 import { EVENTS, TauriBackend } from "./TauriBackend";
-import type { AgentStatus } from "./types";
+import type { AgentStatus, GpuUsage } from "./types";
 
 afterEach(() => clearMocks());
 
@@ -66,6 +66,34 @@ describe("TauriBackend", () => {
       throw error;
     });
     await expect(new TauriBackend().launch("/x", { kind: "new" })).rejects.toEqual(error);
+  });
+
+  it("opens folders and links through their commands", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const refused = { kind: "invalid", message: "Only https links can be opened: http://x" };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "open_url") throw refused;
+    });
+    const backend = new TauriBackend();
+    await backend.openFolder("/home/dev/projects/tidepool-api");
+    await expect(backend.openUrl("http://x")).rejects.toEqual(refused);
+    expect(calls).toEqual([
+      { cmd: "open_folder", args: { path: "/home/dev/projects/tidepool-api" } },
+      { cmd: "open_url", args: { url: "http://x" } },
+    ]);
+  });
+
+  it("delivers GPU usage until unsubscribed", async () => {
+    mockIPC(() => undefined, { shouldMockEvents: true });
+    const usages: GpuUsage[] = [];
+    const stop = new TauriBackend().onGpuUsage((u) => usages.push(u));
+    await settle();
+    await emit(EVENTS.gpu, { totalPercent: 42.5, ownPercent: 7 });
+    stop();
+    await settle();
+    await emit(EVENTS.gpu, { totalPercent: 10, ownPercent: 0 });
+    expect(usages).toEqual([{ totalPercent: 42.5, ownPercent: 7 }]);
   });
 
   it("delivers events until unsubscribed", async () => {

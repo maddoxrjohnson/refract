@@ -30,7 +30,16 @@ tauri-plugin-single-instance = "2.5"
 # The versions wry uses, to reach WebView2 interfaces Tauri does not wrap.
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
-windows = "0.62"
+# PDH for GPU use, ToolHelp for our child processes, ShellExecuteW to open folders
+# and links.
+windows = { version = "0.62", features = [
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Performance",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
+] }
 
 [profile.release]
 codegen-units = 1
