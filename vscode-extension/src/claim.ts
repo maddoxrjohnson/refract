@@ -1,6 +1,6 @@
 // Claim-by-rename scanning of the launch directory. Must not import `vscode`.
 import * as path from "node:path";
-import { isStale, matchesFolder, parseRequest, type LaunchRequest } from "./request";
+import { ageMinutes, classifyAge, matchesFolder, parseRequest, type LaunchRequest } from "./request";
 
 export interface ClaimFs {
   readdir(dir: string): Promise<string[]>;
@@ -12,6 +12,10 @@ export interface ClaimFs {
 export interface ClaimedRequest {
   request: LaunchRequest;
   claimedPath: string;
+  /** Older than the fresh window: the user must confirm before it starts. */
+  late: boolean;
+  /** Whole minutes between `createdAt` and the scan. */
+  ageMinutes: number;
 }
 
 export type Log = (message: string) => void;
@@ -20,7 +24,11 @@ function isErrno(err: unknown, code: string): boolean {
   return typeof err === "object" && err !== null && (err as { code?: unknown }).code === code;
 }
 
-/** Claim every fresh request in `dir` that is addressed to `folder`. */
+/**
+ * Claim every request in `dir` addressed to `folder` that is fresh or late (see
+ * `classifyAge`). When several late requests are found at once, only the newest
+ * is kept; the older ones are deleted, so a held key cannot stack up prompts.
+ */
 export async function claimRequests(
   fs: ClaimFs,
   dir: string,
@@ -59,8 +67,9 @@ export async function claimRequests(
       log(`skip ${name}: other folder`);
       continue;
     }
-    if (isStale(request.createdAt, now)) {
-      log(`skip ${name}: stale`);
+    const freshness = classifyAge(request.createdAt, now);
+    if (freshness === "ignore") {
+      log(`skip ${name}: expired`);
       continue;
     }
     const claimedPath = path.join(dir, name.slice(0, -".json".length) + ".claimed");
@@ -75,9 +84,34 @@ export async function claimRequests(
       continue;
     }
     log(`claimed ${name}`);
-    claimed.push({ request, claimedPath });
+    claimed.push({
+      request,
+      claimedPath,
+      late: freshness === "ask",
+      ageMinutes: ageMinutes(request.createdAt, now),
+    });
   }
-  return claimed;
+  return dropOlderLate(fs, claimed, log);
+}
+
+async function dropOlderLate(fs: ClaimFs, claimed: ClaimedRequest[], log: Log): Promise<ClaimedRequest[]> {
+  const late = claimed.filter((c) => c.late);
+  if (late.length < 2) {
+    return claimed;
+  }
+  const newest = late.reduce((a, b) =>
+    Date.parse(b.request.createdAt) > Date.parse(a.request.createdAt) ? b : a,
+  );
+  const kept: ClaimedRequest[] = [];
+  for (const c of claimed) {
+    if (c.late && c !== newest) {
+      log(`dropped ${c.request.requestId}: a newer late request replaces it`);
+      await release(fs, c, log);
+    } else {
+      kept.push(c);
+    }
+  }
+  return kept;
 }
 
 /** Delete a claimed file once its terminal has started. */
@@ -88,6 +122,36 @@ export async function release(fs: ClaimFs, claimed: ClaimedRequest, log: Log = (
     if (!isErrno(err, "ENOENT")) {
       log(`cannot remove ${claimed.claimedPath}: ${String(err)}`);
     }
+  }
+}
+
+export interface PromptDeps {
+  /** Shows `message` with `buttons`; resolves to the pressed button, or undefined if closed. */
+  showMessage(message: string, ...buttons: string[]): Promise<string | undefined>;
+  /** Starts the request exactly as a fresh one would start. */
+  start(claimed: ClaimedRequest): Promise<void>;
+  fs: ClaimFs;
+  log: Log;
+}
+
+/** Asks whether to start a late request. Start runs it; anything else deletes it. */
+export async function promptLate(claimed: ClaimedRequest, deps: PromptDeps): Promise<void> {
+  const { request } = claimed;
+  const { log } = deps;
+  try {
+    const choice = await deps.showMessage(
+      `Refract asked to start "${request.title}" here ${claimed.ageMinutes} minutes ago, but the window took too long to open. Start it now?`,
+      "Start",
+      "Dismiss",
+    );
+    if (choice === "Start") {
+      await deps.start(claimed);
+    } else {
+      log(`dismissed ${request.requestId}`);
+      await release(deps.fs, claimed, log);
+    }
+  } catch (err) {
+    log(`failed to start ${request.requestId}: ${String(err)}`);
   }
 }
 

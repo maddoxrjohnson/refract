@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as vscode from "vscode";
-import { claimRequests, release, Scanner, type ClaimedRequest, type ClaimFs } from "./claim";
+import { claimRequests, promptLate, release, Scanner, type ClaimedRequest, type ClaimFs } from "./claim";
 import { tabsToClose } from "./layout";
 import { launchDir, terminalCommand } from "./request";
 
@@ -75,9 +75,23 @@ export function activate(context: vscode.ExtensionContext): void {
     }
   }
 
+  // A late request waits for an answer, so the prompt must not hold up the scan
+  // queue: a fresh request that arrives meanwhile still starts at once.
+  async function handle(claimed: ClaimedRequest, first: boolean): Promise<void> {
+    if (!claimed.late) {
+      return start(claimed, first);
+    }
+    void promptLate(claimed, {
+      showMessage: (message, ...buttons) => Promise.resolve(vscode.window.showInformationMessage(message, ...buttons)),
+      start: (c) => start(c, first),
+      fs: nodeFs,
+      log,
+    });
+  }
+
   const scanner = new Scanner(
     () => claimRequests(nodeFs, dir, folder, Date.now(), log),
-    start,
+    handle,
     log,
   );
 

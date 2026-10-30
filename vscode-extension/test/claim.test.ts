@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { claimRequests, release, Scanner, type ClaimFs } from "../src/claim";
+import { claimRequests, promptLate, release, Scanner, type ClaimedRequest, type ClaimFs } from "../src/claim";
 
 const nodeFs: ClaimFs = {
   readdir: (d) => fs.promises.readdir(d),
@@ -43,9 +43,9 @@ describe("claimRequests", () => {
     expect(fs.readdirSync(dir)).toEqual(["a.claimed"]);
   });
 
-  it("skips other folders, stale, invalid, unknown version and non-json files", async () => {
+  it("skips other folders, expired, invalid, unknown version and non-json files", async () => {
     write("other", req("other", { folder: "/elsewhere" }));
-    write("stale", req("stale", { createdAt: "2026-10-29T17:00:00Z" }));
+    write("stale", req("stale", { createdAt: "2026-10-29T16:00:00Z" }));
     write("bad", "{not json");
     write("v2", req("v2", { version: 2 }));
     fs.writeFileSync(path.join(dir, "note.txt"), "x");
@@ -54,6 +54,27 @@ describe("claimRequests", () => {
     expect(got).toEqual([]);
     expect(fs.readdirSync(dir).sort()).toEqual(["bad.json", "note.txt", "other.json", "stale.json", "v2.json"]);
     expect(logs.length).toBe(4);
+  });
+
+  it("claims a request between two minutes and an hour old as late", async () => {
+    write("a", req("a", { createdAt: "2026-10-29T17:53:00Z" }));
+    write("b", req("b", { createdAt: "2026-10-29T17:59:30Z" }));
+    const got = await claimRequests(nodeFs, dir, folder, now);
+    expect(got.map((c) => [c.request.requestId, c.late, c.ageMinutes])).toEqual([
+      ["a", true, 7],
+      ["b", false, 0],
+    ]);
+    expect(fs.readdirSync(dir).sort()).toEqual(["a.claimed", "b.claimed"]);
+  });
+
+  it("keeps only the newest of several late requests and deletes the rest", async () => {
+    write("a", req("a", { createdAt: "2026-10-29T17:50:00Z" }));
+    write("b", req("b", { createdAt: "2026-10-29T17:55:00Z" }));
+    write("c", req("c", { createdAt: "2026-10-29T17:52:00Z" }));
+    write("d", req("d"));
+    const got = await claimRequests(nodeFs, dir, folder, now);
+    expect(got.map((c) => c.request.requestId)).toEqual(["b", "d"]);
+    expect(fs.readdirSync(dir).sort()).toEqual(["b.claimed", "d.claimed"]);
   });
 
   it("returns nothing when the directory does not exist", async () => {
@@ -143,5 +164,83 @@ describe("Scanner", () => {
     await scanner.scan();
     expect(handled).toEqual([["b", false]]);
     expect(logs.some((l) => l.includes("boom"))).toBe(true);
+  });
+});
+
+describe("promptLate", () => {
+  async function lateClaim(): Promise<ClaimedRequest> {
+    write("a", req("a", { title: "Fix the widget", createdAt: "2026-10-29T17:53:00Z" }));
+    const [c] = await claimRequests(nodeFs, dir, folder, now);
+    return c!;
+  }
+
+  function deps(answer: string | undefined) {
+    const shown: Array<[string, string[]]> = [];
+    const started: string[] = [];
+    return {
+      shown,
+      started,
+      deps: {
+        showMessage: async (message: string, ...buttons: string[]) => {
+          shown.push([message, buttons]);
+          return answer;
+        },
+        start: async (c: ClaimedRequest) => {
+          started.push(c.request.requestId);
+        },
+        fs: nodeFs,
+        log: () => {},
+      },
+    };
+  }
+
+  it("names the request and its age, and offers Start and Dismiss", async () => {
+    const claimed = await lateClaim();
+    const d = deps("Dismiss");
+    await promptLate(claimed, d.deps);
+    expect(d.shown).toEqual([
+      [
+        'Refract asked to start "Fix the widget" here 7 minutes ago, but the window took too long to open. Start it now?',
+        ["Start", "Dismiss"],
+      ],
+    ]);
+  });
+
+  it("starts the request on Start and leaves the file for start to release", async () => {
+    const claimed = await lateClaim();
+    const d = deps("Start");
+    await promptLate(claimed, d.deps);
+    expect(d.started).toEqual(["a"]);
+    expect(fs.readdirSync(dir)).toEqual(["a.claimed"]);
+  });
+
+  it("deletes the claimed file and starts nothing on Dismiss", async () => {
+    const claimed = await lateClaim();
+    const d = deps("Dismiss");
+    await promptLate(claimed, d.deps);
+    expect(d.started).toEqual([]);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it("treats a closed message like Dismiss", async () => {
+    const claimed = await lateClaim();
+    const d = deps(undefined);
+    await promptLate(claimed, d.deps);
+    expect(d.started).toEqual([]);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it("logs and does not throw when starting fails", async () => {
+    const claimed = await lateClaim();
+    const logs: string[] = [];
+    const d = deps("Start");
+    await promptLate(claimed, {
+      ...d.deps,
+      start: async () => {
+        throw new Error("nope");
+      },
+      log: (m) => logs.push(m),
+    });
+    expect(logs.some((l) => l.includes("failed to start a"))).toBe(true);
   });
 });

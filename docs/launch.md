@@ -44,7 +44,7 @@ Directory: `$XDG_STATE_HOME/refract/launch/`, defaulting to `~/.local/state/refr
 
 A window **claims** a request by renaming `<requestId>.json` to `<requestId>.claimed`. If the rename fails because the file has gone, another window took it. After starting the terminal, the window deletes the `.claimed` file.
 
-A window ignores requests for other folders, requests with an unknown `version`, and requests older than two minutes. The helper deletes request, claimed and leftover temporary files older than one hour each time it writes a new one.
+A window ignores requests for other folders, requests with an unknown `version` or that cannot be parsed, requests older than one hour, and requests dated more than a minute in the future. A request between two minutes and one hour old is claimed but not started on its own; see "In the window". The helper deletes request, claimed and leftover temporary files older than one hour each time it writes a new one.
 
 ## Protocol
 
@@ -148,3 +148,10 @@ On activation the extension scans the launch directory for requests matching its
 1. Opens a terminal in the editor area, named after `title`, with the folder as its working directory.
 2. Types the command into it. Arguments that are plain tokens, such as `claude`, flags and UUIDs, are typed as they are. Any other argument, such as an opening prompt, is passed in the terminal's environment as `REFRACT_ARG_<n>` and typed as `"$REFRACT_ARG_<n>"`. The typed line therefore stays short, and tabs, quotes or a long prompt cannot be misread by the shell. The shell stays open after `claude` exits.
 3. On a request found during activation (that is, the window was opened for it), sets up the bare layout. It closes the sidebar, panel and secondary sidebar, then closes every tab that is not a terminal and has no unsaved changes. Requests that arrive later only add a terminal tab, so an existing window's layout is left alone.
+
+A request is fresh for two minutes after `createdAt`. A window can take longer than that to connect, for example while VS Code's server downloads after an update, so a request between two minutes and one hour old is not dropped. The window claims it, then shows a message: `Refract asked to start "<title>" here <N> minutes ago, but the window took too long to open. Start it now?` with **Start** and **Dismiss**.
+
+- **Start** runs the request exactly as a fresh one, including the bare layout if it was found during activation.
+- **Dismiss**, or closing the message, deletes the claimed file and starts nothing.
+- If several such requests are found at once, such as after a held key, only the newest gets a message. The older ones are deleted.
+- The message is not modal, so a fresh request that arrives while it is open still starts at once.

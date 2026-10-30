@@ -15,6 +15,7 @@ export type ParseResult =
   | { ok: false; reason: string };
 
 const STALE_AFTER_MS = 2 * 60 * 1000;
+const EXPIRED_AFTER_MS = 60 * 60 * 1000;
 const FUTURE_SLACK_MS = 60 * 1000;
 
 export function parseRequest(text: string): ParseResult {
@@ -76,14 +77,30 @@ export function matchesFolder(
   );
 }
 
-/** Older than two minutes, unparseable, or more than a minute in the future. */
-export function isStale(createdAt: string, now: Date | number): boolean {
+export type Freshness = "fresh" | "ask" | "ignore";
+
+/**
+ * What to do with a request of this age. Up to two minutes old it starts at
+ * once. Up to an hour old it waits for the user to confirm. Older than that,
+ * unparseable, or more than a minute in the future, it is ignored.
+ */
+export function classifyAge(createdAt: string, now: Date | number): Freshness {
   const created = Date.parse(createdAt);
   if (Number.isNaN(created)) {
-    return true;
+    return "ignore";
   }
   const age = (typeof now === "number" ? now : now.getTime()) - created;
-  return age > STALE_AFTER_MS || age < -FUTURE_SLACK_MS;
+  if (age < -FUTURE_SLACK_MS || age > EXPIRED_AFTER_MS) {
+    return "ignore";
+  }
+  return age > STALE_AFTER_MS ? "ask" : "fresh";
+}
+
+/** How long ago `createdAt` was, in whole minutes (0 if unparseable or in the future). */
+export function ageMinutes(createdAt: string, now: Date | number): number {
+  const created = Date.parse(createdAt);
+  const age = (typeof now === "number" ? now : now.getTime()) - created;
+  return Number.isNaN(age) || age < 0 ? 0 : Math.floor(age / 60_000);
 }
 
 const SAFE_TOKEN = /^[A-Za-z0-9._/:=@%+-]+$/;

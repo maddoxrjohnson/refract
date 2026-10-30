@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
-import { isSafeToken, isStale, launchDir, matchesFolder, parseRequest, terminalCommand } from "../src/request";
+import { ageMinutes, classifyAge, isSafeToken, launchDir, matchesFolder, parseRequest, terminalCommand } from "../src/request";
 
 const valid = {
   version: 1,
@@ -49,22 +49,39 @@ describe("matchesFolder", () => {
   });
 });
 
-describe("isStale", () => {
+describe("classifyAge", () => {
   const now = Date.parse("2026-10-29T18:00:00Z");
   it("is fresh within two minutes", () => {
-    expect(isStale("2026-10-29T17:59:30Z", now)).toBe(false);
-    expect(isStale("2026-10-29T17:58:00Z", new Date(now))).toBe(false);
+    expect(classifyAge("2026-10-29T17:59:30Z", now)).toBe("fresh");
+    expect(classifyAge("2026-10-29T17:58:00Z", new Date(now))).toBe("fresh");
   });
-  it("is stale beyond two minutes", () => {
-    expect(isStale("2026-10-29T17:57:59Z", now)).toBe(true);
+  it("asks between two minutes and an hour", () => {
+    expect(classifyAge("2026-10-29T17:57:59Z", now)).toBe("ask");
+    expect(classifyAge("2026-10-29T17:00:00Z", now)).toBe("ask");
   });
-  it("is stale when unparseable", () => {
-    expect(isStale("yesterday-ish", now)).toBe(true);
-    expect(isStale("", now)).toBe(true);
+  it("ignores requests more than an hour old", () => {
+    expect(classifyAge("2026-10-29T16:59:59Z", now)).toBe("ignore");
+    expect(classifyAge("2026-10-28T18:00:00Z", now)).toBe("ignore");
   });
-  it("is stale when more than a minute in the future", () => {
-    expect(isStale("2026-10-29T18:00:50Z", now)).toBe(false);
-    expect(isStale("2026-10-29T18:01:01Z", now)).toBe(true);
+  it("ignores unparseable timestamps", () => {
+    expect(classifyAge("yesterday-ish", now)).toBe("ignore");
+    expect(classifyAge("", now)).toBe("ignore");
+  });
+  it("tolerates a minute of clock skew into the future, no more", () => {
+    expect(classifyAge("2026-10-29T18:00:50Z", now)).toBe("fresh");
+    expect(classifyAge("2026-10-29T18:01:01Z", now)).toBe("ignore");
+  });
+});
+
+describe("ageMinutes", () => {
+  const now = Date.parse("2026-10-29T18:00:00Z");
+  it("counts whole minutes", () => {
+    expect(ageMinutes("2026-10-29T17:57:30Z", now)).toBe(2);
+    expect(ageMinutes("2026-10-29T17:30:00Z", new Date(now))).toBe(30);
+  });
+  it("is 0 for the future and for garbage", () => {
+    expect(ageMinutes("2026-10-29T18:00:30Z", now)).toBe(0);
+    expect(ageMinutes("nope", now)).toBe(0);
   });
 });
 
