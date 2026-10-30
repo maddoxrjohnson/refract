@@ -11,6 +11,15 @@ test.beforeEach(async ({ page }) => {
     if (msg.type() === "error") errors.push(msg.text());
   });
   page.on("pageerror", (err) => errors.push(err.message));
+  // Low draws only on change. Software WebGL on a small CI runner can't keep up with
+  // Medium's constant motion, and the busy main thread then starves the demo's timers.
+  await page.addInitScript(() => {
+    try {
+      localStorage.setItem("refract.quality", "low");
+    } catch {
+      // Storage may be unavailable; the test then runs at the default level.
+    }
+  });
   await page.goto("./");
   await expect(page.locator(".scene canvas")).toBeVisible();
   // The scene has drawn: the gems are listed and the usage widget has numbers.
