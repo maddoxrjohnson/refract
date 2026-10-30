@@ -1,4 +1,4 @@
-import { useId } from "react";
+import { useId, type ReactNode } from "react";
 import type {
   CiStatus,
   LaunchMode,
@@ -34,6 +34,8 @@ export interface DetailPanelProps {
   details?: RemoteDetailsState | null;
   /** Fetches the details again, past the cache. */
   onRefreshDetails?(): void;
+  /** Move to WSL, for a cloned repo on a Windows drive (spec §2.1). */
+  move?: ReactNode;
 }
 
 const CI_LABELS: Record<CiStatus, string> = {
@@ -157,6 +159,7 @@ export function DetailPanel({
   remoteOnly = false,
   details = null,
   onRefreshDetails,
+  move = null,
 }: DetailPanelProps) {
   const hintId = useId();
   const direct = repo.preselect.kind === "noPicker";
@@ -278,6 +281,8 @@ export function DetailPanel({
             </dd>
           </dl>
         </section>
+
+        {move}
 
         <section className="rf-section">
           <h3 className="rf-section__label">Last commit</h3>

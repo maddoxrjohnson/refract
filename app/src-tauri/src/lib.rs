@@ -48,6 +48,7 @@ pub fn run() {
             Some(vec![HIDDEN_ARG]),
         ))
         .plugin(hotkey::plugin())
+        .plugin(tauri_plugin_notification::init())
         .manage(remote::Remote::new())
         .manage(migrate::Migrations::default())
         .setup(|app| {

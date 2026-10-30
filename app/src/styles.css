@@ -39,6 +39,17 @@ main.app {
   will-change: transform;
 }
 
+/* A mark centred on a gem; the scene sets its transform and `--r`, the gem's radius. */
+.scene-mark {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  pointer-events: none;
+  will-change: transform;
+}
+
 .scene-fail {
   position: absolute;
   inset: 0;

@@ -27,6 +27,8 @@ sha2 = "0.10"
 tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2.7"
 tauri-plugin-global-shortcut = "2.4"
+# A Windows toast when a Move to WSL is ready or failed while the window is hidden.
+tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2.5"
 # Blocking HTTP for GitHub and GitLab, over the system TLS (schannel on Windows).
 ureq = { version = "3.4", default-features = false, features = ["native-tls-no-default"] }

@@ -50,9 +50,8 @@
 //!   report}` reach the interface on `agent://event` like every helper event. The app
 //!   also reads `migrateReady` to know which migrations may be deleted.
 //!
-//! A migration that becomes ready, or fails, while the window is hidden should show a
-//! Windows notification. The app has no notification plugin and Tauri's tray has no
-//! balloon, so for now [`notify`] only logs it.
+//! A migration that becomes ready, or fails, while the window is hidden shows a
+//! Windows notification ([`notify`], through `tauri-plugin-notification`).
 //!
 //! The snapshot file goes to `%LOCALAPPDATA%\<identifier>\migrate`, written under a
 //! temporary name and renamed into place before `migrate` is sent, and is deleted when
@@ -224,11 +223,12 @@ pub fn on_helper_event(app: &AppHandle, event: &Event) {
     }
 }
 
-/// Shows a Windows notification.
-// TODO: show a real toast. The app has no notification plugin
-// (tauri-plugin-notification would do) and Tauri's tray icon has no balloon.
-fn notify(_app: &AppHandle, title: &str, body: &str) {
-    eprintln!("refract: (notification) {title}: {body}");
+/// Shows a Windows notification; a failure is only logged.
+fn notify(app: &AppHandle, title: &str, body: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    if let Err(err) = app.notification().builder().title(title).body(body).show() {
+        eprintln!("refract: cannot show the notification {title:?}: {err}");
+    }
 }
 
 /// One progress report of a preflight or snapshot, sent as `migrate://snapshot`.

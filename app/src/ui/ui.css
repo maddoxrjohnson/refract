@@ -948,6 +948,374 @@
   color: var(--danger);
 }
 
+/* Move to WSL: the gem marks, the panel section and the dialog */
+
+.rf-gem-mark {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
+/* Four small panes at the gem's upper left, quiet like the dimmed facets. */
+.rf-drive-mark {
+  position: absolute;
+  left: calc(var(--r, 20px) * -0.66 - 6px);
+  top: calc(var(--r, 20px) * -0.66 - 6px);
+  fill: rgb(169 216 255 / 0.16);
+  stroke: rgb(169 216 255 / 0.62);
+  stroke-width: 0.8;
+  filter: drop-shadow(0 0 3px rgb(111 211 255 / 0.45));
+}
+
+/* A thin ring just outside the facets, inside the halo; it fills as the move goes on. */
+.rf-move-ring {
+  position: absolute;
+  width: calc(var(--r, 20px) * 2.24);
+  height: calc(var(--r, 20px) * 2.24);
+  left: calc(var(--r, 20px) * -1.12);
+  top: calc(var(--r, 20px) * -1.12);
+  overflow: visible;
+  transform: rotate(-90deg);
+  fill: none;
+}
+
+.rf-move-ring circle {
+  stroke-width: 2px;
+  vector-effect: non-scaling-stroke;
+}
+
+.rf-move-ring__track {
+  stroke: rgb(169 216 255 / 0.14);
+}
+
+.rf-move-ring__fill {
+  stroke: var(--glass);
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 4px rgb(111 211 255 / 0.7));
+  transition: stroke-dasharray 400ms var(--ease-out);
+}
+
+.rf-move-ring--failed .rf-move-ring__fill {
+  stroke: var(--amber);
+  filter: drop-shadow(0 0 4px rgb(255 179 71 / 0.6));
+}
+
+.rf-focus-label__drive {
+  margin-top: 4px;
+  max-width: 236px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: normal;
+}
+
+.rf-state--move {
+  color: var(--glass);
+}
+
+.rf-state--move::before {
+  background: var(--glass);
+  box-shadow: 0 0 6px var(--halo);
+}
+
+.rf-move-section__line {
+  margin: 0 0 8px;
+}
+
+.rf-move-section__line--failed {
+  color: var(--amber);
+}
+
+.rf-move-section__step {
+  margin-bottom: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rf-move-section .rf-move-bar {
+  margin-bottom: 10px;
+}
+
+.rf-move-bar {
+  height: 4px;
+  overflow: hidden;
+  border-radius: 2px;
+  background: rgb(255 255 255 / 0.08);
+}
+
+.rf-move-bar__fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--glass);
+  box-shadow: 0 0 6px var(--halo);
+  transition: width 400ms var(--ease-out);
+}
+
+.rf-move-bar__fill--unknown {
+  opacity: 0.45;
+}
+
+/* The dialog takes the detail panel's place, so the zoomed gem stays in view. */
+.rf-move-shield {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+}
+
+.rf-move {
+  position: fixed;
+  z-index: 15;
+  top: 16px;
+  right: 16px;
+  bottom: 16px;
+  width: min(420px, calc(100vw - 32px));
+  display: flex;
+  flex-direction: column;
+  border-radius: 16px;
+  background: var(--panel-strong);
+  overflow: hidden;
+  animation: rf-slide-in 220ms var(--ease-out);
+}
+
+.rf-move:focus-visible {
+  outline: none;
+}
+
+.rf-move__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 12px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rf-move__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.rf-move__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 2px 18px 12px;
+}
+
+.rf-move__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 18px 16px;
+  border-top: 1px solid var(--line);
+}
+
+.rf-move__actions--column {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+.rf-move__actions .rf-error,
+.rf-move__actions .rf-hint {
+  margin: 0;
+}
+
+.rf-move__hint {
+  flex-basis: 100%;
+}
+
+.rf-move__dest {
+  width: 100%;
+}
+
+.rf-move-facts {
+  margin-top: 10px;
+}
+
+.rf-move-note {
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+
+.rf-move-warn {
+  color: var(--amber);
+}
+
+.rf-move-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rf-move-list li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.rf-move-list--stacked li {
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rf-move-list__name,
+.rf-move-busy__name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.rf-move-list code,
+.rf-move-check code {
+  font-size: 12px;
+  color: var(--glass);
+}
+
+.rf-move-warnings {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.rf-move-warnings li::marker {
+  color: var(--amber);
+}
+
+.rf-move-warnings li + li {
+  margin-top: 4px;
+}
+
+.rf-move-busy {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rf-move-busy li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.rf-move-busy .rf-button {
+  flex: none;
+}
+
+.rf-move-confirm {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+
+.rf-move-refusals {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--amber);
+}
+
+.rf-move-refusals li + li {
+  margin-top: 4px;
+}
+
+.rf-move-paths {
+  margin-top: 4px;
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.rf-move-notice {
+  padding-top: 10px;
+}
+
+.rf-move-progress__text {
+  margin-bottom: 6px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rf-move-progress {
+  margin-top: 12px;
+}
+
+.rf-move-verdict {
+  margin: 4px 0 0;
+}
+
+.rf-move-verdict--failed {
+  color: var(--amber);
+}
+
+.rf-move-checks {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rf-move-check {
+  display: flex;
+  gap: 8px;
+}
+
+.rf-move-check__icon {
+  flex: none;
+  width: 14px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.rf-move-check--passed .rf-move-check__icon {
+  color: #7ee2a8;
+}
+
+.rf-move-check--failed .rf-move-check__icon,
+.rf-move-check--failed .rf-move-check__advice {
+  color: var(--amber);
+}
+
+.rf-move-check__body {
+  min-width: 0;
+}
+
+.rf-move-check__advice {
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.rf-move-ask {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.rf-move-ask__question {
+  margin: 0;
+  font-weight: 500;
+}
+
+.rf-move-ask .rf-move-note {
+  margin: 0;
+}
+
+.rf-button--danger {
+  color: var(--danger);
+  border-color: rgb(255 138 138 / 0.35);
+}
+
+.rf-button--danger:hover {
+  background: rgb(255 138 138 / 0.08);
+  border-color: rgb(255 138 138 / 0.55);
+}
+
 /* Widgets: system load top right, Claude usage bottom right. Both fade while the detail
    panel is docked on the right, and both go on windows too small to keep them clear of
    the filter bar, the toast and the error line. */
@@ -1298,6 +1666,7 @@
   .rf-picker,
   .rf-settings,
   .rf-hook-offer,
+  .rf-move,
   .rf-toast {
     animation: rf-fade 120ms linear;
   }
@@ -1311,7 +1680,9 @@
   .rf-quality__option span,
   .rf-meter__fill,
   .rf-meter__own,
-  .rf-limit__fill {
+  .rf-limit__fill,
+  .rf-move-bar__fill,
+  .rf-move-ring__fill {
     transition: none;
   }
 
