@@ -859,7 +859,36 @@ function ReportView(props: ReportViewProps) {
         </div>
       </div>
     );
+  } else if (outcome?.kind === "driveHidden") {
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-ask__question">WSL can't see the drive the original is on, so nothing was deleted.</p>
+        <p className="rf-move-note rf-muted">
+          The folder is still there on Windows, but not at {report.source}, so Refract couldn't check it for changes.
+          Make the drive visible in WSL (for example, restart WSL or mount it), then{" "}
+          {deleting ? "finish deleting" : "try again"}.
+        </p>
+        <div className="rf-row">
+          {deleting ? (
+            finishButton
+          ) : (
+            <button
+              type="button"
+              className="rf-button rf-button--accent"
+              ref={defaultAction}
+              data-primary
+              disabled={disabled}
+              onClick={() => void deleteOriginal(false)}
+            >
+              Try again
+            </button>
+          )}
+        </div>
+      </div>
+    );
   } else if (outcome?.kind === "changed") {
+    // The copy is gone altogether: nothing to keep, and ending the move leaves the original as it is.
+    const copyGone = outcome.copyChanged.length === 1 && outcome.copyChanged[0] === ".";
     const resyncable = outcome.changed.length > 0 && outcome.copyChanged.length === 0;
     actions = (
       <div className="rf-move-ask" role="alert">
@@ -874,18 +903,34 @@ function ReportView(props: ReportViewProps) {
             <PathList paths={outcome.changed} />
           </>
         )}
-        {outcome.copyChanged.length > 0 && (
-          <>
-            <p className="rf-move-note">
-              The copy in WSL changed after it was checked, so it may hold work the original doesn't:
-            </p>
-            <PathList paths={outcome.copyChanged} />
-          </>
+        {copyGone ? (
+          <p className="rf-move-note">The copy in WSL is gone, so there's nothing to keep.</p>
+        ) : (
+          outcome.copyChanged.length > 0 && (
+            <>
+              <p className="rf-move-note">
+                The copy in WSL changed after it was checked, so it may hold work the original doesn't. Refract won't
+                re-sync over it or delete it; you can keep both:
+              </p>
+              <PathList paths={outcome.copyChanged} />
+            </>
+          )
         )}
         {outcome.unreadable.length > 0 && (
           <>
-            <p className="rf-move-note">These couldn't be read to check them. Close the program using them:</p>
+            <p className="rf-move-note">
+              These couldn't be read, so Refract can't tell whether they changed. Close any program using them, then
+              try again:
+            </p>
             <PathList paths={outcome.unreadable} />
+          </>
+        )}
+        {outcome.removed.length > 0 && (
+          <>
+            <p className="rf-move-note rf-muted">
+              Gone from the original since the check. That's fine: the copy still has them.
+            </p>
+            <PathList paths={outcome.removed} />
           </>
         )}
         {outcome.busyAgents.map((sentence) => (
@@ -906,6 +951,10 @@ function ReportView(props: ReportViewProps) {
         <div className="rf-row">
           {deleting ? (
             finishButton
+          ) : copyGone ? (
+            <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={discard}>
+              End the move
+            </button>
           ) : resyncable ? (
             <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={resync}>
               Re-sync
@@ -922,7 +971,7 @@ function ReportView(props: ReportViewProps) {
               Try again
             </button>
           ) : null}
-          {!deleting && (
+          {!deleting && !copyGone && (
             <button
               type="button"
               className={`rf-button${outcome.copyChanged.length > 0 ? " rf-button--accent" : ""}`}
@@ -1138,6 +1187,12 @@ function ReportView(props: ReportViewProps) {
                   {installChanges.length > MAX_PROBLEMS && `\nand ${installChanges.length - MAX_PROBLEMS} more`}
                 </div>
               </>
+            )}
+            {report.installBackup && (
+              <p className="rf-move-note rf-muted">
+                The original's version of each file the install changed or removed is saved in{" "}
+                <span className="rf-mono">{report.installBackup}</span>.
+              </p>
             )}
           </section>
         )}

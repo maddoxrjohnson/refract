@@ -19,12 +19,12 @@ use std::time::Duration;
 
 use refract_client::RequestError;
 use refract_core::migrate::preflight::Refusal;
-use refract_core::migrate::report::Report;
 use refract_core::protocol::{
     code, FinishAction, Method, MigrateCancelParams, MigrateFinishParams, MigrateIdParams,
     MigrateParams, Reply, StopAgentParams,
 };
-use serde::{Deserialize, Serialize};
+pub use refract_core::protocol::{BeginDelete, PendingMigration, Recheck};
+use serde::Serialize;
 
 use super::snapshot::RefusalView;
 use super::vscode::VsCodeWindow;
@@ -48,7 +48,6 @@ const FINISH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long `migrateCancel` waits: it deletes the partial copy.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long `migrateBeginDelete` waits: it stats every file of the source over `/mnt`.
-#[allow(dead_code)] // until refract-core can send it
 const BEGIN_DELETE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long the quick requests wait: `migrateResync` answers before it copies,
 /// `migratePending` and `stopAgent` read state the helper holds.
@@ -155,54 +154,6 @@ impl MigrateError {
     }
 }
 
-/// The recheck inside the answer to `migrateBeginDelete` (as `migrateRecheck` answers): what
-/// changed in the source and in the copy since the final check, and the agents still
-/// running on the source. Paths are relative to the source (or the copy), sorted.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct Recheck {
-    /// Changed or added in the source.
-    #[serde(default)]
-    pub changed: Vec<String>,
-    /// Gone from the source: deleting is still safe, the copy has them.
-    #[serde(default)]
-    pub removed: Vec<String>,
-    /// Could not be read to check them.
-    #[serde(default)]
-    pub unreadable: Vec<String>,
-    /// Changed in the copy after it was checked.
-    #[serde(default)]
-    pub copy_changed: Vec<String>,
-    /// One sentence per agent still running in the folder.
-    #[serde(default)]
-    pub busy_agents: Vec<String>,
-    /// The source folder itself is gone.
-    #[serde(default)]
-    pub source_missing: bool,
-}
-
-/// The answer to `migrateBeginDelete`: `ok` when the recheck passed (nothing changed or
-/// unreadable in the source, the copy as checked, no agent running; removed paths and a
-/// missing source are fine) and the helper is now in the deleting state (also when it
-/// already was).
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct BeginDelete {
-    pub ok: bool,
-    pub recheck: Recheck,
-}
-
-/// One migration whose report waits for an answer, from `migratePending`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PendingMigration {
-    pub id: String,
-    pub report: Report,
-    /// The helper is in the deleting state: only finishing the delete is left.
-    #[serde(default)]
-    pub deleting: bool,
-}
-
 /// The helper's side of a migration (see the module docs).
 pub trait MigrateHelper: Send + Sync {
     /// `migrate`: answers with the migration's id.
@@ -239,16 +190,15 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    fn begin_delete(&self, _id: &str) -> Result<BeginDelete, RequestError> {
-        // refract-core's protocol has no `migrateBeginDelete` yet, so it can't be sent;
-        // answering as an older helper does makes Delete original refuse.
-        Err(RequestError::Agent {
-            code: code::METHOD_NOT_FOUND,
-            message: format!(
-                "this helper does not support {} yet; update it",
-                method::BEGIN_DELETE
-            ),
-        })
+    fn begin_delete(&self, id: &str) -> Result<BeginDelete, RequestError> {
+        let params = MigrateIdParams { id: id.to_owned() };
+        match self
+            .0
+            .request(Method::MigrateBeginDelete(params), BEGIN_DELETE_TIMEOUT)?
+        {
+            Reply::BeginDelete(begin) => Ok(begin),
+            other => Err(unexpected(method::BEGIN_DELETE, &other)),
+        }
     }
 
     fn resync(&self, id: &str) -> Result<(), RequestError> {
@@ -289,14 +239,7 @@ impl MigrateHelper for AgentHelper<'_> {
 
     fn pending(&self) -> Result<Vec<PendingMigration>, RequestError> {
         match self.0.request(Method::MigratePending, QUICK_TIMEOUT)? {
-            Reply::PendingMigrations(list) => Ok(list
-                .into_iter()
-                .map(|p| PendingMigration {
-                    id: p.id,
-                    report: *p.report,
-                    deleting: false,
-                })
-                .collect()),
+            Reply::PendingMigrations(list) => Ok(list),
             other => Err(unexpected(method::PENDING, &other)),
         }
     }
@@ -403,6 +346,10 @@ pub enum DeleteOutcome {
     /// "Delete permanently?" (default **No**, which is **Keep both**, or, in the
     /// deleting state, leaving it for later).
     WontFit { reason: String, deleting: bool },
+    /// The original is still there on Windows, but the helper can't see it over `/mnt`
+    /// (its drive isn't mounted in WSL), so it could not be checked: nothing was
+    /// deleted. The interface asks to make the drive visible in WSL, then try again.
+    DriveHidden { deleting: bool },
     /// The helper is in the deleting state but the original is not (all) gone, or the
     /// helper did not finish: the interface offers only **Finish deleting**.
     Unfinished { reason: String },
@@ -427,7 +374,8 @@ impl DeleteOutcome {
         match self {
             DeleteOutcome::Changed { deleting, .. }
             | DeleteOutcome::WindowsOpen { deleting, .. }
-            | DeleteOutcome::WontFit { deleting, .. } => *deleting,
+            | DeleteOutcome::WontFit { deleting, .. }
+            | DeleteOutcome::DriveHidden { deleting } => *deleting,
             DeleteOutcome::Unfinished { .. } => true,
             DeleteOutcome::Deleted { .. } => false,
         }
@@ -495,6 +443,13 @@ pub fn delete_original(
     let begin = helper
         .begin_delete(&target.id)
         .map_err(|err| MigrateError::agent("Cannot check the original again", err))?;
+    // `sourceMissing` only says the `/mnt` path is absent. Still there on Windows, it is
+    // on a drive WSL doesn't see, so the recheck saw nothing of it.
+    if begin.recheck.source_missing && os.exists(&target.source) {
+        return Ok(DeleteOutcome::DriveHidden {
+            deleting: deleting || begin.ok,
+        });
+    }
     if !begin.ok {
         return Ok(DeleteOutcome::Changed {
             recheck: begin.recheck,
@@ -920,6 +875,39 @@ mod tests {
     }
 
     #[test]
+    fn a_source_wsl_cannot_see_is_not_deleted() {
+        let helper = FakeHelper {
+            begin: Some(BeginDelete {
+                ok: true,
+                recheck: Recheck {
+                    source_missing: true,
+                    ..Recheck::default()
+                },
+            }),
+            ..FakeHelper::default()
+        };
+        let os = FakeOs::with_source();
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert_eq!(outcome, DeleteOutcome::DriveHidden { deleting: true });
+        assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
+        assert!(!helper
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("finish")));
+        // Gone on Windows too: the move only needs finishing.
+        let os = FakeOs::default();
+        assert!(matches!(
+            delete_original(&helper, &os, &target(), false).unwrap(),
+            DeleteOutcome::Deleted {
+                already_gone: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn a_folder_that_survives_is_unfinished_and_finish_is_not_sent() {
         let helper = safe_helper();
         let os = FakeOs {
@@ -1067,9 +1055,9 @@ mod tests {
             value,
             serde_json::json!({"kind": "unfinished", "reason": "x"})
         );
-        // What the helper sends: missing lists read as empty.
+        // What the helper sends: the newer lists read as empty when missing.
         let begin: BeginDelete = serde_json::from_value(serde_json::json!(
-            {"ok": false, "recheck": {"changed": ["a"], "sourceMissing": true}}
+            {"ok": false, "recheck": {"changed": ["a"], "busyAgents": [], "sourceMissing": true}}
         ))
         .unwrap();
         assert!(!begin.ok && begin.recheck.source_missing && begin.recheck.removed.is_empty());

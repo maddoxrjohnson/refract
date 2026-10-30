@@ -290,6 +290,36 @@ describe("MoveDialog report", () => {
     expect(document.activeElement).toBe(button("Keep both"));
   });
 
+  it("offers only ending the move when the copy is gone", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete.mockResolvedValueOnce({ ...RECHECK, kind: "changed", copyChanged: ["."], deleting: false });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("The copy in WSL is gone");
+    expect(screen.queryByRole("button", { name: "Keep both" })).toBeNull();
+    fireEvent.click(button("End the move"));
+    await act(async () => {});
+    expect(backend.migrateFinish).toHaveBeenCalledWith(expect.any(String), "discard");
+  });
+
+  it("refuses when WSL can't see the original's drive, and lists unreadable and removed paths", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete
+      .mockResolvedValueOnce({ kind: "driveHidden", deleting: false })
+      .mockResolvedValueOnce({ ...RECHECK, kind: "changed", unreadable: ["locked.db"], removed: ["old.txt"], deleting: false });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("WSL can't see the drive");
+    fireEvent.click(button("Try again"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("locked.db");
+    expect(dialog.textContent).toContain("can't tell whether they changed");
+    expect(dialog.textContent).toContain("old.txt");
+    expect(dialog.textContent).toContain("the copy still has them");
+  });
+
   it("after a partial delete offers only Finish deleting, which finishes", async () => {
     const backend = fakeBackend({}, [testReport()]);
     backend.migrateDelete

@@ -511,6 +511,8 @@ export interface MigrationReport {
   install: MigrateInstallResult[];
   /** Repo-relative paths the install created, changed or removed; they don't block delete. */
   installChanges?: { created: string[]; changed: string[]; removed: string[] };
+  /** Linux folder holding the original's version of each file the install changed or removed. */
+  installBackup?: string;
   history: { sessions: number; fromDirs: string[]; toDirs: string[] };
   linuxGit: boolean;
   warnings: string[];
@@ -532,11 +534,11 @@ export interface Recheck {
   removed: string[];
   /** Couldn't be read, so whether they changed is unknown. */
   unreadable: string[];
-  /** Changed in the copy after it was checked. */
+  /** Changed in the copy after it was checked; `["."]` when the copy is gone. */
   copyChanged: string[];
   /** Sentences to show as they are, one per agent still running in the folder. */
   busyAgents: string[];
-  /** The original folder itself is gone. */
+  /** The original isn't there over `/mnt`; the app checks from Windows before saying it's gone. */
   sourceMissing: boolean;
 }
 
@@ -551,6 +553,8 @@ export type DeleteOutcome =
   | { kind: "windowsOpen"; windows: VsCodeWindow[]; deleting: boolean }
   /** Ask "Delete permanently?" (default No: Keep both, or later while deleting). */
   | { kind: "wontFit"; reason: string; deleting: boolean }
+  /** The original is there on Windows, but its drive isn't visible from WSL, so it couldn't be checked. */
+  | { kind: "driveHidden"; deleting: boolean }
   /** The delete began but didn't finish (a file was in use, or the helper didn't answer). */
   | { kind: "unfinished"; reason: string }
   | {

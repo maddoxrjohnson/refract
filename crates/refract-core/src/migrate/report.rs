@@ -61,7 +61,12 @@ impl Check {
     /// What to do when the check fails.
     pub fn advice(self) -> &'static str {
         match self {
-            Check::Files => "Discard the copy and retry. If it fails again, check the disk.",
+            Check::Files => {
+                "If a file says it was kept byte for byte, it mixes line endings or a git filter \
+                 changes it: on Windows, give it one kind of line ending throughout, then \
+                 retry. Otherwise discard the copy and retry; if it fails again, check the \
+                 disk."
+            }
             Check::GitState => {
                 "Discard the copy and retry. If it fails again, run git fsck on the original."
             }

@@ -43,6 +43,9 @@
 //! - `wontFit {reason}`: ask "Delete permanently?" (default **No**, which is
 //!   `migrate_finish keep`, or, while deleting, leaving it), and on **Yes** call
 //!   `migrate_delete {id, permanent: true}`;
+//! - `driveHidden`: the original is there on Windows but not over `/mnt` (its drive
+//!   isn't mounted in WSL), so it could not be checked and nothing was deleted. Make
+//!   the drive visible in WSL, then try again (or finish deleting);
 //! - `unfinished {reason}`: the helper is in the deleting state but the original is not
 //!   all gone (a file was in use) or the helper did not finish. Offer only **Finish
 //!   deleting** (`migrate_delete` again), never Re-sync, Keep or Discard;

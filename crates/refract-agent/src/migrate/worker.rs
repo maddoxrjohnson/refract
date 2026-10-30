@@ -66,10 +66,11 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 pub const DELETING: &str = "The original is being deleted.";
 
 /// Check 1's message for a file [`gitx::Normalised::kept`] whose blob then differs.
-const KEPT: &str = "Git on Windows stores this file without part of its bytes (mixed line \
-    endings, or a filter that drops some of it), so it can't become a Linux checkout \
-    without losing them. It was copied byte for byte, and git in WSL sees it as changed. \
-    Make its line endings consistent or commit it on Windows, then retry.";
+const KEPT: &str = "Kept byte for byte: this tracked file mixes line endings (or a git \
+    filter changes it), so a Linux checkout of it would not have the same bytes, and git \
+    in WSL shows it as modified. The original can't be deleted while it differs. On \
+    Windows, give it one kind of line ending throughout (or restore it with git checkout \
+    -- <file>), then retry.";
 
 /// What the main thread asks of a migration; each carries the request to answer.
 #[derive(Debug)]
