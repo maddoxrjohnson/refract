@@ -53,7 +53,11 @@ pub fn run(
 
 fn command(dir: &Path, config: &[String]) -> Command {
     let mut command = Command::new("git");
-    command.arg("--no-optional-locks");
+    // As the app runs git.exe: paths unquoted where `-z` is not available (`submodule
+    // status`), and English messages, which `parse_fsck` filters.
+    command
+        .arg("--no-optional-locks")
+        .args(["-c", "core.quotepath=false"]);
     for entry in config {
         command.arg("-c").arg(entry);
     }
@@ -61,7 +65,9 @@ fn command(dir: &Path, config: &[String]) -> Command {
         .arg("-C")
         .arg(dir)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("LC_ALL", "C")
+        .env("LANG", "C");
     if let Some(parent) = dir.parent() {
         command.env("GIT_CEILING_DIRECTORIES", parent);
     }
@@ -348,17 +354,21 @@ fn hash_bytes(
 }
 
 /// The `-c` settings under which Linux git computes the blob Windows git would store
-/// for a working-tree file: `core.autocrlf` as the repo's local config sets it, else
-/// `true` (Git for Windows' default, from its system config, which the snapshot does
-/// not carry), and `core.safecrlf=false` so a file with mixed line endings is hashed
-/// rather than refused.
-pub fn windows_config(local: &[ConfigEntry]) -> Vec<String> {
-    let autocrlf = local
-        .iter()
-        .rev()
-        .find(|e| e.key.eq_ignore_ascii_case("core.autocrlf"))
-        .map(|e| e.value.clone().unwrap_or_else(|| "true".into()))
-        .unwrap_or_else(|| "true".into());
+/// for a working-tree file: `core.autocrlf` as `recorded` says (the value the app's
+/// git saw, from [`refract_core::migrate::RepoGit::autocrlf`], global and system
+/// config included), else as the repo's local config sets it, else `true` (Git for
+/// Windows' default, from its system config); and `core.safecrlf=false` so a file with
+/// mixed line endings is hashed rather than refused.
+pub fn windows_config(local: &[ConfigEntry], recorded: Option<&str>) -> Vec<String> {
+    let autocrlf = match recorded {
+        Some(value) => value.to_owned(),
+        None => local
+            .iter()
+            .rev()
+            .find(|e| e.key.eq_ignore_ascii_case("core.autocrlf"))
+            .map(|e| e.value.clone().unwrap_or_else(|| "true".into()))
+            .unwrap_or_else(|| "true".into()),
+    };
     vec![
         format!("core.autocrlf={autocrlf}"),
         "core.filemode=false".into(),
@@ -599,13 +609,18 @@ mod tests {
             key: key.into(),
             value: value.map(str::to_owned),
         };
-        assert_eq!(windows_config(&[])[0], "core.autocrlf=true");
+        assert_eq!(windows_config(&[], None)[0], "core.autocrlf=true");
         assert_eq!(
-            windows_config(&[entry("core.autocrlf", Some("input"))])[0],
+            windows_config(&[entry("core.autocrlf", Some("input"))], None)[0],
             "core.autocrlf=input"
         );
         assert_eq!(
-            windows_config(&[entry("core.autocrlf", Some("false"))])[0],
+            windows_config(&[entry("core.autocrlf", Some("false"))], None)[0],
+            "core.autocrlf=false"
+        );
+        // What the app's git saw, global config included, wins.
+        assert_eq!(
+            windows_config(&[entry("core.autocrlf", Some("true"))], Some("false"))[0],
             "core.autocrlf=false"
         );
     }

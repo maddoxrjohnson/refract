@@ -5,9 +5,15 @@
 //! documents, parsed with its parser, so the helper can build the copy's the same way.
 //! Every command runs with `-c core.quotepath=false` and with `GIT_OPTIONAL_LOCKS=0`,
 //! so `git status` never refreshes (and so rewrites) the index while it is recorded,
-//! and with `LC_ALL=C`, so fsck's lines are the English ones `parse_fsck` filters.
-//! Linux git also gets `-c core.autocrlf=true -c core.filemode=false`, so it sees the
-//! files as Windows git does.
+//! and with `LC_ALL=C`, so fsck's lines are the English ones `parse_fsck` filters, as
+//! the helper runs Linux git. Linux git also gets `-c core.autocrlf=true -c
+//! core.filemode=false`, so it sees the files as Windows git does.
+//!
+//! Blob ids are computed with git's effective config, global and system included, as
+//! Windows git sees the repo; the `core.autocrlf` that comes to is recorded
+//! ([`autocrlf`]) so the helper normalises with the same value. `hash-object` gets
+//! `-c core.safecrlf=false`, so a file with mixed line endings is hashed rather than
+//! refused, and a symlink's blob is its target as stored, as git stores it.
 //!
 //! git runs behind [`GitRun`], so the rules here are tested without git.
 
@@ -22,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use refract_core::migrate::gitconfig::parse_config;
 use refract_core::migrate::gitstate::{
-    parse_fsck, parse_head, parse_lines, parse_nul_records, parse_refs, parse_status,
-    parse_submodules, GitSnapshot, StatusKind, FOR_EACH_REF_FORMAT,
+    parse_fsck, parse_head, parse_index_flags, parse_lines, parse_nul_records, parse_refs,
+    parse_status, parse_submodules, GitSnapshot, StatusKind, FOR_EACH_REF_FORMAT,
 };
 
 use crate::agent::{neutral_dir, no_window};
@@ -110,9 +116,11 @@ pub fn git_snapshot(git: &dyn GitRun, repo: &str) -> Result<GitSnapshot, GitErro
         &["stash", "list", "--format=%H"],
         false,
     )?);
-    let config = parse_config(&run_text(git, repo, &["config", "--local", "-l"], false)?);
+    // Exits 1 when the repo has no local config at all.
+    let config = parse_config(&run_text(git, repo, &["config", "--local", "-l"], true)?);
     let status = parse_status(&run_text(git, repo, STATUS, false)?)?;
     let index = parse_nul_records(&run_text(git, repo, &["ls-files", "-s", "-z"], false)?);
+    let index_flags = parse_index_flags(&run_text(git, repo, &["ls-files", "-v", "-z"], false)?);
     let submodules = parse_submodules(&run_text(
         git,
         repo,
@@ -133,9 +141,18 @@ pub fn git_snapshot(git: &dyn GitRun, repo: &str) -> Result<GitSnapshot, GitErro
         config,
         status,
         index,
+        index_flags,
         submodules,
         fsck: parse_fsck(&fsck_text),
     })
+}
+
+/// The `core.autocrlf` git applies in the repo at `repo`, from every config file (and
+/// the `-c` of Linux git): what `git config core.autocrlf` prints, `false` when unset.
+pub fn autocrlf(git: &dyn GitRun, repo: &str) -> Result<String, GitError> {
+    let value = run_text(git, repo, &["config", "core.autocrlf"], true)?;
+    let value = value.trim();
+    Ok(if value.is_empty() { "false" } else { value }.to_owned())
 }
 
 /// What the preflight needs from git, cheaper than [`git_snapshot`]: the status of
@@ -244,7 +261,7 @@ pub fn clean_blobs(
     let out = git
         .run(
             repo,
-            &["hash-object", "--stdin-paths"],
+            &["-c", "core.safecrlf=false", "hash-object", "--stdin-paths"],
             Some(&stdin_paths(paths)),
         )
         .map_err(|err| format!("cannot run git hash-object: {err}"))?;
@@ -263,6 +280,27 @@ pub fn clean_blobs(
         ));
     }
     Ok(ids)
+}
+
+/// The blob id git stores for a symlink to `target` (`/`-separated, as stored): the
+/// target's bytes, unfiltered. `hash-object` on the link's path would hash the file it
+/// points to, or fail on a folder.
+pub fn link_blob(git: &dyn GitRun, repo: &str, target: &str) -> Result<String, GitError> {
+    let out = git
+        .run(
+            repo,
+            &["hash-object", "--no-filters", "--stdin"],
+            Some(target.as_bytes()),
+        )
+        .map_err(|err| format!("cannot run git hash-object: {err}"))?;
+    let id = text("hash-object", &out.stdout)?.trim();
+    if !out.success || id.is_empty() {
+        return Err(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(id.to_owned())
 }
 
 /// `git.exe`: the first one on `path`, else the Git for Windows install under
@@ -520,6 +558,11 @@ pub mod tests {
         );
         git.answer(
             "",
+            "ls-files -v -z",
+            "H README.md\0S docs/big.csv\0h notes.md\0",
+        );
+        git.answer(
+            "",
             "submodule status --recursive",
             &format!(" {ID} lib/sub (heads/main)\n-{ID} lib/unused\n"),
         );
@@ -540,6 +583,8 @@ pub mod tests {
         );
         assert_eq!(snapshot.status.len(), 4);
         assert_eq!(snapshot.index.len(), 2);
+        assert_eq!(snapshot.index_flags, ["S docs/big.csv", "h notes.md"]);
+        assert_eq!(snapshot.config.len(), 1);
         assert_eq!(snapshot.submodules.len(), 2);
         assert!(snapshot.fsck.is_empty());
         assert_eq!(submodule_repos(&snapshot), ["lib/sub"]);
@@ -551,9 +596,45 @@ pub mod tests {
             ignored_dirs("lib/sub", &parse_status("! target/\0").unwrap()),
             ["lib/sub/target"]
         );
-        // An unborn HEAD is no commit, not an error.
+        // An unborn HEAD is no commit, not an error, and no local config is none.
+        let mut git = git;
+        git.answers.insert(
+            "lib/sub|config --local -l".into(),
+            GitOutput {
+                success: false,
+                ..GitOutput::default()
+            },
+        );
         let empty = git_snapshot(&git, "lib/sub").unwrap();
         assert_eq!(empty.head, None);
+        assert!(empty.config.is_empty());
+    }
+
+    #[test]
+    fn autocrlf_is_what_git_applies_and_false_when_unset() {
+        let mut git = FakeGit::default();
+        git.answer("", "config core.autocrlf", "input\n");
+        assert_eq!(autocrlf(&git, "").unwrap(), "input");
+        git.answers.insert(
+            "lib/sub|config core.autocrlf".into(),
+            GitOutput {
+                success: false,
+                ..GitOutput::default()
+            },
+        );
+        assert_eq!(autocrlf(&git, "lib/sub").unwrap(), "false");
+    }
+
+    #[test]
+    fn a_link_blob_is_its_target_unfiltered() {
+        let mut git = FakeGit::default();
+        git.answer("", "hash-object --no-filters --stdin", &format!("{ID}\n"));
+        assert_eq!(link_blob(&git, "", "docs/v2").unwrap(), ID);
+        assert_eq!(
+            git.calls.lock().unwrap()[0],
+            "|hash-object --no-filters --stdin <docs/v2"
+        );
+        assert!(link_blob(&FakeGit::default(), "", "x").is_err());
     }
 
     #[test]
@@ -609,12 +690,16 @@ pub mod tests {
     #[test]
     fn clean_blobs_are_one_per_path() {
         let mut git = FakeGit::default();
-        git.answer("", "hash-object --stdin-paths", &format!("{ID}\n{ID}\n"));
+        git.answer(
+            "",
+            "-c core.safecrlf=false hash-object --stdin-paths",
+            &format!("{ID}\n{ID}\n"),
+        );
         let paths = ["a".to_owned(), "b".to_owned()];
         assert_eq!(clean_blobs(&git, "", &paths).unwrap(), [ID, ID]);
         assert_eq!(
             git.calls.lock().unwrap()[0],
-            "|hash-object --stdin-paths <a\nb\n"
+            "|-c core.safecrlf=false hash-object --stdin-paths <a\nb\n"
         );
         let one = ["a".to_owned()];
         assert!(clean_blobs(&git, "", &one)

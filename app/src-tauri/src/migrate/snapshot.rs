@@ -15,8 +15,8 @@ use refract_core::sessions::is_windows_mount;
 use serde::Serialize;
 
 use super::git::{
-    clean_blobs, git_snapshot, ignored_dirs, ignored_dirs_quick, submodule_repos, tracked_paths,
-    GitRun,
+    autocrlf, clean_blobs, git_snapshot, ignored_dirs, ignored_dirs_quick, link_blob,
+    submodule_repos, tracked_paths, GitRun,
 };
 use super::walk::{read_files, walk, Cancelled, ReadMode, ReadProgress, SourceFs, Walk};
 
@@ -77,15 +77,17 @@ pub fn take_snapshot(
         read: ReadProgress::default(),
     };
     progress(phase(SnapshotPhase::Git));
-    let top = git_snapshot(git, "").map_err(SnapshotError::Git)?;
-    let mut repos = vec![RepoGit {
-        path: String::new(),
-        snapshot: top,
-    }];
+    let repo_git = |path: String| -> Result<RepoGit, SnapshotError> {
+        Ok(RepoGit {
+            snapshot: git_snapshot(git, &path).map_err(SnapshotError::Git)?,
+            autocrlf: Some(autocrlf(git, &path).map_err(SnapshotError::Git)?),
+            path,
+        })
+    };
+    let mut repos = vec![repo_git(String::new())?];
     for path in submodule_repos(&repos[0].snapshot) {
         check(cancel)?;
-        let snapshot = git_snapshot(git, &path).map_err(SnapshotError::Git)?;
-        repos.push(RepoGit { path, snapshot });
+        repos.push(repo_git(path)?);
     }
     let ignored: BTreeSet<String> = repos
         .iter()
@@ -164,7 +166,8 @@ fn refuse_links_or_unreadable(
 }
 
 /// Sets the clean blob id on the manifest entry of each tracked path of the repo at
-/// `repo` that is a file or symlink in the working tree. Tracked paths deleted from
+/// `repo` that is a file or symlink in the working tree: a file's from its content
+/// through the repo's filters, a symlink's from its target. Tracked paths deleted from
 /// the working tree have no entry and get none.
 fn set_blobs(
     git: &dyn GitRun,
@@ -179,17 +182,27 @@ fn set_blobs(
         .filter(|(_, e)| matches!(e.kind, EntryKind::File | EntryKind::Symlink))
         .map(|(i, e)| (e.path.to_string(), i))
         .collect();
-    let (present, slots): (Vec<String>, Vec<usize>) = tracked
-        .iter()
-        .filter_map(|path| {
-            let full = if repo.is_empty() {
-                path.clone()
-            } else {
-                format!("{repo}/{path}")
-            };
-            index.get(&full).map(|slot| (path.clone(), *slot))
-        })
-        .unzip();
+    let (mut present, mut slots) = (Vec::new(), Vec::new());
+    for path in tracked {
+        let full = if repo.is_empty() {
+            path.clone()
+        } else {
+            format!("{repo}/{path}")
+        };
+        let Some(&slot) = index.get(&full) else {
+            continue;
+        };
+        match &manifest.entries[slot].link_target {
+            Some(target) if manifest.entries[slot].kind == EntryKind::Symlink => {
+                let blob = link_blob(git, repo, target).map_err(SnapshotError::Git)?;
+                manifest.entries[slot].blob = Some(blob);
+            }
+            _ => {
+                present.push(path.clone());
+                slots.push(slot);
+            }
+        }
+    }
     let blobs = clean_blobs(git, repo, &present).map_err(SnapshotError::Git)?;
     for (slot, blob) in slots.into_iter().zip(blobs) {
         manifest.entries[slot].blob = Some(blob);
@@ -267,13 +280,31 @@ pub struct LinuxFacts {
     pub dest_exists: bool,
     /// Free bytes on the filesystem the destination would be on.
     pub free_bytes: u64,
+    /// Install tools asked about that a login shell does not find.
+    pub missing_tools: BTreeSet<String>,
+    /// Transcripts in the source's project folder under `~/.claude/projects`.
+    pub sessions: u32,
 }
 
 /// Prints `key=value` lines: `home`, `lfs` (1 or 0), `exists` (1 or 0, only with a
-/// destination in `$1`) and `freekb`, the free KiB of the nearest existing folder
-/// above the destination, or of `$HOME` without one.
+/// destination in `$1`), `freekb`, the free KiB of the nearest existing folder above
+/// the destination, or of `$HOME` without one; `missing` for each tool in `$3`
+/// (space-separated) that `command -v` does not find in a login shell, as the
+/// helper's install looks for it; and `sessions`, the `*.jsonl` transcripts in the
+/// project folder named `$2` (the source's encoded path, matched ignoring ASCII case,
+/// as for any `/mnt` path).
 pub const LINUX_FACTS_SCRIPT: &str = r#"d="$1"; printf 'home=%s\n' "$HOME"
 if command -v git-lfs >/dev/null 2>&1; then echo lfs=1; else echo lfs=0; fi
+for t in $3; do bash -lc "command -v $t" >/dev/null 2>&1 </dev/null || echo "missing=$t"; done
+n=0
+if [ -n "$2" ]; then
+  want=$(printf '%s' "$2" | tr 'A-Z' 'a-z')
+  for p in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/projects/*/; do
+    [ "$(basename "$p" | tr 'A-Z' 'a-z')" = "$want" ] || continue
+    for f in "$p"*.jsonl; do [ -f "$f" ] && n=$((n+1)); done
+  done
+fi
+echo "sessions=$n"
 if [ -n "$d" ]; then
   if [ -e "$d" ] || [ -L "$d" ]; then echo exists=1; else echo exists=0; fi
   p="$d"
@@ -284,7 +315,8 @@ while [ ! -d "$p" ] && [ "$p" != / ] && [ -n "$p" ]; do p=$(dirname "$p"); done
 printf 'freekb=%s\n' "$(df -Pk "$p" 2>/dev/null | awk 'NR==2 {print $4}')""#;
 
 /// Reads [`LINUX_FACTS_SCRIPT`]'s output. Missing or unreadable lines leave the
-/// defaults: no home, no LFS, nothing at the destination, no free space.
+/// defaults: no home, no LFS, nothing at the destination, no free space, no tool
+/// missing, no sessions.
 pub fn parse_linux_facts(stdout: &str) -> LinuxFacts {
     let mut facts = LinuxFacts::default();
     for line in stdout.lines() {
@@ -295,6 +327,10 @@ pub fn parse_linux_facts(stdout: &str) -> LinuxFacts {
             Some(("freekb", kb)) => {
                 facts.free_bytes = kb.trim().parse::<u64>().unwrap_or(0).saturating_mul(1024)
             }
+            Some(("missing", tool)) if !tool.is_empty() => {
+                facts.missing_tools.insert(tool.to_owned());
+            }
+            Some(("sessions", n)) => facts.sessions = n.trim().parse().unwrap_or(0),
             _ => {}
         }
     }
@@ -306,6 +342,22 @@ pub fn parse_linux_facts(stdout: &str) -> LinuxFacts {
 // TODO: take the helper's roots once it reports them.
 pub fn default_roots(home: &str) -> Vec<String> {
     vec![format!("{}/projects", home.trim_end_matches('/'))]
+}
+
+/// The tools of `steps` to ask the Linux side about, once each. Only plain names are
+/// asked, since the script runs `command -v` on them through a shell.
+pub fn install_tools(steps: &[InstallStep]) -> Vec<String> {
+    let plain = |t: &str| {
+        !t.is_empty()
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    let tools: BTreeSet<String> = steps
+        .iter()
+        .map(|s| s.tool.clone())
+        .filter(|t| plain(t))
+        .collect();
+    tools.into_iter().collect()
 }
 
 /// Builds the facts [`refusals`] decides on from both sides.
@@ -354,6 +406,16 @@ impl From<Refusal> for RefusalView {
     }
 }
 
+/// An install step, and whether its tool is missing in WSL (the dialog says how to
+/// get it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlannedStep {
+    #[serde(flatten)]
+    pub step: InstallStep,
+    pub missing: bool,
+}
+
 /// What the dialog shows before **Start** (spec §2.2), apart from busy windows and
 /// agents.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -366,21 +428,20 @@ pub struct PreflightSummary {
     pub dirs: u64,
     pub bytes: u64,
     pub skipped: Vec<refract_core::migrate::build::SkippedFolder>,
-    pub install: Vec<InstallStep>,
+    pub install: Vec<PlannedStep>,
     /// Alternate data streams that will be dropped.
     pub dropped_streams: usize,
+    /// Claude sessions whose history moves with it.
+    pub history_sessions: u32,
 }
 
-/// The dialog's summary from the facts and the walk. `root_files` are the names of
-/// the files at the repo root, and `package_json` and `yarn_lock` the start of those
-/// files when present.
-pub fn summarize(
-    facts: &PreflightFacts,
+/// The install steps for the walked source: `package_json` and `yarn_lock` are the
+/// start of those files when present.
+pub fn install_steps(
     walk: &Walk,
     package_json: Option<&str>,
     yarn_lock: Option<&str>,
-) -> PreflightSummary {
-    let totals = walk.manifest.totals();
+) -> Vec<InstallStep> {
     let root_names = walk
         .manifest
         .entries
@@ -389,6 +450,18 @@ pub fn summarize(
         .map(|e| e.path.to_string())
         .collect();
     let root = RootFiles::new(root_names, package_json, yarn_lock);
+    install_plan(&walk.manifest.skipped, &root)
+}
+
+/// The dialog's summary from the facts, the walk, its [`install_steps`] and the
+/// Linux side's facts.
+pub fn summarize(
+    facts: &PreflightFacts,
+    walk: &Walk,
+    install: Vec<InstallStep>,
+    linux: &LinuxFacts,
+) -> PreflightSummary {
+    let totals = walk.manifest.totals();
     PreflightSummary {
         refusals: refusals(facts).into_iter().map(RefusalView::from).collect(),
         warnings: windows_tool_warnings(
@@ -402,8 +475,15 @@ pub fn summarize(
         dirs: totals.dirs,
         bytes: totals.bytes,
         skipped: walk.manifest.skipped.clone(),
-        install: install_plan(&walk.manifest.skipped, &root),
+        install: install
+            .into_iter()
+            .map(|step| PlannedStep {
+                missing: linux.missing_tools.contains(&step.tool),
+                step,
+            })
+            .collect(),
         dropped_streams: walk.manifest.streams.len(),
+        history_sessions: linux.sessions,
     }
 }
 
@@ -468,19 +548,37 @@ mod tests {
             ("lib/sub/target/CACHEDIR.TAG", file("Signature")),
             ("package.json", file(r#"{"packageManager": "pnpm@9.1.0"}"#)),
             ("App.sln", file("")),
+            ("latest", FakeNode::Link("README.md".into())),
         ])
     }
 
     /// The submodule repo of `repo_with_submodule`, with its own tracked file.
     fn git() -> FakeGit {
         let mut git = repo_with_submodule();
-        git.answer("", "hash-object --stdin-paths", "aaaa\n");
+        git.answer(
+            "",
+            "ls-files -s -z",
+            "100644 1111111111111111111111111111111111111111 0\tREADME.md\0\
+             160000 1111111111111111111111111111111111111111 0\tlib/sub\0\
+             120000 1111111111111111111111111111111111111111 0\tlatest\0",
+        );
+        git.answer("", "config core.autocrlf", "true\n");
+        git.answer(
+            "",
+            "-c core.safecrlf=false hash-object --stdin-paths",
+            "aaaa\n",
+        );
+        git.answer("", "hash-object --no-filters --stdin", "cccc\n");
         git.answer(
             "lib/sub",
             "ls-files -s -z",
             "100644 1111111111111111111111111111111111111111 0\tsrc.rs\0",
         );
-        git.answer("lib/sub", "hash-object --stdin-paths", "bbbb\n");
+        git.answer(
+            "lib/sub",
+            "-c core.safecrlf=false hash-object --stdin-paths",
+            "bbbb\n",
+        );
         git
     }
 
@@ -505,6 +603,10 @@ mod tests {
         );
         let repos: Vec<&str> = snapshot.git.iter().map(|r| r.path.as_str()).collect();
         assert_eq!(repos, ["", "lib/sub"]);
+        // The autocrlf git applied, `false` where unset.
+        let autocrlf: Vec<Option<&str>> =
+            snapshot.git.iter().map(|r| r.autocrlf.as_deref()).collect();
+        assert_eq!(autocrlf, [Some("true"), Some("false")]);
         let skipped: Vec<&str> = snapshot
             .manifest
             .skipped
@@ -524,6 +626,8 @@ mod tests {
         };
         assert_eq!(blob("README.md").as_deref(), Some("aaaa"));
         assert_eq!(blob("lib/sub/src.rs").as_deref(), Some("bbbb"));
+        // A link's blob is its target's, not the file it points to.
+        assert_eq!(blob("latest").as_deref(), Some("cccc"));
         assert_eq!(blob("notes.txt"), None);
         assert!(snapshot
             .manifest
@@ -578,7 +682,9 @@ mod tests {
                 uses_lfs: true,
             }
         );
-        let linux = parse_linux_facts("home=/home/dev\nlfs=0\nexists=1\nfreekb=1000\n");
+        let linux = parse_linux_facts(
+            "home=/home/dev\nlfs=0\nmissing=pnpm\nsessions=3\nexists=1\nfreekb=1000\n",
+        );
         let facts = preflight_facts(
             &shape,
             true,
@@ -591,12 +697,9 @@ mod tests {
         assert_eq!(facts.unreadable, ["data.db (locked)"]);
         assert!(facts.dest_on_linux && facts.dest_exists);
         assert_eq!(facts.free_bytes, 1_024_000);
-        let summary = summarize(
-            &facts,
-            &walk,
-            Some(r#"{"packageManager": "pnpm@9.1.0"}"#),
-            None,
-        );
+        let steps = install_steps(&walk, Some(r#"{"packageManager": "pnpm@9.1.0"}"#), None);
+        assert_eq!(install_tools(&steps), ["pnpm"]);
+        let summary = summarize(&facts, &walk, steps, &linux);
         let kinds: Vec<String> = summary
             .refusals
             .iter()
@@ -621,7 +724,16 @@ mod tests {
         assert!(summary.refusals[0].message.contains("merge"));
         assert_eq!(summary.warnings.len(), 1);
         assert_eq!(summary.install.len(), 1);
-        assert_eq!(summary.install[0].command, "pnpm install --frozen-lockfile");
+        assert_eq!(
+            summary.install[0].step.command,
+            "pnpm install --frozen-lockfile"
+        );
+        assert!(summary.install[0].missing);
+        assert_eq!(summary.history_sessions, 3);
+        let value = serde_json::to_value(&summary).unwrap();
+        assert_eq!(value["install"][0]["tool"], "pnpm");
+        assert_eq!(value["install"][0]["missing"], true);
+        assert_eq!(value["historySessions"], 3);
     }
 
     #[test]
@@ -651,7 +763,21 @@ mod tests {
                 has_git_lfs: true,
                 dest_exists: false,
                 free_bytes: 12 * 1024,
+                ..LinuxFacts::default()
             }
+        );
+        let facts = parse_linux_facts("missing=uv\nmissing=\nmissing=npm\nsessions=x\n");
+        assert_eq!(facts.missing_tools.len(), 2);
+        assert_eq!(facts.sessions, 0);
+        let step = |tool: &str| InstallStep {
+            folder: refract_core::migrate::manifest::RelPath::new("node_modules").unwrap(),
+            tool: tool.into(),
+            command: String::new(),
+            install_hint: String::new(),
+        };
+        assert_eq!(
+            install_tools(&[step("npm"), step("npm"), step("uv; rm -rf /"), step("uv")]),
+            ["npm", "uv"]
         );
         assert_eq!(
             parse_linux_facts("garbage\nfreekb=\n"),

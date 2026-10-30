@@ -72,6 +72,12 @@ pub struct RepoGit {
     /// Working-tree path relative to the top repo, `/`-separated; `""` for the top repo.
     pub path: String,
     pub snapshot: GitSnapshot,
+    /// The `core.autocrlf` the blob ids of this repo's files were computed with: what
+    /// `git config core.autocrlf` prints in it for the git that read the source
+    /// (`false` when unset, git's default). The helper normalises with the same value.
+    /// `None` means the repo's local value, else `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autocrlf: Option<String>,
 }
 
 #[cfg(test)]
@@ -100,6 +106,7 @@ mod tests {
             git: vec![RepoGit {
                 path: String::new(),
                 snapshot: GitSnapshot::default(),
+                autocrlf: Some("true".into()),
             }],
             linux_git: false,
         };

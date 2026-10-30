@@ -378,6 +378,11 @@ export interface VsCodeWindow {
   title: string;
 }
 
+/** An install step of the preflight; `missing` when its tool isn't found in WSL. */
+export interface PlannedInstallStep extends InstallStep {
+  missing: boolean;
+}
+
 /** What the dialog shows before Start, from `migratePreflight`. */
 export interface MigratePreflight {
   /** The source's WSL path (`/mnt/c/...`). */
@@ -394,9 +399,11 @@ export interface MigratePreflight {
   dirs: number;
   bytes: number;
   skipped: SkippedFolder[];
-  install: InstallStep[];
+  install: PlannedInstallStep[];
   /** Alternate data streams (such as Zone.Identifier) that will be dropped. */
   droppedStreams: number;
+  /** Claude sessions (transcripts) whose history moves with it. */
+  historySessions: number;
   /** Each one blocks Start until closed. */
   vscodeWindows: VsCodeWindow[];
   /** `git.exe` is missing, so Linux git reads the source. */
@@ -430,6 +437,9 @@ export type MigrateStep =
 /** Data of a `migrateProgress` event. `copying` counts bytes; the others count items. */
 export interface MigrateProgress {
   id: string;
+  /** WSL paths of the original (`/mnt/...`) and the copy, so a reloaded window can place it. */
+  source: string;
+  dest: string;
   step: MigrateStep;
   done: number;
   total: number;
@@ -444,6 +454,8 @@ export type MigrateCheck = "files" | "gitState" | "nothingSkipped" | "unchanged"
 
 export interface MigrateCheckResult {
   check: MigrateCheck;
+  /** The check's name as the report shows it. */
+  title: string;
   status: "passed" | "failed" | "notRun";
   problems: MigrateProblem[];
   /** What to do; set when it failed. */

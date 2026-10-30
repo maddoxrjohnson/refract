@@ -60,6 +60,8 @@ export type MigrationAction =
   | { type: "pending"; list: PendingMigration[] }
   /** Re-sync was asked for: copying and checking start again. */
   | { type: "resyncing"; id: string }
+  /** The helper stopped: a running copy is gone with it (it deletes the copy when it starts again). */
+  | { type: "helperStopped" }
   /** Cancelled, failed to start, or finished. */
   | { type: "gone"; source: string };
 
@@ -99,11 +101,11 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
       return withEntry(state, { ...m, id: action.id, phase: { kind: "running", step: null, done: 0, total: 0 } });
     }
     case "progress": {
-      // Progress of a migration this window never started (a reload) has no source to show it on.
-      const m = byId(state, action.progress.id);
+      const { id, source, dest, step, done, total } = action.progress;
+      // A migration this window never started (a reload) is placed by its source.
+      const m = byId(state, id) ?? (source ? { ...state.get(source), source, dest, id } : undefined);
       if (!m) return state;
-      const { step, done, total } = action.progress;
-      return withEntry(state, { ...m, phase: { kind: "running", step, done, total } });
+      return withEntry(state, { ...m, id, dest: m.dest || dest, phase: { kind: "running", step, done, total } });
     }
     case "ready":
       return ready(state, action.id, action.report);
@@ -113,6 +115,13 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
       const m = byId(state, action.id);
       if (!m) return state;
       return withEntry(state, { ...m, phase: { kind: "running", step: "rechecking", done: 0, total: 0 } });
+    }
+    case "helperStopped": {
+      const running = [...state.values()].filter((m) => m.phase.kind === "running");
+      if (running.length === 0) return state;
+      const next = new Map(state);
+      for (const m of running) next.delete(m.source);
+      return next;
     }
     case "gone": {
       if (!state.has(action.source)) return state;
@@ -220,15 +229,6 @@ export function canDelete(report: MigrationReport): boolean {
     report.checks.some((c) => c.check === check && c.status === "passed"),
   );
 }
-
-/** The report's names for the checks (refract-core `Check::title`). */
-export const CHECK_TITLES: Record<MigrateCheck, string> = {
-  files: "Every file matches",
-  gitState: "Git state is identical",
-  nothingSkipped: "Nothing skipped without you knowing",
-  unchanged: "Nothing touched it during the copy",
-  history: "History copied",
-};
 
 /** One line for an install step's result. */
 export function installText(result: MigrateInstallResult): string {

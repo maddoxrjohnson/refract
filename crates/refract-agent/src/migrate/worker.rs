@@ -224,6 +224,8 @@ impl From<Cancelled> for Stop {
 /// first and the last.
 struct Progress {
     id: String,
+    source: String,
+    dest: String,
     sink: Sink,
     step: Option<MigrateStep>,
     last: Instant,
@@ -240,6 +242,8 @@ impl Progress {
         self.last = now;
         (self.sink)(Update::Event(Event::MigrateProgress(MigrateProgress {
             id: self.id.clone(),
+            source: self.source.clone(),
+            dest: self.dest.clone(),
             step,
             done,
             total,
@@ -292,6 +296,8 @@ impl Worker {
     ) -> Worker {
         let progress = Progress {
             id: id.clone(),
+            source: state::path_str(&source),
+            dest: state::path_str(&dest),
             sink: sink.clone(),
             step: None,
             last: Instant::now(),
@@ -605,7 +611,10 @@ impl Worker {
             .snapshot()
             .git
             .iter()
-            .map(|g| (g.path.clone(), gitx::windows_config(&g.snapshot.config)))
+            .map(|g| {
+                let config = gitx::windows_config(&g.snapshot.config, g.autocrlf.as_deref());
+                (g.path.clone(), config)
+            })
             .collect();
         let total = match only {
             Some(only) => only.len() as u64,
@@ -1039,9 +1048,15 @@ impl Worker {
     fn resync(&mut self) {
         let skipped = self.skipped();
         let Some(record) = self.record.clone() else {
+            // Not expected once placed; the app still waits for a report, so it gets
+            // the last one again.
+            if let Some(report) = self.report.clone() {
+                self.ready(report);
+            }
             return;
         };
-        let result = (|| -> Result<Verdict, Stop> {
+        // A panic is reported like any other stop, so the app is never left waiting.
+        let result = catch_unwind(AssertUnwindSafe(|| -> Result<Verdict, Stop> {
             let now = tree::stats(&self.source, &skipped, &*self.cancel)?;
             let changes = compare_stats(&record.final_stats, &now);
             self.progress.report(MigrateStep::Rechecking, 0, MAX_ROUNDS);
@@ -1057,7 +1072,8 @@ impl Worker {
             let dest = self.dest.clone();
             self.normalise(&dest, Some(&touched))?;
             self.verify_rounds(&dest, now, changes)
-        })();
+        }))
+        .unwrap_or_else(|_| Err(Stop::Fatal("internal error".into())));
         let old = record.report.clone();
         let mut checks = match &result {
             Ok(verdict) => verdict.checks.to_vec(),

@@ -148,7 +148,9 @@ pub fn walk(
                         Some(stored) => out.manifest.entries.push(Entry {
                             path,
                             kind: EntryKind::Symlink,
-                            size: stored.len() as u64,
+                            // As the helper's stat records it: sizes of links are not
+                            // compared.
+                            size: 0,
                             mtime_ns: raw.mtime_ns,
                             attributes: raw.attributes,
                             sha256: None,
@@ -634,7 +636,7 @@ pub mod tests {
             .unwrap();
         assert_eq!(link.kind, EntryKind::Symlink);
         assert_eq!(link.link_target.as_deref(), Some("v2"));
-        assert_eq!(link.size, 2);
+        assert_eq!(link.size, 0);
     }
 
     #[test]

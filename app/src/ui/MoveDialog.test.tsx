@@ -19,8 +19,9 @@ const PREFLIGHT: MigratePreflight = {
   dirs: 14,
   bytes: 3 * 1024 ** 3,
   skipped: [{ path: "node_modules", rule: "nodeModules", bytes: 400 * 1024 ** 2, files: 30_000 }],
-  install: [{ folder: "node_modules", tool: "npm", command: "npm ci", installHint: "install node" }],
+  install: [{ folder: "node_modules", tool: "npm", command: "npm ci", installHint: "install node", missing: false }],
   droppedStreams: 0,
+  historySessions: 2,
   vscodeWindows: [],
   linuxGit: false,
 };
@@ -123,6 +124,21 @@ describe("MoveDialog preflight", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("says which install tool is missing and how many sessions move", async () => {
+    const backend = fakeBackend({ install: [{ ...PREFLIGHT.install[0], missing: true }], historySessions: 2 });
+    const { dialog } = await setup(backend);
+    expect(dialog.textContent).toContain("npm isn't installed in WSL");
+    expect(dialog.textContent).toContain("install node");
+    expect(dialog.textContent).toContain("2 Claude sessions will move with it.");
+  });
+
+  it("shows the report's own check titles", async () => {
+    const report = testReport();
+    report.checks[0] = { ...report.checks[0], title: "Every file matches, byte for byte" };
+    const { dialog } = await setup(fakeBackend({}, [report]));
+    expect(dialog.textContent).toContain("Every file matches, byte for byte");
   });
 
   it("shows refusals instead of Start", async () => {

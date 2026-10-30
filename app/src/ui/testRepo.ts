@@ -53,8 +53,17 @@ export function testReport(extra: Partial<MigrationReport> = {}): MigrationRepor
     dest: TEST_DEST,
     startedAt: "2026-10-30T12:00:00Z",
     finishedAt: "2026-10-30T12:01:00Z",
-    checks: (["files", "gitState", "nothingSkipped", "unchanged", "history"] as const).map((check) => ({
+    checks: (
+      [
+        ["files", "Every file matches"],
+        ["gitState", "Git state is identical"],
+        ["nothingSkipped", "Nothing skipped without you knowing"],
+        ["unchanged", "Nothing touched it during the copy"],
+        ["history", "History copied"],
+      ] as const
+    ).map(([check, title]) => ({
       check,
+      title,
       status: "passed",
       problems: [],
     })),

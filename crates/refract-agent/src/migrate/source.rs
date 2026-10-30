@@ -21,9 +21,19 @@
 //!   nanoseconds since the Unix epoch, `sha256` lowercase hex for files, `linkTarget`
 //!   for symlinks as stored. `blob` is set for each path `git ls-files` lists in the
 //!   repo or submodule holding it: for a file, what `git hash-object --stdin-paths`
-//!   prints for it with `-c core.autocrlf=<the repo's local value, else true>`; for a
-//!   symlink, the blob of its target (`git hash-object --no-filters --stdin`).
+//!   prints for it with `-c core.safecrlf=false` and the repo's `core.autocrlf`; for a
+//!   symlink, the blob of its target as stored (`git hash-object --no-filters
+//!   --stdin`), never of the file it points to.
+//! - **`git[].autocrlf`**: the `core.autocrlf` those blobs were computed with. The app
+//!   records what `git config core.autocrlf` prints in each repo for git.exe (`false`
+//!   when unset), so a global or system setting counts as it does for Windows git; the
+//!   helper then normalises and re-reads with that value. Left out here, which means
+//!   the repo's local value, else `true` (Git for Windows' system default).
 //! - **`linuxGit`**: true here; false when `git.exe` read it.
+//!
+//! Both sides run git with `core.quotepath=false`, `GIT_OPTIONAL_LOCKS=0` and
+//! `LC_ALL=C`. Every `git` field of a [`GitSnapshot`] is filled, `indexFlags`
+//! (`ls-files -v -z`) included; `config --local -l` may exit 1 (no local config).
 //!
 //! The helper compares the source's sizes and modification times with its own stat of
 //! the source over `/mnt` when the copy starts; a difference counts as a change made
@@ -46,13 +56,14 @@ use super::fsx::{self, Visit};
 use super::gitx;
 use super::tree;
 
-/// The Windows `-c` settings for the repo whose working tree is `dir`, from its local
-/// config (see [`gitx::windows_config`]).
-pub fn windows_config_of(dir: &Path) -> Vec<String> {
+/// The Windows `-c` settings for the repo whose working tree is `dir`: `recorded`
+/// when the snapshot has it, else from its local config (see
+/// [`gitx::windows_config`]).
+pub fn windows_config_of(dir: &Path, recorded: Option<&str>) -> Vec<String> {
     let local = gitx::run(dir, &[], &["config", "--local", "-l"], None)
         .map(|out| parse_config(&String::from_utf8_lossy(&out.stdout)))
         .unwrap_or_default();
-    gitx::windows_config(&local)
+    gitx::windows_config(&local, recorded)
 }
 
 /// Builds the [`SourceSnapshot`] of the repo at `repo` as the module docs describe.
@@ -70,7 +81,7 @@ pub fn build(repo: &Path) -> Result<SourceSnapshot, String> {
     )
     .map_err(|_| "cancelled".to_string())??;
     for repo_git in &git {
-        let config = windows_config_of(&join(repo, &repo_git.path));
+        let config = windows_config_of(&join(repo, &repo_git.path), None);
         tree::add_blobs(
             repo,
             &mut manifest,
@@ -98,15 +109,19 @@ fn join(root: &Path, rel: &str) -> std::path::PathBuf {
 
 /// G0 of the top repo and each checked-out submodule, read with the Windows settings.
 pub fn git_snapshots(repo: &Path) -> Result<Vec<RepoGit>, String> {
-    let config = windows_config_of(repo);
+    let config = windows_config_of(repo, None);
     let mut paths = vec![String::new()];
     paths.extend(gitx::submodule_paths(repo, &config)?);
     paths
         .into_iter()
         .map(|path| {
             let dir = join(repo, &path);
-            let snapshot = gitx::snapshot(&dir, &windows_config_of(&dir))?;
-            Ok(RepoGit { path, snapshot })
+            let snapshot = gitx::snapshot(&dir, &windows_config_of(&dir, None))?;
+            Ok(RepoGit {
+                path,
+                snapshot,
+                autocrlf: None,
+            })
         })
         .collect()
 }
@@ -245,7 +260,7 @@ pub fn refresh(
         ..Default::default()
     };
     for repo_git in &snapshot.git {
-        let config = windows_config_of(&join(root, &repo_git.path));
+        let config = windows_config_of(&join(root, &repo_git.path), repo_git.autocrlf.as_deref());
         tree::add_blobs(
             root,
             &mut part,
@@ -264,14 +279,19 @@ pub fn refresh(
         .chain(&changes.changed)
         .any(|p| !root.join(p.as_str()).is_dir());
     if files_changed {
-        let paths: Vec<String> = snapshot.git.iter().map(|g| g.path.clone()).collect();
+        let repos: Vec<(String, Option<String>)> = snapshot
+            .git
+            .iter()
+            .map(|g| (g.path.clone(), g.autocrlf.clone()))
+            .collect();
         let mut fresh_git = Vec::new();
-        for path in paths {
+        for (path, autocrlf) in repos {
             let dir = join(root, &path);
-            let git = gitx::snapshot(&dir, &windows_config_of(&dir))?;
+            let git = gitx::snapshot(&dir, &windows_config_of(&dir, autocrlf.as_deref()))?;
             fresh_git.push(RepoGit {
                 path,
                 snapshot: git,
+                autocrlf,
             });
         }
         snapshot.git = fresh_git;

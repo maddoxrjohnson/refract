@@ -745,8 +745,9 @@ export class DemoBackend implements Backend {
       warnings: [],
       ...DEMO_MOVE_TOTALS,
       skipped: DEMO_MOVE_SKIPPED,
-      install: [DEMO_MOVE_INSTALL],
+      install: [{ ...DEMO_MOVE_INSTALL, missing: false }],
       droppedStreams: 1,
+      historySessions: 1,
       vscodeWindows: [...this.moveWindows],
       linuxGit: false,
     };
@@ -777,7 +778,8 @@ export class DemoBackend implements Backend {
       for (let i = 1; i <= DEMO_TICKS; i++) {
         await sleep(step === "copying" ? 260 : 130);
         if (move.cancelled) return;
-        this.emit({ event: "migrateProgress", data: { id: move.id, step, done: Math.round((total * i) / DEMO_TICKS), total } });
+        const done = Math.round((total * i) / DEMO_TICKS);
+        this.emit({ event: "migrateProgress", data: { id: move.id, source: move.source, dest: move.dest, step, done, total } });
       }
     }
     move.report = demoMoveReport(move);
@@ -911,6 +913,15 @@ interface DemoMove {
 /** What `migrateDelete` says short of deleting: `wontFit` shows the permanent-delete question. */
 export type DemoMoveOutcome = "deleted" | "wontFit";
 
+/** The checks as the helper names them (refract-core `Check::title`). */
+const DEMO_CHECKS = [
+  ["files", "Every file matches"],
+  ["gitState", "Git state is identical"],
+  ["nothingSkipped", "Nothing skipped without you knowing"],
+  ["unchanged", "Nothing touched it during the copy"],
+  ["history", "History copied"],
+] as const;
+
 /** A report where every check passed and `npm ci` ran. */
 function demoMoveReport(move: DemoMove): MigrationReport {
   const name = move.dest.split("/").pop() ?? "repo";
@@ -922,8 +933,9 @@ function demoMoveReport(move: DemoMove): MigrationReport {
     dest: move.dest,
     startedAt: new Date(stamp.getTime() - 9_000).toISOString(),
     finishedAt: stamp.toISOString(),
-    checks: (["files", "gitState", "nothingSkipped", "unchanged", "history"] as const).map((check) => ({
+    checks: DEMO_CHECKS.map(([check, title]) => ({
       check,
+      title,
       status: "passed",
       problems: [],
     })),

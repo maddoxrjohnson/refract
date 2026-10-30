@@ -14,7 +14,6 @@ import { isCancelled, type MigrationControls } from "../hooks/useMigrations";
 import {
   busyAgents,
   canDelete,
-  CHECK_TITLES,
   installText,
   overallProgress,
   snapshotText,
@@ -412,6 +411,12 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
                 <dd>
                   {formatBytes(preflight.bytes)} in {plural(preflight.files, "file", "files")}
                 </dd>
+                <dt>History</dt>
+                <dd>
+                  {preflight.historySessions > 0
+                    ? `${plural(preflight.historySessions, "Claude session", "Claude sessions")} will move with it.`
+                    : "No Claude sessions to move."}
+                </dd>
               </>
             )}
           </dl>
@@ -449,6 +454,12 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
               {preflight.install.map((step) => (
                 <li key={`${step.folder}-${step.command}`}>
                   <code className="rf-mono">{step.command}</code>
+                  {step.missing && (
+                    <p className="rf-move-note rf-muted">
+                      {step.tool} isn't installed in WSL, so this step will be skipped. Install it with{" "}
+                      <code className="rf-mono">{step.installHint}</code>.
+                    </p>
+                  )}
                 </li>
               ))}
             </ul>
@@ -840,7 +851,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
                 </span>
                 <div className="rf-move-check__body">
                   <div>
-                    {CHECK_TITLES[c.check]}
+                    {c.title}
                     <span className="rf-visually-hidden">: {STATUS_LABEL[c.status]}</span>
                     {c.check === "history" && c.status === "failed" && (
                       <span className="rf-muted"> · doesn't block deleting</span>

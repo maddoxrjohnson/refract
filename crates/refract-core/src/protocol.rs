@@ -418,6 +418,12 @@ pub enum MigrateStep {
 #[serde(rename_all = "camelCase")]
 pub struct MigrateProgress {
     pub id: String,
+    /// Linux path of the original (`/mnt/...`) and of the copy, as in the report, so a
+    /// window that missed the start (a reload) can place the progress.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub dest: String,
     pub step: MigrateStep,
     pub done: u64,
     pub total: u64,
@@ -1423,6 +1429,8 @@ mod tests {
 
         let progress = Event::MigrateProgress(MigrateProgress {
             id: "m-1".into(),
+            source: "/mnt/c/dev/aurora-notes".into(),
+            dest: "/home/dev/projects/aurora-notes".into(),
             step: MigrateStep::CheckingGit,
             done: 1,
             total: 3,
@@ -1430,7 +1438,9 @@ mod tests {
         assert_eq!(
             round_trip(&Message::Event(progress)),
             json!({"event": "migrateProgress", "data": {
-                "id": "m-1", "step": "checkingGit", "done": 1, "total": 3}})
+                "id": "m-1", "source": "/mnt/c/dev/aurora-notes",
+                "dest": "/home/dev/projects/aurora-notes", "step": "checkingGit",
+                "done": 1, "total": 3}})
         );
 
         let report = Report {

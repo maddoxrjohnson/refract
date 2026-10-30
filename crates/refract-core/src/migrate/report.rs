@@ -96,6 +96,9 @@ pub enum CheckStatus {
 #[serde(rename_all = "camelCase")]
 pub struct CheckResult {
     pub check: Check,
+    /// [`Check::title`], so the interface shows the report's own names.
+    #[serde(default)]
+    pub title: String,
     pub status: CheckStatus,
     /// What failed, by path. Empty when it passed.
     #[serde(default)]
@@ -111,6 +114,7 @@ impl CheckResult {
         let failed = !problems.is_empty();
         CheckResult {
             check,
+            title: check.title().to_owned(),
             status: if failed {
                 CheckStatus::Failed
             } else {
@@ -124,6 +128,7 @@ impl CheckResult {
     pub fn not_run(check: Check) -> CheckResult {
         CheckResult {
             check,
+            title: check.title().to_owned(),
             status: CheckStatus::NotRun,
             problems: Vec::new(),
             advice: None,
@@ -331,6 +336,7 @@ mod tests {
         .into_iter()
         .map(|check| CheckResult {
             check,
+            title: check.title().to_owned(),
             status,
             problems: vec![],
             advice: None,
@@ -422,8 +428,14 @@ mod tests {
         assert_eq!(value["checks"][3]["problems"][0]["path"], "src/main.rs");
         assert_eq!(
             value["checks"][0],
-            json!({"check": "files", "status": "passed", "problems": []})
+            json!({"check": "files", "title": "Every file matches", "status": "passed",
+                "problems": []})
         );
+        assert_eq!(
+            value["checks"][3]["title"],
+            "Nothing touched it during the copy"
+        );
+        assert_eq!(value["checks"][3]["advice"], Check::Unchanged.advice());
         assert_eq!(value["startedAt"], "2026-10-30T10:00:00Z");
         assert_eq!(value["newObjects"], 3);
         assert_eq!(

@@ -46,9 +46,14 @@
 //! - `migrate://snapshot`: `{path, phase, filesDone, filesTotal, bytesDone,
 //!   bytesTotal}` while a preflight or snapshot runs; `phase` is `git`, `walking`,
 //!   `probing` (preflight), `hashing` or `blobs` (snapshot).
-//! - The helper's `migrateProgress {id, step, done, total}` and `migrateReady {id,
-//!   report}` reach the interface on `agent://event` like every helper event. The app
-//!   also reads `migrateReady` to know which migrations may be deleted.
+//! - The helper's `migrateProgress {id, source, dest, step, done, total}` and
+//!   `migrateReady {id, report}` reach the interface on `agent://event` like every
+//!   helper event. The app also reads `migrateReady` to know which migrations may be
+//!   deleted.
+//!
+//! Helper errors keep their meaning ([`MigrateError::agent`]): an unknown migration or
+//! one not at that step is `notReady`, a working agent `busy`; a `migrate` the helper's
+//! preflight refuses is `refused` (without `refusals`, the message says why).
 //!
 //! A migration that becomes ready, or fails, while the window is hidden shows a
 //! Windows notification ([`notify`], through `tauri-plugin-notification`).
@@ -76,7 +81,7 @@ use refract_core::migrate::preflight::{default_destination, Refusal};
 use refract_core::migrate::report::Report;
 use refract_core::migrate::SourceSnapshot;
 use refract_core::protocol::{Event, FinishAction, MigrateParams, MigrationTicket};
-use refract_core::sessions::is_windows_mount;
+use refract_core::sessions::{encode_project_dir, is_windows_mount};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -87,9 +92,9 @@ use flow::{delete_original, AgentHelper, DeleteTarget, MigrateHelper};
 pub use flow::{DeleteOutcome, MigrateError, MigrateErrorKind, PendingMigration};
 use git::{find_git_exe, GitExe, GitRun, WslGit};
 use snapshot::{
-    default_roots, parse_linux_facts, preflight_facts, preflight_walk, repo_shape, summarize,
-    take_snapshot, LinuxFacts, PreflightSummary, SnapshotError, SnapshotProgress,
-    LINUX_FACTS_SCRIPT,
+    default_roots, install_steps, install_tools, parse_linux_facts, preflight_facts,
+    preflight_walk, repo_shape, summarize, take_snapshot, LinuxFacts, PreflightSummary,
+    SnapshotError, SnapshotProgress, LINUX_FACTS_SCRIPT,
 };
 pub use vscode::VsCodeWindow;
 use walk::{SourceFs as _, Walk};
@@ -364,8 +369,14 @@ fn emitter(app: &AppHandle, path: &str) -> impl Fn(SnapshotProgress) + Sync {
     }
 }
 
-/// Runs [`LINUX_FACTS_SCRIPT`] in the helper's distro.
-fn linux_facts(distro: Option<&str>, dest: Option<&str>) -> LinuxFacts {
+/// Runs [`LINUX_FACTS_SCRIPT`] in the helper's distro, for the source at `source` (its
+/// Linux path) and the install `tools`.
+fn linux_facts(
+    distro: Option<&str>,
+    dest: Option<&str>,
+    source: &str,
+    tools: &[String],
+) -> LinuxFacts {
     let mut command = wsl_command();
     command
         .args(distro_args(distro))
@@ -376,6 +387,8 @@ fn linux_facts(distro: Option<&str>, dest: Option<&str>) -> LinuxFacts {
             LINUX_FACTS_SCRIPT,
             "sh",
             dest.unwrap_or(""),
+            &encode_project_dir(source),
+            &tools.join(" "),
         ])
         .stdin(std::process::Stdio::null());
     match output_with_deadline(&mut command, LINUX_FACTS_TIMEOUT) {
@@ -442,7 +455,15 @@ pub async fn migrate_preflight(
         } else {
             (Walk::default(), Vec::new())
         };
-        let mut linux = linux_facts(distro.as_deref(), dest.as_deref());
+        let package_json = fs.read_text("package.json", 1 << 20).ok();
+        let yarn_lock = fs.read_text("yarn.lock", 4096).ok();
+        let steps = install_steps(&walked, package_json.as_deref(), yarn_lock.as_deref());
+        let mut linux = linux_facts(
+            distro.as_deref(),
+            dest.as_deref(),
+            &path,
+            &install_tools(&steps),
+        );
         let dest = match dest {
             Some(dest) => Some(dest),
             None => {
@@ -455,14 +476,7 @@ pub async fn migrate_preflight(
             }
         };
         let facts = preflight_facts(&shape, true, &walked, &unreadable, &linux, dest.as_deref());
-        let package_json = fs.read_text("package.json", 1 << 20).ok();
-        let yarn_lock = fs.read_text("yarn.lock", 4096).ok();
-        let summary = summarize(
-            &facts,
-            &walked,
-            package_json.as_deref(),
-            yarn_lock.as_deref(),
-        );
+        let summary = summarize(&facts, &walked, steps, &linux);
         Ok(Preflight {
             source: path,
             windows_path: windows,
@@ -602,7 +616,7 @@ pub async fn migrate_start(
             Ok(id) => id,
             Err(err) => {
                 forget_file();
-                return Err(MigrateError::agent("Cannot start the move", err));
+                return Err(MigrateError::start_failed(err));
             }
         };
         let totals = snapshot.manifest.totals();
@@ -893,6 +907,7 @@ mod tests {
             },
             copy_totals: Totals::default(),
             install: vec![],
+            install_changes: Default::default(),
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
@@ -943,6 +958,84 @@ mod tests {
         assert!(file.exists());
         assert!(!other.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// End to end with the real `git.exe`, run by hand (`--ignored`): builds a small
+    /// repo at `%TEMP%\refract-e2e\marigold-site`, takes its snapshot as **Start**
+    /// does, and writes it to `%TEMP%\refract-e2e` for the WSL helper to migrate. Prints
+    /// the repo's and the file's Linux paths. The repo is left for the helper; delete
+    /// `%TEMP%\refract-e2e` afterwards.
+    #[test]
+    #[ignore]
+    fn real_git_exe_snapshot_for_the_helper() {
+        let base = std::env::temp_dir().join("refract-e2e");
+        let repo = base.join("marigold-site");
+        let _ = std::fs::remove_dir_all(&base);
+        let files = [
+            ("README.md", "# Marigold\r\n\r\nA small site.\r\n"),
+            ("index.html", "<!doctype html>\n<h1>Marigold</h1>\n"),
+            ("src/app.js", "console.log('marigold');\r\n"),
+            ("src/mixed.txt", "one\r\ntwo\nthree\r\n"),
+            (".gitignore", "node_modules/\n"),
+            (
+                "package.json",
+                "{\"name\": \"marigold-site\", \"private\": true}\n",
+            ),
+            ("node_modules/left-pad/index.js", "module.exports = 1;\n"),
+        ];
+        for (path, text) in files {
+            let file = repo.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(file, text).unwrap();
+        }
+        let path_var = std::env::var("PATH").ok();
+        let program_files = std::env::var_os("ProgramFiles").map(PathBuf::from);
+        let exe = find_git_exe(path_var.as_deref(), program_files.as_deref(), Path::is_file)
+            .expect("git.exe");
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new(&exe)
+                .args([
+                    "-c",
+                    "user.name=Test Dev",
+                    "-c",
+                    "user.email=dev@example.com",
+                ])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "First page"]);
+        git(&["branch", "feature"]);
+        git(&["update-index", "--skip-worktree", "index.html"]);
+        std::fs::write(repo.join("notes.txt"), "draft\r\n").unwrap();
+        std::fs::write(
+            repo.join("README.md"),
+            "# Marigold\r\n\r\nA small site, now with notes.\r\n",
+        )
+        .unwrap();
+
+        let fs = win::NtfsFs::new(&repo.to_string_lossy());
+        let runner = GitExe {
+            exe,
+            root: repo.clone(),
+            cancel: Arc::new(AtomicBool::new(false)),
+        };
+        let snapshot = take_snapshot(&fs, &runner, 4, &AtomicBool::new(false), &|_| {}).unwrap();
+        assert_eq!(snapshot.git[0].snapshot.index_flags, ["S index.html"]);
+        assert!(snapshot.git[0].autocrlf.is_some());
+        assert_eq!(snapshot.manifest.skipped[0].path.as_str(), "node_modules");
+        let file = write_snapshot(&base, &snapshot).unwrap();
+        println!("autocrlf={}", snapshot.git[0].autocrlf.as_deref().unwrap());
+        println!("source={}", wsl_path(&repo.to_string_lossy()).unwrap());
+        println!("snapshot={}", wsl_path(&file.to_string_lossy()).unwrap());
     }
 
     #[test]

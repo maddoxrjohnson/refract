@@ -38,7 +38,10 @@ describe("migrationsReducer", () => {
     s = run(
       [
         { type: "started", source: SOURCE, id: "m-1" },
-        { type: "progress", progress: { id: "m-1", step: "copying", done: GB, total: 3 * GB } },
+        {
+          type: "progress",
+          progress: { id: "m-1", source: SOURCE, dest: DEST, step: "copying", done: GB, total: 3 * GB },
+        },
       ],
       s,
     );
@@ -50,9 +53,39 @@ describe("migrationsReducer", () => {
     expect(s.size).toBe(0);
   });
 
+  it("places progress of a migration this window didn't start by its source", () => {
+    const hashing = { id: "m-3", source: SOURCE, dest: DEST, step: "hashing" as const, done: 1, total: 2 };
+    const s = run([{ type: "progress", progress: hashing }]);
+    expect(s.get(SOURCE)).toEqual({
+      source: SOURCE,
+      dest: DEST,
+      id: "m-3",
+      phase: { kind: "running", step: "hashing", done: 1, total: 2 },
+    });
+    // Started here: the progress takes the entry, and the late answer changes nothing.
+    const t = run([
+      { type: "starting", source: SOURCE, dest: DEST },
+      { type: "progress", progress: { ...hashing, id: "m-4", step: "copying" } },
+      { type: "started", source: SOURCE, id: "m-4" },
+    ]);
+    expect(t.get(SOURCE)).toMatchObject({ id: "m-4", phase: { kind: "running", step: "copying" } });
+  });
+
+  it("drops running copies when the helper stops, and keeps reports", () => {
+    const other = testReport({ id: "m-5", source: "/mnt/d/other", dest: "/home/dev/other" });
+    const s = run([
+      { type: "progress", progress: { id: "m-3", source: SOURCE, dest: DEST, step: "hashing", done: 1, total: 2 } },
+      { type: "ready", id: "m-5", report: other },
+      { type: "starting", source: "/mnt/c/third", dest: "/home/dev/third" },
+      { type: "helperStopped" },
+    ]);
+    expect([...s.keys()].sort()).toEqual(["/mnt/c/third", "/mnt/d/other"]);
+    expect(run([{ type: "helperStopped" }])).toBe(initialMigrations);
+  });
+
   it("ignores progress it can't place and snapshots of folders not starting", () => {
     const s = run([
-      { type: "progress", progress: { id: "elsewhere", step: "hashing", done: 1, total: 2 } },
+      { type: "progress", progress: { id: "elsewhere", source: "", dest: "", step: "hashing", done: 1, total: 2 } },
       {
         type: "snapshot",
         progress: { path: SOURCE, phase: "walking", filesDone: 1, filesTotal: 2, bytesDone: 0, bytesTotal: 0 },

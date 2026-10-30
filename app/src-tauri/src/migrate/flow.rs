@@ -3,10 +3,10 @@
 //! tested with fakes.
 //!
 //! [`MigrateHelper`] is the thin request layer: one method per helper request, named
-//! in [`method`]. `migrate`, `migrateFinish` and `migrateCancel` are protocol
-//! [`Method`]s already; the others are not in `protocol.rs` yet, so [`AgentHelper`]
-//! answers them with [`not_supported`] until they are, which makes **Delete
-//! original** refuse rather than skip its recheck.
+//! in [`method`], each a protocol [`Method`] that [`AgentHelper`] sends. A helper that
+//! does not know a request answers `METHOD_NOT_FOUND`, which makes **Delete original**
+//! refuse rather than skip its recheck. [`MigrateError::agent`] maps the helper's
+//! error codes to [`MigrateErrorKind`]s.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,7 +15,8 @@ use refract_client::RequestError;
 use refract_core::migrate::preflight::Refusal;
 use refract_core::migrate::report::Report;
 use refract_core::protocol::{
-    code, FinishAction, Method, MigrateCancelParams, MigrateFinishParams, MigrateParams, Reply,
+    code, FinishAction, Method, MigrateCancelParams, MigrateFinishParams, MigrateIdParams,
+    MigrateParams, Reply, StopAgentParams,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,11 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long `migrateCancel` waits: it deletes the partial copy.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// How long `migrateRecheck` waits: it stats every file of the source over `/mnt`.
+const RECHECK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long the quick requests wait: `migrateResync` answers before it copies,
+/// `migratePending` and `stopAgent` read state the helper holds.
+const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Why a migration command failed, sent as `{"kind": "...", "message": "..."}`, with
 /// `refusals` for `refused`.
@@ -99,13 +105,43 @@ impl MigrateError {
         }
     }
 
-    /// A failed helper request, made while `doing` something.
+    /// A failed helper request, made while `doing` something. The helper's own error
+    /// codes keep their meaning: `MIGRATE_FAILED` (the migration is unknown or not at
+    /// that step) is `notReady`, `AGENT_BUSY` (the agent is working) `busy`,
+    /// `NOT_RUNNING` (no such agent process) `notReady` and `REPO_NOT_FOUND` `invalid`;
+    /// everything else, and a helper that did not answer, is `agent`.
     pub fn agent(doing: &str, err: RequestError) -> MigrateError {
-        let message = match err {
-            RequestError::Agent { message, .. } => message,
-            err => err.to_string(),
+        let (kind, message) = match err {
+            RequestError::Agent { code, message } => {
+                let kind = match code {
+                    code::MIGRATE_FAILED | code::NOT_RUNNING => MigrateErrorKind::NotReady,
+                    code::AGENT_BUSY => MigrateErrorKind::Busy,
+                    code::REPO_NOT_FOUND => MigrateErrorKind::Invalid,
+                    _ => MigrateErrorKind::Agent,
+                };
+                (kind, message)
+            }
+            err => (MigrateErrorKind::Agent, err.to_string()),
         };
-        MigrateError::new(MigrateErrorKind::Agent, format!("{doing}: {message}"))
+        MigrateError::new(kind, format!("{doing}: {message}"))
+    }
+
+    /// A failed `migrate`: `MIGRATE_FAILED` there is the helper's preflight refusing,
+    /// one reason per line.
+    pub fn start_failed(err: RequestError) -> MigrateError {
+        match err {
+            RequestError::Agent {
+                code: code::MIGRATE_FAILED,
+                message,
+            } => MigrateError::new(
+                MigrateErrorKind::Refused,
+                format!(
+                    "Cannot start the move: {}",
+                    message.lines().collect::<Vec<_>>().join(" ")
+                ),
+            ),
+            err => MigrateError::agent("Cannot start the move", err),
+        }
     }
 }
 
@@ -153,14 +189,6 @@ pub trait MigrateHelper: Send + Sync {
     fn stop_agent(&self, path: &str, session_id: &str) -> Result<(), RequestError>;
 }
 
-/// The error for a request the helper protocol does not have yet.
-pub fn not_supported(method: &str) -> RequestError {
-    RequestError::Agent {
-        code: code::METHOD_NOT_FOUND,
-        message: format!("this version of the helper does not support {method} yet"),
-    }
-}
-
 fn unexpected(method: &str, reply: &Reply) -> RequestError {
     RequestError::Agent {
         code: code::INTERNAL_ERROR,
@@ -179,15 +207,29 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    // TODO: send `migrateRecheck` once protocol.rs has it. It stats every file of the
-    // source over `/mnt`, so it needs minutes, like `migrateFinish`.
-    fn recheck(&self, _id: &str) -> Result<Recheck, RequestError> {
-        Err(not_supported(method::RECHECK))
+    fn recheck(&self, id: &str) -> Result<Recheck, RequestError> {
+        let params = MigrateIdParams { id: id.to_owned() };
+        match self
+            .0
+            .request(Method::MigrateRecheck(params), RECHECK_TIMEOUT)?
+        {
+            Reply::Recheck(recheck) => Ok(Recheck {
+                changed: recheck.changed,
+                busy_agents: recheck.busy_agents,
+            }),
+            other => Err(unexpected(method::RECHECK, &other)),
+        }
     }
 
-    // TODO: send `migrateResync` once protocol.rs has it.
-    fn resync(&self, _id: &str) -> Result<(), RequestError> {
-        Err(not_supported(method::RESYNC))
+    fn resync(&self, id: &str) -> Result<(), RequestError> {
+        let params = MigrateIdParams { id: id.to_owned() };
+        match self
+            .0
+            .request(Method::MigrateResync(params), QUICK_TIMEOUT)?
+        {
+            Reply::Done => Ok(()),
+            other => Err(unexpected(method::RESYNC, &other)),
+        }
     }
 
     fn finish(&self, id: &str, action: FinishAction) -> Result<(), RequestError> {
@@ -215,14 +257,28 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    // TODO: send `migratePending` once protocol.rs has it.
     fn pending(&self) -> Result<Vec<PendingMigration>, RequestError> {
-        Err(not_supported(method::PENDING))
+        match self.0.request(Method::MigratePending, QUICK_TIMEOUT)? {
+            Reply::PendingMigrations(list) => Ok(list
+                .into_iter()
+                .map(|p| PendingMigration {
+                    id: p.id,
+                    report: *p.report,
+                })
+                .collect()),
+            other => Err(unexpected(method::PENDING, &other)),
+        }
     }
 
-    // TODO: send `stopAgent` once protocol.rs has it.
-    fn stop_agent(&self, _path: &str, _session_id: &str) -> Result<(), RequestError> {
-        Err(not_supported(method::STOP_AGENT))
+    fn stop_agent(&self, path: &str, session_id: &str) -> Result<(), RequestError> {
+        let params = StopAgentParams {
+            path: path.to_owned(),
+            session_id: session_id.to_owned(),
+        };
+        match self.0.request(Method::StopAgent(params), QUICK_TIMEOUT)? {
+            Reply::Done => Ok(()),
+            other => Err(unexpected(method::STOP_AGENT, &other)),
+        }
     }
 }
 
@@ -454,6 +510,14 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::sync::Mutex;
+
+    /// What an older helper answers to a request it does not know.
+    fn not_supported(method: &str) -> RequestError {
+        RequestError::Agent {
+            code: code::METHOD_NOT_FOUND,
+            message: format!("unknown method {method}"),
+        }
+    }
 
     #[derive(Default)]
     struct FakeHelper {
@@ -810,5 +874,33 @@ mod tests {
             .contains("worktree"));
         let plain = serde_json::to_value(MigrateError::new(MigrateErrorKind::Busy, "x")).unwrap();
         assert_eq!(plain, serde_json::json!({"kind": "busy", "message": "x"}));
+    }
+
+    #[test]
+    fn helper_error_codes_keep_their_meaning() {
+        let agent = |code| RequestError::Agent {
+            code,
+            message: "why".into(),
+        };
+        let kind = |code| MigrateError::agent("Doing", agent(code)).kind;
+        assert_eq!(kind(code::MIGRATE_FAILED), MigrateErrorKind::NotReady);
+        assert_eq!(kind(code::AGENT_BUSY), MigrateErrorKind::Busy);
+        assert_eq!(kind(code::NOT_RUNNING), MigrateErrorKind::NotReady);
+        assert_eq!(kind(code::REPO_NOT_FOUND), MigrateErrorKind::Invalid);
+        assert_eq!(kind(code::METHOD_NOT_FOUND), MigrateErrorKind::Agent);
+        assert_eq!(
+            MigrateError::agent("Doing", RequestError::Timeout).kind,
+            MigrateErrorKind::Agent
+        );
+        let refused = MigrateError::start_failed(RequestError::Agent {
+            code: code::MIGRATE_FAILED,
+            message: "The destination exists.\nNot enough space.".into(),
+        });
+        assert_eq!(refused.kind, MigrateErrorKind::Refused);
+        assert_eq!(
+            refused.message,
+            "Cannot start the move: The destination exists. Not enough space."
+        );
+        assert_eq!(MigrateError::agent("Doing", agent(7)).message, "Doing: why");
     }
 }

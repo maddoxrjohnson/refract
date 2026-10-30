@@ -21,7 +21,8 @@ export interface MigrationControls {
 /**
  * Follows migrations through the helper's events, and asks for pending reports whenever
  * `refresh` changes while `enabled` (the helper is running): after a restart, and on each
- * show, since WebView2 is suspended while hidden and events can be lost then.
+ * show, since WebView2 is suspended while hidden and events can be lost then. While the
+ * helper is not running, no copy runs, so none is shown as running.
  */
 export function useMigrations(backend: Backend, enabled: boolean, refresh: number): MigrationControls {
   const [state, dispatch] = useReducer(migrationsReducer, initialMigrations);
@@ -39,7 +40,12 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
   useEffect(() => backend.onMigrateSnapshot((progress) => dispatch({ type: "snapshot", progress })), [backend]);
 
   useEffect(() => {
-    if (!enabled) return;
+    // A stopped helper takes its running copies with it; the pending list brings back
+    // the reports it kept once it runs again.
+    if (!enabled) {
+      dispatch({ type: "helperStopped" });
+      return;
+    }
     let live = true;
     backend.migratePending().then(
       (list) => live && dispatch({ type: "pending", list }),
