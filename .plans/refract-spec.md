@@ -206,3 +206,7 @@ The interface talks to the backend through one `Backend` interface. A `DemoBacke
 
 - Whether Claude Code exposes plan-usage limits through an official local source (affects the usage widget).
 - Code signing: whether to pay for a certificate (for example Azure Trusted Signing) so Windows doesn't warn on install.
+
+## 12. Move to WSL
+
+Repos on a Windows drive can be moved onto the WSL Linux filesystem from their detail panel: Refract copies the repo (skipping regenerable build folders), re-checks it out with Linux line endings, verifies every file and the full git state, moves Claude session history, runs the install, and sends the original to the Recycle Bin only after you confirm. Full spec: `.plans/wsl-migration-spec.md`.
