@@ -1,7 +1,8 @@
 //! The Windows side of a launch (see `docs/launch.md`): the arguments for `code`, and
 //! the bare layout added to the Refract profile's settings. [`setup`] has the
-//! first-run steps. Nothing here depends on the operating system, so it is tested on
-//! Linux and used by the Windows app.
+//! first-run steps and [`windows`] closes the window the first run opens. Nothing
+//! here depends on the operating system, so it is tested on Linux and used by the
+//! Windows app.
 
 use std::fs;
 use std::io::{self, Write};
@@ -12,6 +13,7 @@ use jsonc_parser::ParseOptions;
 use serde_json::Value;
 
 pub mod setup;
+pub mod windows;
 
 /// The VS Code profile every Refract window opens with, unless the caller names another.
 pub const PROFILE: &str = "Refract";

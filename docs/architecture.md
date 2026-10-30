@@ -65,11 +65,17 @@ An `id` may be any JSON number or string and is echoed back unchanged. A line wh
 
 The first `listRepos` starts loading in the background and answers immediately with `{"repos": [...], "loading": true}`, listing what has loaded so far. Linux repos load first and repos under `/mnt/` after them. Repos arrive as `repoChanged` events as each phase finishes, and `{"event": "loadComplete"}` follows once everything is reported. After that, `loading` is `false`. A `getRepo` for a repo that has not loaded yet is answered once it has.
 
-`prepareLaunch` leaves a request file for the VS Code extension and answers with the folder URI to open; [launch.md](launch.md) describes the launch path.
+`prepareLaunch` leaves a request file for the VS Code extension and answers with the folder URI to open. `setupServer` installs the Refract extension in the WSL VS Code server. It runs on a separate thread inside the helper, so other requests are still answered while it runs, and its response can arrive after theirs. [launch.md](launch.md) describes both.
 
 Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
 
 The helper never writes anything else to standard output; logs go to standard error.
+
+## The app's client
+
+The app talks to the helper through `refract-client`, which starts the helper, numbers each request and hands each response back to the caller waiting for it. Events go straight to the interface. Each line of the helper's standard error is forwarded to the app's own standard error, which shows when the app is run from a terminal (a log file comes later), and the last few lines are kept to explain a crash.
+
+If the helper exits, every request still waiting for an answer fails at once as disconnected, and the client starts the helper again after a delay. The delay starts at one second and doubles with each failure in a row, up to 30 seconds. A helper that ran for at least a minute before exiting counts as healthy, so the next delay is back to one second. Failing to start the helper at all, for example when `wsl.exe` is missing, counts as a failure too. While the helper is down, requests fail straight away instead of queueing, and the interface shows that it is restarting, when it will try again and why it stopped. A request that times out is forgotten, so an answer that arrives later is dropped. Shutting down sends `shutdown`, closes the helper's input and kills it if it has not exited after a grace period. Nothing is restarted after that.
 
 ## Session state
 

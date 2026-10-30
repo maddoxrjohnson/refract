@@ -9,5 +9,6 @@ pub mod procs;
 pub mod scan;
 pub mod server;
 pub mod sessions;
+pub mod setup;
 pub mod state;
 pub mod watch;

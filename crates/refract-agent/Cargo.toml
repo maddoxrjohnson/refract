@@ -7,6 +7,7 @@ description = "Refract's WSL helper: scans repos, reads Claude Code sessions and
 
 [dependencies]
 refract-core = { path = "../refract-core" }
+refract-launch = { path = "../refract-launch" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 inotify = { version = "0.11", default-features = false }
 serde = { version = "1", features = ["derive"] }
@@ -16,3 +17,4 @@ uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3"
+zip = { version = "9", default-features = false, features = ["deflate"] }

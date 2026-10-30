@@ -508,3 +508,135 @@ fn prepare_launch_writes_a_request_file() {
     assert_eq!(agent.response(), json!({"id": 4, "result": null}));
     assert!(agent.child.wait().unwrap().success());
 }
+
+/// A vsix holding just `extension/package.json` at `version`.
+fn write_vsix(path: &Path, version: &str) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut zip = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default();
+    zip.start_file("extension/package.json", options).unwrap();
+    zip.write_all(format!(r#"{{"name":"refract","version":"{version}"}}"#).as_bytes())
+        .unwrap();
+    zip.finish().unwrap();
+}
+
+/// A fake `code-server` for `commit` in `home`'s WSL server. It logs its arguments,
+/// sleeps a second like a real install, and lists `refract.refract` 0.3.0 in the
+/// server's `extensions.json`.
+fn fake_code_server(home: &Path, commit: &str) -> PathBuf {
+    let server = home.join(".vscode-server");
+    let script = server.join(format!("bin/{commit}/bin/code-server"));
+    let log = server.join("code-server.log");
+    let registry = server.join("extensions/extensions.json");
+    write(
+        &script,
+        &format!(
+            "#!/bin/sh\necho \"$@\" >> '{}'\nsleep 1\nmkdir -p '{}'\nprintf '%s' '{}' > '{}'\n",
+            log.display(),
+            registry.parent().unwrap().display(),
+            r#"[{"identifier":{"id":"refract.refract"},"version":"0.3.0","location":{"$mid":1,"path":"/x"}}]"#,
+            registry.display(),
+        ),
+    );
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    log
+}
+
+#[test]
+fn setup_server_installs_once_without_blocking_other_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _root, config) = setup(tmp.path());
+    let vsix = tmp.path().join("dist/refract.vsix");
+    std::fs::create_dir_all(vsix.parent().unwrap()).unwrap();
+    write_vsix(&vsix, "0.3.0");
+    let vsix_str = vsix.to_str().unwrap();
+    let mut agent = Agent::spawn(&home, &config);
+
+    // No server yet: VS Code has not connected to WSL.
+    agent.send(json!({"id": 1, "method": "setupServer", "params": {"vsix": vsix_str}}));
+    let skipped = agent.response();
+    assert_eq!(skipped["id"], 1);
+    assert_eq!(skipped["result"]["installed"], false);
+    assert_eq!(skipped["result"]["applicationScoped"], false);
+    assert!(skipped["result"]["skipped"]
+        .as_str()
+        .unwrap()
+        .contains("no VS Code server"));
+
+    let log = fake_code_server(&home, "1a2b3c");
+    agent.send(json!({"id": 2, "method": "setupServer", "params": {
+        "vsix": format!("{vsix_str}/"), "commit": "1a2b3c"}}));
+    agent.send(json!({"id": 3, "method": "ping"}));
+    let first = agent.response();
+    assert_eq!(first["id"], 3, "ping waited for the install: {first}");
+    let done = agent.response();
+    assert_eq!(
+        done,
+        json!({"id": 2, "result": {"installed": true, "applicationScoped": true}})
+    );
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(calls, format!("--install-extension {vsix_str} --force\n"));
+    let registry: Value = serde_json::from_str(
+        &std::fs::read_to_string(home.join(".vscode-server/extensions/extensions.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(registry[0]["metadata"]["isApplicationScoped"], true);
+    assert_eq!(registry[0]["location"]["$mid"], 1);
+
+    // Done already, and the newest server is used without a commit.
+    agent.send(json!({"id": 4, "method": "setupServer", "params": {
+        "vsix": vsix_str, "commit": null}}));
+    assert_eq!(
+        agent.response(),
+        json!({"id": 4, "result": {"installed": false, "applicationScoped": false}})
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap(), calls);
+
+    let missing = tmp.path().join("dist/missing.vsix");
+    agent.send(json!({"id": 5, "method": "setupServer", "params": {
+        "vsix": missing.to_str().unwrap()}}));
+    assert_eq!(
+        agent.response()["result"]["skipped"],
+        format!("no vsix at {}", missing.display())
+    );
+
+    agent.send(json!({"id": 6, "method": "setupServer", "params": {"vsix": "dist/refract.vsix"}}));
+    assert_eq!(agent.response()["error"]["code"], -32602);
+
+    // A registry that cannot be read is an error, not a skip.
+    let registry = home.join(".vscode-server/extensions/extensions.json");
+    std::fs::remove_file(&registry).unwrap();
+    std::fs::create_dir(&registry).unwrap();
+    agent.send(json!({"id": 7, "method": "setupServer", "params": {"vsix": vsix_str}}));
+    let failed = agent.response();
+    assert_eq!(failed["id"], 7);
+    assert_eq!(failed["error"]["code"], 2);
+
+    agent.send(json!({"id": 8, "method": "shutdown"}));
+    assert_eq!(agent.response(), json!({"id": 8, "result": null}));
+    assert!(agent.child.wait().unwrap().success());
+}
+
+#[test]
+fn setup_server_requests_run_one_at_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _root, config) = setup(tmp.path());
+    let vsix = tmp.path().join("refract.vsix");
+    write_vsix(&vsix, "0.3.0");
+    let log = fake_code_server(&home, "1a2b3c");
+    let mut agent = Agent::spawn(&home, &config);
+    let params = json!({"vsix": vsix.to_str().unwrap()});
+    agent.send(json!({"id": 1, "method": "setupServer", "params": params}));
+    agent.send(json!({"id": 2, "method": "setupServer", "params": params}));
+    let first = agent.response();
+    let second = agent.response();
+    assert_eq!(first["id"], 1);
+    assert_eq!(first["result"]["installed"], true);
+    assert_eq!(second["id"], 2);
+    assert_eq!(
+        second["result"],
+        json!({"installed": false, "applicationScoped": false})
+    );
+    assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+}

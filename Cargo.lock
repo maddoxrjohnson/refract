@@ -332,11 +332,22 @@ dependencies = [
  "chrono",
  "inotify",
  "refract-core",
+ "refract-launch",
  "serde",
  "serde_json",
  "tempfile",
  "toml",
  "uuid",
+ "zip",
+]
+
+[[package]]
+name = "refract-client"
+version = "0.1.0"
+dependencies = [
+ "refract-core",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

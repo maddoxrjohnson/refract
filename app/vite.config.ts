@@ -1,0 +1,22 @@
+/// <reference types="vitest/config" />
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+// The WebView2 window on Windows reaches this dev server through WSL's localhost
+// forwarding, so it binds to 127.0.0.1 on a fixed port that tauri.conf.json names.
+export default defineConfig({
+  plugins: [react()],
+  clearScreen: false,
+  server: {
+    host: "127.0.0.1",
+    port: 1420,
+    strictPort: true,
+    watch: { ignored: ["**/src-tauri/**"] },
+  },
+  build: {
+    target: "es2022",
+  },
+  test: {
+    environment: "jsdom",
+  },
+});

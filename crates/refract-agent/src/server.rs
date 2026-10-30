@@ -3,7 +3,9 @@
 //! Three threads: one reads stdin, one reads inotify, and this one owns all state and is
 //! the only writer to stdout. It blocks on a channel, waking only for input, for a
 //! debounce deadline, or for the liveness timer while some session is live or recent.
-//! A fourth thread runs the first load, so requests are answered while it runs.
+//! A fourth thread runs the first load, so requests are answered while it runs, and a
+//! fifth runs `setupServer` requests one at a time, sending each response back through
+//! the channel for this thread to write.
 //!
 //! Backpressure: the channel is bounded and writes to stdout block. If the app stops
 //! reading stdout, this thread stops; the stdin and inotify threads then block on the
@@ -13,11 +15,13 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use refract_core::launch::wsl_path;
 use refract_core::protocol::{
     code, parse_request, ErrorBody, Event, Hello, Id, Method, Outcome, Reply, RepoList, Response,
     PROTOCOL_VERSION,
@@ -28,6 +32,7 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::launch;
 use crate::scan;
+use crate::setup;
 use crate::state::{self, path_str, Agent, Refresh};
 use crate::watch::{self, Change, FsEvent, Watcher};
 
@@ -55,6 +60,8 @@ enum Msg {
         agent: Box<Agent>,
         last: bool,
     },
+    /// A response the setup thread finished.
+    Answer(Response),
 }
 
 /// One line of input, without its newline.
@@ -126,8 +133,10 @@ struct Server<W: Write> {
     pending: Pending,
     next_live: Option<Instant>,
     load: Load,
-    /// For the loading thread.
+    /// For the loading and setup threads.
     tx: SyncSender<Msg>,
+    /// Queues `setupServer` jobs for the setup thread, once it is started.
+    setup_jobs: Option<Sender<setup::Job>>,
     /// Refreshes asked for since the load started, re-applied to each loaded phase.
     touched: HashMap<PathBuf, Refresh>,
     /// `getRepo` requests for repos not loaded yet, answered when they are.
@@ -174,6 +183,7 @@ where
         next_live: None,
         load: Load::NotStarted,
         tx,
+        setup_jobs: None,
         touched: HashMap::new(),
         waiting: Vec::new(),
         prewatched: Vec::new(),
@@ -199,6 +209,7 @@ where
             Ok(Msg::Eof) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Ok(Msg::Fs(batch)) => server.queue(&batch),
             Ok(Msg::Loaded { agent, last }) => server.loaded(*agent, last)?,
+            Ok(Msg::Answer(response)) => server.send(&response)?,
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
@@ -357,6 +368,22 @@ impl<W: Write> Server<W> {
                     Err(e) => Response::err(id, e.code, e.message),
                 }
             }
+            Method::SetupServer { vsix, commit } => match wsl_path(&vsix) {
+                Some(path) => {
+                    let job = setup::Job {
+                        id,
+                        vsix: path.into(),
+                        commit,
+                    };
+                    self.start_setup(job)?;
+                    return Ok(true);
+                }
+                None => Response::err(
+                    id,
+                    code::INVALID_PARAMS,
+                    format!("vsix is not an absolute Linux, Windows or WSL path: {vsix:?}"),
+                ),
+            },
             Method::Shutdown => {
                 self.send(&Response::ok(id, Reply::Done))?;
                 return Ok(false);
@@ -364,6 +391,33 @@ impl<W: Write> Server<W> {
         };
         self.send(&response)?;
         Ok(true)
+    }
+
+    /// Queues `job` for the setup thread, starting it on first use. Jobs run one at a
+    /// time, so two installs never race, and each response arrives as [`Msg::Answer`].
+    /// If the thread cannot start, `job` is answered with `SETUP_FAILED` at once.
+    fn start_setup(&mut self, job: setup::Job) -> io::Result<()> {
+        let job = match &self.setup_jobs {
+            Some(jobs) => match jobs.send(job) {
+                Ok(()) => return Ok(()),
+                // The thread is gone (it panicked); start another.
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let (jobs, rx) = mpsc::channel::<setup::Job>();
+        let tx = self.tx.clone();
+        let started = std::thread::Builder::new()
+            .name("setup".into())
+            .spawn(move || run_setup_jobs(rx, &tx, setup::run));
+        if let Err(e) = started {
+            let message = format!("cannot start the setup thread: {e}");
+            return self.send(&Response::err(job.id, code::SETUP_FAILED, message));
+        }
+        // The thread holds the receiver until it has run a job, so this cannot fail.
+        let _ = jobs.send(job);
+        self.setup_jobs = Some(jobs);
+        Ok(())
     }
 
     /// Answers `getRepo`, or returns `None` and holds the request when the repo may
@@ -691,10 +745,63 @@ fn mark_sessions(refresh: &mut HashMap<PathBuf, Refresh>, repo: &Path) {
     entry.sessions = true;
 }
 
+/// The setup thread: runs each job with `run` and sends its response to the main
+/// thread, until either side goes away. A job that panics is answered with
+/// `SETUP_FAILED` and the thread goes on to the next.
+fn run_setup_jobs(
+    jobs: Receiver<setup::Job>,
+    tx: &SyncSender<Msg>,
+    run: impl Fn(setup::Job) -> Response,
+) {
+    for job in jobs {
+        let id = job.id.clone();
+        let response = catch_unwind(AssertUnwindSafe(|| run(job)))
+            .unwrap_or_else(|_| Response::err(id, code::SETUP_FAILED, "internal error"));
+        if tx.send(Msg::Answer(response)).is_err() {
+            return;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn a_panicking_setup_job_is_answered_and_the_worker_goes_on() {
+        let (jobs, rx) = mpsc::channel();
+        let (tx, answers) = mpsc::sync_channel(4);
+        for n in [1u64, 2] {
+            let job = setup::Job {
+                id: n.into(),
+                vsix: "/tmp/refract.vsix".into(),
+                commit: None,
+            };
+            jobs.send(job).unwrap();
+        }
+        drop(jobs);
+        run_setup_jobs(rx, &tx, |job| {
+            if job.id == 1u64.into() {
+                panic!("setup blew up");
+            }
+            Response::ok(job.id, Reply::Done)
+        });
+        let answers: Vec<Response> = answers
+            .try_iter()
+            .map(|msg| match msg {
+                Msg::Answer(response) => response,
+                _ => panic!("expected an answer"),
+            })
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                Response::err(1u64, code::SETUP_FAILED, "internal error"),
+                Response::ok(2u64, Reply::Done),
+            ]
+        );
+    }
 
     fn lines(input: &[u8]) -> Vec<Line> {
         let mut input = Cursor::new(input.to_vec());

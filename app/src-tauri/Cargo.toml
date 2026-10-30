@@ -1,0 +1,38 @@
+[package]
+name = "refract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Refract: a tray launcher for Claude Code in VS Code."
+publish = false
+
+# Built on its own (cross-compiled for Windows), not as part of the root workspace.
+[workspace]
+
+[lib]
+name = "refract_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[dependencies]
+refract-client = { path = "../../crates/refract-client" }
+refract-core = { path = "../../crates/refract-core" }
+refract-launch = { path = "../../crates/refract-launch" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
+tauri-plugin-autostart = "2.7"
+tauri-plugin-global-shortcut = "2.4"
+tauri-plugin-single-instance = "2.5"
+
+# The versions wry uses, to reach WebView2 interfaces Tauri does not wrap.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.39"
+windows = "0.62"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true

@@ -1,0 +1,11 @@
+[package]
+name = "refract-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+description = "The app's side of the protocol with refract-agent: runs the helper, matches responses to requests and restarts it after a crash."
+
+[dependencies]
+refract-core = { path = "../refract-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

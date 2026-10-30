@@ -33,6 +33,9 @@ pub mod code {
     /// `getRepo` named a path that is not a known repo, or `prepareLaunch` a path that
     /// is not a directory.
     pub const REPO_NOT_FOUND: i32 = 1;
+    /// `setupServer` failed to read or change the WSL server's files, or `code-server`
+    /// failed.
+    pub const SETUP_FAILED: i32 = 2;
 }
 
 /// A request from the app.
@@ -56,6 +59,16 @@ pub enum Method {
     /// Leaves a request file for the VS Code extension: answered with a
     /// [`LaunchTicket`]. See `docs/launch.md`.
     PrepareLaunch { path: String, mode: LaunchMode },
+    /// Installs the Refract extension in the WSL VS Code server and applies it to every
+    /// profile: answered with a [`ServerSetup`]. `vsix` is a Linux path, a Windows
+    /// drive path or a `\\wsl.localhost\<distro>\…` path (see
+    /// [`crate::launch::wsl_path`]); `commit` is the Windows VS Code's commit, with
+    /// `None` meaning the newest server. See `docs/launch.md`.
+    SetupServer {
+        vsix: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        commit: Option<String>,
+    },
     /// Answered with `null`, then the helper exits.
     Shutdown,
 }
@@ -99,6 +112,7 @@ pub enum Reply {
     Repos(RepoList),
     Repo(Box<RepoSnapshot>),
     Launch(LaunchTicket),
+    ServerSetup(ServerSetup),
     /// `null`, for methods with nothing to return.
     Done,
 }
@@ -157,6 +171,19 @@ pub struct LaunchTicket {
     pub session_id: String,
     /// What to pass to `code --folder-uri`.
     pub folder_uri: String,
+}
+
+/// The result of `setupServer`: what it changed, or why it did nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServerSetup {
+    /// The vsix was installed now, because its version was not the installed one.
+    pub installed: bool,
+    /// The extension was marked application-scoped now.
+    pub application_scoped: bool,
+    /// Why nothing was done: no vsix at the path, or no VS Code server yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
 }
 
 /// The request file `prepareLaunch` leaves for the VS Code extension, as
@@ -362,7 +389,7 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         ));
     };
     let takes_params = match method {
-        "getRepo" | "prepareLaunch" => true,
+        "getRepo" | "prepareLaunch" | "setupServer" => true,
         "ping" | "listRepos" | "shutdown" => false,
         _ => {
             return Err(fail(
@@ -590,6 +617,114 @@ mod tests {
                 "createdAt": "2026-10-29T17:54:44Z"
             })
         );
+    }
+
+    #[test]
+    fn setup_server_round_trips() {
+        let setup = Request {
+            id: 9.into(),
+            method: Method::SetupServer {
+                vsix: "C:\\Users\\dev\\refract.vsix".into(),
+                commit: Some("1a2b3c".into()),
+            },
+        };
+        assert_eq!(
+            round_trip(&setup),
+            json!({"id": 9, "method": "setupServer", "params": {
+                "vsix": "C:\\Users\\dev\\refract.vsix", "commit": "1a2b3c"}})
+        );
+        let newest = Request {
+            id: 10.into(),
+            method: Method::SetupServer {
+                vsix: "/home/dev/refract.vsix".into(),
+                commit: None,
+            },
+        };
+        assert_eq!(
+            round_trip(&newest),
+            json!({"id": 10, "method": "setupServer", "params": {"vsix": "/home/dev/refract.vsix"}})
+        );
+        for line in [
+            r#"{"id":10,"method":"setupServer","params":{"vsix":"/home/dev/refract.vsix"}}"#,
+            r#"{"id":10,"method":"setupServer","params":{"vsix":"/home/dev/refract.vsix","commit":null}}"#,
+        ] {
+            assert_eq!(parse_request(line).unwrap(), newest, "{line}");
+        }
+        for line in [
+            r#"{"id":11,"method":"setupServer"}"#,
+            r#"{"id":11,"method":"setupServer","params":{}}"#,
+            r#"{"id":11,"method":"setupServer","params":{"vsix":7}}"#,
+        ] {
+            let err = parse_request(line).unwrap_err();
+            assert_eq!(err.error.code, code::INVALID_PARAMS, "{line}");
+        }
+
+        let done = Response::ok(
+            9,
+            Reply::ServerSetup(ServerSetup {
+                installed: true,
+                application_scoped: false,
+                skipped: None,
+            }),
+        );
+        assert_eq!(
+            round_trip(&done),
+            json!({"id": 9, "result": {"installed": true, "applicationScoped": false}})
+        );
+        let skipped = Response::ok(
+            10,
+            Reply::ServerSetup(ServerSetup {
+                installed: false,
+                application_scoped: false,
+                skipped: Some("no vsix at /home/dev/refract.vsix".into()),
+            }),
+        );
+        assert_eq!(
+            round_trip(&skipped)["result"]["skipped"],
+            "no vsix at /home/dev/refract.vsix"
+        );
+    }
+
+    /// `Reply` is untagged, so each variant must read back as itself, as the app reads
+    /// it: inside a [`Message`].
+    #[test]
+    fn every_reply_reads_back_as_its_own_variant() {
+        let replies = [
+            Reply::Hello(Hello {
+                protocol_version: PROTOCOL_VERSION,
+                agent_version: "0.1.0".into(),
+            }),
+            Reply::Repos(RepoList {
+                repos: vec![],
+                loading: false,
+            }),
+            Reply::Repos(RepoList {
+                repos: vec![snapshot()],
+                loading: true,
+            }),
+            Reply::Repo(Box::new(snapshot())),
+            Reply::Repo(Box::new(empty_snapshot())),
+            Reply::Launch(LaunchTicket {
+                request_id: "6f1c0000-0000-4000-8000-000000000001".into(),
+                session_id: "0b7e0000-0000-4000-8000-000000000002".into(),
+                folder_uri: "vscode-remote://wsl+Ubuntu/home/dev/projects/tidepool-api".into(),
+            }),
+            Reply::ServerSetup(ServerSetup {
+                installed: false,
+                application_scoped: false,
+                skipped: None,
+            }),
+            Reply::ServerSetup(ServerSetup {
+                installed: false,
+                application_scoped: false,
+                skipped: Some("no VS Code server".into()),
+            }),
+            Reply::Done,
+        ];
+        for reply in replies {
+            let message = Message::Response(Response::ok(1, reply));
+            round_trip(&message);
+        }
     }
 
     #[test]

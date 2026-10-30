@@ -17,7 +17,7 @@ Goals
 
 - One keystroke from "which project was I on?" to a working agent in the right folder.
 - Never lose an interrupted agent conversation.
-- Negligible cost when idle: 0% GPU, under 1% CPU and under 100 MB of memory while in the tray.
+- Negligible cost when idle: 0% GPU, under 1% CPU and under 100 MB of memory in use (Task Manager's Memory column) while in the tray. The hidden WebView2 is suspended, so it keeps some memory reserved but paged out (about 140 MB in all in M3); that is acceptable as long as it stays within reason.
 - A codebase that is pleasant to read: clear module boundaries, tests for the logic that matters, and documentation written for people.
 
 Non-goals for version 1
@@ -31,7 +31,7 @@ Non-goals for version 1
 ### 3.1 Opening Refract
 
 - Refract starts with a tray icon. Starting with Windows is optional and off by default; it is toggled from the tray menu.
-- Win+Shift+Space shows or hides the window from anywhere. Clicking the tray icon does the same.
+- Win+Alt+Space shows or hides the window from anywhere. (Win+Shift+Space was the first choice, but Windows reserves it for switching input languages.) Clicking the tray icon does the same.
 - When hidden, Refract stops rendering completely.
 
 ### 3.2 The scene: Frozen shatter
@@ -188,7 +188,7 @@ The interface talks to the backend through one `Backend` interface. A `DemoBacke
 | Hook installer | Install then uninstall leaves `settings.json` byte-for-byte identical |
 | Interface | Component tests (Vitest); browser tests of the demo build (Playwright) |
 | End to end | Hotkey opens Refract. Launching a clean repo opens a bare VS Code terminal running a new agent. Launching again focuses the same window. Killing a session mid-tool shows amber edges and preselects Resume. |
-| Resources | In the tray: 0% GPU, under 1% CPU, under 100 MB. Under heavy GPU load from another app, Refract drops to Low. |
+| Resources | In the tray: 0% GPU, under 1% CPU, under 100 MB in use (reserved memory may be higher; see §2). Under heavy GPU load from another app, Refract drops to Low. |
 
 ## 10. Build order
 

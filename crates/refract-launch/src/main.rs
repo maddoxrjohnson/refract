@@ -1,6 +1,7 @@
 //! `refract-launch`: a development tool that runs the launch path from WSL before the
-//! Windows app exists. It does the first-run setup, asks `refract-agent` for a
-//! ticket, opens VS Code on it and adds the bare layout to the Refract profile.
+//! Windows app exists. It does the first-run setup, with the WSL server's part done by
+//! `refract-agent`'s `setupServer` as the app will, asks the agent for a ticket, opens
+//! VS Code on it and adds the bare layout to the Refract profile.
 //!
 //! ```text
 //! refract-launch <repo-path> [--resume <id>] [--prompt <text>]
@@ -13,24 +14,23 @@
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use refract_core::protocol::{LaunchMode, LaunchTicket, Message, Outcome, Reply, Response};
+use refract_core::protocol::{
+    Id, LaunchMode, LaunchTicket, Message, Method, Outcome, Reply, Request, Response,
+};
 use refract_launch::setup::{
-    ensure_application_scoped, ensure_profile, ensure_vsix, server_cli, windows_code_commit,
-    CliCommand, CodeCli, Processes, Runner, WindowCloser, WindowMatch, REFRACT_EXTENSION,
+    ensure_profile, windows_code_commit, CodeCli, Processes, Runner, WindowCloser, WindowMatch,
+};
+use refract_launch::windows::{
+    close_window_command, closed_windows, WINDOWS_SCRIPT, WINDOWS_SCRIPT_NAME,
 };
 use refract_launch::{ensure_profile_settings, vscode_args, PROFILE};
-use serde_json::json;
 
 const USAGE: &str = "usage: refract-launch <repo-path> [--resume <id>] [--prompt <text>] \
                      [--agent <path>] [--code <path>] [--user-dir <path>] [--vsix <path>] \
                      [--profile-name <name>]";
-
-/// The helper that lists and closes VS Code windows, copied to the Windows temp
-/// directory so Windows PowerShell can run it.
-const WINDOWS_SCRIPT: &str = include_str!("../../../scripts/vscode-windows.ps1");
 
 /// The extension package built in this repo, used when `--vsix` is not given.
 const DEFAULT_VSIX: &str = concat!(
@@ -95,9 +95,16 @@ fn run() -> Result<(), String> {
         }
     };
 
-    setup(profile, &user_dir, user.as_deref(), args.vsix.as_deref())?;
+    let cli = CodeCli::WslCmd {
+        cwd: "/mnt/c".into(),
+    };
+    setup_profile(&cli, profile, &user_dir, user.as_deref())?;
 
-    let ticket = prepare(&agent, &repo, &mode)?;
+    let mut agent = AgentProcess::start(&agent)?;
+    let ticket = setup_server(&mut agent, &cli, args.vsix.as_deref())
+        .and_then(|()| prepare(&mut agent, &repo, &mode));
+    agent.shutdown();
+    let ticket = ticket?;
     println!(
         "{}",
         serde_json::to_string_pretty(&ticket).map_err(|e| e.to_string())?
@@ -168,74 +175,61 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Args, String> {
     Ok(parsed)
 }
 
-/// The first-run setup: the profile with the WSL extension in it, the Refract
-/// extension in the WSL server, and that extension applied to every profile. A
-/// missing server or vsix is reported and skipped, so the window still opens.
-fn setup(
+/// Steps 1 and 2 of the first-run setup, on the Windows side: the profile with the
+/// WSL extension in it.
+fn setup_profile(
+    cli: &CodeCli,
     profile: &str,
     user_dir: &Path,
     user: Option<&str>,
-    vsix: Option<&Path>,
 ) -> Result<(), String> {
-    let cli = CodeCli::WslCmd {
-        cwd: "/mnt/c".into(),
-    };
     let mut runner = Processes;
     let mut closer = PowerShell { user };
     let mut sleep = std::thread::sleep;
-    let done = ensure_profile(
-        &cli,
-        profile,
-        user_dir,
-        &mut runner,
-        &mut closer,
-        &mut sleep,
-    )
-    .map_err(|e| format!("cannot set up the {profile} profile: {e}"))?;
+    let done = ensure_profile(cli, profile, user_dir, &mut runner, &mut closer, &mut sleep)
+        .map_err(|e| format!("cannot set up the {profile} profile: {e}"))?;
     if done.created {
         eprintln!("refract-launch: created the {profile} profile");
     }
     if done.installed_wsl {
         eprintln!("refract-launch: installed the WSL extension in the {profile} profile");
     }
-
-    let vsix = vsix.unwrap_or(Path::new(DEFAULT_VSIX));
-    if !vsix.is_file() {
-        eprintln!(
-            "refract-launch: skipping the extension install: no {}",
-            vsix.display()
-        );
-        return Ok(());
-    }
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
-    let server = Path::new(&home).join(".vscode-server");
-    let commit = windows_code_commit(&cli, &mut runner);
-    let code_server = match server_cli(&server, commit.as_deref()) {
-        Ok(path) => path,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            eprintln!("refract-launch: skipping the extension install: {e}");
-            return Ok(());
-        }
-        Err(e) => return Err(format!("cannot find the VS Code server: {e}")),
-    };
-    let registry = server.join("extensions/extensions.json");
-    if ensure_vsix(
-        &code_server,
-        vsix,
-        &registry,
-        REFRACT_EXTENSION,
-        &mut runner,
-    )
-    .map_err(|e| format!("cannot install the extension: {e}"))?
-    {
-        eprintln!("refract-launch: installed the Refract extension in the WSL server");
-    }
-    if ensure_application_scoped(&registry, REFRACT_EXTENSION)
-        .map_err(|e| format!("cannot update {}: {e}", registry.display()))?
-    {
-        eprintln!("refract-launch: applied the Refract extension to all profiles");
-    }
     Ok(())
+}
+
+/// Steps 3 and 4, run by the agent's `setupServer`: the Refract extension in the WSL
+/// server, applied to every profile. A missing server or vsix is reported and
+/// skipped, so the window still opens.
+fn setup_server(
+    agent: &mut AgentProcess,
+    cli: &CodeCli,
+    vsix: Option<&Path>,
+) -> Result<(), String> {
+    let vsix = vsix.unwrap_or(Path::new(DEFAULT_VSIX));
+    let vsix =
+        std::path::absolute(vsix).map_err(|e| format!("cannot resolve {}: {e}", vsix.display()))?;
+    let vsix = vsix
+        .to_str()
+        .ok_or_else(|| format!("{} is not UTF-8", vsix.display()))?
+        .to_owned();
+    let commit = windows_code_commit(cli, &mut Processes);
+    let response = agent.call(Method::SetupServer { vsix, commit })?;
+    match response.outcome {
+        Outcome::Result(Reply::ServerSetup(done)) => {
+            if let Some(reason) = done.skipped {
+                eprintln!("refract-launch: skipping the extension install: {reason}");
+            }
+            if done.installed {
+                eprintln!("refract-launch: installed the Refract extension in the WSL server");
+            }
+            if done.application_scoped {
+                eprintln!("refract-launch: applied the Refract extension to all profiles");
+            }
+            Ok(())
+        }
+        Outcome::Error(e) => Err(format!("setupServer failed ({}): {}", e.code, e.message)),
+        Outcome::Result(other) => Err(format!("unexpected setupServer result: {other:?}")),
+    }
 }
 
 /// Closes VS Code windows with [`WINDOWS_SCRIPT`], run by Windows PowerShell from a
@@ -253,23 +247,13 @@ impl WindowCloser for PowerShell<'_> {
                 "cannot find the Windows temp directory",
             )
         })?;
-        let name = "refract-vscode-windows.ps1";
-        std::fs::write(linux_temp.join(name), WINDOWS_SCRIPT)?;
-        let command = CliCommand {
-            program: "powershell.exe".into(),
-            args: vec![
-                "-NoProfile".into(),
-                "-ExecutionPolicy".into(),
-                "Bypass".into(),
-                "-File".into(),
-                format!("{windows_temp}\\{name}"),
-                "-Close".into(),
-                window.title.clone(),
-                "-Without".into(),
-                window.without.clone(),
-            ],
-            cwd: Some("/mnt/c".into()),
-        };
+        std::fs::write(linux_temp.join(WINDOWS_SCRIPT_NAME), WINDOWS_SCRIPT)?;
+        let command = close_window_command(
+            "powershell.exe",
+            &format!("{windows_temp}\\{WINDOWS_SCRIPT_NAME}"),
+            window,
+            Some("/mnt/c".into()),
+        );
         let out = Processes.run(&command)?;
         if !out.success {
             return Err(io::Error::other(format!(
@@ -277,7 +261,7 @@ impl WindowCloser for PowerShell<'_> {
                 out.stderr.trim()
             )));
         }
-        for line in out.stdout.lines().filter(|l| l.starts_with("closed:")) {
+        for line in closed_windows(&out.stdout) {
             eprintln!("refract-launch: {line}");
         }
         Ok(())
@@ -318,39 +302,77 @@ fn windows_output(program: &str, args: &[&str]) -> Option<String> {
     (out.status.success() && !text.is_empty()).then_some(text)
 }
 
-/// Runs the agent for `ping` and `prepareLaunch`, then shuts it down.
-fn prepare(agent: &Path, repo: &str, mode: &LaunchMode) -> Result<LaunchTicket, String> {
-    let mut child = Command::new(agent)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| format!("cannot start {}: {e}", agent.display()))?;
-    let mut stdin = child.stdin.take().expect("piped stdin");
-    let mut lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
-    let mut call = |id: u64, request: serde_json::Value| -> Result<Response, String> {
-        writeln!(stdin, "{request}").map_err(|e| format!("agent stdin: {e}"))?;
+/// A running `refract-agent`, asked one request at a time.
+struct AgentProcess {
+    child: Child,
+    stdin: ChildStdin,
+    lines: io::Lines<BufReader<ChildStdout>>,
+    next_id: u64,
+}
+
+impl AgentProcess {
+    /// Starts the agent and checks that it answers `ping`.
+    fn start(agent: &Path) -> Result<AgentProcess, String> {
+        let mut child = Command::new(agent)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| format!("cannot start {}: {e}", agent.display()))?;
+        let stdin = child.stdin.take().expect("piped stdin");
+        let lines = BufReader::new(child.stdout.take().expect("piped stdout")).lines();
+        let mut process = AgentProcess {
+            child,
+            stdin,
+            lines,
+            next_id: 1,
+        };
+        process.call(Method::Ping)?;
+        Ok(process)
+    }
+
+    /// Sends `method` and waits for its response, skipping events.
+    fn call(&mut self, method: Method) -> Result<Response, String> {
+        let id = Id::from(self.next_id);
+        self.next_id += 1;
+        let request = Request {
+            id: id.clone(),
+            method,
+        };
+        let line = serde_json::to_string(&request).map_err(|e| e.to_string())?;
+        writeln!(self.stdin, "{line}").map_err(|e| format!("agent stdin: {e}"))?;
         loop {
-            let line = lines
+            let line = self
+                .lines
                 .next()
                 .ok_or("agent exited without answering")?
                 .map_err(|e| format!("agent stdout: {e}"))?;
             let message: Message =
                 serde_json::from_str(&line).map_err(|e| format!("agent wrote {line:?}: {e}"))?;
             if let Message::Response(response) = message {
-                if response.id == Some(id.into()) {
+                if response.id.as_ref() == Some(&id) {
                     return Ok(response);
                 }
             }
         }
-    };
-    call(1, json!({"id": 1, "method": "ping"}))?;
-    let response = call(
-        2,
-        json!({"id": 2, "method": "prepareLaunch", "params": {"path": repo, "mode": mode}}),
-    )?;
-    let _ = call(3, json!({"id": 3, "method": "shutdown"}));
-    let _ = child.wait();
+    }
+
+    fn shutdown(mut self) {
+        let _ = self.call(Method::Shutdown);
+        let _ = self.child.wait();
+    }
+}
+
+/// Asks the agent for a launch ticket with `prepareLaunch`.
+fn prepare(
+    agent: &mut AgentProcess,
+    repo: &str,
+    mode: &LaunchMode,
+) -> Result<LaunchTicket, String> {
+    let response = agent.call(Method::PrepareLaunch {
+        path: repo.to_owned(),
+        mode: mode.clone(),
+    })?;
     match response.outcome {
         Outcome::Result(Reply::Launch(ticket)) => Ok(ticket),
         Outcome::Error(e) => Err(format!("prepareLaunch failed ({}): {}", e.code, e.message)),
