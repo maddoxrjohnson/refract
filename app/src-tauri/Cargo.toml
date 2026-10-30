@@ -35,13 +35,15 @@ webview2-com = "0.39"
 # CPU and memory for the system widget.
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # PDH for GPU use, ToolHelp for our child processes, ShellExecuteW to open folders
-# and links, Credential Manager for tokens.
+# and links, Credential Manager for tokens, a pipe for standard error's log file.
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security_Credentials",
   "Win32_System_Com",
+  "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_Performance",
+  "Win32_System_Pipes",
   "Win32_UI_Shell",
   "Win32_UI_WindowsAndMessaging",
 ] }

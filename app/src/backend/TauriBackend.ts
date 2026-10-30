@@ -101,6 +101,11 @@ export class TauriBackend implements Backend {
     return invoke<void>("open_url", { url });
   }
 
+  /** Rejects with `{kind, message}` as `openFolder` does. */
+  openLogFolder(): Promise<void> {
+    return invoke<void>("open_log_folder");
+  }
+
   onGpuUsage(cb: (usage: GpuUsage) => void): Unsubscribe {
     return subscribe<GpuUsage>(EVENTS.gpu, (e) => cb(e.payload));
   }

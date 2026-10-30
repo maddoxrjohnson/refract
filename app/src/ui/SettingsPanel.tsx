@@ -353,6 +353,22 @@ export function SettingsPanel({
           <HookSection hook={hook} labelId={`${titleId}-hook`} />
         </div>
       )}
+
+      <footer className="rf-settings__footer">
+        <button
+          type="button"
+          className="rf-link"
+          onClick={() =>
+            backend.openLogFolder().then(
+              () => note("log", null),
+              (err: unknown) => note("log", { tone: "error", text: describeError(err) }),
+            )
+          }
+        >
+          Open log folder
+        </button>
+        <NoteLine note={notes.log ?? null} />
+      </footer>
     </div>
   );
 }

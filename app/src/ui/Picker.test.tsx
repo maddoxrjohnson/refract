@@ -58,6 +58,24 @@ describe("Picker", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("keeps the highlighted option scrolled into view", () => {
+    const scrolled: Element[] = [];
+    const scrollIntoView = vi.fn(function (this: Element) {
+      scrolled.push(this);
+    });
+    Element.prototype.scrollIntoView = scrollIntoView;
+    try {
+      const props = { repoName: "tidepool", options, now: NOW, onMove: vi.fn(), onAccept: vi.fn(), onClose: vi.fn() };
+      const { rerender } = render(<Picker {...props} index={0} />);
+      rerender(<Picker {...props} index={1} />);
+      const all = screen.getAllByRole("option");
+      expect(scrolled).toEqual([all[0], all[1]]);
+      expect(scrollIntoView).toHaveBeenLastCalledWith({ block: "nearest" });
+    } finally {
+      delete (Element.prototype as Partial<Element>).scrollIntoView;
+    }
+  });
+
   it("is labelled by the repo name", () => {
     setup();
     expect(screen.getByRole("dialog", { name: "Start an agent in tidepool" })).toBeTruthy();

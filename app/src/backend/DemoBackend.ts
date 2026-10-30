@@ -233,32 +233,38 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const DEMO_SETTINGS_PATH = "/home/demo/.claude/settings.json";
 const DEMO_HOOK_SCRIPT = "/home/demo/.local/share/refract/status-hook.sh";
-const HOOK_EVENTS: [event: string, status: string][] = [
-  ["SessionStart", "finished"],
-  ["UserPromptSubmit", "working"],
-  ["PostToolUse", "working"],
-  ["Notification", "waitingOnUser"],
-  ["Stop", "finished"],
-  ["SessionEnd", "ended"],
+const DEMO_STATUS_DIR = "/home/demo/.local/state/refract/sessions";
+// The events, statuses and matchers refract-core's `hook::EVENTS` registers.
+const HOOK_EVENTS: [event: string, status: string, matcher: string | null][] = [
+  ["SessionStart", "finished", "startup|resume|clear"],
+  ["UserPromptSubmit", "working", null],
+  ["PostToolUse", "working", "*"],
+  ["Notification", "waitingOnUser", "permission_prompt|elicitation_dialog"],
+  ["Stop", "finished", null],
+  ["SessionEnd", "ended", null],
 ];
 
-function demoHookDiff(): string {
-  const entries = HOOK_EVENTS.flatMap(([event, status], i) => [
+/** The command `hook::command` writes, for the demo's paths. */
+function demoHookCommand(status: string): string {
+  const script = `'${DEMO_HOOK_SCRIPT}'`;
+  return `[ -f ${script} ] && sh ${script} ${status} '${DEMO_STATUS_DIR}' || cat >/dev/null; exit 0`;
+}
+
+export function demoHookDiff(): string {
+  const entries = HOOK_EVENTS.flatMap(([event, status, matcher], i) => [
     `+    "${event}": [`,
-    `+      { "hooks": [{ "type": "command", "command": "sh '${DEMO_HOOK_SCRIPT}' ${status}" }] }`,
+    `+      { ${matcher ? `"matcher": "${matcher}", ` : ""}"hooks": [{ "type": "command", "command": "${demoHookCommand(status)}" }] }`,
     `+    ]${i < HOOK_EVENTS.length - 1 ? "," : ""}`,
   ]);
+  const added = ['+  "theme": "dark",', '+  "hooks": {', ...entries, "+  }"];
   return [
     `--- ${DEMO_SETTINGS_PATH}`,
     `+++ ${DEMO_SETTINGS_PATH}`,
-    "@@ -1,4 +1,23 @@",
+    `@@ -1,4 +1,${added.length + 3} @@`,
     " {",
     '   "model": "opus",',
     '-  "theme": "dark"',
-    '+  "theme": "dark",',
-    '+  "hooks": {',
-    ...entries,
-    "+  }",
+    ...added,
     " }",
     "",
   ].join("\n");
@@ -392,6 +398,11 @@ export class DemoBackend implements Backend {
   // instead, and any other link opens nothing.
   openUrl(url: string): Promise<void> {
     if (isGithubUrl(url)) window.open(DEMO_HOME, "_blank", "noopener");
+    return Promise.resolve();
+  }
+
+  // The demo keeps no log file.
+  openLogFolder(): Promise<void> {
     return Promise.resolve();
   }
 

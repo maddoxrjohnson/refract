@@ -85,6 +85,27 @@ const LIFT = 0.35;
 const ZOOM_FILL = 0.34;
 /** Where a zoomed gem sits horizontally, in normalised device coordinates. */
 const ZOOM_X = -0.4;
+/** How far a zoomed gem's facets and glow reach, as a share of half the view height. */
+export const ZOOM_REACH = 0.48;
+/**
+ * Pixels kept clear at the bottom for the launch picker: its 24 px offset, its
+ * 300 px maximum height (`.rf-picker` in ui.css) and a gap.
+ */
+export const PICKER_CLEAR_PX = 340;
+/** The least room left above a lifted gem, in pixels. */
+export const ZOOM_TOP_MARGIN_PX = 16;
+
+/**
+ * How far a zoomed gem moves up from the middle, in normalised device coordinates:
+ * enough to clear the launch picker below it, but never past the top edge.
+ */
+export function zoomLift(height: number): number {
+  if (!(height > 0)) return 0;
+  const half = height / 2;
+  const room = (1 - ZOOM_REACH) * half;
+  const px = Math.min(Math.max(0, PICKER_CLEAR_PX - room), Math.max(0, room - ZOOM_TOP_MARGIN_PX));
+  return px / half;
+}
 const EXPOSURE = 1.1;
 const GL_OPTIONS = { antialias: false, powerPreference: "high-performance" } as const;
 const CAMERA = { fov: FOV, near: 0.1, far: 120, position: [0, 0, 12] as [number, number, number] };
@@ -470,24 +491,27 @@ function SceneContents(props: ContentsProps) {
     const k = rdt * (reducedMotion ? 4 : 1);
     const W = size.width;
     const H = size.height;
+    // A collapsed canvas (zero height) is drawn as if square rather than with NaNs.
+    const aspect = H > 0 ? W / H : 1;
     const tv = Math.tan(MathUtils.degToRad(FOV / 2));
     let settling = false;
 
     s.ptr.lerp(s.ptrTarget, ease(k, 6));
     if (s.ptr.distanceTo(s.ptrTarget) > 0.002) settling = true;
 
-    // The camera fits every gem, or frames the zoomed one left of centre.
+    // The camera fits every gem, or frames the zoomed one left of centre and above the picker.
     const breathe = ambient ? 1 + 0.022 * Math.sin(T * 0.5) : 1;
     s.breathe = breathe;
     const zoomGem = zoomed ? gems.get(zoomed) : undefined;
     if (zoomGem) {
       const dist = zoomGem.radius / (tv * ZOOM_FILL);
       lookGoal.copy(zoomGem.base).multiplyScalar(breathe);
-      lookGoal.x -= ZOOM_X * tv * (W / H) * dist;
+      lookGoal.x -= ZOOM_X * tv * aspect * dist;
+      lookGoal.y -= zoomLift(H) * tv * dist;
       camGoal.set(lookGoal.x + s.ptr.x * 0.4, lookGoal.y - s.ptr.y * 0.25, lookGoal.z + dist);
     } else {
       const fit =
-        Math.max((bounds.maxY + 0.5) / tv, (bounds.maxX + 0.5) / (tv * (W / H))) + 1.0;
+        Math.max((bounds.maxY + 0.5) / tv, (bounds.maxX + 0.5) / (tv * aspect)) + 1.0;
       lookGoal.set(0, 0, 0);
       camGoal.set(s.ptr.x * 1.6, -s.ptr.y * 1.0, fit);
     }

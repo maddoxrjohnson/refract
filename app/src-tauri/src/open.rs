@@ -1,4 +1,5 @@
-//! Opens a repo's folder in Explorer and links in the default browser.
+//! Opens a repo's folder or the log folder in Explorer, and links in the default
+//! browser.
 
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
@@ -138,6 +139,28 @@ pub async fn open_folder(app: AppHandle, path: String) -> Result<(), OpenError> 
         check_is_dir(&folder, std::fs::metadata(&folder).map(|m| m.is_dir()))?;
         // `explore` only opens folders, so a file swapped in after the check still
         // does not run.
+        shell_open("explore", &folder)
+    })
+    .await
+}
+
+/// Opens the folder that holds `refract.log` in Explorer, creating it if needed.
+#[tauri::command]
+pub async fn open_log_folder(app: AppHandle) -> Result<(), OpenError> {
+    run_blocking(move || {
+        let dir = app.path().app_log_dir().map_err(|err| {
+            OpenError::new(
+                OpenErrorKind::Internal,
+                format!("Cannot find the log folder: {err}"),
+            )
+        })?;
+        let folder = dir.to_string_lossy().into_owned();
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            OpenError::new(
+                OpenErrorKind::Failed,
+                format!("Cannot create {folder}: {err}"),
+            )
+        })?;
         shell_open("explore", &folder)
     })
     .await

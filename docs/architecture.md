@@ -53,7 +53,7 @@ When VS Code is given a folder that is already open, it focuses that window. Tha
 
 | Path | Contents |
 |---|---|
-| `crates/refract-core` | Session parsing and classification, mass score, picker rules, usage totals, hook settings edits, protocol types |
+| `crates/refract-core` | Session parsing and classification, mass score, picker rules, usage totals, hook settings edits, protocol types, log line splitting and stamping |
 | `crates/refract-agent` | The WSL helper binary, including the status hook script (`src/status-hook.sh`) |
 | `crates/refract-client` | The app's side of the protocol: starts the helper, matches responses to requests, restarts it |
 | `crates/refract-launch` | `refract-launch`, a development tool that runs the launch path from WSL |
@@ -124,7 +124,13 @@ The helper never writes anything else to standard output; logs go to standard er
 
 ## The app's client
 
-The app talks to the helper through `refract-client`, which starts the helper, numbers each request and hands each response back to the caller waiting for it. Events go straight to the interface. Each line of the helper's standard error is forwarded to the app's own standard error, which shows when the app is run from a terminal (there is no log file), and the last few lines are kept to explain a crash.
+The app talks to the helper through `refract-client`, which starts the helper, numbers each request and hands each response back to the caller waiting for it. Events go straight to the interface. Each line of the helper's standard error is forwarded to the app's own standard error, and the last few lines are kept to explain a crash.
+
+### The log file
+
+The app's standard error shows in the terminal when the app is started from one. A release build has no console, so at startup, when the process has no standard error handle, `app/src-tauri/src/logfile.rs` points it at a pipe. Rust's standard library looks the handle up on every write, so every `eprintln!` in the app and its crates, the helper's forwarded lines included, goes into the pipe (an unreadable line from the helper is logged only by its first 200 bytes, since it may hold reply text or paths); so does the standard error of any child process that inherits it. One thread reads the pipe, splits it into lines of at most 16 KiB and stamps each with the UTC time to the millisecond. A failed read is tried again after 50 ms; after 20 failures in a row the thread stops and empties the standard error handle, so later writes are dropped rather than left waiting on a pipe nobody empties. Another appends them to `refract.log` in the app's log folder (`%LOCALAPPDATA%\io.github.maddoxrjohnson.refract\logs`), so a slow disk never holds up a writer: if that thread falls 1024 lines behind, new lines are dropped and the count is written once the queue empties. Lines the file cannot take are dropped too, and the file is opened again for the next one.
+
+Each start writes a line with the app's version. A log over 1 MiB at startup, or one about to pass 2 MiB while running, is renamed to `refract.old.log`, replacing the previous one. If the rename fails (another program holds the log open without allowing it), the log may grow to twice the limit before one more try; if that fails too, the log is emptied instead. On exit, and after a panic's message, the app waits up to 200 ms for the lines already written to reach the file: it writes a marker line that the reading thread swallows, and waits for it and every line before it to be written. The settings panel's "Open log folder" opens the folder in Explorer.
 
 If the helper exits, every request still waiting for an answer fails at once as disconnected, and the client starts the helper again after a delay. The delay starts at one second and doubles with each failure in a row, up to 30 seconds. A helper that ran for at least a minute before exiting counts as healthy, so the next delay is back to one second. Failing to start the helper at all, for example when `wsl.exe` is missing, counts as a failure too. While the helper is down, requests fail straight away instead of queueing, and the interface shows that it is restarting, when it will try again and why it stopped. A request that times out is forgotten, so an answer that arrives later is dropped. Shutting down sends `shutdown`, closes the helper's input and kills it if it has not exited after a grace period. Nothing is restarted after that.
 
@@ -179,7 +185,7 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 
 - **Detail panel.** Branch, upstream, changed files, last commit, last agent session, and for repos with a GitHub or GitLab remote the open pull or merge requests and CI state. Actions: launch (or Clone and launch), Resume, New agent, Open folder, Open on the host, Hide. Remote details are fetched when a gem is zoomed, again 15 minutes after they were fetched while the same gem stays zoomed and the window is shown, and on Refresh.
 - **Picker, filter bar, focus label.** Presentation for the navigation state above.
-- **Settings.** GitLab address and token, GitHub token (the GitHub CLI login is used otherwise), show forks, show archived, refresh remotes, the hidden list with Unhide, adding a folder, and the status hook's install and remove. Changes are saved one after another; if saving fails the old values come back.
+- **Settings.** GitLab address and token, GitHub token (the GitHub CLI login is used otherwise), show forks, show archived, refresh remotes, the hidden list with Unhide, adding a folder, the status hook's install and remove, and Open log folder. Changes are saved one after another; if saving fails the old values come back.
 - **Status hook offer.** Once the repos are in, a small card offers to install the hook, with "Show what changes" revealing the diff of `settings.json`. "Not now" is remembered.
 - **Widgets.** System load at the top right, Claude token use at the bottom right (hovering or focusing lists the last 7 days by repo). Both fade while the detail panel covers their corner.
 - **Launch toast.** Shows cloning, setup and opening steps, and failures until dismissed. One launch or clone runs at a time.
@@ -195,7 +201,7 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 
 ### The web demo
 
-`DemoBackend` implements the whole `Backend` with invented data: 13 local repos covering every gem state, remote repos (some matching, some not cloned, a fork and an archived one), pull request and CI numbers, a pretend hook diff, and usage and system numbers that drift slowly. Settings, hook state and clones live in memory and reset on reload. A launch walks through the progress steps and then tells `DemoTerminal`, which types out the `claude` command and an invented reply in a fake terminal. GitHub links open this project's page rather than the invented owner's. The demo has no GPU counters, so its automatic quality uses frame times only.
+`DemoBackend` implements the whole `Backend` with invented data: 13 local repos covering every gem state, remote repos (some matching, some not cloned, a fork and an archived one), pull request and CI numbers, a pretend hook diff with the real installer's commands and matchers, and usage and system numbers that drift slowly. Settings, hook state and clones live in memory and reset on reload. A launch walks through the progress steps and then tells `DemoTerminal`, which types out the `claude` command and an invented reply in a fake terminal. GitHub links open this project's page rather than the invented owner's. The demo has no GPU counters, so its automatic quality uses frame times only.
 
 `main.tsx` picks the demo backend when built with `--mode demo` and whenever the page is not inside Tauri, which is what `npm run dev` shows in a plain browser. `npm run build:demo` builds it into `app/dist-demo` for GitHub Pages. `app/e2e/demo.spec.ts` runs seven browser tests against that build (see [Build, CI and release](#build-ci-and-release)).
 
@@ -205,7 +211,7 @@ The scene is React Three Fiber code in `app/src/scene`.
 
 ### Layout and camera
 
-Gems sit on a golden-angle spiral from the centre outwards, heaviest first (`layout.ts`). Depth and every random choice are seeded from a hash of the repo's path, so a gem keeps its place whatever order repos arrive in. Gems shrink once there are more than about 14. The camera fits every gem, shifts a little with the pointer, and when a gem is zoomed flies to it, placing it left of centre so the panel fits on the right. The focus label is moved by the frame loop with a DOM transform, so React does not re-render per frame.
+Gems sit on a golden-angle spiral from the centre outwards, heaviest first (`layout.ts`). Depth and every random choice are seeded from a hash of the repo's path, so a gem keeps its place whatever order repos arrive in. Gems shrink once there are more than about 14. The camera fits every gem, shifts a little with the pointer, and when a gem is zoomed flies to it, placing it left of centre so the panel fits on the right, and in windows less than about 1300 px tall raising it so the launch picker fits below it. The focus label is moved by the frame loop with a DOM transform, so React does not re-render per frame.
 
 ### Two-pass refraction
 
@@ -444,7 +450,7 @@ Third-party actions are pinned to commit hashes, and checkouts do not keep crede
 - The interface cannot reach the network itself: its content security policy allows only the connection to the Rust side. The window has only the default core permissions.
 - GitHub and GitLab tokens are stored in Windows Credential Manager and never reach files, logs or the interface. GitHub can reuse the GitHub CLI's existing login.
 - API requests use HTTPS only, do not follow redirects, and send the token only to the host that was configured.
-- `open_folder` opens directories only, and `open_url` opens `https://` links only and refuses addresses with a user name in them.
+- `open_folder` opens directories only, `open_log_folder` opens only the app's own log folder, and `open_url` opens `https://` links only and refuses addresses with a user name in them.
 - The status hook installer backs up `~/.claude/settings.json` before editing it, only touches the entries it added, and its hook command cannot block Claude Code.
 - Refract never calls a model. Usage numbers are summed from files already on your machine.
 - Nothing is sent anywhere except the GitHub and GitLab API calls needed to list repos, pull requests and CI status, and `git clone` from the host you chose to clone from.

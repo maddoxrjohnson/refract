@@ -78,9 +78,11 @@ describe("TauriBackend", () => {
     const backend = new TauriBackend();
     await backend.openFolder("/home/dev/projects/tidepool-api");
     await expect(backend.openUrl("http://x")).rejects.toEqual(refused);
+    await backend.openLogFolder();
     expect(calls).toEqual([
       { cmd: "open_folder", args: { path: "/home/dev/projects/tidepool-api" } },
       { cmd: "open_url", args: { url: "http://x" } },
+      { cmd: "open_log_folder", args: {} },
     ]);
   });
 

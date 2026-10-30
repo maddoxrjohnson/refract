@@ -6,6 +6,7 @@ mod creds;
 mod gpu;
 mod hotkey;
 mod launch;
+mod logfile;
 mod open;
 mod process;
 mod remote;
@@ -40,6 +41,8 @@ pub fn run() {
         .manage(remote::Remote::new())
         .setup(|app| {
             let handle = app.handle();
+            // First, so everything after it is logged.
+            logfile::init(handle);
             window::init(handle);
             tray::create(handle)?;
             hotkey::register(handle);
@@ -70,6 +73,7 @@ pub fn run() {
             launch::launch,
             open::open_folder,
             open::open_url,
+            open::open_log_folder,
             remote::remote_list,
             remote::remote_details,
             remote::credentials,
@@ -89,6 +93,8 @@ pub fn run() {
     app.run(|app, event| {
         if let RunEvent::Exit = event {
             agent::shutdown(app);
+            // The last lines, the helper's included, still have to reach the log.
+            logfile::flush();
         }
     });
 }

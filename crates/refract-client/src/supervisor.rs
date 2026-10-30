@@ -139,12 +139,30 @@ fn read_messages(shared: &Shared, stdout: ChildStdout) {
             Err(e) => {
                 eprintln!(
                     "refract-client: skipping a line from the helper ({e}): {}",
-                    String::from_utf8_lossy(line)
+                    excerpt(line)
                 );
                 fail_unreadable(shared, line, &e);
             }
         }
     }
+}
+
+/// Bytes of an unreadable line that are logged. The rest could hold Claude's replies
+/// or paths, which do not belong in a log.
+const EXCERPT: usize = 200;
+
+/// The start of `line` for the log: up to [`EXCERPT`] bytes, cut on a character
+/// boundary, and the full length when anything was left out.
+fn excerpt(line: &[u8]) -> String {
+    let text = String::from_utf8_lossy(line);
+    if text.len() <= EXCERPT {
+        return text.into_owned();
+    }
+    let mut end = EXCERPT;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes)", &text[..end], line.len())
 }
 
 /// Fails the request an unreadable line answers, when its `id` can still be read, so
@@ -231,4 +249,19 @@ fn read_stderr(
         eprintln!("refract-client: cannot start the stderr reader: {e}");
     }
     finished
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_lines_are_cut_short() {
+        assert_eq!(excerpt(b"{\"id\": 3, oops"), "{\"id\": 3, oops");
+        let long = format!("{}{}", "x".repeat(199), "\u{e9}".repeat(300));
+        let cut = excerpt(long.as_bytes());
+        assert_eq!(cut, format!("{}… (799 bytes)", "x".repeat(199)));
+        let exact = "y".repeat(EXCERPT);
+        assert_eq!(excerpt(exact.as_bytes()), exact);
+    }
 }

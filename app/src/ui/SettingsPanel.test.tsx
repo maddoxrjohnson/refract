@@ -18,6 +18,7 @@ function fakeBackend() {
     credentials: vi.fn().mockResolvedValue({ github: "ghCli", gitlab: "missing" }),
     setToken: vi.fn().mockResolvedValue(undefined),
     addRepo: vi.fn().mockResolvedValue(undefined),
+    openLogFolder: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -132,5 +133,24 @@ describe("SettingsPanel", () => {
     expect(screen.getByRole("status").textContent).toContain("Added /home/demo/code/sketches.");
     fireEvent.click(screen.getByRole("button", { name: "Refresh remotes" }));
     expect(props.onRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("opens the log folder, showing a failure", async () => {
+    const { backend } = await setup();
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Open log folder" }));
+    });
+    expect(backend.openLogFolder).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("alert")).toBeNull();
+    backend.openLogFolder.mockRejectedValueOnce({ kind: "failed", message: "Cannot open the folder." });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Open log folder" }));
+    });
+    expect(screen.getByRole("alert").textContent).toBe("Cannot open the folder.");
+  });
+
+  it("offers the log folder while settings load", async () => {
+    await setup({ settings: null });
+    expect(screen.getByRole("button", { name: "Open log folder" })).toBeTruthy();
   });
 });

@@ -28,6 +28,10 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
   const list = useRef<HTMLUListElement>(null);
 
   useEffect(() => list.current?.focus(), []);
+  // A long list scrolls; keep the highlighted option in sight.
+  useEffect(() => {
+    list.current?.querySelector('[aria-selected="true"]')?.scrollIntoView?.({ block: "nearest" });
+  }, [index]);
 
   return (
     <div className="rf-glass rf-picker" role="dialog" aria-labelledby={titleId}>

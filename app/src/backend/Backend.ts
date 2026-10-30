@@ -42,6 +42,8 @@ export interface Backend {
   openFolder(path: string): Promise<void>;
   /** Opens an `https://` URL in the default browser; other schemes are refused. */
   openUrl(url: string): Promise<void>;
+  /** Opens the folder holding the app's log file, `refract.log`, in the file manager. */
+  openLogFolder(): Promise<void>;
   /** System GPU use, sampled about every 2 s while the window is visible. */
   onGpuUsage(cb: (usage: GpuUsage) => void): Unsubscribe;
 
