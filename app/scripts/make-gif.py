@@ -17,7 +17,7 @@ WIDTH = 800
 COLOURS = 128
 # Pixels whose channels all changed by less than this since the last frame stay
 # transparent, so the slow shimmer of the backdrop costs almost nothing.
-STILL = 16
+STILL = 20
 
 # An arrow pointer, tip at (0, 0), in screenshot pixels.
 ARROW = [(0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12)]
