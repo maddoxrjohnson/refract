@@ -800,7 +800,8 @@ impl<W: Write> Server<W> {
         self.load = Load::Running;
         let (slow_config, fast_config) = split_slow(self.agent.config());
         let walk = scan::walk_roots(&fast_config);
-        // Only a test puts a slow repo under a Linux root.
+        // A Linux root can still reach a Windows drive (a root of `/`, or `/mnt` without
+        // the slash, or a test prefix); such repos are prewatched in `found()` like the rest.
         let (slow_found, fast): (Vec<PathBuf>, Vec<PathBuf>) =
             walk.repos.into_iter().partition(|p| is_slow(p));
         if let Some(watcher) = &mut self.watcher {

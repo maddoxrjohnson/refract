@@ -794,11 +794,20 @@ fn repos_appearing_on_either_drive_while_slow_repos_load_are_found() {
     init_repo(&drive.join("group/tidepool-api"));
     std::thread::sleep(Duration::from_millis(500));
     std::fs::remove_file(&gate).unwrap();
-    agent.event(|e| e["event"] == "loadComplete");
+    // A late /mnt search can still list tidepool-api in the load itself, so its event
+    // may come before or after loadComplete.
     let mut missing = vec!["reef-maps", "tidepool-api"];
-    while !missing.is_empty() {
-        let event = agent.event_within(Duration::from_secs(20), |e| e["event"] == "repoChanged");
-        missing.retain(|name| event["data"]["name"] != *name);
+    let mut complete = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while !missing.is_empty() || !complete {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let message = agent.next(left);
+        if message["event"] == "loadComplete" {
+            assert!(!complete, "loadComplete sent twice");
+            complete = true;
+        } else if message["event"] == "repoChanged" {
+            missing.retain(|name| message["data"]["name"] != *name);
+        }
     }
     assert_no_more_load_complete(&mut agent, 2);
 }
