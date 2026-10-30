@@ -167,6 +167,7 @@ impl Entry {
             size: self.size,
             mtime_ns: self.mtime_ns,
             hash: None,
+            dir: self.kind == EntryKind::Dir,
         }
     }
 }
@@ -501,6 +502,10 @@ pub struct StatEntry {
     /// Compared only when both sides have one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// A folder. A folder's time changes whenever something in it is added or removed,
+    /// which shows on its own, so a folder whose time alone changed is no change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dir: bool,
 }
 
 /// The result of [`compare_stats`]; each list sorted.
@@ -520,17 +525,31 @@ impl StatChanges {
 }
 
 /// What changed between two stat snapshots of the source: a different size or mtime,
-/// or a different hash when both have one.
+/// or a different hash when both have one. A path that is a folder on both sides is
+/// never changed (see [`StatEntry::dir`]).
 pub fn compare_stats(before: &[StatEntry], after: &[StatEntry]) -> StatChanges {
+    compare_readable(before, after, &[])
+}
+
+/// [`compare_stats`] for an `after` that could not read everything: a path that is, or
+/// lies under, one of `unreadable` (`""` for the whole tree) is never removed, since
+/// it may well still be there.
+pub fn compare_readable(
+    before: &[StatEntry],
+    after: &[StatEntry],
+    unreadable: &[String],
+) -> StatChanges {
     let old: BTreeMap<&RelPath, &StatEntry> = before.iter().map(|e| (&e.path, e)).collect();
     let new: BTreeMap<&RelPath, &StatEntry> = after.iter().map(|e| (&e.path, e)).collect();
     let mut changes = StatChanges::default();
     for (path, a) in &old {
         match new.get(path) {
+            None if under_any(path, unreadable) => {}
             None => changes.removed.push((*path).clone()),
             Some(b) => {
                 let hash_differs = matches!((&a.hash, &b.hash), (Some(x), Some(y)) if x != y);
-                if a.size != b.size || a.mtime_ns != b.mtime_ns || hash_differs {
+                let differs = a.size != b.size || a.mtime_ns != b.mtime_ns || hash_differs;
+                if differs && !(a.dir && b.dir) {
                     changes.changed.push((*path).clone());
                 }
             }
@@ -542,6 +561,32 @@ pub fn compare_stats(before: &[StatEntry], after: &[StatEntry]) -> StatChanges {
         .map(|path| (*path).clone())
         .collect();
     changes
+}
+
+/// `after`, plus the entries of `before` that lie under one of `unreadable` and are
+/// missing from `after`: what is known of the tree when part of it could not be read.
+pub fn carry_unreadable(
+    before: &[StatEntry],
+    after: &[StatEntry],
+    unreadable: &[String],
+) -> Vec<StatEntry> {
+    let mut merged = after.to_vec();
+    if unreadable.is_empty() {
+        return merged;
+    }
+    let seen: BTreeSet<&RelPath> = after.iter().map(|e| &e.path).collect();
+    merged.extend(
+        before
+            .iter()
+            .filter(|e| !seen.contains(&e.path) && under_any(&e.path, unreadable))
+            .cloned(),
+    );
+    merged.sort_by(|a, b| a.path.cmp(&b.path));
+    merged
+}
+
+fn under_any(path: &RelPath, dirs: &[String]) -> bool {
+    dirs.iter().any(|d| d.is_empty() || path.within(d))
 }
 
 #[cfg(test)]
@@ -904,6 +949,7 @@ mod tests {
             size,
             mtime_ns,
             hash: hash.map(str::to_owned),
+            dir: false,
         };
         let before = vec![
             stat("a.txt", 1, 10, None),
@@ -926,5 +972,55 @@ mod tests {
         assert!(!changes.is_empty());
         assert!(compare_stats(&before, &before).is_empty());
         assert_eq!(file("x", "y").stat().size, 1);
+    }
+
+    #[test]
+    fn folder_times_and_unreadable_paths_are_no_change() {
+        let stat = |path: &str, mtime_ns: i64, dir: bool| StatEntry {
+            path: p(path),
+            size: 0,
+            mtime_ns,
+            hash: None,
+            dir,
+        };
+        let before = vec![
+            stat("docs", 1, true),
+            stat("docs/a.md", 1, false),
+            stat("locked", 1, true),
+            stat("locked/b.md", 1, false),
+            stat("locked2/c.md", 1, false),
+            stat("gone.md", 1, false),
+        ];
+        // `docs` lost nothing but its time changed; `locked` could not be listed.
+        let after = vec![
+            stat("docs", 2, true),
+            stat("docs/a.md", 1, false),
+            stat("locked", 1, true),
+        ];
+        let unreadable = ["locked".to_string(), "locked2".to_string()];
+        let changes = compare_readable(&before, &after, &unreadable);
+        assert_eq!(changes.changed, Vec::<RelPath>::new());
+        assert_eq!(changes.removed, vec![p("gone.md")]);
+        assert_eq!(
+            compare_stats(&before, &after).removed,
+            vec![p("gone.md"), p("locked/b.md"), p("locked2/c.md")]
+        );
+        // The whole tree unreadable: nothing is removed.
+        assert!(compare_readable(&before, &[], &[String::new()]).is_empty());
+        // A folder that became a file is a change.
+        let file_now = vec![StatEntry {
+            size: 3,
+            ..stat("docs", 1, false)
+        }];
+        assert_eq!(
+            compare_stats(&before[..1], &file_now).changed,
+            vec![p("docs")]
+        );
+        let merged = carry_unreadable(&before, &after, &unreadable);
+        let paths: Vec<&str> = merged.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["docs", "docs/a.md", "locked", "locked/b.md", "locked2/c.md"]
+        );
     }
 }

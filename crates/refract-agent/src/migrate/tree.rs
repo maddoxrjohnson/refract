@@ -49,17 +49,44 @@ impl Cancel for std::sync::atomic::AtomicBool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cancelled;
 
+/// A path that could not be read during a walk (`""` for the root), and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Unreadable {
+    pub path: String,
+    pub message: String,
+}
+
+impl Unreadable {
+    fn new(rel: &Path, error: &io::Error) -> Unreadable {
+        Unreadable {
+            path: rel.to_string_lossy().into_owned(),
+            message: error.to_string(),
+        }
+    }
+}
+
 /// Lists the tree under `root` without hashing. A name that cannot be represented is
-/// listed in `unrepresentable`, and so is each path under it.
-fn list(root: &Path, skipped: &[RelPath], cancel: &dyn Cancel) -> Result<Manifest, Cancelled> {
+/// listed in `unrepresentable`, and so is each path under it. Paths that could not be
+/// read are returned beside it, never left out silently.
+fn list(
+    root: &Path,
+    skipped: &[RelPath],
+    cancel: &dyn Cancel,
+) -> Result<(Manifest, Vec<Unreadable>), Cancelled> {
     let mut manifest = Manifest::default();
+    let mut unreadable = Vec::new();
     let skip = skipper(skipped);
     let finished = fsx::walk(root, &skip, &mut |visit| {
         if cancel.cancelled() {
             return false;
         }
-        let Visit::Entry { rel, abs, meta } = visit else {
-            return true;
+        let (rel, abs, meta) = match visit {
+            Visit::Entry { rel, abs, meta } => (rel, abs, meta),
+            Visit::Error { rel, error } => {
+                unreadable.push(Unreadable::new(rel, &error));
+                return true;
+            }
+            Visit::DirDone { .. } => return true,
         };
         let path = match RelPath::from_bytes(rel.as_os_str().as_bytes()) {
             Ok(path) => path,
@@ -76,10 +103,16 @@ fn list(root: &Path, skipped: &[RelPath], cancel: &dyn Cancel) -> Result<Manifes
         } else {
             EntryKind::File
         };
-        let link_target = (kind == EntryKind::Symlink)
-            .then(|| fs::read_link(abs).ok())
-            .flatten()
-            .map(|t| t.to_string_lossy().into_owned());
+        let link_target = match kind {
+            EntryKind::Symlink => match fs::read_link(abs) {
+                Ok(target) => Some(target.to_string_lossy().into_owned()),
+                Err(e) => {
+                    unreadable.push(Unreadable::new(rel, &e));
+                    None
+                }
+            },
+            _ => None,
+        };
         manifest.entries.push(Entry {
             path,
             kind,
@@ -99,7 +132,7 @@ fn list(root: &Path, skipped: &[RelPath], cancel: &dyn Cancel) -> Result<Manifes
     if !finished {
         return Err(Cancelled);
     }
-    Ok(manifest)
+    Ok((manifest, unreadable))
 }
 
 /// Builds the manifest of the tree under `root`: every entry outside `skipped` with its
@@ -114,7 +147,22 @@ pub fn manifest(
     cancel: &dyn Cancel,
     progress: &mut dyn FnMut(u64, u64),
 ) -> Result<Result<Manifest, String>, Cancelled> {
-    let mut manifest = list(root, skipped, cancel)?;
+    let (mut manifest, unreadable) = list(root, skipped, cancel)?;
+    if let Some(first) = unreadable.first() {
+        let shown = if first.path.is_empty() {
+            "."
+        } else {
+            &first.path
+        };
+        return Ok(Err(format!(
+            "{shown} could not be read: {}{}",
+            first.message,
+            match unreadable.len() {
+                1 => String::new(),
+                n => format!(" (and {} more)", n - 1),
+            }
+        )));
+    }
     let total = manifest
         .entries
         .iter()
@@ -193,27 +241,51 @@ fn hashed_for_stat(path: &str) -> bool {
     matches!(rest.last(), Some(&("HEAD" | "index" | "packed-refs"))) || rest.contains(&"refs")
 }
 
+/// What [`stats`] found: the stat facts it could read, and the paths it could not.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Stats {
+    pub entries: Vec<StatEntry>,
+    pub unreadable: Vec<Unreadable>,
+}
+
+impl Stats {
+    /// The unreadable paths, `""` for the root.
+    pub fn unreadable_paths(&self) -> Vec<String> {
+        self.unreadable.iter().map(|u| u.path.clone()).collect()
+    }
+}
+
 /// The stat facts of every entry under `root` outside `skipped`: size (0 for folders
 /// and symlinks) and modification time, and a SHA-256 for refs, `HEAD`, `packed-refs`
-/// and the index.
-pub fn stats(
-    root: &Path,
-    skipped: &[RelPath],
-    cancel: &dyn Cancel,
-) -> Result<Vec<StatEntry>, Cancelled> {
-    let listed = list(root, skipped, cancel)?;
-    Ok(listed
-        .entries
-        .iter()
-        .map(|e| StatEntry {
+/// and the index. A path whose listing, metadata or (for those) content cannot be read
+/// is listed as unreadable.
+pub fn stats(root: &Path, skipped: &[RelPath], cancel: &dyn Cancel) -> Result<Stats, Cancelled> {
+    let (listed, mut unreadable) = list(root, skipped, cancel)?;
+    let mut entries = Vec::with_capacity(listed.entries.len());
+    for e in &listed.entries {
+        let hash = if e.kind == EntryKind::File && hashed_for_stat(e.path.as_str()) {
+            match fsx::sha256_file(&root.join(e.path.as_str())) {
+                Ok(hash) => Some(hash),
+                Err(error) => {
+                    unreadable.push(Unreadable::new(Path::new(e.path.as_str()), &error));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        entries.push(StatEntry {
             path: e.path.clone(),
             size: e.size,
             mtime_ns: e.mtime_ns,
-            hash: (e.kind == EntryKind::File && hashed_for_stat(e.path.as_str()))
-                .then(|| fsx::sha256_file(&root.join(e.path.as_str())).ok())
-                .flatten(),
-        })
-        .collect())
+            hash,
+            dir: e.kind == EntryKind::Dir,
+        });
+    }
+    Ok(Stats {
+        entries,
+        unreadable,
+    })
 }
 
 /// The stat facts of a source manifest's entries, sized as [`stats`] sizes them.
@@ -379,6 +451,10 @@ fn copy_entry(
 /// go, added and changed ones are copied again (a folder only itself, not what is under
 /// it), and the folders holding them get the source's modification times back. Returns
 /// the problems, by path.
+///
+/// A path leaves the copy only when it is verifiably gone from `from` at that moment:
+/// `from` itself is there and the path is not found. Anything else (an error reading
+/// it, the whole original gone) is a problem, never a removal.
 pub fn recopy(
     from: &Path,
     to: &Path,
@@ -387,10 +463,39 @@ pub fn recopy(
 ) -> Result<Vec<Problem>, Cancelled> {
     let mut problems = Vec::new();
     let mut parents: BTreeSet<String> = BTreeSet::new();
+    let gone = |src: &Path| -> io::Result<bool> {
+        fs::symlink_metadata(from)?;
+        match fs::symlink_metadata(src) {
+            Ok(_) => Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                // The nearest folder above it that is there must also list.
+                let mut dir = src.parent();
+                while let Some(d) = dir {
+                    match fs::symlink_metadata(d) {
+                        Ok(_) => return fs::read_dir(d).map(|_| true),
+                        Err(e) if e.kind() == io::ErrorKind::NotFound && d != from => {
+                            dir = d.parent();
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                Ok(true)
+            }
+            Err(e) => Err(e),
+        }
+    };
     // Deepest first, so a removed folder's children go before it.
     for path in changes.removed.iter().rev() {
-        if let Err(e) = fsx::remove_any(&to.join(path.as_str())) {
-            problems.push(problem(Path::new(path.as_str()), &e));
+        let rel = Path::new(path.as_str());
+        match gone(&from.join(path.as_str())) {
+            Ok(true) => {
+                if let Err(e) = fsx::remove_any(&to.join(path.as_str())) {
+                    problems.push(problem(rel, &e));
+                }
+            }
+            // Back again: the next look at the source sees it.
+            Ok(false) => {}
+            Err(e) => problems.push(problem(rel, &e)),
         }
         parents.extend(path.parent().map(str::to_owned));
     }
@@ -403,19 +508,23 @@ pub fn recopy(
         }
         let src = from.join(path.as_str());
         let dest = to.join(path.as_str());
+        let rel = Path::new(path.as_str());
         let result = fs::symlink_metadata(&src).and_then(|meta| {
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
             }
-            let rel = Path::new(path.as_str());
             copy_entry(&src, rel, &dest, &meta, &mut bytes, &mut |_| {}, cancel)
         });
         match result {
-            // Removed again since it was statted: removed here too.
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                let _ = fsx::remove_any(&dest);
-            }
-            Err(e) => problems.push(problem(Path::new(path.as_str()), &e)),
+            // Removed again since it was statted: removed here too, when verifiably.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match gone(&src) {
+                Ok(true) => {
+                    let _ = fsx::remove_any(&dest);
+                }
+                Ok(false) => problems.push(problem(rel, &e)),
+                Err(e) => problems.push(problem(rel, &e)),
+            },
+            Err(e) => problems.push(problem(rel, &e)),
             Ok(()) => {}
         }
         parents.extend(path.parent().map(str::to_owned));
@@ -497,13 +606,56 @@ mod tests {
 
         let before = stats(&from, &skipped, &cancel).unwrap();
         assert_eq!(before, stats(&to, &skipped, &cancel).unwrap());
+        assert!(before.unreadable.is_empty());
         fs::write(from.join("src/new.txt"), "n").unwrap();
         fs::remove_file(from.join("run")).unwrap();
         let after = stats(&from, &skipped, &cancel).unwrap();
-        let changes = refract_core::migrate::manifest::compare_stats(&before, &after);
+        let changes =
+            refract_core::migrate::manifest::compare_stats(&before.entries, &after.entries);
         assert_eq!(changes.added, vec![RelPath::new("src/new.txt").unwrap()]);
         let problems = recopy(&from, &to, &changes, &cancel).unwrap();
         assert_eq!(problems, vec![]);
         assert_eq!(stats(&to, &skipped, &cancel).unwrap(), after);
+    }
+
+    #[test]
+    fn unreadable_paths_are_listed_and_never_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (from, to) = (tmp.path().join("from"), tmp.path().join("to"));
+        fs::create_dir_all(from.join("locked")).unwrap();
+        fs::write(from.join("locked/keep.txt"), "k").unwrap();
+        fs::create_dir(&to).unwrap();
+        let cancel = AtomicBool::new(false);
+        copy_tree(&from, &to, &[], &cancel, &mut |_| {}).unwrap();
+        let before = stats(&from, &[], &cancel).unwrap();
+        fs::set_permissions(from.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(from.join("locked")).is_ok() {
+            // Running as root: nothing is unreadable.
+            return;
+        }
+        let after = stats(&from, &[], &cancel).unwrap();
+        fs::set_permissions(from.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(after.unreadable_paths(), ["locked"]);
+        // Taken for removed, the file would leave the copy; it must not.
+        let naive = refract_core::migrate::manifest::compare_stats(&before.entries, &after.entries);
+        assert_eq!(
+            naive.removed,
+            vec![RelPath::new("locked/keep.txt").unwrap()]
+        );
+        fs::set_permissions(from.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let problems = recopy(&from, &to, &naive, &cancel).unwrap();
+        fs::set_permissions(from.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(to.join("locked/keep.txt").exists());
+        // The whole original gone: nothing leaves the copy either.
+        let all = refract_core::migrate::manifest::StatChanges {
+            removed: vec![RelPath::new("locked/keep.txt").unwrap()],
+            ..Default::default()
+        };
+        fs::remove_dir_all(&from).unwrap();
+        let missing = stats(&from, &[], &cancel).unwrap();
+        assert_eq!(missing.unreadable_paths(), [""]);
+        assert!(!recopy(&from, &to, &all, &cancel).unwrap().is_empty());
+        assert!(to.join("locked/keep.txt").exists());
     }
 }

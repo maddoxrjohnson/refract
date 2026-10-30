@@ -257,6 +257,12 @@ pub struct Report {
     /// What the install created, changed or removed outside the build folders.
     #[serde(default)]
     pub install_changes: InstallChanges,
+    /// Linux path of the folder holding the original's version of each file the
+    /// install changed or removed (`installChanges.changed` and `.removed`, at the same
+    /// relative paths), under `~/.local/share/refract/migrations/`. `None` when the
+    /// install changed or removed nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_backup: Option<String>,
     #[serde(default)]
     pub history: HistoryMoved,
     /// Linux git read the source because `git.exe` was missing.
@@ -319,6 +325,7 @@ mod tests {
             copy_totals: Totals::default(),
             install: vec![],
             install_changes: InstallChanges::default(),
+            install_backup: None,
             history: HistoryMoved::default(),
             linux_git: false,
             warnings: vec![],

@@ -10,9 +10,10 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use refract_core::migrate::build::{install_plan, InstallStep, RootFiles, SkippedFolder};
-use refract_core::migrate::manifest::{RelPath, StatChanges};
-use refract_core::migrate::report::{InstallChanges, InstallResult, InstallStatus};
+use refract_core::migrate::manifest::{Manifest, RelPath, StatChanges, StatEntry};
+use refract_core::migrate::report::{InstallChanges, InstallResult, InstallStatus, Problem};
 
+use super::fsx;
 use super::tree::Cancel;
 
 /// Longest one install step may run.
@@ -68,6 +69,89 @@ pub fn changes(dest: &Path, stats: &StatChanges) -> InstallChanges {
             .collect(),
         removed: list(&stats.removed),
     }
+}
+
+/// Backs up into `backup` the original's version of each path the install changed or
+/// removed in the copy (spec §3.5), read from `source`, so that deleting the original
+/// loses none of them. A file is copied only while the source still has the size and
+/// time `final_stats` recorded, and the backup must hash as `manifest` (the snapshot
+/// the copy was checked against) says the source did. Returns the problems, by path:
+/// each one means a version would be lost, and fails check 3.
+pub fn backup(
+    source: &Path,
+    changes: &InstallChanges,
+    backup: &Path,
+    final_stats: &[StatEntry],
+    manifest: &Manifest,
+) -> Vec<Problem> {
+    let mut problems = Vec::new();
+    let mut paths: Vec<&String> = changes.changed.iter().chain(&changes.removed).collect();
+    paths.sort();
+    for path in paths {
+        if let Err(message) = backup_one(source, path, backup, final_stats, manifest) {
+            problems.push(Problem {
+                path: Some(path.clone()),
+                message: format!(
+                    "The install changed it, and the original's version could not be backed up: {message}"
+                ),
+            });
+        }
+    }
+    problems
+}
+
+fn backup_one(
+    source: &Path,
+    path: &str,
+    backup: &Path,
+    final_stats: &[StatEntry],
+    manifest: &Manifest,
+) -> Result<(), String> {
+    let rel = RelPath::new(path.to_owned())?;
+    let entry = manifest
+        .entries
+        .iter()
+        .find(|e| e.path == rel)
+        .ok_or("the snapshot does not list it")?;
+    let stat = final_stats
+        .iter()
+        .find(|s| s.path == rel)
+        .ok_or("the last check did not see it")?;
+    let src = source.join(path);
+    let dest = backup.join(path);
+    let meta = fs::symlink_metadata(&src).map_err(|e| e.to_string())?;
+    let size = if meta.is_file() { meta.len() } else { 0 };
+    if size != stat.size || fsx::mtime_ns(&meta) != stat.mtime_ns {
+        return Err("it changed in the original since the check".into());
+    }
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if meta.is_dir() {
+        return fs::create_dir_all(&dest).map_err(|e| e.to_string());
+    }
+    if meta.file_type().is_symlink() {
+        let target = fs::read_link(&src).map_err(|e| e.to_string())?;
+        if entry.link_target.as_deref() != Some(&*target.to_string_lossy()) {
+            return Err("its target differs from the snapshot's".into());
+        }
+        let _ = fs::remove_file(&dest);
+        return std::os::unix::fs::symlink(target, &dest).map_err(|e| e.to_string());
+    }
+    let bytes = fs::read(&src).map_err(|e| e.to_string())?;
+    let want = entry
+        .sha256
+        .as_deref()
+        .ok_or("the snapshot has no hash of it")?;
+    if fsx::sha256_bytes(&bytes) != want {
+        return Err("it differs from the snapshot".into());
+    }
+    fs::write(&dest, &bytes).map_err(|e| e.to_string())?;
+    if !fsx::sha256_file(&dest).is_ok_and(|h| h == want) {
+        return Err("the backup differs from what was written".into());
+    }
+    let _ = fsx::set_mtime(&dest, fsx::mtime_ns(&meta));
+    Ok(())
 }
 
 /// Runs `steps` in `dest`, appending their output to `log`. `progress` gets the steps

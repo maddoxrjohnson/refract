@@ -294,7 +294,41 @@ pub fn refresh(
                 autocrlf,
             });
         }
+        // A file staged or unstaged for the first time changed whether it has a blob.
+        for (old, new) in snapshot.git.iter().zip(&fresh_git) {
+            let (was, is) = (tracked_paths(old), tracked_paths(new));
+            let gone: BTreeSet<&String> = was.difference(&is).collect();
+            let came: BTreeSet<String> = is.difference(&was).cloned().collect();
+            for entry in &mut snapshot.manifest.entries {
+                if gone.contains(&entry.path.as_str().to_owned()) {
+                    entry.blob = None;
+                }
+            }
+            if !came.is_empty() {
+                let config = windows_config_of(&join(root, &new.path), new.autocrlf.as_deref());
+                tree::add_blobs(
+                    root,
+                    &mut snapshot.manifest,
+                    std::slice::from_ref(&new.path),
+                    &config,
+                    Some(&came),
+                )?;
+            }
+        }
         snapshot.git = fresh_git;
     }
     Ok(())
+}
+
+/// The paths a repo's index lists (`ls-files -s` records), relative to the top repo.
+fn tracked_paths(repo: &RepoGit) -> BTreeSet<String> {
+    repo.snapshot
+        .index
+        .iter()
+        .filter_map(|record| record.split_once('\t').map(|(_, path)| path))
+        .map(|path| match repo.path.as_str() {
+            "" => path.to_owned(),
+            prefix => format!("{prefix}/{path}"),
+        })
+        .collect()
 }

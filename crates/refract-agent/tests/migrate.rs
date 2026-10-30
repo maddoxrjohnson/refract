@@ -445,7 +445,8 @@ fn a_repo_moves_as_a_linux_checkout_and_finishing_deletes_the_old_history() {
     let recheck = agent.request("migrateRecheck", json!({"id": id}));
     assert_eq!(
         recheck["result"],
-        json!({"changed": [], "busyAgents": []}),
+        json!({"changed": [], "removed": [], "unreadable": [], "copyChanged": [],
+            "busyAgents": [], "sourceMissing": false}),
         "{recheck}"
     );
     write(&src.join("notes.txt"), "edited after the report\n");
@@ -463,7 +464,13 @@ fn a_repo_moves_as_a_linux_checkout_and_finishing_deletes_the_old_history() {
     );
     let recheck = agent.request("migrateRecheck", json!({"id": id}));
     assert_eq!(recheck["result"]["changed"], json!([]), "{recheck}");
+    assert_eq!(recheck["result"]["copyChanged"], json!([]), "{recheck}");
 
+    // Deleting needs migrateBeginDelete first.
+    let early = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(early["error"]["code"], 6, "{early}");
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
     // The app sends the original to the Recycle Bin, then finishes.
     fs::remove_dir_all(src).unwrap();
     let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
@@ -645,6 +652,11 @@ fn failed_migration(world: &World, hook: Option<&Path>) -> Value {
         json!({"id": report["id"], "action": "keep"}),
     );
     assert_eq!(keep["error"]["code"], 6);
+    // Nothing to recheck or delete against a failed report.
+    for method in ["migrateRecheck", "migrateBeginDelete"] {
+        let refused = agent.request(method, json!({"id": report["id"]}));
+        assert_eq!(refused["error"]["code"], 6, "{method}: {refused}");
+    }
     let delete = agent.request(
         "migrateFinish",
         json!({"id": report["id"], "action": "delete"}),
@@ -882,6 +894,17 @@ fn what_the_install_changes_is_listed_and_allowed_in_a_resync() {
     });
     assert_eq!(report["installChanges"], expected, "{report:#}");
     assert!(world.dest.join("node_modules/left-pad").is_dir());
+    // The original's package.json, which npm rewrote in the copy, is backed up.
+    let backup = PathBuf::from(report["installBackup"].as_str().expect("a backup"));
+    assert!(backup.starts_with(world.migrations_dir()), "{backup:?}");
+    assert_eq!(
+        fs::read_to_string(backup.join("package.json")).unwrap(),
+        "{\"name\": \"aurora-notes\"}\n"
+    );
+    assert!(!backup.join("package-lock.json").exists());
+    // The copy as checked is the one after the install.
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["copyChanged"], json!([]), "{recheck}");
 
     // A re-sync checks the copy again: the install's files are allowed, and listed.
     write(&src.join("notes.txt"), "edited after the report\n");
@@ -960,4 +983,400 @@ fn stop_agent_stops_an_idle_session_and_refuses_a_working_one() {
     assert_eq!(gone["error"]["code"], 5, "{gone}");
     let _ = working_proc.kill();
     let _ = working_proc.wait();
+}
+
+/// Starts a migration with `hook` and waits for its report, which must allow deleting.
+fn placed_migration(world: &World, hook: Option<&Path>) -> (Agent, String) {
+    let mut agent = world.agent(hook);
+    let ticket = world.migrate(&mut agent, &world.dest);
+    let id = ticket["result"]["id"].as_str().expect("an id").to_owned();
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    (agent, id)
+}
+
+fn error_message(response: &Value) -> String {
+    assert_eq!(response["error"]["code"], 6, "{response}");
+    response["error"]["message"].as_str().unwrap().to_owned()
+}
+
+#[test]
+fn a_file_a_clean_filter_strips_is_kept_byte_for_byte_and_blocks_deleting() {
+    let world = World::new();
+    let src = &world.src;
+    git(src, &["config", "filter.strip.clean", "sed /^OUT/d"]);
+    git(src, &["config", "filter.strip.smudge", "cat"]);
+    write(&src.join(".gitattributes"), "*.nb filter=strip\n");
+    write(&src.join("a.nb"), "cell\n");
+    git(src, &["add", ".gitattributes", "a.nb"]);
+    git(
+        src,
+        &["commit", "-q", "-m", "nb", "--", ".gitattributes", "a.nb"],
+    );
+    // Uncommitted outputs the clean filter strips; git on Windows sees no change.
+    write(&src.join("a.nb"), "cell\r\nOUT precious result\r\n");
+    git(src, &["add", "a.nb"]);
+    let mut agent = world.agent(None);
+    world.migrate(&mut agent, &world.dest);
+    let report = agent.ready();
+    assert!(!can_delete(&report), "{report:#}");
+    let files = check(&report, "files");
+    assert!(
+        files["problems"].as_array().unwrap().iter().any(
+            |p| p["path"] == "a.nb" && p["message"].as_str().unwrap().contains("byte for byte")
+        ),
+        "{report:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(src.join("a.nb")).unwrap(),
+        "cell\r\nOUT precious result\r\n"
+    );
+}
+
+#[test]
+fn staging_during_the_copy_still_passes() {
+    let world = World::new();
+    let hook = world.hook(
+        "[ \"$1\" = copied ] || exit 0\n\
+         git -C \"$4\" -c core.autocrlf=true -c core.filemode=false add notes.txt\n",
+    );
+    let (_agent, _) = placed_migration(&world, Some(&hook));
+    let status = status(&world.dest, &[]);
+    assert!(
+        status
+            .lines()
+            .any(|l| l.starts_with("1 A. ") && l.ends_with(" notes.txt")),
+        "{status}"
+    );
+}
+
+#[test]
+fn a_resync_after_staging_passes() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    git(&world.src, &["add", "notes.txt"]);
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    let changed = recheck["result"]["changed"].as_array().unwrap().clone();
+    assert!(changed.contains(&json!(".git/index")), "{recheck}");
+    for _ in 0..2 {
+        let resync = agent.request("migrateResync", json!({"id": id}));
+        assert_eq!(resync["result"], Value::Null, "{resync}");
+        let report = agent.ready();
+        assert!(can_delete(&report), "{report:#}");
+    }
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+}
+
+#[test]
+fn a_copy_that_changed_or_went_is_never_trusted_or_deleted() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    write(&world.dest.join("README.md"), "my own edit in the copy\n");
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(
+        recheck["result"]["copyChanged"],
+        json!(["README.md"]),
+        "{recheck}"
+    );
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], false, "{begin}");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert!(error_message(&resync).contains("changed since it was checked"));
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert!(error_message(&discard).contains("won't delete it"));
+    assert!(world.dest.join("README.md").exists());
+    // A refused re-sync leaves it ready.
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"][0]["id"], id.as_str(), "{pending}");
+
+    // The copy deleted by hand: not deletable, not even after a restart.
+    fs::remove_dir_all(&world.dest).unwrap();
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["copyChanged"], json!(["."]), "{recheck}");
+    drop(agent);
+    let mut agent = world.agent(None);
+    let report = agent.ready();
+    assert!(!can_delete(&report), "{report:#}");
+    assert!(check(&report, "files")["problems"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("is gone"));
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["error"]["code"], 6, "{begin}");
+    let delete = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(delete["error"]["code"], 6, "{delete}");
+    // With no copy left, discarding only forgets it.
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(world.src.join(".git").exists());
+}
+
+#[test]
+fn history_moves_only_the_repos_sessions_and_keeps_what_changed() {
+    use refract_agent::migrate::history;
+    use refract_core::sessions::encode_project_dir;
+    let tmp = tempfile::tempdir().unwrap();
+    let projects = tmp.path().join("projects");
+    let old = "/mnt/c/dev/app";
+    let new = "/home/dev/projects/app";
+    // `/mnt/c/dev/app/web` and the sibling repo `/mnt/c/dev/app-web` share a folder.
+    let shared = projects.join(encode_project_dir("/mnt/c/dev/app/web"));
+    assert_eq!(
+        shared,
+        projects.join(encode_project_dir("/mnt/c/dev/app-web"))
+    );
+    let line = |cwd: &str| format!("{{\"type\":\"user\",\"cwd\":\"{cwd}\"}}\n");
+    write(&shared.join("s1.jsonl"), &line("/mnt/c/dev/app/web"));
+    write(&shared.join("s1/tool-results/t.txt"), "output");
+    write(&shared.join("s2.jsonl"), &line("/mnt/c/dev/app-web"));
+    write(&shared.join("s2/tool-results/t.txt"), "sibling output");
+    let top = projects.join(encode_project_dir(old));
+    write(&top.join("s3.jsonl"), &line(old));
+    write(&top.join("s4.jsonl"), &line(old));
+    write(&top.join("memory/MEMORY.md"), "notes");
+    let copied = history::copy(&projects, old, new, &mut |_, _| {});
+    assert_eq!(copied.problems, vec![]);
+    let new_top = projects.join(encode_project_dir(new));
+    let new_web = projects.join(encode_project_dir(&format!("{new}/web")));
+    assert!(new_web.join("s1.jsonl").exists() && new_web.join("s1/tool-results/t.txt").exists());
+    assert!(!new_web.join("s2.jsonl").exists());
+    assert!(new_top.join("memory/MEMORY.md").exists());
+    // s3 goes on in the old path after the copy; s4 goes on in the new one.
+    let append = |path: &Path, text: &str| {
+        fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap()
+    };
+    append(&top.join("s3.jsonl"), &line(old));
+    append(&top.join("s4.jsonl"), &line(old));
+    append(&new_top.join("s4.jsonl"), &line(new));
+    let kept = history::remove_originals(&projects, &copied.files, old, new);
+    assert!(shared.join("s2.jsonl").exists() && shared.join("s2/tool-results/t.txt").exists());
+    assert!(!shared.join("s1.jsonl").exists());
+    // s3's new lines reached its copy before it went; s4 changed on both sides and stays.
+    assert!(!top.join("s3.jsonl").exists());
+    let s3 = fs::read_to_string(new_top.join("s3.jsonl")).unwrap();
+    assert_eq!(s3, line(new).repeat(2));
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert!(kept[0].path.as_ref().unwrap().ends_with("s4.jsonl"));
+    assert!(top.join("s4.jsonl").exists());
+    // Discarding keeps a copy that was written to since.
+    let kept = history::remove_copies(&projects, &copied.files);
+    assert!(new_top.join("s4.jsonl").exists());
+    assert!(kept
+        .iter()
+        .any(|k| k.path.as_ref().unwrap().ends_with("s4.jsonl")));
+}
+
+#[test]
+fn cancelling_while_history_moves_leaves_no_transcript_copies() {
+    let world = World::new();
+    let src = &world.src;
+    write(
+        &project_dir(&world.projects(), src).join(format!("{SESSION_ID}.jsonl")),
+        &transcript(SESSION_ID, src, &src.join("README.md"), Utc::now(), true),
+    );
+    let reached = world.tmp.join("reached");
+    let hold = world.tmp.join("hold");
+    write(&hold, "");
+    let hook = world.hook(&format!(
+        "[ \"$1\" = moved ] || exit 0\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let mut agent = world.agent(Some(&hook));
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !reached.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(project_dir(&world.projects(), &world.dest).exists());
+    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    fs::remove_file(&hold).unwrap();
+    let answer = agent.response(cancel);
+    assert_eq!(answer["result"], Value::Null, "{answer}");
+    assert!(!world.dest.exists());
+    assert!(!project_dir(&world.projects(), &world.dest).exists());
+    assert!(project_dir(&world.projects(), src).exists());
+}
+
+#[test]
+fn a_submodule_pointing_outside_the_copy_stops_it_untouched() {
+    let world = World::new();
+    let module = world.src.join(".git/modules/libs/kelp");
+    let before = (
+        fs::read(module.join("index")).unwrap(),
+        fs::read(module.join("config")).unwrap(),
+    );
+    let hook = world.hook(
+        "[ \"$1\" = copied ] || exit 0\n\
+         printf 'gitdir: %s/.git/modules/libs/kelp\\n' \"$4\" > \"$3/libs/kelp/.git\"\n",
+    );
+    let report = failed_migration(&world, Some(&hook));
+    let skipped = check(&report, "nothingSkipped");
+    assert!(
+        skipped["problems"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("outside the repo"),
+        "{report:#}"
+    );
+    let after = (
+        fs::read(module.join("index")).unwrap(),
+        fs::read(module.join("config")).unwrap(),
+    );
+    assert!(
+        before == after,
+        "the original's submodule git folder changed"
+    );
+}
+
+#[test]
+fn a_destination_reaching_the_drive_through_a_link_is_refused() {
+    let world = World::new();
+    std::os::unix::fs::symlink(&world.drive, world.root.join("drive-link")).unwrap();
+    let mut agent = world.agent(None);
+    let refused = world.migrate(&mut agent, &world.root.join("drive-link/aurora-notes"));
+    assert!(
+        error_message(&refused).contains("isn't on the Linux filesystem"),
+        "{refused}"
+    );
+    let dotted = world.migrate(&mut agent, &world.root.join("x/../aurora-notes"));
+    assert_eq!(dotted["error"]["code"], 6, "{dotted}");
+}
+
+#[test]
+fn nested_migrations_do_not_run_together() {
+    let world = World::new();
+    let hold = world.tmp.join("hold");
+    write(&hold, "");
+    let hook = world.hook(&format!(
+        "[ \"$1\" = copied ] || exit 0\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let mut agent = world.agent(Some(&hook));
+    let first = world.migrate(&mut agent, &world.dest);
+    let id = first["result"]["id"].as_str().expect("an id").to_owned();
+    let snapshot = world.snapshot();
+    for (path, dest) in [
+        (world.src.join("src"), world.root.join("elsewhere")),
+        (world.drive.join("Desktop"), world.root.join("elsewhere")),
+        (world.drive.join("other"), world.dest.join("inner")),
+    ] {
+        let refused = agent.request(
+            "migrate",
+            json!({"path": path, "dest": dest, "snapshot": snapshot}),
+        );
+        assert!(
+            error_message(&refused).contains("Another migration"),
+            "{refused}"
+        );
+    }
+    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    fs::remove_file(&hold).unwrap();
+    agent.response(cancel);
+}
+
+#[test]
+fn an_unreadable_folder_in_the_original_is_never_taken_for_removed() {
+    let world = World::new();
+    let docs = world.src.join("docs");
+    write(&docs.join("plan.md"), "the plan\n");
+    let (mut agent, id) = placed_migration(&world, None);
+    fs::set_permissions(&docs, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read_dir(&docs).is_ok() {
+        // Running as root: nothing is unreadable.
+        fs::set_permissions(&docs, fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    let report = agent.ready();
+    fs::set_permissions(&docs, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        recheck["result"]["unreadable"],
+        json!(["docs"]),
+        "{recheck}"
+    );
+    assert_eq!(recheck["result"]["removed"], json!([]), "{recheck}");
+    assert_eq!(recheck["result"]["changed"], json!([]), "{recheck}");
+    assert_eq!(begin["result"]["ok"], false, "{begin}");
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    assert!(!can_delete(&report), "{report:#}");
+    assert_eq!(check(&report, "unchanged")["problems"][0]["path"], "docs");
+    assert_eq!(
+        fs::read_to_string(world.dest.join("docs/plan.md")).unwrap(),
+        "the plan\n"
+    );
+}
+
+#[test]
+fn a_missing_original_leaves_only_delete() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let away = world.tmp.join("away");
+    fs::rename(&world.src, &away).unwrap();
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["sourceMissing"], true, "{recheck}");
+    assert_eq!(recheck["result"]["removed"], json!([]), "{recheck}");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert!(error_message(&resync).contains("is gone"));
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert!(error_message(&discard).contains("only one left"));
+    assert!(world.dest.join(".git").exists());
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(finish["result"], Value::Null, "{finish}");
+    assert!(world.dest.join(".git").exists());
+}
+
+#[test]
+fn deleting_is_saved_and_refuses_everything_but_finishing() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    let refusals = |agent: &mut Agent| {
+        for (method, params) in [
+            ("migrateResync", json!({"id": id})),
+            ("migrateCancel", json!({"id": id})),
+            ("migrateFinish", json!({"id": id, "action": "keep"})),
+            ("migrateFinish", json!({"id": id, "action": "discard"})),
+        ] {
+            let refused = agent.request(method, params);
+            assert_eq!(
+                error_message(&refused),
+                "The original is being deleted.",
+                "{method}"
+            );
+        }
+        let pending = agent.request("migratePending", json!(null));
+        assert_eq!(pending["result"][0]["deleting"], true, "{pending}");
+    };
+    refusals(&mut agent);
+    drop(agent);
+    let mut agent = world.agent(None);
+    agent.ready();
+    refusals(&mut agent);
+    // Part of the original is gone: the rest may still go.
+    fs::remove_file(world.src.join("notes.txt")).unwrap();
+    fs::remove_dir_all(world.src.join("src")).unwrap();
+    let again = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(again["result"]["ok"], true, "{again}");
+    let removed = again["result"]["recheck"]["removed"].as_array().unwrap();
+    assert!(removed.contains(&json!("notes.txt")) && removed.contains(&json!("src/main.rs")));
+    assert_eq!(again["result"]["recheck"]["changed"], json!([]), "{again}");
+    fs::remove_dir_all(&world.src).unwrap();
+    let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(finish["result"], Value::Null, "{finish}");
+    assert_eq!(
+        fs::read_to_string(world.dest.join("notes.txt")).unwrap(),
+        "untracked\r\n"
+    );
 }

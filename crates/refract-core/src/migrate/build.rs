@@ -258,14 +258,29 @@ fn python_step(folder: &RelPath, root: &RootFiles) -> Option<InstallStep> {
         ));
     }
     if root.has("requirements.txt") {
+        let quoted = shell_quote(name);
         return Some(step(
             folder,
             "python3",
-            format!("python3 -m venv {name} && {name}/bin/pip install -r requirements.txt"),
+            format!("python3 -m venv {quoted} && {quoted}/bin/pip install -r requirements.txt"),
             "sudo apt install python3-venv python3-pip",
         ));
     }
     None
+}
+
+/// `word` as one POSIX shell word: as it is when it holds only safe characters, else
+/// in single quotes.
+pub fn shell_quote(word: &str) -> String {
+    let plain = !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-/+@%=:,".contains(&b));
+    if plain {
+        word.to_owned()
+    } else {
+        format!("'{}'", word.replace('\'', r"'\''"))
+    }
 }
 
 #[cfg(test)]
@@ -542,5 +557,25 @@ mod tests {
         // node_modules with no package.json has nothing to install from.
         let lone = [skipped("node_modules", BuildFolder::NodeModules)];
         assert!(install_plan(&lone, &root(&["README.md"])).is_empty());
+    }
+
+    #[test]
+    fn shell_words_are_quoted() {
+        assert_eq!(shell_quote(".venv"), ".venv");
+        assert_eq!(shell_quote("my env"), "'my env'");
+        assert_eq!(shell_quote("$(rm -rf ~)"), "'$(rm -rf ~)'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
+        let odd = [SkippedFolder {
+            path: RelPath::new("env;x").unwrap(),
+            rule: BuildFolder::PythonVenv,
+            bytes: 0,
+            files: 0,
+        }];
+        let root = RootFiles::new(vec!["requirements.txt".into()], None, None);
+        assert_eq!(
+            install_plan(&odd, &root)[0].command,
+            "python3 -m venv 'env;x' && 'env;x'/bin/pip install -r requirements.txt"
+        );
     }
 }

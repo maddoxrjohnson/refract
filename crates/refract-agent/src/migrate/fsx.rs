@@ -25,7 +25,8 @@ pub enum Visit<'a> {
         abs: &'a Path,
         meta: &'a Metadata,
     },
-    /// A path whose metadata or listing could not be read.
+    /// A path whose metadata or listing could not be read (`""` for the root itself).
+    /// What lies under it is unknown; callers must never take it for gone.
     Error { rel: &'a Path, error: io::Error },
 }
 
@@ -49,7 +50,22 @@ fn walk_dir(
 ) -> bool {
     let names = match fs::read_dir(abs_dir) {
         Ok(entries) => {
-            let mut names: Vec<_> = entries.flatten().map(|e| e.file_name()).collect();
+            let mut names = Vec::new();
+            for entry in entries {
+                match entry {
+                    Ok(entry) => names.push(entry.file_name()),
+                    // The listing broke off: what follows is unknown, not gone.
+                    Err(error) => {
+                        if !visit(Visit::Error {
+                            rel: rel_dir,
+                            error,
+                        }) {
+                            return false;
+                        }
+                        break;
+                    }
+                }
+            }
             names.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
             names
         }
@@ -180,6 +196,18 @@ pub fn free_bytes(path: &Path) -> io::Result<u64> {
         return Err(io::Error::last_os_error());
     }
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// True when `path` is on a 9p file system, which is how WSL 2 mounts Windows drives.
+pub fn is_9p(path: &Path) -> bool {
+    const V9FS_MAGIC: i64 = 0x0102_1997;
+    let Ok(c) = c_path(path) else {
+        return false;
+    };
+    // SAFETY: statfs fills the zeroed struct it is given; `c` is NUL-terminated.
+    let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::statfs(c.as_ptr(), &mut stat) };
+    rc == 0 && stat.f_type as i64 == V9FS_MAGIC
 }
 
 /// Renames `from` to `to`, failing with `AlreadyExists` if `to` exists, atomically

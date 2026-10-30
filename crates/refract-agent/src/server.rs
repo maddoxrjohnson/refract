@@ -35,7 +35,7 @@ use refract_core::protocol::{
     Outcome, PendingMigration, Reply, RepoList, RepoSnapshot, Response, StopAgentParams,
     PROTOCOL_VERSION,
 };
-use refract_core::sessions::{is_windows_mount, paths_match, project_dir_matches};
+use refract_core::sessions::{is_windows_mount, path_within, paths_match, project_dir_matches};
 use serde::Serialize;
 
 use crate::config::{self, Config};
@@ -657,8 +657,12 @@ impl<W: Write> Server<W> {
                 return Ok(true);
             }
             Method::Migrate(params) => {
+                // Any of the two folders within, or holding, one of another migration's.
                 let busy = self.migrations.values().any(|m| {
-                    paths_match(&m.source, &params.path) || paths_match(&m.dest, &params.dest)
+                    let overlap = |a: &str, b: &str| path_within(a, b) || path_within(b, a);
+                    [&m.source, &m.dest].iter().any(|theirs| {
+                        overlap(theirs, &params.path) || overlap(theirs, &params.dest)
+                    })
                 });
                 if busy {
                     Response::err(
@@ -696,6 +700,9 @@ impl<W: Write> Server<W> {
                     }
                     Response::err(id, code::MIGRATE_FAILED, "the migration stopped")
                 }
+                Some(m) if m.deleting => {
+                    Response::err(id, code::MIGRATE_FAILED, migrate::worker::DELETING)
+                }
                 Some(_) => Response::err(
                     id,
                     code::MIGRATE_FAILED,
@@ -717,6 +724,18 @@ impl<W: Write> Server<W> {
                     Err(message) => Response::err(id, code::MIGRATE_FAILED, message),
                 }
             }
+            Method::MigrateBeginDelete(params) => {
+                let command = migrate::Command::BeginDelete(id.clone());
+                match self.send_to_ready_migration(&params.id, command, None) {
+                    Ok(()) => return Ok(true),
+                    Err(message) => Response::err(id, code::MIGRATE_FAILED, message),
+                }
+            }
+            Method::MigrateResync(params)
+                if self.migrations.get(&params.id).is_some_and(|m| m.deleting) =>
+            {
+                Response::err(id, code::MIGRATE_FAILED, migrate::worker::DELETING)
+            }
             Method::MigrateResync(params) => {
                 let command = migrate::Command::Resync(id.clone());
                 match self.send_to_ready_migration(&params.id, command, Some(Phase::Resyncing)) {
@@ -733,6 +752,7 @@ impl<W: Write> Server<W> {
                         Some(PendingMigration {
                             id: m.id.clone(),
                             report: m.report.clone()?,
+                            deleting: m.deleting,
                         })
                     })
                     .collect();
@@ -820,6 +840,20 @@ impl<W: Write> Server<W> {
             }
             migrate::Update::Ended { id } => {
                 self.migrations.remove(&id);
+                Ok(())
+            }
+            migrate::Update::Deleting { id } => {
+                if let Some(migration) = self.migrations.get_mut(&id) {
+                    migration.deleting = true;
+                }
+                Ok(())
+            }
+            migrate::Update::Idle { id } => {
+                if let Some(migration) = self.migrations.get_mut(&id) {
+                    if migration.phase == Phase::Resyncing {
+                        migration.phase = Phase::Ready;
+                    }
+                }
                 Ok(())
             }
             migrate::Update::Finished {

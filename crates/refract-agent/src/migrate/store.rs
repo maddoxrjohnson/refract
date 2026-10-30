@@ -5,23 +5,27 @@
 //!   to it.
 //! - `state/<id>.json`: a migration placed at its destination and not yet finished
 //!   ([`Record`]), so its report comes back after a restart (spec §4.5).
+//! - `<timestamp>-<name>.backup/`: the original's version of each file the install
+//!   changed or removed, at its path in the repo.
 //! - `state/<id>.temp.json`: the temporary folder a running migration copies into, and
 //!   the helper's pid ([`TempMarker`]), so a later helper knows the folder is its own
 //!   to delete.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use refract_core::migrate::manifest::StatEntry;
-use refract_core::migrate::report::Report;
+use refract_core::migrate::manifest::{RelPath, StatEntry};
+use refract_core::migrate::report::{Problem, Report};
 use refract_core::migrate::SourceSnapshot;
+use refract_core::sessions::is_windows_mount;
 use serde::{Deserialize, Serialize};
 
 use super::fsx;
+use super::history::HistoryFile;
 
 /// Version of the [`Record`] format.
-const RECORD_VERSION: u32 = 1;
+const RECORD_VERSION: u32 = 2;
 
 /// The prefix of a temporary copy's folder name: `.refract-migrate-<name>-<id>`.
 pub const TEMP_PREFIX: &str = ".refract-migrate-";
@@ -55,9 +59,23 @@ pub struct Record {
     pub snapshot: SourceSnapshot,
     /// The source's stat at the last check, for `migrateRecheck`.
     pub final_stats: Vec<StatEntry>,
-    /// Transcripts copied: (original, copy).
+    /// The placed copy's stat as last checked (after the install), its index files by
+    /// their entries ([`super::gitx::index_digest`]): `migrateRecheck` and `discard`
+    /// compare the copy with it.
     #[serde(default)]
-    pub history: Vec<(PathBuf, PathBuf)>,
+    pub copy_stats: Vec<StatEntry>,
+    /// Transcripts copied.
+    #[serde(default)]
+    pub history: Vec<HistoryFile>,
+    /// Copy problems still standing, by path (check 3).
+    #[serde(default)]
+    pub copy_errors: Vec<Problem>,
+    /// Tracked files kept byte for byte ([`super::gitx::Normalised::kept`]).
+    #[serde(default)]
+    pub kept: Vec<String>,
+    /// `migrateBeginDelete` passed: the app may be deleting the original.
+    #[serde(default)]
+    pub deleting: bool,
 }
 
 impl Record {
@@ -77,9 +95,72 @@ impl Record {
             report_path,
             snapshot,
             final_stats,
+            copy_stats: Vec::new(),
             history: Vec::new(),
+            copy_errors: Vec::new(),
+            kept: Vec::new(),
+            deleting: false,
         }
     }
+
+    /// Checks what the record names before anything acts on it, since a later helper
+    /// deletes and writes the paths it holds: the id is a UUID, the source and the
+    /// destination absolute (the destination not on a Windows drive), the report
+    /// under [`dir`], the transcripts under `claude_projects`, and the snapshot's paths
+    /// relative ([`check_snapshot_paths`]).
+    pub fn check(&self, claude_projects: &Path) -> Result<(), String> {
+        if uuid::Uuid::try_parse(&self.id).is_err() {
+            return Err(format!("the id {:?} is not a UUID", self.id));
+        }
+        let plain = |p: &Path| {
+            p.is_absolute()
+                && p.components()
+                    .all(|c| matches!(c, Component::RootDir | Component::Normal(_)))
+        };
+        if !plain(Path::new(&self.source)) || !plain(Path::new(&self.dest)) {
+            return Err("the source and destination must be plain absolute paths".into());
+        }
+        if is_windows_mount(&self.dest) {
+            return Err("the destination is on a Windows drive".into());
+        }
+        if self.report.source != self.source || self.report.dest != self.dest {
+            return Err("the report names other paths".into());
+        }
+        if !plain(&self.report_path) || !self.report_path.starts_with(dir()) {
+            return Err("the report path is outside the migrations folder".into());
+        }
+        let under_projects = |p: &Path| plain(p) && p.starts_with(claude_projects);
+        if !self
+            .history
+            .iter()
+            .all(|f| under_projects(&f.original) && under_projects(&f.copy))
+        {
+            return Err("a transcript path is outside Claude Code's projects folder".into());
+        }
+        check_snapshot_paths(&self.snapshot)
+    }
+}
+
+/// Checks that each repo path in `snapshot` is `""` or a relative path with no `.` or
+/// `..` and outside any `.git`, since the helper runs git and writes there.
+pub fn check_snapshot_paths(snapshot: &SourceSnapshot) -> Result<(), String> {
+    for repo in &snapshot.git {
+        if repo.path.is_empty() {
+            continue;
+        }
+        let ok = RelPath::new(repo.path.clone())
+            .is_ok_and(|p| !p.as_str().split('/').any(|part| part == ".git"));
+        if !ok {
+            return Err(format!(
+                "The snapshot names the repo path {:?}, which is not a folder inside the repo.",
+                repo.path
+            ));
+        }
+    }
+    if snapshot.git.first().is_none_or(|g| !g.path.is_empty()) {
+        return Err("The snapshot does not start with the top repo.".into());
+    }
+    Ok(())
 }
 
 fn record_path(id: &str) -> PathBuf {
@@ -124,6 +205,12 @@ pub fn load_records() -> Vec<Record> {
         .collect();
     records.sort_by_key(|r| r.report.started_at);
     records
+}
+
+/// The folder holding the install backup of the migration whose report is at
+/// `report_path`: `<timestamp>-<name>.backup` next to it.
+pub fn backup_dir(report_path: &Path) -> PathBuf {
+    report_path.with_extension("backup")
 }
 
 /// The report and install log paths of a migration of the folder `name` started at

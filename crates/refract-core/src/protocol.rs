@@ -48,8 +48,9 @@ pub mod code {
     /// whose process does not run in the Refract window on that folder.
     pub const NOT_RUNNING: i32 = 5;
     /// `migrate` could not start (a preflight refusal, or the snapshot file is missing
-    /// or unreadable), or `migrateFinish`, `migrateCancel`, `migrateRecheck` or
-    /// `migrateResync` named a migration that is unknown or not at that step.
+    /// or unreadable), or `migrateFinish`, `migrateCancel`, `migrateRecheck`,
+    /// `migrateBeginDelete` or `migrateResync` named a migration that is unknown or not
+    /// at that step, or that is refused there (see [`Method::MigrateBeginDelete`]).
     pub const MIGRATE_FAILED: i32 = 6;
     /// `stopAgent` named a session that is working on a turn, so stopping it could lose
     /// work.
@@ -115,12 +116,24 @@ pub enum Method {
     MigrateFinish(MigrateFinishParams),
     /// Stops a migration before it is ready and deletes its copy: answered with `null`.
     MigrateCancel(MigrateCancelParams),
-    /// Runs check 4 again on a ready migration, right before the app deletes the
-    /// original: answered with a [`Recheck`]. Empty lists mean it is safe to delete.
+    /// Runs check 4 again on a migration whose report allows deleting the original (or
+    /// that is deleting it), and checks that the placed copy is as it was checked:
+    /// answered with a [`Recheck`]. Refused otherwise.
     MigrateRecheck(MigrateIdParams),
+    /// Sent right before the app recycles or deletes anything of the original: runs
+    /// the recheck and, when it is safe ([`Recheck::safe`]), puts the migration in the
+    /// *deleting* state, saved in its state file, and answers `ok: true`; see
+    /// [`BeginDelete`]. Idempotent: in the deleting state it runs the same test again
+    /// (a partly deleted original shows as removals). In the deleting state
+    /// `migrateResync`, `migrateFinish` `keep` and `discard`, and `migrateCancel` are
+    /// refused ("The original is being deleted."); only `migrateFinish` `delete`, sent
+    /// once the original is gone, ends it, and `migrateFinish` `delete` is refused
+    /// outside it. Refused unless the report allows deleting.
+    MigrateBeginDelete(MigrateIdParams),
     /// Re-copies what changed in the original since the report into the placed copy and
     /// checks it again: answered with `null`, then [`Event::MigrateProgress`] and a fresh
-    /// [`Event::MigrateReady`].
+    /// [`Event::MigrateReady`]. Refused in the deleting state, when the original folder
+    /// is gone, and when the placed copy changed since it was checked.
     MigrateResync(MigrateIdParams),
     /// The migrations whose reports wait for `migrateFinish`, including those from
     /// before the helper restarted: answered with a list of [`PendingMigration`].
@@ -176,6 +189,8 @@ pub enum Reply {
     Migration(MigrationTicket),
     /// The result of `migrateRecheck`.
     Recheck(Recheck),
+    /// The result of `migrateBeginDelete`.
+    BeginDelete(BeginDelete),
     /// The result of `migratePending`: the pending migrations, oldest first.
     PendingMigrations(Vec<PendingMigration>),
     /// A Linux path: the result of `cloneRepo`.
@@ -333,7 +348,7 @@ pub struct MigrationTicket {
     pub id: String,
 }
 
-/// Params of `migrateRecheck` and `migrateResync`.
+/// Params of `migrateRecheck`, `migrateBeginDelete` and `migrateResync`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateIdParams {
@@ -345,31 +360,76 @@ pub struct MigrateIdParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FinishAction {
-    /// The app has already sent the original to the Recycle Bin (after a
-    /// `migrateRecheck` came back empty): the helper deletes the old transcripts (only
-    /// when the history check passed), and rewrites `extra` and `hidden` entries in
-    /// `agent.toml` that name the old path to the new one, adding the new path to
-    /// `extra` when no root covers it. Refused unless the report allows deleting.
+    /// The original is gone (the app recycled it after `migrateBeginDelete` answered
+    /// `ok: true`, or it was gone already): the helper deletes the old transcripts
+    /// that are unchanged since they were copied (only when the history check passed;
+    /// one changed since is copied again first, and kept when its copy changed too),
+    /// and rewrites `extra` and `hidden` entries in `agent.toml` that name the old
+    /// path to the new one, adding the new path to `extra` when no root covers it.
+    /// Refused unless the migration is in the deleting state.
     Delete,
     /// Both stay: the old path is added to `hidden` in `agent.toml`, so its gem goes,
     /// and the new path to `extra` when no root covers it. The old transcripts stay.
-    /// Refused when the checks failed, since then there is no copy to keep.
+    /// Refused when the checks failed, since then there is no copy to keep, and in the
+    /// deleting state.
     Keep,
-    /// The copy is deleted, and the transcripts copied for it. The original is as it
-    /// was.
+    /// The copy is deleted, and the transcripts copied for it that are unchanged since.
+    /// The original is as it was. Refused in the deleting state, when the original
+    /// folder is gone (the copy is then the only one), and when the placed copy
+    /// changed since it was checked (it may hold work of yours).
     Discard,
 }
 
 /// The result of `migrateRecheck`: what changed in the original since the copy was last
-/// checked, and the agents running in it. Both empty means the original may go.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// checked, what of it could not be read, whether the placed copy is still as checked,
+/// and the agents running in the original. Paths are relative and sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Recheck {
-    /// Paths relative to the original, changed, added or removed, sorted.
+    /// Paths modified or added in the original since the last check. A folder whose
+    /// time alone changed is not listed.
     pub changed: Vec<String>,
+    /// Paths gone from the original since the last check (never paths that merely
+    /// could not be read). Still in the copy, so deleting the rest loses nothing.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// Paths of the original that could not be read (`"."` for the folder itself), so
+    /// whether they changed is unknown.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
+    /// Paths of the placed copy that differ from it as last checked (after the
+    /// install), added or removed since, or that could not be read; `["."]` when the
+    /// copy is gone.
+    #[serde(default)]
+    pub copy_changed: Vec<String>,
     /// One sentence per `claude` process whose working directory is the original or
     /// inside it, naming its pid, folder and session when known.
     pub busy_agents: Vec<String>,
+    /// The original folder itself is gone. The lists about it are then empty.
+    #[serde(default)]
+    pub source_missing: bool,
+}
+
+impl Recheck {
+    /// True when deleting (the rest of) the original loses nothing: nothing changed or
+    /// unreadable in it, the copy as checked, and no agent running in it. Removed
+    /// paths and a missing original are fine, since the copy still holds them.
+    pub fn safe(&self) -> bool {
+        self.changed.is_empty()
+            && self.unreadable.is_empty()
+            && self.copy_changed.is_empty()
+            && self.busy_agents.is_empty()
+    }
+}
+
+/// The result of `migrateBeginDelete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginDelete {
+    /// [`Recheck::safe`]: the migration is now in the deleting state, and the app may
+    /// recycle or delete the original. False leaves the state as it was.
+    pub ok: bool,
+    pub recheck: Recheck,
 }
 
 /// A migration whose report waits for `migrateFinish`.
@@ -378,6 +438,10 @@ pub struct Recheck {
 pub struct PendingMigration {
     pub id: String,
     pub report: Box<Report>,
+    /// In the deleting state (see [`Method::MigrateBeginDelete`]): only
+    /// `migrateFinish` `delete` ends it.
+    #[serde(default)]
+    pub deleting: bool,
 }
 
 /// Params of `stopAgent`: the repo (as `getRepo` takes it) and the live session to
@@ -658,9 +722,8 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     };
     let takes_params = match method {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
-        | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateResync" | "stopAgent" => {
-            true
-        }
+        | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateBeginDelete"
+        | "migrateResync" | "stopAgent" => true,
         "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
         | "shutdown" | "migratePending" => false,
         _ => {
@@ -1177,9 +1240,14 @@ mod tests {
                 ..usage()
             }),
             Reply::Migration(MigrationTicket { id: "m-1".into() }),
-            Reply::Recheck(Recheck {
-                changed: vec![],
-                busy_agents: vec![],
+            Reply::Recheck(Recheck::default()),
+            Reply::BeginDelete(BeginDelete {
+                ok: true,
+                recheck: Recheck {
+                    removed: vec!["notes.txt".into()],
+                    source_missing: true,
+                    ..Recheck::default()
+                },
             }),
             Reply::PendingMigrations(vec![]),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
@@ -1458,6 +1526,7 @@ mod tests {
             copy_totals: Default::default(),
             install: vec![],
             install_changes: Default::default(),
+            install_backup: None,
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
@@ -1479,6 +1548,7 @@ mod tests {
     fn migration_follow_up_messages_round_trip() {
         for (method, value) in [
             ("migrateRecheck", json!({"id": "m-1"})),
+            ("migrateBeginDelete", json!({"id": "m-1"})),
             ("migrateResync", json!({"id": "m-1"})),
         ] {
             let line = json!({"id": 1, "method": method, "params": value}).to_string();
@@ -1486,6 +1556,7 @@ mod tests {
             let params = MigrateIdParams { id: "m-1".into() };
             let expected = match method {
                 "migrateRecheck" => Method::MigrateRecheck(params),
+                "migrateBeginDelete" => Method::MigrateBeginDelete(params),
                 _ => Method::MigrateResync(params),
             };
             assert_eq!(request.method, expected);
@@ -1511,24 +1582,64 @@ mod tests {
             5,
             Reply::Recheck(Recheck {
                 changed: vec!["notes.txt".into()],
+                removed: vec!["old.txt".into()],
+                unreadable: vec!["locked".into()],
+                copy_changed: vec!["."].into_iter().map(String::from).collect(),
                 busy_agents: vec![
                     "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes.".into()
                 ],
+                source_missing: false,
             }),
         ));
         assert_eq!(
             round_trip(&recheck),
-            json!({"id": 5, "result": {"changed": ["notes.txt"], "busyAgents": [
-                "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes."]}})
+            json!({"id": 5, "result": {"changed": ["notes.txt"], "removed": ["old.txt"],
+                "unreadable": ["locked"], "copyChanged": ["."], "busyAgents": [
+                "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes."],
+                "sourceMissing": false}})
         );
-        let empty = Message::Response(Response::ok(
-            6,
-            Reply::Recheck(Recheck {
-                changed: vec![],
-                busy_agents: vec![],
+        let empty = Message::Response(Response::ok(6, Reply::Recheck(Recheck::default())));
+        round_trip(&empty);
+        assert!(Recheck::default().safe());
+        let gone = Recheck {
+            removed: vec!["a".into()],
+            source_missing: true,
+            ..Recheck::default()
+        };
+        assert!(gone.safe());
+        for unsafe_one in [
+            Recheck {
+                changed: vec!["a".into()],
+                ..Recheck::default()
+            },
+            Recheck {
+                unreadable: vec!["a".into()],
+                ..Recheck::default()
+            },
+            Recheck {
+                copy_changed: vec![".".into()],
+                ..Recheck::default()
+            },
+            Recheck {
+                busy_agents: vec!["x".into()],
+                ..Recheck::default()
+            },
+        ] {
+            assert!(!unsafe_one.safe(), "{unsafe_one:?}");
+        }
+        let begin = Message::Response(Response::ok(
+            8,
+            Reply::BeginDelete(BeginDelete {
+                ok: false,
+                recheck: Recheck {
+                    changed: vec!["notes.txt".into()],
+                    ..Recheck::default()
+                },
             }),
         ));
-        round_trip(&empty);
+        let value = round_trip(&begin);
+        assert_eq!(value["result"]["ok"], false);
+        assert_eq!(value["result"]["recheck"]["changed"][0], "notes.txt");
 
         let report = Report {
             version: crate::migrate::report::REPORT_VERSION,
@@ -1545,6 +1656,7 @@ mod tests {
             copy_totals: Default::default(),
             install: vec![],
             install_changes: Default::default(),
+            install_backup: None,
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
@@ -1554,6 +1666,7 @@ mod tests {
             vec![PendingMigration {
                 id: "m-1".into(),
                 report: Box::new(report),
+                deleting: true,
             }],
         ] {
             let pending = Message::Response(Response::ok(7, Reply::PendingMigrations(migrations)));
