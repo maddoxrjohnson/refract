@@ -63,6 +63,8 @@ pub struct RepoState {
     /// Status hook statuses of this repo's sessions, by session id.
     pub hooks: HashMap<String, HookReport>,
     pub snapshot: RepoSnapshot,
+    /// What the repo was on disk when it was first read.
+    pub id: Option<scan::RepoId>,
 }
 
 impl RepoState {
@@ -217,18 +219,25 @@ impl Agent {
     }
 
     /// Finds repos again, adding new ones and dropping vanished ones. Returns the
-    /// events and the paths that were added, so the caller can watch them.
+    /// events, the paths that were added, so the caller can watch them, and the paths
+    /// that were removed, so it can forget their watches.
+    ///
+    /// A repo put in place of another at the same path (the old one moved away or
+    /// deleted, another copied or cloned there) is both removed and added: its watches
+    /// still point at the old directories. It is reported as removed only if it cannot
+    /// be read.
     pub fn rescan(&mut self) -> (Vec<Event>, Vec<PathBuf>, Vec<PathBuf>) {
         let found: Vec<PathBuf> = scan::find_repos(&self.config);
-        let removed: Vec<PathBuf> = self
+        let replaced: Vec<PathBuf> = found
+            .iter()
+            .filter(|p| self.repos.get(*p).is_some_and(|r| r.id != scan::repo_id(p)))
+            .cloned()
+            .collect();
+        let mut removed: Vec<PathBuf> = self
             .repos
             .keys()
             .filter(|p| !found.contains(p))
             .cloned()
-            .collect();
-        let added: Vec<PathBuf> = found
-            .into_iter()
-            .filter(|p| !self.repos.contains_key(p))
             .collect();
         let mut events = Vec::new();
         for path in &removed {
@@ -237,6 +246,13 @@ impl Agent {
                 path: path_str(path),
             });
         }
+        for path in &replaced {
+            self.repos.remove(path);
+        }
+        let added: Vec<PathBuf> = found
+            .into_iter()
+            .filter(|p| !self.repos.contains_key(p))
+            .collect();
         if !added.is_empty() {
             self.procs = procs::scan();
         }
@@ -247,12 +263,20 @@ impl Agent {
                     self.insert(path.clone(), status, head);
                     inserted.push(path.clone());
                 }
-                Err(e) => eprintln!("refract-agent: skipping {}: {e}", path.display()),
+                Err(e) => {
+                    eprintln!("refract-agent: skipping {}: {e}", path.display());
+                    if replaced.contains(path) {
+                        events.push(Event::RepoRemoved {
+                            path: path_str(path),
+                        });
+                    }
+                }
             }
         }
         let moved = self.update_masses();
         events.extend(self.repo_events(inserted.iter()));
         events.extend(self.repo_events(moved.iter().filter(|p| !inserted.contains(p))));
+        removed.extend(replaced);
         (events, inserted, removed)
     }
 
@@ -345,7 +369,9 @@ impl Agent {
         sessions: Vec<SessionSummary>,
         live: HashSet<String>,
     ) {
-        let mass = self.repos.get(&path).map_or(0.0, |r| r.snapshot.mass);
+        let old = self.repos.get(&path);
+        let mass = old.map_or(0.0, |r| r.snapshot.mass);
+        let id = old.map_or_else(|| scan::repo_id(&path), |r| r.id);
         let hooks = hooks_for(&self.hooks, &sessions);
         let mut snapshot =
             build_snapshot(&path, &status, &head, &sessions, &live, &hooks, Utc::now());
@@ -359,6 +385,7 @@ impl Agent {
                 live,
                 hooks,
                 snapshot,
+                id,
             },
         );
     }

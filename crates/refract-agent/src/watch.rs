@@ -12,9 +12,10 @@
 //! `refs/remotes` with their subdirectories (in the common git directory for linked
 //! worktrees), and every working-tree directory that holds tracked files. Also watched:
 //! Claude Code's `projects` directory, the project directory of each repo, every
-//! directory the repo search walks (for repos appearing or vanishing), the git directory
-//! of each repo the search found but git could not read yet (for it becoming readable),
-//! and the status hook's directory of status files.
+//! directory the repo search walks (for repos appearing or vanishing), the directory and
+//! git directory of each repo the search found but git could not read yet (for it
+//! becoming readable; the server also tries such a repo again on a timer, see
+//! [`crate::server::RETRY_DELAYS`]), and the status hook's directory of status files.
 //!
 //! Re-watching a repo only adds and removes the directories that differ, so events
 //! already queued for unchanged watches still map to their repo. When the kernel drops a
@@ -62,8 +63,11 @@ pub enum Target {
         descend: bool,
     },
     /// The git directory of a repo the search found but git could not read yet, such as
-    /// one `git init` or a copy is still writing. Any change in it searches again.
-    UnreadGitDir,
+    /// one `git init` or a copy is still writing. A change in it tries the repo again.
+    UnreadGitDir(PathBuf),
+    /// The directory of such a repo, for its `.git` being written, replaced or removed,
+    /// also when that is a file that does not name a git directory yet.
+    UnreadRepo(PathBuf),
     /// The status hook's directory of `<session id>.json` files.
     HookDir,
 }
@@ -90,6 +94,8 @@ pub enum Change {
     Hook(String),
     /// A project directory appeared.
     NewProjectDir(String),
+    /// Something changed in a repo git could not read; it may be readable now.
+    Retry(PathBuf),
     /// Repos may have appeared or vanished.
     Rescan,
     /// Events were lost; reload everything.
@@ -250,8 +256,8 @@ impl Watcher {
     }
 
     /// Watches the directories the repo search walked (see [`crate::scan::Walk`]) for
-    /// directories and `.git` appearing or vanishing, and the git directories of repos it
-    /// found but git could not read (`unread`), replacing the previous sets.
+    /// directories and `.git` appearing or vanishing, and the repos it found but git
+    /// could not read (`unread`) and their git directories, replacing the previous sets.
     ///
     /// Returns true when it watched a directory that was not watched before. What changed
     /// there between the search and the watch was not seen, so the caller searches again.
@@ -265,19 +271,34 @@ impl Watcher {
             .iter()
             .map(|(dir, descend)| (dir.clone(), mask, Target::ScanDir { descend: *descend }))
             .collect();
-        let mask = WatchMask::CREATE
+        // `ATTRIB`: a `chmod` or `chown` can make a repo readable.
+        let repo_mask = WatchMask::CREATE
             | WatchMask::CLOSE_WRITE
             | WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::DELETE
+            | WatchMask::ATTRIB
+            | WatchMask::ONLYDIR;
+        let git_mask = WatchMask::CREATE
+            | WatchMask::CLOSE_WRITE
+            | WatchMask::MOVED_TO
+            | WatchMask::ATTRIB
             | WatchMask::DELETE_SELF
             | WatchMask::MOVE_SELF
             | WatchMask::ONLYDIR;
-        wanted.extend(
-            unread
-                .iter()
-                .map(|dir| (dir.clone(), mask, Target::UnreadGitDir)),
-        );
+        for repo in unread {
+            wanted.push((repo.clone(), repo_mask, Target::UnreadRepo(repo.clone())));
+            if let Some(git_dir) = crate::scan::git_dir(repo) {
+                wanted.push((git_dir, git_mask, Target::UnreadGitDir(repo.clone())));
+            }
+        }
         self.sync(
-            |t| matches!(t, Target::ScanDir { .. } | Target::UnreadGitDir),
+            |t| {
+                matches!(
+                    t,
+                    Target::ScanDir { .. } | Target::UnreadGitDir(_) | Target::UnreadRepo(_)
+                )
+            },
             wanted,
         )
     }
@@ -486,7 +507,24 @@ pub fn change_for(
                 *descend && mask.contains(EventMask::ISDIR) && !crate::scan::is_skipped(name);
             (new_repo || new_dir).then_some(Change::Rescan)
         }
-        Target::UnreadGitDir => (gone || name.is_some()).then_some(Change::Rescan),
+        Target::UnreadGitDir(repo) => {
+            if gone {
+                return Some(Change::Rescan);
+            }
+            // Lock files come before the rename that matters, and a fetch or the reflog
+            // does not make a repo readable.
+            let noise = |n: &str| n.ends_with(".lock") || n == "FETCH_HEAD" || n == "logs";
+            let attrib = name.is_none() && mask.contains(EventMask::ATTRIB);
+            (attrib || name.is_some_and(|n| !noise(n))).then(|| Change::Retry(repo.clone()))
+        }
+        // Without a `.git` the directory is no repo, and the search walks it again.
+        Target::UnreadRepo(repo) => (name? == ".git").then(|| {
+            if mask.intersects(EventMask::DELETE | EventMask::MOVED_FROM) {
+                Change::Rescan
+            } else {
+                Change::Retry(repo.clone())
+            }
+        }),
         // The script writes a temporary file and renames it, so only `.json` names
         // matter; a name that is no session id is skipped when read.
         Target::HookDir => name
@@ -639,18 +677,37 @@ mod tests {
             change(leaf, EventMask::CREATE, ".git"),
             Some(Change::Rescan)
         );
-        // In a git directory git could not read yet, anything written searches again.
-        let unread = Target::UnreadGitDir;
+        // In a git directory git could not read yet, what is written tries it again.
+        let retry = Some(Change::Retry(repo()));
+        let unread = Target::UnreadGitDir(repo());
+        assert_eq!(change(unread.clone(), EventMask::MOVED_TO, "HEAD"), retry);
+        assert_eq!(change(unread.clone(), dir, "objects"), retry);
+        assert_eq!(change(unread.clone(), EventMask::ATTRIB, "config"), retry);
+        assert_eq!(change_for(&unread, EventMask::ATTRIB, None), retry);
+        assert_eq!(change(unread.clone(), EventMask::CREATE, "HEAD.lock"), None);
         assert_eq!(
-            change(unread.clone(), EventMask::MOVED_TO, "HEAD"),
-            Some(Change::Rescan)
+            change(unread.clone(), EventMask::CLOSE_WRITE, "FETCH_HEAD"),
+            None
         );
-        assert_eq!(change(unread.clone(), dir, "objects"), Some(Change::Rescan));
+        assert_eq!(change(unread.clone(), dir, "logs"), None);
         assert_eq!(
             change_for(&unread, EventMask::DELETE_SELF, None),
             Some(Change::Rescan)
         );
         assert_eq!(change_for(&unread, EventMask::IGNORED, None), None);
+        // In its directory only `.git` matters; without one it is no repo.
+        let unread = Target::UnreadRepo(repo());
+        assert_eq!(
+            change(unread.clone(), EventMask::CLOSE_WRITE, ".git"),
+            retry
+        );
+        assert_eq!(change(unread.clone(), EventMask::MOVED_TO, ".git"), retry);
+        assert_eq!(change(unread.clone(), EventMask::ATTRIB, ".git"), retry);
+        assert_eq!(
+            change(unread.clone(), EventMask::DELETE, ".git"),
+            Some(Change::Rescan)
+        );
+        assert_eq!(change(unread, EventMask::CLOSE_WRITE, "README.md"), None);
     }
 
     #[test]
@@ -747,13 +804,31 @@ mod tests {
     }
 
     #[test]
+    fn an_unread_repo_is_tried_again_after_a_chmod() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let kelp = tmp.path().join("kelp-cli");
+        fs::create_dir_all(kelp.join(".git")).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = start(move |batch| tx.send(batch).is_ok()).unwrap();
+        watcher.watch_scan_dirs(&[], std::slice::from_ref(&kelp));
+        let mode = fs::Permissions::from_mode(0o700);
+        fs::set_permissions(kelp.join(".git"), mode).unwrap();
+        let changes: Vec<Change> = fs_events(&rx)
+            .iter()
+            .flat_map(|e| watcher.changes(e))
+            .collect();
+        assert!(changes.contains(&Change::Retry(kelp)), "{changes:?}");
+    }
+
+    #[test]
     fn scan_dirs_report_only_new_watches() {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_owned();
         let group = root.join("group");
-        let git = root.join("kelp-cli/.git");
+        let kelp = root.join("kelp-cli");
         fs::create_dir_all(&group).unwrap();
-        fs::create_dir_all(&git).unwrap();
+        fs::create_dir_all(kelp.join(".git")).unwrap();
         let mut watcher = start(|_| true).unwrap();
         let dirs = vec![(root.clone(), true)];
         assert!(watcher.watch_scan_dirs(&dirs, &[]));
@@ -764,9 +839,18 @@ mod tests {
         let dirs = vec![(root.clone(), true), (group.clone(), true)];
         assert!(!watcher.watch_scan_dirs(&dirs, &[]));
 
-        assert!(watcher.watch_scan_dirs(&dirs, std::slice::from_ref(&git)));
-        assert!(!watcher.watch_scan_dirs(&dirs, std::slice::from_ref(&git)));
-        assert!(!watcher.watch_scan_dirs(&dirs, &[root.join("missing/.git")]));
+        // A repo git cannot read: its directory and its git directory.
+        let unread = std::slice::from_ref(&kelp);
+        assert!(watcher.watch_scan_dirs(&dirs, unread));
+        assert_eq!(watcher.len(), 4);
+        assert!(!watcher.watch_scan_dirs(&dirs, unread));
+        assert!(!watcher.watch_scan_dirs(&dirs, &[root.join("missing")]));
         assert_eq!(watcher.len(), 2);
+
+        // A `.git` file that names no git directory yet: the directory alone.
+        fs::remove_dir(kelp.join(".git")).unwrap();
+        fs::write(kelp.join(".git"), "").unwrap();
+        assert!(watcher.watch_scan_dirs(&dirs, unread));
+        assert_eq!(watcher.len(), 3);
     }
 }

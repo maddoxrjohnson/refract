@@ -2,7 +2,9 @@
 //!
 //! Three threads: one reads stdin, one reads inotify, and this one owns all state and is
 //! the only writer to stdout. It blocks on a channel, waking only for input, for a
-//! debounce deadline, or for the liveness timer while some session is live or recent.
+//! debounce deadline, for the liveness timer while some session is live or recent, or
+//! to try again a repo git could not read (a few times, and once a change in it has
+//! settled; see [`RETRY_DELAYS`] and [`RETRY_QUIET`]).
 //! A fourth thread runs the first load, so requests are answered while it runs, a
 //! fifth runs `setupServer` requests one at a time, sending each response back through
 //! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
@@ -50,6 +52,29 @@ pub const MAX_DELAY: Duration = Duration::from_millis(1500);
 
 /// How often running processes are checked while a session is live or recent.
 pub const LIVE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long after the search first found a repo git could not read, and after each timed
+/// retry of it that failed, it is tried again with nothing prompting it: three times,
+/// then no more. A change in the repo prompts a try of its own (see [`RETRY_QUIET`]).
+pub const RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(2),
+    Duration::from_secs(10),
+    Duration::from_secs(60),
+];
+
+/// Quiet time after the last change in a repo git could not read before the change
+/// prompts a try, so a copy is tried once it is done rather than while it runs.
+pub const RETRY_QUIET: Duration = Duration::from_secs(2);
+
+/// Longest a change in such a repo waits for quiet while changes keep coming. Once
+/// [`BUSY_FAILURES`] tries prompted by changes have failed in a row, also the least time
+/// between such tries, so a busy repo git can never read (owned by another user, from a
+/// newer git) is tried about once a minute while written, and not at all while idle.
+pub const RETRY_MAX_WAIT: Duration = Duration::from_secs(60);
+
+/// Failed tries prompted by changes, in a row, after which they are spaced by
+/// [`RETRY_MAX_WAIT`].
+const BUSY_FAILURES: usize = 3;
 
 /// Longest request line accepted; longer ones are discarded and answered with an error.
 pub const MAX_LINE: usize = 1024 * 1024;
@@ -101,6 +126,8 @@ struct Pending {
     rewatch: HashSet<PathBuf>,
     /// Status hook files written or removed.
     hook_files: HashSet<String>,
+    /// Repos git could not read that changed.
+    retry: HashSet<PathBuf>,
     rescan: bool,
     reload: bool,
     first: Option<Instant>,
@@ -126,6 +153,9 @@ impl Pending {
             Change::Hook(name) => {
                 self.hook_files.insert(name);
             }
+            Change::Retry(path) => {
+                self.retry.insert(path);
+            }
             Change::Rescan => self.rescan = true,
             Change::Overflow => self.reload = true,
         }
@@ -139,6 +169,89 @@ impl Pending {
 
     fn deadline(&self) -> Option<Instant> {
         Some((self.last? + DEBOUNCE).min(self.first? + MAX_DELAY))
+    }
+}
+
+/// A repo the search found but git could not read, and when to try it again. Timed
+/// retries ([`RETRY_DELAYS`]) and tries prompted by changes ([`RETRY_QUIET`],
+/// [`RETRY_MAX_WAIT`]) are counted apart, and a search made for any other reason counts
+/// for neither, so none of them puts off a try a change asks for.
+#[derive(Debug, Default)]
+struct Unread {
+    /// Timed retries that failed in a row, the first sighting included.
+    failures: usize,
+    /// The next timed retry, while any are left.
+    retry_at: Option<Instant>,
+    /// The first and the last change not tried for yet.
+    changes: Option<(Instant, Instant)>,
+    /// Tries prompted by changes that failed in a row, and when the last one began.
+    change_failures: usize,
+    change_tried: Option<Instant>,
+    /// What the coming search tries the repo for: its timer, its changes.
+    trying: (bool, bool),
+}
+
+impl Unread {
+    /// A repo a search found and could not read.
+    fn new(now: Instant) -> Unread {
+        Unread {
+            failures: 1,
+            retry_at: Some(now + RETRY_DELAYS[0]),
+            ..Unread::default()
+        }
+    }
+
+    /// Takes in a change in the repo.
+    fn changed(&mut self, now: Instant) {
+        let first = self.changes.map_or(now, |(first, _)| first);
+        self.changes = Some((first, now));
+    }
+
+    /// When the changes not tried for yet prompt a try.
+    fn change_at(&self) -> Option<Instant> {
+        let (first, last) = self.changes?;
+        let at = (last + RETRY_QUIET).min(first + RETRY_MAX_WAIT);
+        match self.change_tried {
+            Some(tried) if self.change_failures >= BUSY_FAILURES => {
+                Some(at.max(tried + RETRY_MAX_WAIT))
+            }
+            _ => Some(at),
+        }
+    }
+
+    /// When the repo is next tried, if ever.
+    fn next(&self) -> Option<Instant> {
+        [self.retry_at, self.change_at()]
+            .into_iter()
+            .flatten()
+            .min()
+    }
+
+    /// Notes the tries due by `now`, for the search about to run. True if any are.
+    fn start(&mut self, now: Instant) -> bool {
+        if self.retry_at.is_some_and(|at| at <= now) {
+            self.retry_at = None;
+            self.trying.0 = true;
+        }
+        if self.change_at().is_some_and(|at| at <= now) {
+            self.changes = None;
+            self.change_tried = Some(now);
+            self.trying.1 = true;
+        }
+        self.trying.0 || self.trying.1
+    }
+
+    /// Takes in a search that could not read the repo. Only the tries it was started for
+    /// count.
+    fn failed(&mut self, now: Instant) {
+        let (timed, changed) = std::mem::take(&mut self.trying);
+        if timed {
+            self.failures += 1;
+            self.retry_at = RETRY_DELAYS.get(self.failures - 1).map(|d| now + *d);
+        }
+        if changed {
+            self.change_failures += 1;
+        }
     }
 }
 
@@ -168,6 +281,8 @@ struct Server<W: Write> {
     /// A rescan or reload asked for during the load, run once it is done.
     deferred_rescan: bool,
     deferred_reload: bool,
+    /// Repos the search found but git could not read, by path.
+    unread: HashMap<PathBuf, Unread>,
     /// Token usage, kept up to date by its own thread.
     usage: Usage,
 }
@@ -199,32 +314,17 @@ where
             None
         }
     };
-    let usage = Usage::start(config.claude_projects.clone());
-    let mut server = Server {
-        out,
-        agent: Agent::new(config),
-        watcher,
-        pending: Pending::default(),
-        next_live: None,
-        load: Load::NotStarted,
-        tx,
-        setup_jobs: None,
-        clone_jobs: None,
-        added_extra: Vec::new(),
-        unhidden: Vec::new(),
-        touched: HashMap::new(),
-        waiting: Vec::new(),
-        prewatched: Vec::new(),
-        deferred_rescan: false,
-        deferred_reload: false,
-        usage,
-    };
+    let mut server = Server::new(config, out, watcher, tx);
 
     loop {
-        let deadline = [server.pending.deadline(), server.next_live]
-            .into_iter()
-            .flatten()
-            .min();
+        let deadline = [
+            server.pending.deadline(),
+            server.next_live,
+            server.next_retry(),
+        ]
+        .into_iter()
+        .flatten()
+        .min();
         let msg = match deadline {
             Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -243,6 +343,9 @@ where
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
+        if server.next_retry().is_some_and(|d| d <= now) {
+            server.retry_due(now);
+        }
         if server.pending.deadline().is_some_and(|d| d <= now) {
             server.flush()?;
         }
@@ -339,6 +442,30 @@ fn hook_response(id: Id, result: Result<HookInfo, String>) -> Response {
 }
 
 impl<W: Write> Server<W> {
+    fn new(config: Config, out: W, watcher: Option<Watcher>, tx: SyncSender<Msg>) -> Server<W> {
+        let usage = Usage::start(config.claude_projects.clone());
+        Server {
+            out,
+            agent: Agent::new(config),
+            watcher,
+            pending: Pending::default(),
+            next_live: None,
+            load: Load::NotStarted,
+            tx,
+            setup_jobs: None,
+            clone_jobs: None,
+            added_extra: Vec::new(),
+            unhidden: Vec::new(),
+            touched: HashMap::new(),
+            waiting: Vec::new(),
+            prewatched: Vec::new(),
+            deferred_rescan: false,
+            deferred_reload: false,
+            unread: HashMap::new(),
+            usage,
+        }
+    }
+
     /// Handles one request line. Returns false when the helper should exit.
     fn handle_line(&mut self, line: Line) -> io::Result<bool> {
         let (text, utf8) = match line {
@@ -750,24 +877,52 @@ impl<W: Write> Server<W> {
         Ok(())
     }
 
-    /// Watches the directories the repo search walks, and the git directories of repos
-    /// it finds that git could not read (`git init` or a copy may still be writing
-    /// them), so that a change in either searches again. When that adds a watch, searches
-    /// once more: what changed in the directory before it was watched was not seen.
+    /// Watches the directories the repo search walks, and the repos it finds that git
+    /// could not read (`git init` or a copy may still be writing them) with their git
+    /// directories, so that a change in either tries it again. Call after each search:
+    /// it also takes in the failed reads that set when such a repo is tried again (see
+    /// [`Unread`]). When it adds a watch, it searches once more: what changed in the
+    /// directory before it was watched was not seen.
     fn watch_search(&mut self) {
-        let Some(watcher) = &mut self.watcher else {
-            return;
-        };
+        let now = Instant::now();
         let walk = scan::walk_roots(self.agent.config());
         let unread: Vec<PathBuf> = walk
             .repos
-            .iter()
+            .into_iter()
             .filter(|repo| self.agent.repo(repo).is_none())
-            .filter_map(|repo| scan::git_dir(repo))
             .collect();
+        self.unread.retain(|repo, _| unread.contains(repo));
+        for repo in &unread {
+            match self.unread.get_mut(repo) {
+                Some(known) => known.failed(now),
+                None => {
+                    self.unread.insert(repo.clone(), Unread::new(now));
+                }
+            }
+        }
+        let Some(watcher) = &mut self.watcher else {
+            return;
+        };
         if watcher.watch_scan_dirs(&walk.dirs, &unread) {
             self.pending.rescan = true;
-            self.pending.touch(Instant::now());
+            self.pending.touch(now);
+        }
+    }
+
+    /// When a repo git could not read is next tried.
+    fn next_retry(&self) -> Option<Instant> {
+        self.unread.values().filter_map(Unread::next).min()
+    }
+
+    /// Searches again for the repos git could not read that are due a try.
+    fn retry_due(&mut self, now: Instant) {
+        let mut due = false;
+        for unread in self.unread.values_mut() {
+            due |= unread.start(now);
+        }
+        if due {
+            self.pending.rescan = true;
+            self.pending.touch(now);
         }
     }
 
@@ -839,11 +994,22 @@ impl<W: Write> Server<W> {
         let mut events = Vec::new();
         let mut refresh = pending.repos;
 
+        // A change in a repo git could not read prompts a try once the repo is quiet
+        // (see `Unread`); one the search has not taken in yet, at once.
+        let now = Instant::now();
+        let mut rescan = pending.rescan;
+        for repo in &pending.retry {
+            match self.unread.get_mut(repo) {
+                Some(unread) => unread.changed(now),
+                None => rescan = true,
+            }
+        }
+
         if loading {
             // The loaded phases replace the repo list; rescan once they are in.
-            self.deferred_rescan |= pending.rescan;
+            self.deferred_rescan |= rescan;
             self.deferred_reload |= pending.reload;
-        } else if pending.rescan || pending.reload {
+        } else if rescan || pending.reload {
             let (found, added, removed) = self.agent.rescan();
             events.extend(found);
             self.forget_repos(&removed);
@@ -993,6 +1159,7 @@ fn run_clone_jobs(
 mod tests {
     use super::*;
     use std::io::Cursor;
+    use std::process::Command;
 
     #[test]
     fn a_panicking_setup_job_is_answered_and_the_worker_goes_on() {
@@ -1058,6 +1225,144 @@ mod tests {
         assert_eq!(lines(&input), [Line::TooLong, Line::Text("ping".into())]);
         let exact = vec![b'y'; MAX_LINE];
         assert!(matches!(&lines(&exact)[..], [Line::Text(t)] if t.len() == MAX_LINE));
+    }
+
+    /// Runs the server's side of [`Unread`] over `from..to` milliseconds after `t`, a step
+    /// of `step` at a time, with a change in the repo at each step `changes` is true for,
+    /// and a search that fails 300 ms after each try. Returns when each try began, in
+    /// seconds.
+    fn tries(
+        unread: &mut Unread,
+        t: Instant,
+        (from, to, step): (u64, u64, u64),
+        changes: impl Fn(u64) -> bool,
+    ) -> Vec<f64> {
+        let mut tries = Vec::new();
+        let mut searching = None;
+        for ms in (from..to).step_by(step as usize) {
+            let at = t + Duration::from_millis(ms);
+            if changes(ms) {
+                unread.changed(at);
+            }
+            if searching.is_some_and(|began| ms >= began + 300) {
+                unread.failed(at);
+                searching = None;
+            }
+            if searching.is_none() && unread.next().is_some_and(|next| next <= at) {
+                assert!(unread.start(at));
+                tries.push(ms as f64 / 1000.0);
+                searching = Some(ms);
+            }
+        }
+        tries
+    }
+
+    #[test]
+    fn timed_retries_back_off_and_stop() {
+        let t = Instant::now();
+        let s = Duration::from_secs;
+        let mut unread = Unread::new(t);
+        assert_eq!(unread.next(), Some(t + s(2)));
+        // A search made for another reason counts for nothing.
+        unread.failed(t + s(1));
+        assert_eq!(unread.next(), Some(t + s(2)));
+        let seen = tries(&mut unread, t, (0, 200_000, 50), |_| false);
+        assert_eq!(seen, [2.0, 12.3, 72.6]);
+        assert_eq!(unread.next(), None);
+    }
+
+    #[test]
+    fn a_change_is_tried_once_the_repo_is_quiet() {
+        let t = Instant::now();
+        let mut unread = Unread::new(t);
+        // The timed retries have grown long when a copy ends at 20 s with a burst of
+        // writes: the try comes 2 s after the last one, not at the next timed retry.
+        let seen = tries(&mut unread, t, (0, 19_000, 50), |_| false);
+        assert_eq!(seen, [2.0, 12.3]);
+        let copy = |ms| (20_000..20_500).contains(&ms);
+        assert_eq!(tries(&mut unread, t, (19_000, 30_000, 50), copy), [22.45]);
+        // A failed try prompted by a change does not put off the next change.
+        let more = |ms| ms == 40_000 || ms == 50_000;
+        assert_eq!(
+            tries(&mut unread, t, (30_000, 60_000, 50), more),
+            [42.0, 52.0]
+        );
+    }
+
+    #[test]
+    fn a_busy_repo_git_cannot_read_is_tried_about_once_a_minute() {
+        // Written every quarter second for five minutes, then left alone: after the timed
+        // retries, a minute between tries, and one last try once the writes stop.
+        let t = Instant::now();
+        let mut unread = Unread::new(t);
+        let seen = tries(&mut unread, t, (0, 400_000, 250), |ms| ms < 300_000);
+        assert_eq!(seen[..4], [2.0, 12.5, 60.0, 73.0]);
+        assert!(
+            seen[3..].windows(2).all(|w| w[1] - w[0] >= 47.0),
+            "{seen:?}"
+        );
+        assert!(seen.len() <= 8, "{seen:?}");
+        assert!(*seen.last().unwrap() <= 302.0, "{seen:?}");
+        assert_eq!(unread.next(), None);
+
+        // Written in bursts with pauses: three tries for bursts, then, once the timed
+        // retries are over too, a minute between them.
+        let mut unread = Unread::new(t);
+        let bursts = |ms| ms % 5_000 < 500;
+        let seen = tries(&mut unread, t, (100_000, 400_000, 250), bursts);
+        assert_eq!(seen[..5], [100.0, 102.25, 107.25, 110.5, 112.25]);
+        let late: Vec<f64> = seen.into_iter().filter(|s| *s > 180.0).collect();
+        assert!(late.windows(2).all(|w| w[1] - w[0] >= 60.0), "{late:?}");
+        assert!(late.len() <= 4, "{late:?}");
+    }
+
+    #[test]
+    fn a_change_in_a_repo_git_cannot_read_waits_for_quiet() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("projects");
+        let kelp = root.join("kelp-cli");
+        std::fs::create_dir_all(kelp.join(".git")).unwrap();
+        let projects = tmp.path().join("claude/projects");
+        std::fs::create_dir_all(&projects).unwrap();
+        let config = Config {
+            roots: vec![root.clone()],
+            extra: vec![],
+            hidden: vec![],
+            depth: 3,
+            claude_projects: projects,
+        };
+        let (tx, _rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
+        let mut server = Server::new(config, Vec::new(), None, tx);
+        server.load = Load::Done;
+        // The search found kelp-cli and git could not read it.
+        server.watch_search();
+        // A repo only a search would find.
+        let aurora = root.join("aurora-notes");
+        std::fs::create_dir_all(&aurora).unwrap();
+        let init = Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&aurora)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(init.success());
+
+        // A change in kelp-cli does not search at once.
+        server.pending.add(Change::Retry(kelp), Instant::now());
+        server.flush().unwrap();
+        assert!(
+            server.out.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&server.out)
+        );
+
+        // Once the repo has been quiet, it does.
+        let at = server.next_retry().unwrap();
+        assert!(at >= Instant::now() + RETRY_QUIET - Duration::from_millis(500));
+        server.retry_due(at);
+        server.flush().unwrap();
+        assert!(String::from_utf8_lossy(&server.out).contains("aurora-notes"));
     }
 
     #[test]

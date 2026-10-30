@@ -133,16 +133,23 @@ pub fn redact_userinfo(url: &str) -> String {
 }
 
 /// Runs git in `repo`. `Ok(None)` means git ran and exited non-zero.
+///
+/// Git looks no higher than `repo`: past a `.git` it cannot read yet, it would otherwise
+/// report the work tree around it, when a root lies inside one.
 fn git(repo: &Path, args: &[&str]) -> io::Result<Option<Vec<u8>>> {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("--no-optional-locks")
         .arg("-C")
         .arg(repo)
         .args(args)
         .env("GIT_OPTIONAL_LOCKS", "0")
         .env("GIT_TERMINAL_PROMPT", "0")
-        .stdin(std::process::Stdio::null())
-        .output()?;
+        .stdin(std::process::Stdio::null());
+    if let Some(parent) = repo.parent() {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    let out = command.output()?;
     Ok(out.status.success().then_some(out.stdout))
 }
 

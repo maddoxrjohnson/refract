@@ -108,7 +108,13 @@ impl Agent {
     /// Waits for an event matching `pred`.
     #[track_caller]
     fn event(&self, pred: impl Fn(&Value) -> bool) -> Value {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        self.event_within(Duration::from_secs(10), pred)
+    }
+
+    /// Waits at most `timeout` for an event matching `pred`.
+    #[track_caller]
+    fn event_within(&self, timeout: Duration, pred: impl Fn(&Value) -> bool) -> Value {
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             let message = self.next(left);
@@ -333,6 +339,130 @@ fn a_repo_git_cannot_read_yet_is_found_once_it_can() {
         let name = changed["data"]["name"].as_str().unwrap();
         missing.retain(|m| *m != name);
     }
+}
+
+#[test]
+fn a_repo_git_cannot_read_at_the_first_load_is_found_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let repo = root.join("kelp-cli");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    let mut agent = Agent::spawn(&home, &config);
+    let list = agent.list_when_loaded(1);
+    assert_eq!(list["result"]["repos"], json!([]));
+
+    init_repo(&repo);
+    agent.event(|e| e["event"] == "repoChanged" && e["data"]["name"] == "kelp-cli");
+}
+
+#[test]
+fn a_repo_copied_in_with_its_objects_last_is_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let seed = tmp.path().join("seed/kelp-cli");
+    init_repo(&seed);
+    git(&seed, &["gc", "-q"]);
+    let mut agent = Agent::spawn(&home, &config);
+    agent.list_when_loaded(1);
+
+    // A copy that writes `objects` last, as `cp -r` or `tar` may. When the search finds
+    // the repo its commit is missing, and the pack then lands in `objects/pack`, which
+    // nothing watches.
+    let repo = root.join("kelp-cli");
+    std::fs::create_dir_all(repo.join(".git")).unwrap();
+    copy_dir(&seed.join("src"), &repo.join("src"));
+    for entry in std::fs::read_dir(seed.join(".git")).unwrap() {
+        let entry = entry.unwrap();
+        let dest = repo.join(".git").join(entry.file_name());
+        if entry.file_name() == "objects" {
+            continue;
+        } else if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            std::fs::copy(entry.path(), dest).unwrap();
+        }
+    }
+    std::fs::create_dir(repo.join(".git/objects")).unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    copy_dir(&seed.join(".git/objects"), &repo.join(".git/objects"));
+    agent.event(|e| e["event"] == "repoChanged" && e["data"]["name"] == "kelp-cli");
+}
+
+#[test]
+fn a_repo_copied_in_is_found_soon_after_the_copy_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let seed = tmp.path().join("seed/kelp-cli");
+    init_repo(&seed);
+    git(&seed, &["gc", "-q"]);
+    let mut agent = Agent::spawn(&home, &config);
+    agent.list_when_loaded(1);
+
+    // A copy that is slow in `objects` and writes `refs` last: git cannot read the repo
+    // until then, and the timed retries have grown long by the time it can.
+    let repo = root.join("kelp-cli");
+    std::fs::create_dir_all(repo.join(".git/objects")).unwrap();
+    for name in ["HEAD", "config", "description", "index", "packed-refs"] {
+        std::fs::copy(seed.join(".git").join(name), repo.join(".git").join(name)).unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(4000));
+    copy_dir(&seed.join(".git/objects"), &repo.join(".git/objects"));
+    copy_dir(&seed.join(".git/refs"), &repo.join(".git/refs"));
+    agent.event_within(Duration::from_secs(5), |e| {
+        e["event"] == "repoChanged" && e["data"]["name"] == "kelp-cli"
+    });
+}
+
+#[test]
+fn a_repo_replaced_at_the_same_path_is_watched_anew() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let repo = root.join("kelp-cli");
+    init_repo(&repo);
+    let seed = tmp.path().join("seed/kelp-cli");
+    init_repo(&seed);
+    let mut agent = Agent::spawn(&home, &config);
+    agent.list_when_loaded(1);
+
+    // Moved away, with its watches, and another clone put in its place at once.
+    std::fs::rename(&repo, tmp.path().join("old-kelp-cli")).unwrap();
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            "-q",
+            seed.to_str().unwrap(),
+            repo.to_str().unwrap(),
+        ],
+    );
+    agent.event(|e| e["event"] == "repoChanged" && e["data"]["name"] == "kelp-cli");
+
+    write(&repo.join("src/main.rs"), "fn main() { todo!() }\n");
+    agent.event(|e| {
+        e["event"] == "repoChanged"
+            && e["data"]["name"] == "kelp-cli"
+            && e["data"]["changedFiles"] == 1
+    });
+}
+
+#[test]
+fn a_repo_git_cannot_read_does_not_report_the_work_tree_around_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+    // The root lies inside a work tree, and holds a `.git` git cannot read.
+    let outer = tmp.path().join("outer");
+    init_repo(&outer);
+    let root = outer.join("projects");
+    std::fs::create_dir_all(root.join("kelp-cli/.git")).unwrap();
+    let config = tmp.path().join("agent.toml");
+    write(
+        &config,
+        &format!("roots = [{:?}]\ndepth = 3\n", root.to_str().unwrap()),
+    );
+    let mut agent = Agent::spawn(&home, &config);
+    let list = agent.list_when_loaded(1);
+    assert_eq!(list["result"]["repos"], json!([]));
 }
 
 #[test]

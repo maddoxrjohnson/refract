@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use crate::config::Config;
@@ -112,6 +113,23 @@ pub fn under_roots(config: &Config, repo: &Path) -> bool {
 /// True when `dir` has a `.git` directory or file.
 pub fn is_repo(dir: &Path) -> bool {
     fs::symlink_metadata(dir.join(".git")).is_ok()
+}
+
+/// What a repo is on disk: the device and inode of its directory and of its `.git`.
+/// These change when another repo is put in its place, though the path stays.
+///
+/// This assumes stable inode numbers. Where they are not (overlayfs with `xino=off`,
+/// sshfs without `use_ino`, CIFS with `noserverino`), a search may take a repo for
+/// replaced and read it again, which costs a read and nothing else. `/mnt/` drives keep
+/// them stable.
+pub type RepoId = [(u64, u64); 2];
+
+/// The repo's [`RepoId`], if it is still there.
+pub fn repo_id(repo: &Path) -> Option<RepoId> {
+    let id = |meta: fs::Metadata| (meta.dev(), meta.ino());
+    let dir = fs::metadata(repo).ok()?;
+    let dot_git = fs::symlink_metadata(repo.join(".git")).ok()?;
+    Some([id(dir), id(dot_git)])
 }
 
 /// The repo's git directory: `.git`, or where a `.git` file points.

@@ -30,21 +30,40 @@ pub fn hermetic_git() {
     });
 }
 
-/// Runs git in `dir` and returns trimmed stdout, panicking on failure.
+/// Runs git in `dir` and returns trimmed stdout, panicking on failure. Like the agent,
+/// git looks no higher than `dir` for a repo, so a fixture never touches one around the
+/// temporary directory.
 pub fn git(dir: &Path, args: &[&str]) -> String {
-    let out = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(dir)
         .args(args)
-        .envs(GIT_ENV.iter().copied())
-        .output()
-        .expect("run git");
+        .envs(GIT_ENV.iter().copied());
+    if let Some(parent) = dir.parent() {
+        command.env("GIT_CEILING_DIRECTORIES", parent);
+    }
+    let out = command.output().expect("run git");
     assert!(
         out.status.success(),
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8_lossy(&out.stdout).trim().to_owned()
+}
+
+/// Copies a directory tree.
+pub fn copy_dir(from: &Path, to: &Path) {
+    fs::create_dir_all(to).unwrap();
+    for entry in fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let dest = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_dir(&entry.path(), &dest);
+        } else {
+            fs::copy(entry.path(), dest).unwrap();
+        }
+    }
 }
 
 pub fn write(path: &Path, text: &str) {
