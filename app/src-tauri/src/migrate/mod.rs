@@ -18,7 +18,7 @@
 //! | `migrate_close_window` | `path`, `id` | `true` when asked to close, `false` when gone |
 //! | `migrate_stop_agent` | `path`, `sessionId` | `null` |
 //! | `migrate_resync` | `id` | `null`; progress and a new `migrateReady` follow |
-//! | `migrate_delete` | `id`, `permanent`, `force?` | [`DeleteOutcome`] |
+//! | `migrate_delete` | `id`, `permanent`, `force?` (paths) | [`DeleteOutcome`] |
 //! | `migrate_finish` | `id`, `action` (`keep` or `discard`) | `null` |
 //! | `migrate_pending` | | [`PendingMigration`]`[]`, after a restart |
 //! | `migrate_source_exists` | `id` | `false` once the original folder is gone |
@@ -35,19 +35,22 @@
 //! the original and puts the helper in its *deleting* state, then removes the folder
 //! and finishes (see `flow`). Its outcome, each but `deleted` and `unfinished` with
 //! `deleting` (the helper is in the deleting state):
-//! - `changed {changed, removed, unreadable, copyChanged, busyAgents, sourceMissing}`:
-//!   the recheck failed and nothing was deleted. Not deleting: offer **Re-sync**
-//!   (`migrate_resync`) for changed files, **Keep both** for a changed copy, **End the
-//!   move** (`migrate_finish discard`) when the copy is gone (`copyChanged: ["."]`),
-//!   **Stop** for idle agents, then try again. Deleting: **Finish deleting** once
-//!   fixed; for `copyChanged` (then only paths the original still has) **Delete the
-//!   rest anyway**, `migrate_delete {id, permanent: false, force: true}`, after listing
-//!   them; for a copy that is gone, **End the move** (`migrate_finish discard`) after
-//!   asking, pointing to the Recycle Bin;
+//! - `changed {changed, removed, unreadable, copyChanged, copyRemoved, copyUnreadable,
+//!   copyMissing, busyAgents, sourceMissing}`: the recheck failed and nothing was
+//!   deleted. Not deleting: offer **Re-sync** (`migrate_resync`) for changed files,
+//!   **Keep both** for a changed or unreadable copy, **End the move** (`migrate_finish
+//!   discard`) when the copy is gone (`copyMissing`), **Stop** for idle agents, then
+//!   try again. Deleting: **Finish deleting** once fixed; for `copyChanged` (then only
+//!   paths the original still has, none unreadable) **Delete the rest anyway**,
+//!   `migrate_delete {id, permanent: false, force: [those paths]}`, after listing them
+//!   (those in `copyRemoved` apart: the original's version of them goes for good); for
+//!   a copy that is gone, **End the move** (`migrate_finish discard`) after asking,
+//!   pointing to the Recycle Bin;
 //! - `windowsOpen {windows}`: offer **Close** for each, then try again;
 //! - `wontFit {reason}`: ask "Delete permanently?" (default **No**, which is
 //!   `migrate_finish keep`, or, while deleting, leaving it), and on **Yes** call
-//!   `migrate_delete {id, permanent: true}`;
+//!   `migrate_delete {id, permanent: true}`, with the same `force` as the call that
+//!   answered this;
 //! - `driveHidden`: the original is there on Windows but not over `/mnt` (its drive
 //!   isn't mounted in WSL), so it could not be checked, nothing was deleted and the
 //!   deleting state was not entered. Make the drive visible in WSL, then try again (or
@@ -176,6 +179,9 @@ struct Migration {
     files: u64,
     bytes: u64,
     phase: Phase,
+    /// The helper stopped since its report came: the next `migrate_pending` forgets
+    /// it unless the helper lists it again (it forgets reports never placed).
+    unconfirmed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -209,9 +215,11 @@ impl Migrations {
                 files,
                 bytes,
                 phase: Phase::Running,
+                unconfirmed: false,
             });
         migration.files = files;
         migration.bytes = bytes;
+        migration.unconfirmed = false;
         if deleting {
             migration.phase = Phase::Deleting;
         } else if migration.phase != Phase::Deleting {
@@ -222,10 +230,14 @@ impl Migrations {
     }
 
     /// The helper stopped: the copies it was making are gone with it (it deletes them
-    /// when it starts again), so they no longer block **Start**.
+    /// when it starts again), so they no longer block **Start**. The reports wait for
+    /// the next pending list ([`Migrations::pending`]).
     fn helper_stopped(&self) {
         let stale: Vec<Migration> = {
             let mut inner = lock(&self.inner);
+            for m in inner.by_id.values_mut() {
+                m.unconfirmed = true;
+            }
             let ids: Vec<String> = inner
                 .by_id
                 .iter()
@@ -236,6 +248,23 @@ impl Migrations {
         };
         for file in stale.into_iter().filter_map(|m| m.snapshot_file) {
             remove_snapshot_file(&file);
+        }
+    }
+
+    /// Records the helper's pending list, and forgets the reports from before it
+    /// stopped that it no longer lists, so none is left that nothing can answer.
+    fn pending(&self, pending: &[PendingMigration]) {
+        for p in pending {
+            self.ready(&p.id, &p.report, p.deleting);
+        }
+        let gone: Vec<String> = lock(&self.inner)
+            .by_id
+            .iter()
+            .filter(|(_, m)| m.unconfirmed && m.phase != Phase::Running)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in gone {
+            self.forget(&id);
         }
     }
 
@@ -780,6 +809,7 @@ pub async fn migrate_start(
             files: 0,
             bytes: 0,
             phase: Phase::Running,
+            unconfirmed: false,
         });
         migration.snapshot_file = Some(file);
         migration.files = totals.files + skipped.iter().map(|s| s.files).sum::<u64>();
@@ -918,14 +948,14 @@ pub async fn migrate_resync(app: AppHandle, id: String) -> Result<(), MigrateErr
     .await
 }
 
-/// **Delete original** (see the module docs). `force` only after the user answered
-/// **Delete the rest anyway** while deleting.
+/// **Delete original** (see the module docs). `force`: the copy changes the user saw
+/// and answered **Delete the rest anyway** for, while deleting.
 #[tauri::command]
 pub async fn migrate_delete(
     app: AppHandle,
     id: String,
     permanent: bool,
-    force: Option<bool>,
+    force: Option<Vec<String>>,
 ) -> Result<DeleteOutcome, MigrateError> {
     blocking(move || {
         let _one_at_a_time = lock(&DELETES);
@@ -961,8 +991,8 @@ pub async fn migrate_delete(
             bytes: migration.bytes,
             deleting,
         };
-        let force = force.unwrap_or(false);
-        let outcome = delete_original(&AgentHelper(&agent), &win::Os, &target, permanent, force)?;
+        let force = force.unwrap_or_default();
+        let outcome = delete_original(&AgentHelper(&agent), &win::Os, &target, permanent, &force)?;
         if matches!(outcome, DeleteOutcome::Deleted { .. }) {
             migrations.forget(&id);
         } else if outcome.deleting() {
@@ -1026,10 +1056,7 @@ pub async fn migrate_pending(app: AppHandle) -> Result<Vec<PendingMigration>, Mi
         let pending = AgentHelper(&app.state::<Agent>())
             .pending()
             .map_err(|err| MigrateError::agent("Cannot list pending moves", err))?;
-        let migrations = app.state::<Migrations>();
-        for p in &pending {
-            migrations.ready(&p.id, &p.report, p.deleting);
-        }
+        app.state::<Migrations>().pending(&pending);
         Ok(pending)
     })
     .await
@@ -1119,6 +1146,7 @@ mod tests {
             copy_totals: Totals::default(),
             install: vec![],
             install_changes: Default::default(),
+            recovered_changes: Default::default(),
             install_backup: None,
             history: Default::default(),
             linux_git: false,
@@ -1169,6 +1197,7 @@ mod tests {
                 files: 0,
                 bytes: 0,
                 phase: Phase::Running,
+                unconfirmed: false,
             },
         );
         migrations.helper_stopped();
@@ -1177,6 +1206,28 @@ mod tests {
             migrations.get("m-2").unwrap_err().kind,
             MigrateErrorKind::NotReady
         );
+
+        // After the restart, the pending list keeps what the helper still has and
+        // forgets the rest (a failed report it never placed, say).
+        migrations.ready("m-4", &report("m-4", false), false);
+        migrations.set_phase("m-1", Phase::Deleting);
+        migrations.helper_stopped();
+        let listed = PendingMigration {
+            id: "m-1".into(),
+            report: Box::new(report("m-1", true)),
+            deleting: true,
+            copy_missing: false,
+        };
+        migrations.pending(&[listed]);
+        assert_eq!(migrations.get("m-1").unwrap().phase, Phase::Deleting);
+        assert_eq!(
+            migrations.get("m-4").unwrap_err().kind,
+            MigrateErrorKind::NotReady
+        );
+        // Without a restart, a short list forgets nothing.
+        migrations.ready("m-5", &report("m-5", false), false);
+        migrations.pending(&[]);
+        assert!(migrations.get("m-5").is_ok());
 
         let claim = migrations.claim("m-1").unwrap();
         assert_eq!(
