@@ -58,13 +58,13 @@ The rules live in `refract-core` with tests. Skipped folders are listed in the d
 Windows git usually checks files out with CRLF (`core.autocrlf=true`) and `core.filemode=false`. The copy is made to look like a Linux checkout:
 1. Copy `.git` byte for byte.
 2. For each tracked file, compute the blob Windows git would store for it (the "clean" form, using the Windows settings) and write it into the copy's object store. These are new loose objects; nothing existing changes.
-3. Rewrite the working-tree file as Linux git checks that blob out (`git cat-file --filters`, using the repo's `.gitattributes`, `core.autocrlf` unset). That gives LF unless `.gitattributes` asks for otherwise.
+3. Rewrite the working-tree file as Linux git checks that blob out (`git cat-file --filters`, using the repo's `.gitattributes`, `core.autocrlf` unset). That gives LF unless `.gitattributes` asks for otherwise. A file is rewritten only when its bytes are exactly what Windows git checks the blob out as (`git checkout-index --temp` from a scratch index, with the Windows settings), so nothing the blob doesn't hold is lost. Any other tracked file (a clean filter that drops content, mixed line endings) is copied byte for byte; check 1 then fails on it, with advice, unless Linux git stores the same blob.
 4. In the copy's local config, remove the Windows-only keys (`core.autocrlf`, `core.filemode=false`, `core.symlinks=false`, `core.ignorecase=true`) and set `core.filemode=true`. Then run `git update-index --refresh`. Rewritten entries keep their skip-worktree and assume-unchanged flags, and intent-to-add entries stay intent-to-add.
 
 Uncommitted edits carry over as the same diffs, because they're compared as blobs (§5, check 1). Staged changes survive because the index is copied, not rebuilt.
 
 ### 3.4 Session history
-Claude Code keeps transcripts in `~/.claude/projects/<encoded cwd>/`. They're copied to the folder for the new path, and every `cwd` field equal to the old path, or under it, is rewritten to the new path. The rewrite goes line by line through a JSON parse, and no other field changes. To verify: the same number of lines, every line parses, and each line differs only in `cwd`. The old transcripts are deleted after **Delete original**, because the old path is gone. The usage widget already dedupes messages across files, so the copies are never counted twice.
+Claude Code keeps transcripts in `~/.claude/projects/<encoded cwd>/`. They're copied to the folder for the new path, and every `cwd` field equal to the old path, or under it, is rewritten to the new path. Folder names are lossy (`/mnt/c/dev/app/web` and `/mnt/c/dev/app-web` share one), so each transcript moves only when its own first `cwd` lies in the old path; files in a session's folder follow the session, and other files of a project folder move only when all its sessions do. Each copy records the original's size and SHA-256. The rewrite goes line by line through a JSON parse, and no other field changes. To verify: the same number of lines, every line parses, and each line differs only in `cwd`. The old transcripts are deleted after **Delete original**, because the old path is gone: only those unchanged since they were copied. One that changed (the session went on in the old path) is copied again when nobody wrote to its copy, and kept otherwise. **Discard the copy** deletes only copies nobody wrote to since. The usage widget already dedupes messages across files, so the copies are never counted twice.
 
 Refract never edits `~/.claude.json`, so Claude Code asks for folder trust once at the new path.
 
@@ -74,6 +74,8 @@ The install runs after the checks pass, inside the destination, through a login 
 - `.venv` → `uv sync` (`uv.lock`) / `poetry install` (`poetry.lock`) / `python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
 - If the tool is missing in WSL, the report gives the command to install it. If the install fails or runs past 15 minutes, the log is shown, but the migration doesn't fail.
 - The copy is statted before and after the install (skipped folders left out). Files it created, and files from the original it changed or removed (for example `package-lock.json` written, `package.json` rewritten), are listed in the report as changed by install. Later re-syncs allow exactly those differences, until the original's own version is copied over them again.
+- The original's version of each file the install changed or removed is backed up to `~/.local/share/refract/migrations/<timestamp>-<name>.backup/`, at the same relative path, checked against the snapshot's SHA-256; the report gives the folder. A file that can't be backed up fails check 3, so deleting the original never loses it.
+- After the install the copy is statted again (each repo's index by its entries), and that is the copy "as checked" that §6 compares against.
 
 ## 4. Steps
 
@@ -115,25 +117,26 @@ If the app, the helper or WSL stops mid-migration, the helper deletes any leftov
 
 1. **Every file matches.** Every S0 path exists in the copy with the same type. Untracked and ignored files must match in SHA-256 and size. Tracked files must match by blob id: Linux `git hash-object --path` of the copy equals the Windows clean blob id in S0. File counts and total sizes match. The copy has no extra files except the new loose objects from §3.3, which must all pass fsck.
 2. **Git state is identical.** Every `.git` file is byte-identical except `index` (whose `ls-files -s` output and `ls-files -v` flags must be identical), `config` (only the expected key changes from §3.3) and the new loose objects. HEAD, all refs and the stash match G0. `git status --porcelain=v2` in the copy equals G0's (the ignored set excludes the skipped folders). `fsck --full` reports no new problems compared with G0. Submodules are checked recursively. With LFS, `git lfs fsck` must pass.
-3. **Nothing skipped without you knowing.** Any copy error fails this check, and so does any path that couldn't be represented. The only things allowed to be missing are the listed skipped folders and the listed alternate data streams.
-4. **Nothing touched it during the copy.** After verifying, the source is snapshotted again (stat of every file, plus refs and the index hashed). Changed files are re-copied and checked again, up to 3 rounds; after that the check fails with "the folder keeps changing". No VS Code window or agent may have the folder open at the end.
+3. **Nothing skipped without you knowing.** Any copy error fails this check, and so does any path that couldn't be represented, and any file the install changed whose original version couldn't be backed up (§3.5). The only things allowed to be missing are the listed skipped folders and the listed alternate data streams. A submodule whose git folder lies outside the copy stops the copy here, before git touches it.
+4. **Nothing touched it during the copy.** After verifying, the source is snapshotted again (stat of every file, plus refs and the index hashed). Changed files are re-copied and checked again, up to 3 rounds; after that the check fails with "the folder keeps changing". A path that can't be read (a folder that can't be listed, a ref that can't be opened) fails this check: it is never taken for removed, so nothing leaves the copy because of it. When a repo's index changed, the whole repo is normalised again and files it no longer tracks are copied again as they are. No VS Code window or agent may have the folder open at the end.
 5. **History copied** (§3.4 rules). This doesn't block deletion of the repo, but if it fails, the old transcripts are not deleted.
 
 ## 6. Delete original
-1. Run check 4 again right then, because time has passed while the report waited for you: stat every file against the final snapshot and confirm nothing has the folder open. If anything changed, refuse and offer **Re-sync**, which re-copies and re-checks the changes.
+1. Run check 4 again right then, because time has passed while the report waited for you (`migrateBeginDelete`): stat every file against the final snapshot, confirm nothing has the folder open, and stat the placed copy against its state after the install. Files modified or added in the original, paths of it that can't be read, any change to the copy (or the copy gone) and running agents refuse. Files removed from the original don't: the copy still has them. If the original changed, offer **Re-sync**, which re-copies and re-checks the changes and removes from the copy only paths verifiably gone from the original. If the copy changed, it may hold your work, so it is neither re-synced over nor discarded: only **Keep both**. When the check passes, the migration is marked *deleting* in its state file before anything is deleted. From then on, re-sync, keep, discard and cancel are refused; only finishing the delete ends it, after a crash or restart too. Running the check again then passes for a partly deleted original (it shows only removals), so the rest can go. If the original folder is already gone, the Recycle Bin step is skipped, and re-sync and discard are refused, since the copy is the only one left. Check whether the folder fits in the Recycle Bin, and ask about deleting permanently, before this step, since **No** (Keep both) is refused once deleting.
 2. Send the folder to the Recycle Bin with `IFileOperation` (`FOFX_RECYCLEONDELETE`, no UI). Beforehand, check that the drive's Recycle Bin can hold it (bin size limits from `SHQueryRecycleBin` and the drive's quota). If it can't, ask "This won't fit in the Recycle Bin. Delete permanently?" with **No** as the default. If you choose No, the result is the same as **Keep both**.
 3. Create `<name>.lnk` at the old location, pointing to `\\wsl.localhost\<distro>\<dest path>`.
-4. Delete the old transcripts (§3.4). Update the settings and `agent.toml` entries (hidden list, `extra`) that point at the old path.
+4. Delete the old transcripts that are unchanged since they were copied (§3.4); a changed one is copied again first, or kept and named in the saved report. Update the settings and `agent.toml` entries (hidden list, `extra`) that point at the old path.
 5. The gem moves to the new path, keeping its remote match by origin.
 
 ## 7. Where the code goes
 - `refract-core`: build-folder rules, manifest diffing, the `cwd` rewrite, refusal rules, report types (unit tests with fixtures).
 - Helper: preflight (Linux side), copy, normalise, hash, git checks, install, history, temp cleanup, state file. Protocol (details in `docs/architecture.md`):
   - `migrate {path, dest, snapshot}` → `{id}`, then `migrateProgress` events and `migrateReady {id, report}`
-  - `migrateRecheck {id}` → `{changed, busyAgents}` (check 4 again before deleting)
-  - `migrateResync {id}` → `null`, then progress and a fresh `migrateReady`
-  - `migrateFinish {id, action: delete|keep|discard}`; `migrateCancel {id}`
-  - `migratePending` → `[{id, report}]` (reports waiting, including after a restart)
+  - `migrateRecheck {id}` → `{changed, removed, unreadable, copyChanged, busyAgents, sourceMissing}` (§6 step 1 without changing anything); refused unless the report passes or the migration is deleting
+  - `migrateBeginDelete {id}` → `{ok, recheck}`: the same check; when `changed`, `unreadable`, `copyChanged` and `busyAgents` are empty, the migration is marked deleting (saved) and `ok` is true. Idempotent
+  - `migrateResync {id}` → `null`, then progress and a fresh `migrateReady`; refused while deleting, when the original folder is gone, or when the copy changed
+  - `migrateFinish {id, action: delete|keep|discard}`: `delete` only while deleting; `keep` and `discard` refused while deleting, `discard` also when the original folder is gone or the copy changed. `migrateCancel {id}` only before the report
+  - `migratePending` → `[{id, report, deleting}]` (reports waiting, including after a restart)
   - `stopAgent {path, sessionId}` → `null` (SIGTERM an idle session)
   - Errors: `6` a migration could not start, or is unknown or not at that step; `7` `stopAgent` named a working session.
 - App (Windows): S0/G0 snapshot with `git.exe`, reparse-point and lock checks, Recycle Bin, `.lnk`, closing VS Code windows, stopping idle agents, notifications, dialog, gem ring and report UI. DemoBackend simulates a migration for the demo site.
@@ -141,7 +144,7 @@ If the app, the helper or WSL stops mid-migration, the helper deletes any leftov
 ## 8. Testing
 - Unit tests: the build-folder rules, manifest diffs, `cwd` rewrite edge cases, refusal rules.
 - Helper integration tests on temporary repos with CRLF + autocrlf, staged and unstaged edits, untracked and ignored files, stashes, submodules and an executable script.
-- Fault injection: edit the source mid-copy, corrupt a copied byte, drop a ref, make a file unreadable, add an external junction. Each must block deletion with the right message.
+- Fault injection: edit the source mid-copy, corrupt a copied byte, drop a ref, make a file unreadable, add an external junction, a clean filter that drops content, staging during and after the copy, an unreadable folder after the report, the copy edited or deleted after the report, the original deleted by hand, a partly deleted original, a submodule pointing outside the copy, a destination reaching `/mnt` through a link, a project-folder name collision and a session that goes on after the copy. Each must block deletion (or keep the data) with the right message.
 - Windows tests (CI windows runner): the Recycle Bin path, including the case where it doesn't fit, and `.lnk` creation.
 - Live: an invented scratch repo on the Windows Desktop, migrated end to end, then restored from the Recycle Bin to confirm it's intact.
 

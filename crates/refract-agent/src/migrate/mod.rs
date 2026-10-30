@@ -33,10 +33,13 @@
 //!    the original's version over them.
 //!    A failed report deletes the temporary folder at once.
 //!
-//! After the report: `migrateRecheck` stats the source against the last check's stat,
-//! `migrateResync` copies what changed into the placed copy and checks again, and
-//! `migrateFinish` ends it. A placed migration is kept in a state file until then, so
-//! after a restart its worker resumes ([`worker::resume`]) and sends the report again.
+//! After the report: `migrateRecheck` stats the source against the last check's stat
+//! and the placed copy against its own (taken after the install), `migrateBeginDelete`
+//! does the same and, when it is safe, marks the migration deleting, `migrateResync`
+//! copies what changed into the placed copy and checks again, and `migrateFinish` ends
+//! it. Paths that cannot be read are never taken for removed. A placed migration is
+//! kept in a state file until then, so after a restart its worker resumes
+//! ([`worker::resume`]) and sends the report again.
 //! At startup, temporary folders left by a helper that stopped mid-copy are deleted
 //! ([`store::leftovers`]).
 
