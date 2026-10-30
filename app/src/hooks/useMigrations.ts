@@ -18,9 +18,9 @@ export interface MigrationControls {
   resync(id: string): Promise<void>;
   /**
    * Delete original; the entry is dropped once it says `deleted`, and marked deleting once
-   * it says the delete has begun. `force`: Delete the rest anyway, while deleting.
+   * it says the delete has begun. `force`: the copy changes the user saw and answered Delete the rest anyway for.
    */
-  remove(id: string, permanent: boolean, force?: boolean): Promise<DeleteOutcome>;
+  remove(id: string, permanent: boolean, force?: string[]): Promise<DeleteOutcome>;
   /**
    * Keep both or discard the copy; the entry is dropped once it answers. A refusal asks for the pending reports
    * again, so the dialog learns what changed (a copy that went, say).
@@ -113,10 +113,11 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
   const sourceOf = (id: string) => [...stateRef.current.values()].find((m) => m.id === id)?.source;
 
   const remove = useCallback(
-    async (id: string, permanent: boolean, force = false) => {
-      const outcome = force
-        ? await backend.migrateDelete(id, permanent, true)
-        : await backend.migrateDelete(id, permanent);
+    async (id: string, permanent: boolean, force: string[] = []) => {
+      const outcome =
+        force.length > 0
+          ? await backend.migrateDelete(id, permanent, force)
+          : await backend.migrateDelete(id, permanent);
       const source = sourceOf(id);
       if (outcome.kind === "deleted") {
         if (source) dispatch({ type: "gone", source });

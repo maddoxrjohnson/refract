@@ -799,7 +799,7 @@ export class DemoBackend implements Backend {
         if (move.cancelled) return;
         if (move.stopped) break walk;
         const done = Math.round((total * i) / DEMO_TICKS);
-        this.emit({ event: "migrateProgress", data: { id: move.id, source: move.source, dest: move.dest, step, done, total } });
+        this.emit({ event: "migrateProgress", data: { id: move.id, source: move.source, dest: move.dest, step, done, total, placed: move.placed } });
       }
     }
     move.report = demoMoveReport(move, move.stopped ? (resync ? "resync" : "install") : null);
@@ -872,7 +872,7 @@ export class DemoBackend implements Backend {
     void this.runMove(move, [["rechecking", 12]], true);
   }
 
-  async migrateDelete(id: string, permanent: boolean, _force = false): Promise<DeleteOutcome> {
+  async migrateDelete(id: string, permanent: boolean, _force: string[] = []): Promise<DeleteOutcome> {
     const move = this.readyMove(id);
     await sleep(700);
     if (this.moveOutcome === "wontFit" && !permanent && !move.deleting) {

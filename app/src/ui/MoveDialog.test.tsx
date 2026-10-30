@@ -51,7 +51,7 @@ function fakeBackend(
     migrateCloseWindow: vi.fn().mockResolvedValue(true),
     migrateStopAgent: vi.fn().mockResolvedValue(undefined),
     migrateResync: vi.fn().mockResolvedValue(undefined),
-    migrateDelete: vi.fn<(id: string, permanent: boolean, force?: boolean) => Promise<DeleteOutcome>>(),
+    migrateDelete: vi.fn<(id: string, permanent: boolean, force?: string[]) => Promise<DeleteOutcome>>(),
     migrateFinish: vi.fn().mockResolvedValue(undefined),
     migrateCancel: vi.fn().mockResolvedValue({ ended: true }),
     send: (e: AgentEvent) => listeners.forEach((cb) => cb(e)),
@@ -442,14 +442,145 @@ describe("MoveDialog states with a way forward", () => {
     expect(dialog.textContent).toContain("The copy in WSL differs from what's left of the original");
     expect(dialog.textContent).not.toContain("The original changed");
     expect(dialog.textContent).toContain("README.md");
-    expect(dialog.textContent).toContain("Your copy keeps its version either way");
+    expect(dialog.textContent).toContain("Changed in the copy (the copy keeps its version):");
     for (const name of ["Keep both", "Re-sync", "Discard the copy"]) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }
     fireEvent.click(button("Delete the rest anyway"));
     await act(async () => {});
-    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, true);
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, ["README.md"]);
     expect(dialog.textContent).toContain("The original is in the Recycle Bin.");
+  });
+
+  it("review 3 B: Yes, delete permanently after Delete the rest anyway keeps the same paths, so it can't loop", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete
+      .mockResolvedValueOnce({ ...RECHECK, kind: "changed", copyChanged: ["README.md"], deleting: true })
+      .mockResolvedValueOnce({ kind: "wontFit", reason: "The bin is full.", deleting: true })
+      .mockResolvedValueOnce({ kind: "deleted", permanent: true, alreadyGone: false });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    fireEvent.click(button("Delete the rest anyway"));
+    await act(async () => {});
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, ["README.md"]);
+    fireEvent.click(button("Yes, delete permanently"));
+    await act(async () => {});
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", true, ["README.md"]);
+    expect(dialog.textContent).not.toContain("differs from what's left");
+  });
+
+  it("review 3 B: lists what was deleted in the copy apart, as gone for good, and forces every listed path", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete.mockResolvedValueOnce({
+      ...RECHECK,
+      kind: "changed",
+      copyChanged: ["README.md", "notes.txt"],
+      copyRemoved: ["notes.txt"],
+      copyUnreadable: [],
+      copyMissing: false,
+      deleting: true,
+    });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("Changed in the copy (the copy keeps its version):README.md");
+    expect(dialog.textContent).toContain("Deleted in the copy. Deleting the original removes these for good:notes.txt");
+    fireEvent.click(button("Delete the rest anyway"));
+    await act(async () => {});
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false, ["README.md", "notes.txt"]);
+  });
+
+  it("review 3 F: a copy that can't be read is explained, not taken for gone, and Keep both is offered", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete.mockResolvedValueOnce({
+      ...RECHECK,
+      kind: "changed",
+      copyChanged: ["."],
+      copyUnreadable: ["."],
+      copyMissing: false,
+      deleting: false,
+    });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("couldn't be read");
+    expect(dialog.textContent).not.toContain("is gone");
+    expect(button("Keep both")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "End the move" })).toBeNull();
+  });
+
+  it("review 3 F: while deleting, an unreadable copy path is never forced", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete.mockResolvedValueOnce({
+      ...RECHECK,
+      kind: "changed",
+      copyChanged: ["README.md", "src"],
+      copyUnreadable: ["src"],
+      copyMissing: false,
+      deleting: true,
+    });
+    await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: "Delete the rest anyway" })).toBeNull();
+    expect(button("Finish deleting")).toBeTruthy();
+  });
+
+  it("review 3 A: lists changes found after an interrupted install and offers neither Discard nor Re-sync", async () => {
+    const recoveredChanges = { created: ["my-notes.md"], changed: ["README.md"], removed: [] };
+    const backend = fakeBackend({}, [testReport({ recoveredChanges, installBackup: "/home/dev/backup" })]);
+    const { dialog } = await setup(backend);
+    expect(dialog.textContent).toContain("Changed while the install was interrupted — may include your own edits");
+    expect(dialog.textContent).toContain("created my-notes.md");
+    expect(button("Delete original")).toBeTruthy();
+    expect(button("Keep both")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Discard the copy" })).toBeNull();
+    cleanup();
+    const failed = testReport({ recoveredChanges, placed: true });
+    failed.checks[3] = { ...failed.checks[3], status: "failed", problems: [{ message: "changed" }] };
+    await setup(fakeBackend({}, [failed]));
+    expect(button("Keep both")).toBeTruthy();
+    for (const name of ["Re-sync", "Discard the copy"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+  });
+
+  it("review 3 D: a finish refused because the copy went leads, on Finish deleting, to the copy-gone view", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    backend.migrateDelete
+      .mockResolvedValueOnce({ kind: "unfinished", reason: "The original is gone, but the helper could not finish." })
+      .mockResolvedValueOnce({
+        ...RECHECK,
+        kind: "changed",
+        copyChanged: ["."],
+        copyUnreadable: [],
+        copyMissing: true,
+        sourceMissing: true,
+        deleting: true,
+      });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("could not finish");
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("The copy in WSL is gone, so nothing more of the original will be deleted.");
+    expect(dialog.textContent).toContain("Recycle Bin");
+    expect(button("End the move")).toBeTruthy();
+  });
+
+  it("review 3 F: doesn't offer Re-sync when only a failed install backup blocks, and offers what works", async () => {
+    const report = testReport({ installChanges: { created: [], changed: ["package.json"], removed: [] }, placed: true });
+    report.checks[2] = {
+      ...report.checks[2],
+      status: "failed",
+      problems: [{ path: "package.json", message: "Its original couldn't be backed up." }],
+    };
+    await setup(fakeBackend({}, [report]));
+    expect(screen.queryByRole("button", { name: "Re-sync" })).toBeNull();
+    expect(button("Keep both")).toBeTruthy();
+    expect(button("Discard the copy")).toBeTruthy();
   });
 
   it("while deleting, never offers Delete the rest anyway when the original changed", async () => {

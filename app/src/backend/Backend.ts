@@ -102,10 +102,10 @@ export interface Backend {
   /** Re-copies what changed since the report; progress and a new `migrateReady` follow. */
   migrateResync(id: string): Promise<void>;
   /**
-   * Delete original; `permanent` only after the user agreed to skip the Recycle Bin, `force` only after they answered
-   * Delete the rest anyway while deleting.
+   * Delete original; `permanent` only after the user agreed to skip the Recycle Bin. `force`: the `copyChanged` paths
+   * the user saw and answered Delete the rest anyway for, while deleting; the helper skips only those.
    */
-  migrateDelete(id: string, permanent: boolean, force?: boolean): Promise<DeleteOutcome>;
+  migrateDelete(id: string, permanent: boolean, force?: string[]): Promise<DeleteOutcome>;
   /** Keep both, or discard the copy. */
   migrateFinish(id: string, action: FinishAction): Promise<void>;
   /** Reports still waiting for an answer, after a restart. */

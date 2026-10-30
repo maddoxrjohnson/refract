@@ -310,7 +310,7 @@ describe("TauriBackend", () => {
       { cmd: "migrate_close_window", args: { path, id: 42 } },
       { cmd: "migrate_stop_agent", args: { path, sessionId: "0b7e" } },
       { cmd: "migrate_resync", args: { id: "m-1" } },
-      { cmd: "migrate_delete", args: { id: "m-1", permanent: false, force: false } },
+      { cmd: "migrate_delete", args: { id: "m-1", permanent: false, force: [] } },
       { cmd: "migrate_finish", args: { id: "m-1", action: "keep" } },
       { cmd: "migrate_cancel", args: { id: "m-1" } },
       { cmd: "migrate_pending", args: {} },

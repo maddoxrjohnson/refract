@@ -50,6 +50,11 @@ export interface Migration {
   /** `null` until `migrateStart` answers. */
   id: string | null;
   phase: MigrationPhase;
+  /**
+   * The helper stopped since this report came: the next `migratePending` drops it unless the helper lists it again
+   * (it forgets a report whose copy was never placed, which nothing could then answer).
+   */
+  unconfirmed?: boolean;
 }
 
 export type MigrationsState = ReadonlyMap<string, Migration>;
@@ -70,7 +75,10 @@ export type MigrationAction =
   | { type: "resyncing"; id: string }
   /** Delete original began but didn't finish. */
   | { type: "deleting"; id: string }
-  /** The helper stopped: a running copy is gone with it (it deletes the copy when it starts again). */
+  /**
+   * The helper stopped: a running copy is gone with it (it deletes the copy when it starts again), and each report
+   * waits for the next pending list to say whether the helper still has it.
+   */
   | { type: "helperStopped" }
   /** Cancelled, failed to start, or finished. */
   | { type: "gone"; source: string };
@@ -138,6 +146,7 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
       if (!m) return state;
       const before = m.phase as MigrationPhase | undefined;
       const placed =
+        action.progress.placed === true ||
         PLACED_STEPS.has(step) ||
         (before?.kind === "running" && before.placed) ||
         (before?.kind === "ready" && (before.report.placed ?? true));
@@ -150,11 +159,17 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
     }
     case "ready":
       return ready(state, action.id, action.report);
-    case "pending":
-      return action.list.reduce(
+    case "pending": {
+      const next = action.list.reduce(
         (s, p) => ready(s, p.id, p.report, p.deleting ?? false, p.copyMissing ?? false),
         state,
       );
+      const dropped = [...next.values()].filter((m) => m.unconfirmed && m.phase.kind === "ready");
+      if (dropped.length === 0) return next;
+      const kept = new Map(next);
+      for (const m of dropped) kept.delete(m.source);
+      return kept;
+    }
     case "resyncing": {
       const m = byId(state, action.id);
       if (!m) return state;
@@ -169,10 +184,12 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
       return withEntry(state, { ...m, phase: { ...m.phase, deleting: true } });
     }
     case "helperStopped": {
-      const running = [...state.values()].filter((m) => m.phase.kind === "running");
-      if (running.length === 0) return state;
+      if (state.size === 0) return state;
       const next = new Map(state);
-      for (const m of running) next.delete(m.source);
+      for (const m of state.values()) {
+        if (m.phase.kind === "running") next.delete(m.source);
+        else if (m.phase.kind === "ready" && !m.unconfirmed) next.set(m.source, { ...m, unconfirmed: true });
+      }
       return next;
     }
     case "gone": {

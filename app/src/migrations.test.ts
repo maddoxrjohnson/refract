@@ -104,6 +104,32 @@ describe("migrationsReducer", () => {
     expect(run([{ type: "helperStopped" }])).toBe(initialMigrations);
   });
 
+  it("after a helper restart, drops the reports the helper no longer lists", () => {
+    const failed = testReport({ id: "m-5", source: "/mnt/d/other", dest: "/home/dev/other", placed: false });
+    const kept = testReport({ id: "m-6" });
+    let s = run([
+      { type: "ready", id: "m-5", report: failed },
+      { type: "ready", id: "m-6", report: kept },
+    ]);
+    // Without a restart a short list drops nothing (a report may come after it).
+    expect(run([{ type: "pending", list: [] }], s).size).toBe(2);
+    s = run([{ type: "helperStopped" }, { type: "pending", list: [{ id: "m-6", report: kept }] }], s);
+    expect([...s.keys()]).toEqual([SOURCE]);
+    expect(s.get(SOURCE)?.unconfirmed).toBeFalsy();
+    // Confirmed again: a later short list keeps it.
+    expect(run([{ type: "pending", list: [] }], s).size).toBe(1);
+  });
+
+  it("takes placed from the progress itself after a reload during a re-sync", () => {
+    const s = run([
+      {
+        type: "progress",
+        progress: { id: "m-8", source: SOURCE, dest: DEST, step: "rechecking", done: 0, total: 3, placed: true },
+      },
+    ]);
+    expect(s.get(SOURCE)?.phase).toMatchObject({ kind: "running", placed: true });
+  });
+
   it("ignores progress it can't place and snapshots of folders not starting", () => {
     const s = run([
       { type: "progress", progress: { id: "elsewhere", source: "", dest: "", step: "hashing", done: 1, total: 2 } },

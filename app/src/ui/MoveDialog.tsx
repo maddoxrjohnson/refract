@@ -12,6 +12,7 @@ import type {
 } from "../backend/types";
 import { isCancelled, type MigrationControls } from "../hooks/useMigrations";
 import {
+  BLOCKING_CHECKS,
   busyAgents,
   type BusyAgent,
   canDelete,
@@ -724,13 +725,44 @@ interface ReportViewProps {
 
 const STATUS_LABEL = { passed: "Passed", failed: "Failed", notRun: "Not run" } as const;
 
-/** Paths, the first few of them, with how many more. */
-function PathList({ paths }: { paths: string[] }) {
+/** Paths, the first few of them, with how many more; `all` lists every one (what an answer acts on). */
+function PathList({ paths, all = false }: { paths: string[]; all?: boolean }) {
+  const shown = all ? paths : paths.slice(0, MAX_PROBLEMS);
   return (
     <div className="rf-mono rf-muted rf-move-paths">
-      {paths.slice(0, MAX_PROBLEMS).join("\n")}
-      {paths.length > MAX_PROBLEMS && `\nand ${paths.length - MAX_PROBLEMS} more`}
+      {shown.join("\n")}
+      {paths.length > shown.length && `\nand ${paths.length - shown.length} more`}
     </div>
+  );
+}
+
+type ChangeList = { created: string[]; changed: string[]; removed: string[] } | undefined;
+
+/** `[what, path]` rows of an install's (or an interrupted install's) changes. */
+function changeRows(changes: ChangeList): [string, string][] {
+  return changes
+    ? [
+        ...changes.created.map((p): [string, string] => ["created", p]),
+        ...changes.changed.map((p): [string, string] => ["changed", p]),
+        ...changes.removed.map((p): [string, string] => ["removed", p]),
+      ]
+    : [];
+}
+
+/**
+ * Whether Re-sync could clear the failed checks: not when every problem is a file whose original couldn't be backed
+ * up after the install (the paths the install changed or removed), which a re-sync never copies again.
+ */
+function resyncHelps(report: MigrationReport): boolean {
+  const backedUp = new Set([
+    ...(report.installChanges?.changed ?? []),
+    ...(report.installChanges?.removed ?? []),
+    ...(report.recoveredChanges?.changed ?? []),
+    ...(report.recoveredChanges?.removed ?? []),
+  ]);
+  const failed = report.checks.filter((c) => BLOCKING_CHECKS.includes(c.check) && c.status !== "passed");
+  return !failed.every(
+    (c) => c.problems.length > 0 && c.problems.every((p) => p.path !== undefined && backedUp.has(p.path)),
   );
 }
 
@@ -738,28 +770,29 @@ function PathList({ paths }: { paths: string[] }) {
 function ReportView(props: ReportViewProps) {
   const { backend, id, report, moves, setLocked, onKeep, onDiscarded, onDeleted } = props;
   const ok = canDelete(report);
-  const changes = report.installChanges;
-  const installChanges: [string, string][] = changes
-    ? [
-        ...changes.created.map((p): [string, string] => ["created", p]),
-        ...changes.changed.map((p): [string, string] => ["changed", p]),
-        ...changes.removed.map((p): [string, string] => ["removed", p]),
-      ]
-    : [];
+  const installChanges = changeRows(report.installChanges);
+  // Changed in the copy while the install was cut short: maybe the user's own work, so never discarded or re-synced.
+  const recovered = changeRows(report.recoveredChanges);
+  const canDiscard = recovered.length === 0;
   const [pending, setPending] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<DeleteState>(null);
   const [error, setError] = useState<string | null>(props.resyncError);
   const [note, setNote] = useState<string | null>(null);
   // Asked before ending a move whose copy went while deleting.
   const [confirmEnd, setConfirmEnd] = useState(false);
+  // The copy changes the user answered Delete the rest anyway for, carried to Yes, delete permanently.
+  const [forced, setForced] = useState<string[]>([]);
   // The original folder is gone (deleted by hand): the move only needs finishing.
   const [sourceGone, setSourceGone] = useState(false);
   const deleting = props.deleting || outcome?.kind === "unfinished" || (outcome !== null && "deleting" in outcome && outcome.deleting);
   // An older report has no `placed`: one that passed was placed.
   const placed = report.placed ?? ok;
+  // An older helper says only `["."]`, for a copy gone or unreadable alike.
   const copyGone =
     props.copyMissing ||
-    (outcome?.kind === "changed" && outcome.copyChanged.length === 1 && outcome.copyChanged[0] === ".");
+    (outcome?.kind === "changed" &&
+      (outcome.copyMissing ??
+        (outcome.copyChanged.length === 1 && outcome.copyChanged[0] === "." && outcome.copyUnreadable === undefined)));
   useEffect(() => {
     if (!placed || props.deleting) return;
     let live = true;
@@ -803,16 +836,17 @@ function ReportView(props: ReportViewProps) {
     }
   };
 
-  const deleteOriginal = (permanent: boolean, force = false) =>
+  const deleteOriginal = (permanent: boolean, force: string[] = []) =>
     act(
       permanent
         ? "Deleting permanently…"
-        : force
+        : force.length > 0
           ? "Deleting the rest…"
           : deleting
             ? "Finishing the delete…"
             : "Deleting the original…",
       async () => {
+        setForced(force);
         const answer = await moves.remove(id, permanent, force);
         if (answer.kind === "deleted") onDeleted(answer);
         else setOutcome(answer);
@@ -920,7 +954,12 @@ function ReportView(props: ReportViewProps) {
         </p>
         <div className="rf-row">
           {primary(deleting ? "Not now" : "No", deleting ? props.onClose : keep)}
-          <button type="button" className="rf-button rf-button--danger" disabled={disabled} onClick={() => void deleteOriginal(true)}>
+          <button
+            type="button"
+            className="rf-button rf-button--danger"
+            disabled={disabled}
+            onClick={() => void deleteOriginal(true, forced)}
+          >
             Yes, delete permanently
           </button>
         </div>
@@ -952,9 +991,14 @@ function ReportView(props: ReportViewProps) {
   } else if (outcome?.kind === "changed") {
     const originalChanged = outcome.changed.length > 0 || outcome.unreadable.length > 0;
     const copyChanged = outcome.copyChanged.length > 0;
+    const copyUnreadable = outcome.copyUnreadable ?? [];
+    const copyRemoved = outcome.copyRemoved ?? [];
+    const copyEdited = outcome.copyChanged.filter((p) => !copyRemoved.includes(p) && !copyUnreadable.includes(p));
     const resyncable = outcome.changed.length > 0 && !copyChanged;
-    // While deleting, a changed copy may be left behind on purpose: the copy keeps its version either way.
-    const canForce = deleting && copyChanged && !originalChanged && outcome.busyAgents.length === 0;
+    // While deleting, a changed copy may be left behind on purpose, for exactly the paths listed: the copy keeps its
+    // version of those it has. A path that couldn't be read in the copy never is.
+    const canForce =
+      deleting && copyChanged && copyUnreadable.length === 0 && !originalChanged && outcome.busyAgents.length === 0;
     const question = deleting
       ? originalChanged
         ? "The original changed while it was being deleted, so nothing more was deleted."
@@ -975,27 +1019,56 @@ function ReportView(props: ReportViewProps) {
             <PathList paths={outcome.changed} />
           </>
         )}
+        {copyUnreadable.length > 0 && (
+          <>
+            <p className="rf-move-note">
+              {copyUnreadable.includes(".")
+                ? "The copy in WSL couldn't be read, so Refract can't tell whether it changed. It isn't gone."
+                : "These couldn't be read in the copy in WSL, so Refract can't tell whether they changed:"}
+            </p>
+            {!copyUnreadable.includes(".") && <PathList paths={copyUnreadable} />}
+            <p className="rf-move-note rf-muted">
+              {deleting
+                ? "Fix its permissions (or close what's locking it), then finish deleting."
+                : "Fix its permissions (or close what's locking it), then try again; or keep both."}
+            </p>
+          </>
+        )}
         {copyChanged &&
           (deleting ? (
             <>
-              <p className="rf-move-note">
-                These were changed or removed in the copy, and the original still has its own version of them:
-              </p>
-              <PathList paths={outcome.copyChanged} />
-              <p className="rf-move-note rf-muted">
-                Your copy keeps its version either way. Delete the rest anyway sends the original's version of these,
-                and everything else left of the original at {windowsPath(report.source)}, to the Recycle Bin. Or undo
-                those changes in the copy, then finish deleting.
-              </p>
+              {copyEdited.length > 0 && (
+                <>
+                  <p className="rf-move-note">Changed in the copy (the copy keeps its version):</p>
+                  <PathList paths={copyEdited} all />
+                </>
+              )}
+              {copyRemoved.length > 0 && (
+                <>
+                  <p className="rf-move-note rf-move-warn">
+                    Deleted in the copy. Deleting the original removes these for good:
+                  </p>
+                  <PathList paths={copyRemoved} all />
+                </>
+              )}
+              {canForce && (
+                <p className="rf-move-note rf-muted">
+                  Delete the rest anyway sends the original's version of these, and everything else left of the original
+                  at {windowsPath(report.source)}, to the Recycle Bin. Or undo those changes in the copy, then finish
+                  deleting.
+                </p>
+              )}
             </>
           ) : (
-            <>
-              <p className="rf-move-note">
-                The copy in WSL changed after it was checked, so it may hold work the original doesn't. Refract won't
-                re-sync over it or delete it; you can keep both:
-              </p>
-              <PathList paths={outcome.copyChanged} />
-            </>
+            copyEdited.length + copyRemoved.length > 0 && (
+              <>
+                <p className="rf-move-note">
+                  The copy in WSL changed after it was checked, so it may hold work the original doesn't. Refract won't
+                  re-sync over it or delete it; you can keep both:
+                </p>
+                <PathList paths={[...copyEdited, ...copyRemoved]} />
+              </>
+            )
           ))}
         {outcome.unreadable.length > 0 && (
           <>
@@ -1038,7 +1111,7 @@ function ReportView(props: ReportViewProps) {
                   type="button"
                   className="rf-button rf-button--danger"
                   disabled={disabled}
-                  onClick={() => void deleteOriginal(false, true)}
+                  onClick={() => void deleteOriginal(false, outcome.copyChanged)}
                 >
                   Delete the rest anyway
                 </button>
@@ -1117,7 +1190,7 @@ function ReportView(props: ReportViewProps) {
       <div className="rf-row">
         {primary("Delete original", () => void deleteOriginal(false))}
         {secondary("Keep both", keep)}
-        {secondary("Discard the copy", discard)}
+        {canDiscard && secondary("Discard the copy", discard)}
       </div>
     );
   } else if (placed && sourceGone) {
@@ -1131,16 +1204,20 @@ function ReportView(props: ReportViewProps) {
       </div>
     );
   } else if (placed) {
+    const canResync = canDiscard && resyncHelps(report);
     actions = (
       <div className="rf-move-ask" role="alert">
         <p className="rf-move-note rf-muted">
-          The copy is in place at {report.dest}. Re-sync copies what changed in the original again and checks it again;
-          or keep both, or discard the copy.
+          {canResync
+            ? `The copy is in place at ${report.dest}. Re-sync copies what changed in the original again and checks it again; or keep both, or discard the copy.`
+            : !canDiscard
+              ? `The copy is in place at ${report.dest}, with changes made while the install was interrupted, which may include your own edits. Keep both, and look over the copy.`
+              : `The copy is in place at ${report.dest}. Re-sync can't fix this: the original's version of those files couldn't be saved. Keep both, or discard the copy.`}
         </p>
         <div className="rf-row">
-          {primary("Re-sync", resync)}
-          {secondary("Keep both", keep)}
-          {secondary("Discard the copy", discard)}
+          {canResync ? primary("Re-sync", resync) : primary("Keep both", keep)}
+          {canResync && secondary("Keep both", keep)}
+          {canDiscard && secondary("Discard the copy", discard)}
         </div>
       </div>
     );
@@ -1215,6 +1292,28 @@ function ReportView(props: ReportViewProps) {
           </section>
         )}
 
+        {recovered.length > 0 && (
+          <section className="rf-section" aria-label="Changed while interrupted">
+            <h3 className="rf-section__label">Changed in the copy</h3>
+            <p className="rf-move-note rf-move-warn">
+              Changed while the install was interrupted — may include your own edits. Refract won't discard the copy or
+              re-sync over it while these are there:
+            </p>
+            <div className="rf-mono rf-muted rf-move-paths">
+              {recovered
+                .slice(0, MAX_PROBLEMS)
+                .map(([what, path]) => `${what} ${path}`)
+                .join("\n")}
+              {recovered.length > MAX_PROBLEMS && `\nand ${recovered.length - MAX_PROBLEMS} more`}
+            </div>
+            {report.installBackup && (
+              <p className="rf-move-note rf-muted">
+                The original's version of each changed or removed file is saved in{" "}
+                <span className="rf-mono">{report.installBackup}</span>.
+              </p>
+            )}
+          </section>
+        )}
         {report.install.length > 0 && (
           <section className="rf-section" aria-label="Install">
             <h3 className="rf-section__label">Install</h3>

@@ -451,6 +451,8 @@ export interface MigrateProgress {
   step: MigrateStep;
   done: number;
   total: number;
+  /** The copy is in place (from the install on, and during a re-sync): a cancel keeps it. Missing from older helpers. */
+  placed?: boolean;
 }
 
 export interface MigrateProblem {
@@ -512,6 +514,11 @@ export interface MigrationReport {
   install: MigrateInstallResult[];
   /** Repo-relative paths the install created, changed or removed; they don't block delete. */
   installChanges?: { created: string[]; changed: string[]; removed: string[] };
+  /**
+   * What changed in the copy while the install was cut short (the helper stopped): the install's doing or the
+   * user's own edits. Backed up from the original like `installChanges`; Discard and Re-sync are refused while set.
+   */
+  recoveredChanges?: { created: string[]; changed: string[]; removed: string[] };
   /** Linux folder holding the original's version of each file the install changed or removed. */
   installBackup?: string;
   history: { sessions: number; fromDirs: string[]; toDirs: string[] };
@@ -550,6 +557,12 @@ export interface Recheck {
    * original is still there (what Delete the rest anyway would delete a different version of).
    */
   copyChanged: string[];
+  /** Of `copyChanged`, deleted in the copy: deleting the original removes these for good. */
+  copyRemoved?: string[];
+  /** Of `copyChanged`, couldn't be read in the copy (`"."` for the folder itself). Never forced. */
+  copyUnreadable?: string[];
+  /** The copy folder is gone (`copyChanged` is `["."]`), as against one that can't be read. */
+  copyMissing?: boolean;
   /** Sentences to show as they are, one per agent still running in the folder. */
   busyAgents: string[];
   /** The original isn't there over `/mnt`; the app checks from Windows before saying it's gone. */

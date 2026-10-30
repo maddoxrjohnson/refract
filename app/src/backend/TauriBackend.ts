@@ -208,7 +208,7 @@ export class TauriBackend implements Backend {
     return invoke<void>("migrate_resync", { id });
   }
 
-  migrateDelete(id: string, permanent: boolean, force = false): Promise<DeleteOutcome> {
+  migrateDelete(id: string, permanent: boolean, force: string[] = []): Promise<DeleteOutcome> {
     return invoke<DeleteOutcome>("migrate_delete", { id, permanent, force });
   }
 
