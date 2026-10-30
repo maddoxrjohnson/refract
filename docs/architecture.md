@@ -53,7 +53,7 @@ When VS Code is given a folder that is already open, it focuses that window. Tha
 
 | Path | Contents |
 |---|---|
-| `crates/refract-core` | Session parsing and classification, mass score, picker rules, usage totals, hook settings edits, protocol types, log line splitting and stamping |
+| `crates/refract-core` | Session parsing and classification, mass score, picker rules, usage totals, hook settings edits, Move to WSL rules, protocol types, log line splitting and stamping |
 | `crates/refract-agent` | The WSL helper binary, including the status hook script (`src/status-hook.sh`) |
 | `crates/refract-client` | The app's side of the protocol: starts the helper, matches responses to requests, restarts it |
 | `crates/refract-launch` | `refract-launch`, a development tool that runs the launch path from WSL |
@@ -92,6 +92,9 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `installHook` | none | the same | Installs the status hook |
 | `uninstallHook` | none | the same | Removes it and restores `settings.json` |
 | `shutdown` | none | `null` | Answers, then the helper exits |
+| `migrate` | `{path, dest, snapshot}` | `{id}` | Moves a repo from a Windows drive into WSL in the background ([Move to WSL](#move-to-wsl)) |
+| `migrateFinish` | `{id, action}` | `null` | Ends a migration whose report is ready: `action` is `delete`, `keep` or `discard` |
+| `migrateCancel` | `{id}` | `null` | Stops a migration before its report and deletes the temporary copy |
 
 ### Events
 
@@ -101,12 +104,14 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `repoRemoved` | `{path}` | A repo is gone or no longer under a configured root |
 | `sessionChanged` | `{repoPath, session, preselect}` | One session of a repo changed state or content |
 | `loadComplete` | none | The first load finished and every repo has been reported |
+| `migrateProgress` | `{id, step, done, total}` | A migration moved on; `step` is `copying` (bytes), `normalising`, `hashing`, `checkingGit`, `rechecking`, `movingHistory` or `installing` |
+| `migrateReady` | `{id, report}` | A migration finished its checks, passed or failed, and waits for `migrateFinish`; sent again after a helper restart while one is pending |
 
 Usage totals are not pushed. The app asks for them with `usage`.
 
 ### Errors
 
-Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder.
+Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder, `6` a migration could not start or the migration named is unknown or past that step.
 
 ### Rules of the line protocol
 
@@ -121,6 +126,10 @@ Repos that appear later are found by watching every directory the search walks u
 `prepareLaunch` leaves a request file for the VS Code extension and answers with the folder URI to open. `setupServer` runs on a separate thread inside the helper, so other requests are still answered while it runs, and its response can arrive after theirs.
 
 `cloneRepo` and `addRepo` are described under [Cloning and adding repos](#cloning-and-adding-repos).
+
+### Move to WSL
+
+The `migrate` methods and events are specified in `.plans/wsl-migration-spec.md`; the types and the param structs (`MigrateParams`, `MigrateFinishParams`, `MigrateCancelParams`) are in `protocol.rs`, and the helper does not handle the methods yet. Before sending `migrate`, the app writes the source snapshot (the file manifest S0 and the git snapshot G0 it took with `git.exe`) as JSON and passes the file's Linux path as `snapshot`. The rules that decide what to skip, what to compare and what to refuse are in `crates/refract-core/src/migrate` (module docs there).
 
 Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
 

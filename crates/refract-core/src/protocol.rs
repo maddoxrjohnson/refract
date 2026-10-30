@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::classify::SessionState;
+use crate::migrate::report::Report;
 use crate::preselect::Preselect;
 use crate::usage::UsageSummary;
 
@@ -46,6 +47,10 @@ pub mod code {
     /// `prepareLaunch` asked to focus a session that no process runs any more, or
     /// whose process does not run in the Refract window on that folder.
     pub const NOT_RUNNING: i32 = 5;
+    /// `migrate` could not start (the destination exists, or the snapshot file is
+    /// missing or unreadable), or `migrateFinish` or `migrateCancel` named a migration
+    /// that is unknown or past that step.
+    pub const MIGRATE_FAILED: i32 = 6;
 }
 
 /// A request from the app.
@@ -143,6 +148,8 @@ pub enum Reply {
     ServerSetup(ServerSetup),
     Hook(HookInfo),
     Usage(UsageSummary),
+    /// The result of `migrate`.
+    Migration(MigrationTicket),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -260,6 +267,92 @@ pub struct FocusTarget {
     pub pids: Vec<u32>,
 }
 
+/// Params of `migrate`: moves the repo at `path` (a `/mnt/...` path) to `dest` (a
+/// Linux path that must not exist), in the background. Answered at once with a
+/// [`MigrationTicket`], followed by `migrateProgress` events and one `migrateReady`.
+/// `snapshot` is the Linux path of the [`crate::migrate::SourceSnapshot`] file the app
+/// wrote before sending it (see [`crate::migrate`]).
+///
+/// The `migrate*` methods are not [`Method`] variants yet: the helper adds
+/// `Migrate(MigrateParams)`, `MigrateFinish(MigrateFinishParams)` and
+/// `MigrateCancel(MigrateCancelParams)` together with their handling, which gives the
+/// wire format tested here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateParams {
+    pub path: String,
+    pub dest: String,
+    pub snapshot: String,
+}
+
+/// Params of `migrateFinish`: ends a migration whose report is ready. Answered with
+/// `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateFinishParams {
+    pub id: String,
+    pub action: FinishAction,
+}
+
+/// Params of `migrateCancel`: stops a migration before its report and deletes the
+/// temporary copy, leaving the original untouched. Answered with `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateCancelParams {
+    pub id: String,
+}
+
+/// The result of `migrate`: the id its events and later requests use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationTicket {
+    pub id: String,
+}
+
+/// What `migrateFinish` does with a migration whose report is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FinishAction {
+    /// The app has sent the original to the Recycle Bin: the helper deletes the old
+    /// transcripts (when the history check passed) and updates its config entries for
+    /// the old path. Refused unless the report allows deleting.
+    Delete,
+    /// Both stay; the helper only forgets the migration.
+    Keep,
+    /// The copy is deleted, and its moved transcripts with it.
+    Discard,
+}
+
+/// A step of a running migration, as the panel names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MigrateStep {
+    /// Copying files; `done` and `total` count bytes.
+    Copying,
+    /// Rewriting tracked files as Linux git checks them out; counts files.
+    Normalising,
+    /// Hashing the copy; counts files.
+    Hashing,
+    /// Comparing git state; counts repos (submodules included).
+    CheckingGit,
+    /// Re-checking the source for changes and re-copying them; counts rounds of 3.
+    Rechecking,
+    /// Moving session history; counts transcripts.
+    MovingHistory,
+    /// Running the install; counts steps.
+    Installing,
+}
+
+/// Data of a `migrateProgress` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateProgress {
+    pub id: String,
+    pub step: MigrateStep,
+    pub done: u64,
+    pub total: u64,
+}
+
 /// An unsolicited message from the helper.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "event", content = "data", rename_all = "camelCase")]
@@ -272,6 +365,12 @@ pub enum Event {
     SessionChanged(SessionChange),
     /// The first load finished; every repo has been reported. Carries no data.
     LoadComplete,
+    /// A migration moved on.
+    MigrateProgress(MigrateProgress),
+    /// A migration finished its checks, passed or failed, and waits for
+    /// `migrateFinish`. Also sent again for a pending migration after the helper
+    /// restarts.
+    MigrateReady { id: String, report: Box<Report> },
 }
 
 /// Data of a `sessionChanged` event.
@@ -998,6 +1097,7 @@ mod tests {
                 by_repo: vec![],
                 ..usage()
             }),
+            Reply::Migration(MigrationTicket { id: "m-1".into() }),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
@@ -1199,6 +1299,91 @@ mod tests {
         );
         let message: Message = serde_json::from_str(r#"{"event":"loadComplete"}"#).unwrap();
         assert_eq!(message, Message::Event(Event::LoadComplete));
+    }
+
+    #[test]
+    fn migration_messages_round_trip() {
+        let params = MigrateParams {
+            path: "/mnt/c/Users/dev/Desktop/aurora-notes".into(),
+            dest: "/home/dev/projects/aurora-notes".into(),
+            snapshot: "/mnt/c/Users/dev/AppData/Local/refract/migrate/m-1.json".into(),
+        };
+        assert_eq!(
+            round_trip(&params),
+            json!({"path": "/mnt/c/Users/dev/Desktop/aurora-notes",
+                "dest": "/home/dev/projects/aurora-notes",
+                "snapshot": "/mnt/c/Users/dev/AppData/Local/refract/migrate/m-1.json"})
+        );
+        for (action, name) in [
+            (FinishAction::Delete, "delete"),
+            (FinishAction::Keep, "keep"),
+            (FinishAction::Discard, "discard"),
+        ] {
+            let finish = MigrateFinishParams {
+                id: "m-1".into(),
+                action,
+            };
+            assert_eq!(round_trip(&finish), json!({"id": "m-1", "action": name}));
+        }
+        assert!(serde_json::from_value::<MigrateFinishParams>(
+            json!({"id": "m-1", "action": "erase"})
+        )
+        .is_err());
+        assert_eq!(
+            round_trip(&MigrateCancelParams { id: "m-1".into() }),
+            json!({"id": "m-1"})
+        );
+
+        let ticket = Message::Response(Response::ok(
+            20,
+            Reply::Migration(MigrationTicket { id: "m-1".into() }),
+        ));
+        assert_eq!(
+            round_trip(&ticket),
+            json!({"id": 20, "result": {"id": "m-1"}})
+        );
+
+        let progress = Event::MigrateProgress(MigrateProgress {
+            id: "m-1".into(),
+            step: MigrateStep::CheckingGit,
+            done: 1,
+            total: 3,
+        });
+        assert_eq!(
+            round_trip(&Message::Event(progress)),
+            json!({"event": "migrateProgress", "data": {
+                "id": "m-1", "step": "checkingGit", "done": 1, "total": 3}})
+        );
+
+        let report = Report {
+            version: crate::migrate::report::REPORT_VERSION,
+            id: "m-1".into(),
+            source: "/mnt/c/Users/dev/Desktop/aurora-notes".into(),
+            dest: "/home/dev/projects/aurora-notes".into(),
+            started_at: "2026-10-30T10:00:00Z".parse().unwrap(),
+            finished_at: "2026-10-30T10:05:00Z".parse().unwrap(),
+            checks: vec![],
+            skipped: vec![],
+            dropped_streams: vec![],
+            new_objects: 0,
+            source_totals: Default::default(),
+            copy_totals: Default::default(),
+            install: vec![],
+            history: Default::default(),
+            linux_git: false,
+            warnings: vec![],
+        };
+        let ready = Event::MigrateReady {
+            id: "m-1".into(),
+            report: Box::new(report),
+        };
+        let value = round_trip(&Message::Event(ready));
+        assert_eq!(value["event"], "migrateReady");
+        assert_eq!(value["data"]["id"], "m-1");
+        assert_eq!(
+            value["data"]["report"]["dest"],
+            "/home/dev/projects/aurora-notes"
+        );
     }
 
     #[test]
