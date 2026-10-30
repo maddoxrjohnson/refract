@@ -94,7 +94,7 @@ pub enum Command {
     BeginDelete {
         request: Id,
         source_gone: bool,
-        force: bool,
+        force: Vec<String>,
     },
     Resync(Id),
     Finish(Id, FinishAction),
@@ -246,8 +246,10 @@ pub fn resume(record: Record, ctx: Context, sink: Sink) -> io::Result<Handle> {
             worker.started_at = record.report.started_at;
             worker.report_path = record.report_path.clone();
             worker.placed = true;
+            worker.progress.placed = true;
             worker.deleting = record.deleting;
             worker.install_changes = record.report.install_changes.clone();
+            worker.recovered_changes = record.report.recovered_changes.clone();
             worker.install_backup = record.report.install_backup.clone();
             worker.copy_errors = record
                 .copy_errors
@@ -313,6 +315,8 @@ struct Progress {
     sink: Sink,
     step: Option<MigrateStep>,
     last: Instant,
+    /// The copy is in place (sent with each event).
+    placed: bool,
 }
 
 impl Progress {
@@ -331,8 +335,22 @@ impl Progress {
             step,
             done,
             total,
+            placed: self.placed,
         })));
     }
+}
+
+/// The placed copy against its last check ([`Worker::copy_check`]).
+#[derive(Default)]
+struct CopyCheck {
+    /// Every path that differs or could not be read; `["."]` when the copy is gone.
+    changed: Vec<String>,
+    /// Of those, the paths gone from the copy.
+    removed: Vec<String>,
+    /// Of those, the paths that could not be read (`"."` for the folder itself).
+    unreadable: Vec<String>,
+    /// The copy's folder is gone.
+    missing: bool,
 }
 
 /// The checks 1 to 4 of one verification.
@@ -367,6 +385,9 @@ struct Worker {
     warnings: Vec<String>,
     /// What the install did to the placed copy, allowed in later checks.
     install_changes: InstallChanges,
+    /// What changed in the copy while an install was cut short ([`Worker::recover`]):
+    /// maybe the user's work, so discard and re-sync are refused while it is not empty.
+    recovered_changes: InstallChanges,
     /// Where the original's versions of the files the install changed are.
     install_backup: Option<String>,
     /// Tracked files kept byte for byte when normalised, by path from the top.
@@ -396,6 +417,7 @@ impl Worker {
             sink: sink.clone(),
             step: None,
             last: Instant::now(),
+            placed: false,
         };
         Worker {
             id,
@@ -415,6 +437,7 @@ impl Worker {
             copy_errors: BTreeMap::new(),
             warnings: Vec::new(),
             install_changes: InstallChanges::default(),
+            recovered_changes: InstallChanges::default(),
             install_backup: None,
             kept: BTreeSet::new(),
             deleting: false,
@@ -675,6 +698,7 @@ impl Worker {
             return Err(Stop::Fatal(message));
         }
         self.placed = true;
+        self.progress.placed = true;
         self.temp = None;
         let report = self.build_report(
             not_moved(&verdict.checks),
@@ -780,9 +804,11 @@ impl Worker {
     /// helper stopped, or a panic): makes its report from what is on disk, saves it and
     /// returns it. The copy is never deleted here.
     ///
-    /// - The install: what changed in the copy since it was placed counts as the
-    ///   install's (as with an install that ran to its end), the original's versions
-    ///   are backed up, and each step is marked cancelled; the history did not move.
+    /// - The install: what changed in the copy since it was placed may be the install's
+    ///   or the user's own edits made while the helper was down, so it is kept apart
+    ///   (`recovered_changes`): allowed in later checks, the original's versions backed
+    ///   up as for an install, but never discarded or re-synced over. Each step is
+    ///   marked cancelled; the history did not move.
     /// - The history: the copies that were written, unchanged since, are taken as this
     ///   migration's ([`history::adopt`]), so a discard deletes them; the history check
     ///   fails, so the old transcripts are never deleted.
@@ -838,8 +864,9 @@ impl Worker {
                 let now = self.copy_state(&self.dest);
                 let changes =
                     compare_readable(&record.copy_stats, &now.entries, &now.unreadable_paths());
-                let problems = self.take_install_changes(&changes, &now.unreadable);
+                let problems = self.take_install_changes(&changes, &now.unreadable, true);
                 report.install_changes = self.install_changes.clone();
+                report.recovered_changes = self.recovered_changes.clone();
                 report.install_backup = self.install_backup.clone();
                 if let Some(files) = report
                     .checks
@@ -972,23 +999,58 @@ impl Worker {
         stats
     }
 
+    /// True when a difference of the copy at `path` is the install's, or was found
+    /// after an install that was cut short.
+    fn allowed(&self, path: &str) -> bool {
+        self.install_changes.allows(path) || self.recovered_changes.allows(path)
+    }
+
     /// The paths of the placed copy that differ from it as last checked
     /// ([`Record::copy_stats`]), or could not be read; `["."]` when it is gone.
     fn copy_changes(&self) -> Vec<String> {
+        self.copy_check().changed
+    }
+
+    /// [`Worker::copy_changes`], with which of them are gone from the copy and which
+    /// could not be read. A copy placed but not yet recorded is unknown: unreadable.
+    fn copy_check(&self) -> CopyCheck {
         let Some(record) = &self.record else {
-            return vec![".".into()];
+            return CopyCheck {
+                changed: vec![".".into()],
+                unreadable: vec![".".into()],
+                ..CopyCheck::default()
+            };
         };
-        if !fs::symlink_metadata(&self.dest).is_ok_and(|m| m.is_dir()) {
-            return vec![".".into()];
+        if self.copy_missing() {
+            return CopyCheck {
+                changed: vec![".".into()],
+                missing: true,
+                ..CopyCheck::default()
+            };
         }
         let now = self.copy_state(&self.dest);
-        let unreadable = now.unreadable_paths();
-        let changes = compare_readable(&record.copy_stats, &now.entries, &unreadable);
-        let mut paths = changed_paths(&changes);
-        paths.extend(unreadable.into_iter().map(dot));
-        paths.sort();
-        paths.dedup();
-        paths
+        let unreadable: Vec<String> = {
+            let mut paths: Vec<String> = now.unreadable_paths().into_iter().map(dot).collect();
+            paths.sort();
+            paths.dedup();
+            paths
+        };
+        let changes = compare_readable(&record.copy_stats, &now.entries, &now.unreadable_paths());
+        let removed = changes
+            .removed
+            .iter()
+            .map(|p| p.as_str().to_owned())
+            .collect();
+        let mut changed = changed_paths(&changes);
+        changed.extend(unreadable.iter().cloned());
+        changed.sort();
+        changed.dedup();
+        CopyCheck {
+            changed,
+            removed,
+            unreadable,
+            missing: false,
+        }
     }
 
     /// Check 4 again, and the copy against its last check (`migrateRecheck`). With
@@ -1034,21 +1096,28 @@ impl Worker {
             recheck.unreadable.sort();
             recheck.unreadable.dedup();
         }
-        recheck.copy_changed = self.copy_changes();
+        let copy = self.copy_check();
+        recheck.copy_changed = copy.changed;
+        recheck.copy_removed = copy.removed;
+        recheck.copy_unreadable = copy.unreadable;
+        recheck.copy_missing = copy.missing;
         if relax {
             let known: BTreeSet<&str> = self
                 .record
                 .iter()
                 .flat_map(|r| r.copy_stats.iter().map(|e| e.path.as_str()))
                 .collect();
-            recheck.copy_changed.retain(|path| {
+            let matters = |path: &String| {
                 path == "."
                     || (known.contains(path.as_str())
                         && !matches!(
                             fs::symlink_metadata(self.source.join(path)),
                             Err(e) if e.kind() == io::ErrorKind::NotFound
                         ))
-            });
+            };
+            recheck.copy_changed.retain(matters);
+            recheck.copy_removed.retain(matters);
+            recheck.copy_unreadable.retain(matters);
         }
         recheck.busy_agents = self.busy_agents();
         recheck
@@ -1318,8 +1387,7 @@ impl Worker {
             Err(e) => (ManifestDiff::default(), Some(e)),
         };
         // What the install did is listed in the report, not failed on.
-        diff.problems
-            .retain(|p| !self.install_changes.allows(p.path()));
+        diff.problems.retain(|p| !self.allowed(p.path()));
         let copy_errors: Vec<Problem> = self.copy_errors.values().cloned().collect();
         let [mut files, nothing_skipped] = manifest_checks(&diff, &copy_errors);
         for problem in &mut files.problems {
@@ -1382,11 +1450,7 @@ impl Worker {
                         if let Some(path) = &problem.path {
                             problem.path = Some(format!("{prefix}{path}"));
                         }
-                        if problem
-                            .path
-                            .as_deref()
-                            .is_some_and(|p| self.install_changes.allows(p))
-                        {
+                        if problem.path.as_deref().is_some_and(|p| self.allowed(p)) {
                             continue;
                         }
                         // Git shows a file kept byte for byte as modified: say why.
@@ -1480,20 +1544,22 @@ impl Worker {
         );
         let after = tree::stats(&self.dest, &folders, &never).unwrap_or_default();
         let changes = compare_readable(&before.entries, &after.entries, &after.unreadable_paths());
-        let problems = self.take_install_changes(&changes, &after.unreadable);
+        let problems = self.take_install_changes(&changes, &after.unreadable, false);
         (results, problems)
     }
 
-    /// Records `changes` to the placed copy as the install's (`install_changes`), backs
-    /// up the original's version of what they changed or removed, and returns the
-    /// problems (paths of the copy that could not be read, and files that could not be
-    /// backed up), which are copy problems too.
+    /// Records `changes` to the placed copy as the install's (`install_changes`), or,
+    /// `recovered` from an install that was cut short, apart (`recovered_changes`); backs
+    /// up the original's version of what they changed or removed either way, and
+    /// returns the problems (paths of the copy that could not be read, and files that
+    /// could not be backed up), which are copy problems too.
     fn take_install_changes(
         &mut self,
         changes: &StatChanges,
         unreadable: &[tree::Unreadable],
+        recovered: bool,
     ) -> Vec<Problem> {
-        self.install_changes = install::changes(&self.dest, changes);
+        let found = install::changes(&self.dest, changes);
         let mut problems: Vec<Problem> = unreadable
             .iter()
             .map(|u| Problem {
@@ -1504,7 +1570,7 @@ impl Worker {
                 ),
             })
             .collect();
-        if !self.install_changes.changed.is_empty() || !self.install_changes.removed.is_empty() {
+        if !found.changed.is_empty() || !found.removed.is_empty() {
             let backup = store::backup_dir(&self.report_path);
             let final_stats = self
                 .record
@@ -1513,12 +1579,17 @@ impl Worker {
                 .unwrap_or_default();
             problems.extend(install::backup(
                 &self.source,
-                &self.install_changes,
+                &found,
                 &backup,
                 &final_stats,
                 &self.snapshot().manifest,
             ));
             self.install_backup = Some(state::path_str(&backup));
+        }
+        if recovered {
+            self.recovered_changes = found;
+        } else {
+            self.install_changes = found;
         }
         for problem in &problems {
             let key = problem.path.clone().unwrap_or_default();
@@ -1562,6 +1633,7 @@ impl Worker {
             copy_totals: diff.map_or_else(Default::default, |d| d.copy_totals),
             install,
             install_changes: self.install_changes.clone(),
+            recovered_changes: self.recovered_changes.clone(),
             install_backup: self.install_backup.clone(),
             history,
             linux_git: snapshot.linux_git,
@@ -1673,6 +1745,28 @@ impl Worker {
         None
     }
 
+    /// Why `doing` (deleting or re-syncing over the copy) is refused while the copy
+    /// holds what changed during an install that was cut short, if it is.
+    fn recovered_refusal(&self, doing: &str) -> Option<String> {
+        let found = &self.recovered_changes;
+        let paths: Vec<String> = found
+            .created
+            .iter()
+            .chain(&found.changed)
+            .chain(&found.removed)
+            .cloned()
+            .collect();
+        (!paths.is_empty()).then(|| {
+            format!(
+                "The copy at {} changed while the install was cut short ({}), which may include \
+                 your own edits, so Refract won't {doing}. Keep both, or delete the original \
+                 (its versions of those files are saved).",
+                self.dest_str(),
+                sample(&paths)
+            )
+        })
+    }
+
     /// Saves `step` as running (with nothing written yet) before it touches the copy.
     fn mark_running(&mut self, step: Running) -> Result<(), String> {
         let Some(record) = &mut self.record else {
@@ -1706,7 +1800,12 @@ impl Worker {
 
     fn handle(&mut self, command: Command) {
         if let Some(done) = self.finished {
-            if !matches!(command, Command::Finish(..)) {
+            // Once the delete is finishing, the recheck and `migrateBeginDelete` only
+            // read (deleting already), so the app's Finish deleting, which sends
+            // `migrateBeginDelete` before `migrateFinish delete`, still works.
+            let reads = done == FinishAction::Delete
+                && matches!(command, Command::Recheck(_) | Command::BeginDelete { .. });
+            if !reads && !matches!(command, Command::Finish(..)) {
                 let why = format!(
                     "the migration is finishing ({}); send that migrateFinish again",
                     action_name(done)
@@ -1739,6 +1838,8 @@ impl Worker {
                         "{} It can't be re-synced.",
                         self.source_gone_message()
                     ))
+                } else if let Some(why) = self.recovered_refusal("re-sync over it") {
+                    Some(why)
                 } else {
                     let changed = self.copy_changes();
                     (!changed.is_empty()).then(|| {
@@ -1783,9 +1884,10 @@ impl Worker {
     /// `migrateBeginDelete`: the recheck, and the deleting state when it passes. In the
     /// deleting state, and when the original is gone on both sides, a change to the
     /// copy only blocks for a path the original still has ([`Worker::recheck`]), and
-    /// `force` skips even those. A source only the helper can't see (`source_gone`
-    /// false) never passes: nothing of it was checked.
-    fn begin_delete(&mut self, request: Id, source_gone: bool, force: bool) {
+    /// in the deleting state `force` skips those it names (never one that could not be
+    /// read, nor a copy that is gone). A source only the helper can't see
+    /// (`source_gone` false) never passes: nothing of it was checked.
+    fn begin_delete(&mut self, request: Id, source_gone: bool, force: Vec<String>) {
         if let Some(why) = self.recheck_refusal() {
             let command = Command::BeginDelete {
                 request,
@@ -1798,8 +1900,13 @@ impl Worker {
         let relax = self.deleting || (source_gone && self.source_missing());
         let recheck = self.recheck(relax);
         let hidden = recheck.source_missing && !source_gone;
-        let copy_gone = recheck.copy_changed.iter().any(|p| p == ".");
-        let copy_ok = recheck.copy_changed.is_empty() || (force && self.deleting && !copy_gone);
+        let forced = |path: &String| {
+            self.deleting
+                && !recheck.copy_missing
+                && !recheck.copy_unreadable.contains(path)
+                && force.contains(path)
+        };
+        let copy_ok = recheck.copy_changed.iter().all(forced);
         let ok = recheck.changed.is_empty()
             && recheck.unreadable.is_empty()
             && recheck.busy_agents.is_empty()
@@ -2019,6 +2126,12 @@ impl Worker {
                             .into(),
                     );
                 }
+                if copy_gone {
+                    return Err(format!(
+                        "The copy at {} is gone, so the move can't finish; end it with discard.",
+                        self.dest_str()
+                    ));
+                }
                 let report = self.report.clone();
                 if let (Some(record), Some(report)) = (&self.record, &report) {
                     if report.history_ok() {
@@ -2077,6 +2190,9 @@ impl Worker {
                             "{} It won't be deleted.",
                             self.source_gone_message()
                         ));
+                    }
+                    if let Some(why) = self.recovered_refusal("delete it") {
+                        return Err(why);
                     }
                     let changed = self.copy_changes();
                     if !changed.is_empty() {

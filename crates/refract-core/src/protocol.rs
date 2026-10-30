@@ -134,12 +134,15 @@ pub enum Method {
     /// `migrateCancel` are refused ("The original is being deleted."), and
     /// `migrateFinish` `discard` unless the copy is gone; `migrateFinish` `delete`,
     /// sent once the original is gone, ends it, and is refused outside it. Refused
-    /// unless the report allows deleting.
+    /// unless the report allows deleting. While a `migrateFinish` `delete` is finishing
+    /// (its config write failed), this and `migrateRecheck` still answer, so the app's
+    /// retry (this, then `migrateFinish` `delete` again) works.
     MigrateBeginDelete(MigrateBeginDeleteParams),
     /// Re-copies what changed in the original since the report into the placed copy and
     /// checks it again: answered with `null`, then [`Event::MigrateProgress`] and a fresh
     /// [`Event::MigrateReady`]. Refused in the deleting state, when the original folder
-    /// is gone, and when the placed copy changed since it was checked.
+    /// is gone, when the placed copy changed since it was checked, and while the
+    /// report's `recoveredChanges` is not empty.
     MigrateResync(MigrateIdParams),
     /// The migrations whose reports wait for `migrateFinish`, including those from
     /// before the helper restarted: answered with a list of [`PendingMigration`].
@@ -374,12 +377,14 @@ pub struct MigrateBeginDeleteParams {
     /// false with `sourceMissing`. Missing means `false`.
     #[serde(default)]
     pub source_gone: bool,
-    /// Only in the deleting state: delete the rest even though the copy's version of
-    /// the paths in `copyChanged` differs from the original's (the copy keeps its
-    /// version). Never skips `changed`, `unreadable`, `busyAgents`, a hidden original
-    /// or a copy that is gone.
+    /// Only in the deleting state: the paths of `copyChanged` the user saw and agreed
+    /// to delete the rest anyway for, though the copy's version differs from the
+    /// original's (the copy keeps its version; for one in `copyRemoved` the original's
+    /// is then gone for good). Only these are skipped: any other copy change still
+    /// blocks. Never skips `changed`, `unreadable`, `busyAgents`, `copyUnreadable`, a
+    /// hidden original or a copy that is gone. Missing means none.
     #[serde(default)]
-    pub force: bool,
+    pub force: Vec<String>,
 }
 
 /// The result of `migrateCancel`.
@@ -403,7 +408,8 @@ pub enum FinishAction {
     /// one changed since is copied again first, and kept when its copy changed too),
     /// and rewrites `extra` and `hidden` entries in `agent.toml` that name the old
     /// path to the new one, adding the new path to `extra` when no root covers it.
-    /// Refused unless the migration is in the deleting state.
+    /// Refused unless the migration is in the deleting state, and when the copy is
+    /// gone (then only `discard` ends it).
     Delete,
     /// Both stay: the old path is added to `hidden` in `agent.toml`, so its gem goes,
     /// and the new path to `extra` when no root covers it. The old transcripts stay.
@@ -413,7 +419,8 @@ pub enum FinishAction {
     /// The copy is deleted, and the transcripts copied for it that are unchanged since.
     /// The original is as it was. Refused in the deleting state, when the original
     /// folder is gone (the copy is then the only one), and when the placed copy
-    /// changed since it was checked (it may hold work of yours). With the copy gone
+    /// changed since it was checked (it may hold work of yours), as while the report's
+    /// `recoveredChanges` is not empty. With the copy gone
     /// (deleted by hand) it only forgets the migration, in any state and whatever
     /// became of the original.
     Discard,
@@ -441,6 +448,18 @@ pub struct Recheck {
     /// copy is gone.
     #[serde(default)]
     pub copy_changed: Vec<String>,
+    /// The paths of `copyChanged` that are gone from the copy (deleted there): deleting
+    /// the original's version of one loses it for good.
+    #[serde(default)]
+    pub copy_removed: Vec<String>,
+    /// The paths of `copyChanged` that could not be read in the copy (`"."` for the
+    /// folder itself), so whether they changed is unknown. Never forced.
+    #[serde(default)]
+    pub copy_unreadable: Vec<String>,
+    /// The placed copy's folder is gone (`copyChanged` is then `["."]`), as against
+    /// one that can't be read (`copyUnreadable: ["."]`).
+    #[serde(default)]
+    pub copy_missing: bool,
     /// One sentence per `claude` process whose working directory is the original or
     /// inside it, naming its pid, folder and session when known.
     pub busy_agents: Vec<String>,
@@ -534,6 +553,10 @@ pub struct MigrateProgress {
     pub step: MigrateStep,
     pub done: u64,
     pub total: u64,
+    /// The copy is in place at `dest` (from the install on, and during a re-sync): a
+    /// cancel then keeps it and a report follows.
+    #[serde(default)]
+    pub placed: bool,
 }
 
 /// An unsolicited message from the helper.
@@ -1547,13 +1570,14 @@ mod tests {
             step: MigrateStep::CheckingGit,
             done: 1,
             total: 3,
+            placed: true,
         });
         assert_eq!(
             round_trip(&Message::Event(progress)),
             json!({"event": "migrateProgress", "data": {
                 "id": "m-1", "source": "/mnt/c/dev/aurora-notes",
                 "dest": "/home/dev/projects/aurora-notes", "step": "checkingGit",
-                "done": 1, "total": 3}})
+                "done": 1, "total": 3, "placed": true}})
         );
 
         let report = Report {
@@ -1571,6 +1595,7 @@ mod tests {
             copy_totals: Default::default(),
             install: vec![],
             install_changes: Default::default(),
+            recovered_changes: Default::default(),
             install_backup: None,
             history: Default::default(),
             linux_git: false,
@@ -1614,17 +1639,17 @@ mod tests {
             Method::MigrateBeginDelete(MigrateBeginDeleteParams {
                 id: "m-1".into(),
                 source_gone: false,
-                force: false,
+                force: vec![],
             })
         );
         let begin = MigrateBeginDeleteParams {
             id: "m-1".into(),
             source_gone: true,
-            force: true,
+            force: vec!["README.md".into()],
         };
         assert_eq!(
             round_trip(&begin),
-            json!({"id": "m-1", "sourceGone": true, "force": true})
+            json!({"id": "m-1", "sourceGone": true, "force": ["README.md"]})
         );
         let cancelled = Message::Response(Response::ok(
             4,
@@ -1654,6 +1679,9 @@ mod tests {
                 removed: vec!["old.txt".into()],
                 unreadable: vec!["locked".into()],
                 copy_changed: vec!["."].into_iter().map(String::from).collect(),
+                copy_removed: vec![],
+                copy_unreadable: vec![],
+                copy_missing: true,
                 busy_agents: vec![
                     "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes.".into()
                 ],
@@ -1663,7 +1691,8 @@ mod tests {
         assert_eq!(
             round_trip(&recheck),
             json!({"id": 5, "result": {"changed": ["notes.txt"], "removed": ["old.txt"],
-                "unreadable": ["locked"], "copyChanged": ["."], "busyAgents": [
+                "unreadable": ["locked"], "copyChanged": ["."], "copyRemoved": [],
+                "copyUnreadable": [], "copyMissing": true, "busyAgents": [
                 "An agent (pid 4242) is running in /mnt/c/dev/aurora-notes."],
                 "sourceMissing": false}})
         );
@@ -1725,6 +1754,7 @@ mod tests {
             copy_totals: Default::default(),
             install: vec![],
             install_changes: Default::default(),
+            recovered_changes: Default::default(),
             install_backup: None,
             history: Default::default(),
             linux_git: false,

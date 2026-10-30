@@ -268,6 +268,13 @@ pub struct Report {
     /// What the install created, changed or removed outside the build folders.
     #[serde(default)]
     pub install_changes: InstallChanges,
+    /// What changed in the placed copy while an install was cut short (the helper
+    /// stopped while it ran): the install's doing or the user's own edits, which can't
+    /// be told apart. The original's versions are backed up as for `install_changes`,
+    /// and later checks allow them, but `migrateFinish discard` and `migrateResync`
+    /// are refused while this is not empty, so they are never lost.
+    #[serde(default)]
+    pub recovered_changes: InstallChanges,
     /// Linux path of the folder holding the original's version of each file the
     /// install changed or removed (`installChanges.changed` and `.removed`, at the same
     /// relative paths), under `~/.local/share/refract/migrations/`. `None` when the
@@ -340,6 +347,7 @@ mod tests {
             copy_totals: Totals::default(),
             install: vec![],
             install_changes: InstallChanges::default(),
+            recovered_changes: InstallChanges::default(),
             install_backup: None,
             history: HistoryMoved::default(),
             linux_git: false,
