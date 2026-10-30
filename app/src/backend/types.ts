@@ -261,6 +261,25 @@ export interface RepoUsage {
   last7Days: TokenTotals;
 }
 
+/** One plan-limit window as Claude Code's status line last saw it. */
+export interface LimitWindow {
+  /** Percentage of the window's limit used; can pass 100. */
+  usedPercent: number;
+  /** RFC 3339: when the window resets. */
+  resetsAt: string;
+}
+
+/**
+ * Plan-limit percentages relayed from Claude Code's status line through
+ * `~/.claude/usage-state.json` (spec §3.5). Either window can be missing.
+ */
+export interface PlanLimits {
+  fiveHour?: LimitWindow;
+  sevenDay?: LimitWindow;
+  /** RFC 3339: when the status line wrote the reading. */
+  updatedAt: string;
+}
+
 /** Token use summed from Claude Code's local session files (spec §3.5). */
 export interface UsageSummary {
   /** Since local midnight in WSL. */
@@ -274,6 +293,8 @@ export interface UsageSummary {
   byRepo: RepoUsage[];
   /** The windows split by model; absent from helpers older than the cost estimate. */
   byModel?: ModelWindows;
+  /** Plan limits from the status line's file; absent with no reading or from older helpers. */
+  limits?: PlanLimits;
   /** RFC 3339. */
   computedAt: string;
   /** False until the helper has read the transcripts once; the totals are zeros until then. */

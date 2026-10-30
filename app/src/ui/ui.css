@@ -1123,6 +1123,62 @@
   box-shadow: 0 0 6px var(--halo);
 }
 
+/* Plan limits from the status line: a line of text over a thin meter per window. */
+.rf-limits {
+  margin: 6px 0 0;
+  padding-top: 6px;
+  border-top: 1px solid var(--line);
+}
+
+.rf-limit + .rf-limit {
+  margin-top: 4px;
+}
+
+.rf-limit__line {
+  display: flex;
+  align-items: baseline;
+  gap: 5px;
+  margin: 0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.rf-limit__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--muted);
+}
+
+.rf-limit__reset {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rf-limit__track {
+  position: relative;
+  height: 3px;
+  margin-top: 3px;
+  border-radius: 2px;
+  background: rgb(255 255 255 / 0.07);
+  overflow: hidden;
+}
+
+.rf-limit__fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 2px;
+  background: rgb(169 216 255 / 0.55);
+  transition: width 600ms var(--ease-out);
+}
+
+/* Close to the limit, the bar turns amber like a gem that needs attention. */
+.rf-limit__fill--high {
+  background: var(--amber);
+  box-shadow: 0 0 6px var(--amber);
+}
+
 /* The 7-day breakdown grows the widget upward, short of the system widget. */
 .rf-usage__repos {
   margin: 0 0 10px;
@@ -1137,6 +1193,16 @@
   padding: 0;
   max-height: min(220px, max(40px, calc(100vh - 360px)));
   overflow-y: auto;
+}
+
+/* The plan limits take about 80px (100px with their "as of" line) below the list, so the
+   list gives that room back to stay clear of the system widget on short windows. */
+.rf-widget--limits .rf-usage__repos ul {
+  max-height: min(220px, max(18px, calc(100vh - 440px)));
+}
+
+.rf-widget--limits-stale .rf-usage__repos ul {
+  max-height: min(220px, max(18px, calc(100vh - 460px)));
 }
 
 .rf-usage__repos li {
@@ -1244,7 +1310,8 @@
   .rf-gear,
   .rf-quality__option span,
   .rf-meter__fill,
-  .rf-meter__own {
+  .rf-meter__own,
+  .rf-limit__fill {
     transition: none;
   }
 

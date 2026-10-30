@@ -132,12 +132,27 @@ test.describe("at 1280×800", () => {
     // Every row stays on one line inside the widget.
     const fits = await widget.evaluate((el) => {
       const box = el.getBoundingClientRect();
-      return [...el.querySelectorAll(".rf-usage__totals > div, .rf-usage__note")].every((row) => {
+      return [...el.querySelectorAll(".rf-usage__totals > div, .rf-usage__note, .rf-limit__line")].every((row) => {
         const r = row.getBoundingClientRect();
         return r.left >= box.left && r.right <= box.right && r.height < 22 && row.scrollWidth <= row.clientWidth;
       });
     });
     expect(fits).toBe(true);
+    // The plan limits sit under the rows, one meter per window, and the widget stays
+    // compact and clear of the system widget above it.
+    await expect(widget.getByRole("meter", { name: "5-hour limit" })).toHaveAttribute(
+      "aria-valuetext",
+      /^\d+% used, resets \d\d:\d\d$/,
+    );
+    await expect(widget.getByRole("meter", { name: "Weekly limit" })).toHaveAttribute(
+      "aria-valuetext",
+      /^\d+% used, resets \w{3} \d\d:\d\d$/,
+    );
+    const box = (await widget.boundingBox())!;
+    const system = (await page.getByRole("region", { name: "System" }).boundingBox())!;
+    expect(box.height).toBeLessThanOrEqual(260);
+    expect(box.y).toBeGreaterThan(system.y + system.height + 100);
+    expect(box.y + box.height).toBeLessThanOrEqual(800 - 16 + 0.5);
   });
 
   test("the cost estimate settings fit the dialog", async ({ page }) => {
@@ -184,5 +199,19 @@ test.describe("at 1280×800", () => {
     await expect(table).toBeHidden();
     await page.keyboard.press("Escape");
     await expect(page.getByRole("region", { name: "Claude usage" })).not.toContainText("$");
+  });
+});
+
+test.describe("at 1280×480", () => {
+  test.use({ viewport: { width: 1280, height: 480 } });
+
+  test("the usage widget's breakdown with the plan limits stays clear of the system widget", async ({ page }) => {
+    const widget = page.getByRole("region", { name: "Claude usage" });
+    await expect(widget.getByRole("meter", { name: "Weekly limit" })).toBeVisible();
+    await widget.focus();
+    await expect(widget.getByRole("list")).toBeVisible();
+    const usage = (await widget.boundingBox())!;
+    const system = (await page.getByRole("region", { name: "System" }).boundingBox())!;
+    expect(usage.y).toBeGreaterThanOrEqual(system.y + system.height + 4);
   });
 });

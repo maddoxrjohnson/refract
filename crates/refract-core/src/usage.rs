@@ -29,6 +29,7 @@ use std::sync::Arc;
 use chrono::{DateTime, FixedOffset, NaiveTime, TimeDelta, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::limits::PlanLimits;
 use crate::sessions::path_within;
 
 /// Length of the rolling short window.
@@ -105,7 +106,7 @@ pub struct ModelWindows {
 }
 
 /// The result of `usage`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageSummary {
     /// Since local midnight.
@@ -121,6 +122,11 @@ pub struct UsageSummary {
     /// estimate, hence the default.
     #[serde(default)]
     pub by_model: ModelWindows,
+    /// Plan-limit percentages from the status line's file, when there is a reading
+    /// (see [`crate::limits`]). Left out otherwise, and absent from older helpers.
+    /// Boxed to keep [`crate::protocol::Reply`] small.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Box<PlanLimits>>,
     pub computed_at: DateTime<Utc>,
     /// False until the helper has read the transcripts once; the totals are zeros
     /// until then, not real ones.
@@ -314,6 +320,7 @@ where
         live_agents,
         by_repo: Vec::new(),
         by_model: ModelWindows::default(),
+        limits: None,
         computed_at: now,
         ready: true,
     };

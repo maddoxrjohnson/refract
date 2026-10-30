@@ -167,6 +167,7 @@ mod tests {
             hidden: vec![],
             depth,
             claude_projects: PathBuf::from("/nonexistent"),
+            limits_file: PathBuf::from("/nonexistent/usage-state.json"),
         }
     }
 

@@ -300,3 +300,54 @@ fn a_resumed_old_session_has_its_new_subagents_counted() {
     agent.call("shutdown");
     assert!(agent.child.wait().unwrap().success());
 }
+
+#[test]
+fn usage_carries_plan_limits_from_the_status_line_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(home.join(".claude")).unwrap();
+    let config = tmp.path().join("agent.toml");
+    write(&config, "roots = []\n");
+    let state = home.join(".claude/usage-state.json");
+
+    let mut agent = Agent::spawn(&home, &config);
+    // No file: no limits, and no error.
+    let usage = agent.call("usage");
+    assert!(usage["error"].is_null(), "{usage}");
+    assert!(usage["result"].get("limits").is_none(), "{usage}");
+
+    write(
+        &state,
+        r#"{"updated": 1793361600.25, "five_hour": {"used": 37.0, "resets_at": 1793370000}, "seven_day": null}"#,
+    );
+    let usage = agent.call("usage")["result"].clone();
+    assert_eq!(
+        usage["limits"],
+        json!({
+            "fiveHour": {"usedPercent": 37.0, "resetsAt": "2026-10-30T14:20:00Z"},
+            "updatedAt": "2026-10-30T12:00:00.250Z"})
+    );
+
+    // Malformed: no limits again.
+    write(
+        &state,
+        r#"{"updated": 1793361600, "five_hour": {"used": 1200, "resets_at": 1793370000}}"#,
+    );
+    let usage = agent.call("usage")["result"].clone();
+    assert!(usage.get("limits").is_none(), "{usage}");
+
+    // Moved by the config.
+    let moved = tmp.path().join("limits.json");
+    write(
+        &config,
+        &format!("roots = []\nlimits_file = {:?}\n", moved.to_str().unwrap()),
+    );
+    write(
+        &moved,
+        r#"{"updated": 1793361600, "seven_day": {"used": 58, "resets_at": 1793800000}}"#,
+    );
+    let mut agent = Agent::spawn(&home, &config);
+    let usage = agent.call("usage")["result"].clone();
+    assert_eq!(usage["limits"]["sevenDay"]["usedPercent"], 58.0);
+    assert!(usage["limits"].get("fiveHour").is_none());
+}

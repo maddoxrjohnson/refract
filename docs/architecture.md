@@ -87,7 +87,7 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `setupServer` | `{vsix, commit?}` | `{installed, applicationScoped, skipped?}` | Installs the Refract extension in the WSL VS Code server ([launch.md](launch.md)) |
 | `cloneRepo` | `{url, name}` | the clone's path | Clones an `https://` URL into `~/projects/<name>` |
 | `addRepo` | `{path}` | `null` | Reports the repo that holds `path` from now on |
-| `usage` | none | token totals | Tokens used today, in 7 days and in 5 hours, by repo and by model |
+| `usage` | none | token totals, and `limits` when there is a reading | Tokens used today, in 7 days and in 5 hours, by repo and by model; plan-limit percentages from the status line ([plan limits](#plan-limits)) |
 | `hookInfo` | none | `{installed, settingsPath, diff}` | Whether the status hook is installed, and what installing would change |
 | `installHook` | none | the same | Installs the status hook |
 | `uninstallHook` | none | the same | Removes it and restores `settings.json` |
@@ -191,7 +191,7 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 - **Picker, filter bar, focus label.** Presentation for the navigation state above.
 - **Settings.** GitLab address and token, GitHub token (the GitHub CLI login is used otherwise), show forks, show archived, refresh remotes, the hidden list with Unhide, adding a folder, the cost estimate (on or off, and its price table with Add row, remove, Reset to defaults and Save prices), the status hook's install and remove, and Open log folder. Changes are saved one after another; if saving fails the old values come back. Price table edits stay a draft until Save prices, which checks every row first and marks the bad cells (`aria-invalid`, described by the message); the Windows side checks them again (a match of 1 to 100 characters, prices from 0 to 10,000, at most 50 rows) and refuses the save otherwise. Edits made while a save is under way are kept. A row that an earlier, shorter match always wins gets a warning under the table. A price table in `settings.json` that is the wrong shape or fails those checks is replaced by the defaults when the file is read, leaving every other setting as it was.
 - **Status hook offer.** Once the repos are in, a small card offers to install the hook, with "Show what changes" revealing the diff of `settings.json`. "Not now" is remembered.
-- **Widgets.** System load at the top right, Claude token use at the bottom right, with the optional cost estimate (hovering or focusing lists the last 7 days by repo). Both fade while the detail panel covers their corner.
+- **Widgets.** System load at the top right, Claude token use at the bottom right, with the optional cost estimate (hovering or focusing lists the last 7 days by repo) and, when Claude Code's status line relays them, the 5-hour and weekly plan limits ([plan limits](#plan-limits)). Both fade while the detail panel covers their corner.
 - **Launch toast.** Shows cloning, setup and opening steps, and failures until dismissed. One launch or clone runs at a time.
 
 ### Where state is kept
@@ -201,13 +201,13 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 | Graphics setting (`refract.quality`), hook offer dismissed (`refract.hookOfferDismissed`) | The webview's `localStorage`; the interface works without it |
 | GitLab address, show forks, show archived, hidden gems, cost estimate and its prices (`costEstimate`; a file without it gets the estimate off and the shipped prices) | `settings.json` in the app's config directory on Windows |
 | GitHub and GitLab tokens | Windows Credential Manager |
-| Extra folders, roots, hidden local paths | `~/.config/refract/agent.toml` in WSL (optional; `addRepo` appends to `extra`) |
+| Extra folders, roots, hidden local paths, where the plan limits file is | `~/.config/refract/agent.toml` in WSL (optional; `addRepo` appends to `extra`). Keys: `roots`, `extra`, `hidden`, `depth`, `limits_file`; an unknown key makes the helper ignore the file and say so on stderr |
 
 ### The web demo
 
-`DemoBackend` implements the whole `Backend` with invented data: 13 local repos covering every gem state, remote repos (some matching, some not cloned, a fork and an archived one), pull request and CI numbers, a pretend hook diff with the real installer's commands and matchers, and usage and system numbers that drift slowly, with usage split across invented shares of Opus, Sonnet and Haiku so the cost estimate, on in the demo, has something to price. Settings, hook state and clones live in memory and reset on reload. A launch walks through the progress steps and then tells `DemoTerminal`, which types out the `claude` command and an invented reply in a fake terminal. GitHub links open this project's page rather than the invented owner's. The demo has no GPU counters, so its automatic quality uses frame times only.
+`DemoBackend` implements the whole `Backend` with invented data: 13 local repos covering every gem state, remote repos (some matching, some not cloned, a fork and an archived one), pull request and CI numbers, a pretend hook diff with the real installer's commands and matchers, and usage and system numbers that drift slowly, with usage split across invented shares of Opus, Sonnet and Haiku so the cost estimate, on in the demo, has something to price, and invented plan limits (about 37% of the 5-hour window and 58% of the week, resetting a couple of hours and a few days after the page loads). Settings, hook state and clones live in memory and reset on reload. A launch walks through the progress steps and then tells `DemoTerminal`, which types out the `claude` command and an invented reply in a fake terminal. GitHub links open this project's page rather than the invented owner's. The demo has no GPU counters, so its automatic quality uses frame times only.
 
-`main.tsx` picks the demo backend when built with `--mode demo` and whenever the page is not inside Tauri, which is what `npm run dev` shows in a plain browser. `npm run build:demo` builds it into `app/dist-demo` for GitHub Pages. `app/e2e/demo.spec.ts` runs nine browser tests against that build (see [Build, CI and release](#build-ci-and-release)).
+`main.tsx` picks the demo backend when built with `--mode demo` and whenever the page is not inside Tauri, which is what `npm run dev` shows in a plain browser. `npm run build:demo` builds it into `app/dist-demo` for GitHub Pages. `app/e2e/demo.spec.ts` runs ten browser tests against that build (see [Build, CI and release](#build-ci-and-release)).
 
 ## The scene
 
@@ -377,7 +377,7 @@ The usage widget adds up the tokens in Claude Code's own session files. Nothing 
 
 **Windows.** Today (since local midnight in WSL's time zone), the last 7 days and the last 5 hours, both rolling and ending now. The 7 day total is also split by repo: a transcript belongs to the deepest known repo that contains the directory the session started in, else to that directory itself.
 
-**The result.** `today`, `last7Days` and `last5Hours` are token totals `{input, output, cacheRead, cacheWrite}`. `byRepo` lists `{path, name, last7Days}`, heaviest first. `byModel` holds the three windows again, `{today, last7Days, last5Hours}`, each a list of `{model, input, output, cacheRead, cacheWrite, cacheWrite1h}` heaviest first, where `cacheWrite1h` is the 1-hour part of `cacheWrite`. `byModel` was added after the first release: it is a separate field rather than a list inside each window, so the window totals keep their shape, and an app reading a helper without it treats it as absent. Then come `liveAgents`, `computedAt` and `ready`.
+**The result.** `today`, `last7Days` and `last5Hours` are token totals `{input, output, cacheRead, cacheWrite}`. `byRepo` lists `{path, name, last7Days}`, heaviest first. `byModel` holds the three windows again, `{today, last7Days, last5Hours}`, each a list of `{model, input, output, cacheRead, cacheWrite, cacheWrite1h}` heaviest first, where `cacheWrite1h` is the 1-hour part of `cacheWrite`. `byModel` was added after the first release: it is a separate field rather than a list inside each window, so the window totals keep their shape, and an app reading a helper without it treats it as absent. Then come `liveAgents`, `limits` (see [plan limits](#plan-limits); left out when there is no reading), `computedAt` and `ready`.
 
 **De-duplication.** Claude Code writes one response as several lines that repeat the same `message.id`, `requestId` and usage. Records are keyed by `message.id` (else `requestId`) and counted once, within a file and across files, because a session and its fork can both hold the same message.
 
@@ -385,9 +385,43 @@ The usage widget adds up the tokens in Claude Code's own session files. Nothing 
 
 **Never waiting.** The first scan runs on that thread, and until it finishes the answer is zeros marked `ready: false`, which the widget shows as counting. While the thread is busy reading, `usage` answers the last summary it computed rather than waiting for it.
 
-The widget asks every 2 seconds, one request after the last has answered, only while the window is visible and the helper is running. It never shows a plan-limit percentage, which Refract will not guess.
+The widget asks every 2 seconds, one request after the last has answered, only while the window is visible and the helper is running.
 
 **Cost estimate.** Off by default; settings turn it on. Each window's row then shows `≈ $X` between its label and its token count, worked out by `app/src/usage/cost.ts` from that window's `byModel` list and the price table in settings, and a line under the rows says it is an estimate at API list prices. A price row is `{match, input, output, cacheWrite5m, cacheWrite1h, cacheRead}` in US dollars per million tokens; the first row whose `match` is in the model id, ignoring case, prices it. Tokens of models no row matches are left out of the dollars, and the line then says how many there are (over the 7 days), with the model ids in its tooltip and in text a screen reader reads. With the estimate on and a helper too old to send `byModel`, the line says "Cost needs a newer helper" instead. The shipped table, `app/src/usage/defaultPrices.json`, was taken from Anthropic's pricing page on 2026-10-30 (its `takenOn`) and is read by both the interface (Reset to defaults) and the Windows side (settings saved before the estimate existed). It lists longer ids before their prefixes (`opus-5-5` before `opus-5`), which a test checks. **Known limitation:** Claude Haiku 5.5 costs 5 times as much for prompts over 100,000 tokens, and cached tokens read count toward a prompt's size, so Claude Code's Haiku subagents often cross that line. The table holds only the lower rate, which can make Haiku's share several times too low. Pricing each record by its own prompt size would fix it and is not done yet. Regional (`inference_geo`), batch and fast-mode prices are not modelled either.
+
+### Plan limits
+
+The usage widget can show how much of the plan's 5-hour and weekly limits is used, but only as Claude Code itself reports it. Refract never works a percentage out from token counts: with no reading, the rows are not shown.
+
+**Where the numbers come from.** Claude Code passes a JSON object on standard input to the user's status line command each time it refreshes the status line. That object can hold `rate_limits.five_hour` and `rate_limits.seven_day`, each with `used_percentage` and `resets_at`. The helper does not run inside the status line, so a status line script relays them into a small file. By default that is `usage-state.json` in Claude Code's config directory: `$CLAUDE_CONFIG_DIR` when it is set, else `~/.claude`, the same directory whose `projects` the helper reads. Refract only reads that file and never writes it. Another path can be set with `limits_file` in `agent.toml` (`~` is expanded).
+
+**The file.** Any status line can write it; write a temporary file and rename it over the old one so the helper never reads half a file.
+
+```json
+{"updated": 1793361600.5,
+ "five_hour": {"used": 37.0, "resets_at": 1793370000},
+ "seven_day": {"used": 58.0, "resets_at": 1793800000}}
+```
+
+| Key | Meaning |
+|---|---|
+| `updated` | When the status line wrote the file, in Unix seconds (a fraction is allowed). Required |
+| `five_hour`, `seven_day` | A window, or `null` or left out when Claude Code gave none |
+| `used` | `rate_limits.<window>.used_percentage`: a percentage from 0 to 1000. A window with `null` or no `used` is left out |
+| `resets_at` | `rate_limits.<window>.resets_at`: when the window resets, in Unix seconds (milliseconds are refused). A window with `null` or no `resets_at` is left out |
+
+Unknown keys are ignored. Anything else, such as text that is not JSON, a missing `updated`, or a percentage that is negative, not a number or over 1000, counts as no reading. That is never an error. `refract-core/src/limits.rs` parses the file. On each `usage` request the helper opens the file without blocking and checks it through that handle: anything but a regular file of at most 64 KiB gives no reading, so a FIFO in its place is never waited on and a large file is never read. It reads and parses the file again only when its size, modification time or inode has changed (`refract-agent/src/limits.rs`), and then reads at most 64 KiB.
+
+**In the answer.** `limits` is `{fiveHour?, sevenDay?, updatedAt}`, where each window is `{usedPercent, resetsAt}` and times are RFC 3339 strings like `computedAt`. It is left out when there is no reading. It was added after the first release, so an app reading an older helper finds no `limits` and shows no rows, and an older app ignores it.
+
+**In the widget.** Under the token rows (and the cost note, when the estimate is on) are two compact rows, "5-hour limit 37% · resets 15:30" and "Weekly limit 58% · resets Mon 03:00", each over a thin meter (`role="meter"`, with the percentage and reset time as its text). Times are local and in 24-hour form, with the weekday whenever the date is not today's ("Sat 00:30"), and the date when it is more than 6 days away. The bar turns amber when the rounded percentage is 90 or more, and a percentage that rounds above 999 shows as ">999%". The rows' tooltip, also read by screen readers, names the source ("Claude Code's status line, via the helper's limits file"; the app does not know the path). `app/src/usage/limits.ts` decides what to show, given the time now:
+- A window whose `resetsAt` has passed on Windows' clock shows "reset since last reading" and no percentage, because its real value is unknown until the next reading.
+- A reading more than 15 minutes old keeps its values and adds "Limits as of 14:02". The status line runs only while a Claude Code session is open (with `"refreshInterval": 60` in its settings, about once a minute), so readings stop when no session is. `updatedAt` was taken on WSL's clock, which can drift from Windows' (WSL 2 does after sleep), so the age is measured on the helper's clock: the answer's `computedAt` less `updatedAt`, plus the time since that answer arrived. An `updatedAt` more than a minute ahead of `computedAt` counts as stale.
+- With neither window, the rows are not shown.
+
+These rules also run on a timer, not only when an answer arrives, so the rows change at a reset, when the reading turns stale, and at local midnight even if the helper has stopped answering. The widget sets one timeout for the earliest of those and clears it when it unmounts.
+
+When the rows are shown, the 7-day breakdown's list gets less room on short windows, so the widget stays clear of the system widget.
 
 ### System stats
 

@@ -36,6 +36,7 @@ use serde::Serialize;
 use crate::config::{self, Config};
 use crate::hook;
 use crate::launch;
+use crate::limits::LimitsFile;
 use crate::procs;
 use crate::repos;
 use crate::scan;
@@ -285,6 +286,8 @@ struct Server<W: Write> {
     unread: HashMap<PathBuf, Unread>,
     /// Token usage, kept up to date by its own thread.
     usage: Usage,
+    /// Plan limits from the status line's file, added to each `usage` answer.
+    limits: LimitsFile,
 }
 
 /// Runs the helper until `shutdown` or the end of `input`.
@@ -446,6 +449,7 @@ fn hook_response(id: Id, result: Result<HookInfo, String>) -> Response {
 impl<W: Write> Server<W> {
     fn new(config: Config, out: W, watcher: Option<Watcher>, tx: SyncSender<Msg>) -> Server<W> {
         let usage = Usage::start(config.claude_projects.clone());
+        let limits = LimitsFile::new(config.limits_file.clone());
         Server {
             out,
             agent: Agent::new(config),
@@ -463,6 +467,7 @@ impl<W: Write> Server<W> {
             deferred_reload: false,
             unread: HashMap::new(),
             usage,
+            limits,
         }
     }
 
@@ -570,7 +575,9 @@ impl<W: Write> Server<W> {
             Method::Usage => {
                 let repos: Vec<String> = self.agent.repo_paths().map(|p| path_str(p)).collect();
                 let live = procs::scan().len() as u32;
-                Response::ok(id, Reply::Usage(self.usage.summary(&repos, live)))
+                let mut summary = self.usage.summary(&repos, live);
+                summary.limits = self.limits.read().map(Box::new);
+                Response::ok(id, Reply::Usage(summary))
             }
             Method::HookInfo => hook_response(id, hook::info(&hook::Paths::from_env())),
             Method::InstallHook | Method::UninstallHook => {
@@ -1324,6 +1331,7 @@ mod tests {
             hidden: vec![],
             depth: 3,
             claude_projects: projects,
+            limits_file: tmp.path().join("usage-state.json"),
         };
         let (tx, _rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let mut server = Server::new(config, Vec::new(), None, tx);

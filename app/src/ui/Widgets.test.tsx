@@ -1,5 +1,5 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CostEstimate, ModelUsage, SystemStats, UsageSummary } from "../backend/types";
 import { SystemWidget } from "./SystemWidget";
 import { UsageWidget, totalTokens } from "./UsageWidget";
@@ -169,5 +169,109 @@ describe("UsageWidget", () => {
     expect(widget.textContent).toContain("Today4.2M");
     // On, but the helper sends no split: say so rather than show nothing.
     expect(widget.textContent).toContain("Cost needs a newer helper");
+  });
+});
+
+describe("UsageWidget plan limits", () => {
+  // Local times, so the clock text holds in any time zone.
+  const NOW = new Date(2026, 9, 30, 14, 10);
+  const local = (day: number, hour: number, minute = 0) => new Date(2026, 9, day, hour, minute).toISOString();
+  const WITH_LIMITS: UsageSummary = {
+    ...USAGE,
+    computedAt: NOW.toISOString(),
+    limits: {
+      fiveHour: { usedPercent: 2, resetsAt: local(30, 15, 30) },
+      sevenDay: { usedPercent: 94.6, resetsAt: local(33, 3) },
+      updatedAt: local(30, 14, 9),
+    },
+  };
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
+    vi.setSystemTime(NOW);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("shows each window as a meter with its reset time and says where it comes from", () => {
+    const { container } = render(<UsageWidget usage={WITH_LIMITS} away={false} />);
+    const five = screen.getByRole("meter", { name: "5-hour limit" });
+    expect(five.getAttribute("aria-valuenow")).toBe("2");
+    expect(five.getAttribute("aria-valuetext")).toBe("2% used, resets 15:30");
+    const week = screen.getByRole("meter", { name: "Weekly limit" });
+    expect(week.getAttribute("aria-valuetext")).toBe("95% used, resets Mon 03:00");
+    expect(week.querySelector(".rf-limit__fill--high")).not.toBeNull();
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).toContain("5-hour limit2%· resets 15:30");
+    expect(widget.textContent).toContain("From Claude Code's status line, via the helper's limits file");
+    expect(container.querySelector(".rf-limits")!.getAttribute("title")).toContain("status line");
+    // Below the token rows and above the agents.
+    const order = [...widget.children].map((el) => el.className);
+    expect(order.indexOf("rf-limits")).toBeGreaterThan(order.indexOf("rf-usage__totals"));
+    expect(order.indexOf("rf-limits")).toBeLessThan(order.findIndex((c) => c.startsWith("rf-usage__agents")));
+  });
+
+  it("shows a window that reset since the reading without its old percentage", () => {
+    const usage: UsageSummary = {
+      ...WITH_LIMITS,
+      limits: { ...WITH_LIMITS.limits!, fiveHour: { usedPercent: 81, resetsAt: local(30, 14, 0) } },
+    };
+    render(<UsageWidget usage={usage} away={false} />);
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).toContain("5-hour limitreset since last reading");
+    expect(widget.textContent).not.toContain("81%");
+    expect(screen.queryByRole("meter", { name: "5-hour limit" })).toBeNull();
+    expect(screen.getByRole("meter", { name: "Weekly limit" })).toBeTruthy();
+  });
+
+  it("marks an old reading with its time", () => {
+    const usage: UsageSummary = { ...WITH_LIMITS, limits: { ...WITH_LIMITS.limits!, updatedAt: local(30, 13, 2) } };
+    render(<UsageWidget usage={usage} away={false} />);
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).toContain("Limits as of 13:02");
+    expect(screen.getByRole("meter", { name: "5-hour limit" }).getAttribute("aria-valuetext")).toBe(
+      "2% used, resets 15:30",
+    );
+  });
+
+  it("turns amber from a rounded 90%", () => {
+    const at = (usedPercent: number): UsageSummary => ({
+      ...WITH_LIMITS,
+      limits: { ...WITH_LIMITS.limits!, fiveHour: { usedPercent, resetsAt: local(30, 15, 30) } },
+    });
+    const { rerender } = render(<UsageWidget usage={at(89.4)} away={false} />);
+    const five = () => screen.getByRole("meter", { name: "5-hour limit" });
+    expect(five().querySelector(".rf-limit__fill--high")).toBeNull();
+    rerender(<UsageWidget usage={at(89.5)} away={false} />);
+    expect(five().getAttribute("aria-valuetext")).toBe("90% used, resets 15:30");
+    expect(five().querySelector(".rf-limit__fill--high")).not.toBeNull();
+  });
+
+  it("follows resets and staleness with no new answer, as when the helper stops", () => {
+    const usage: UsageSummary = {
+      ...WITH_LIMITS,
+      limits: { ...WITH_LIMITS.limits!, fiveHour: { usedPercent: 40, resetsAt: local(30, 14, 12) } },
+    };
+    const { unmount } = render(<UsageWidget usage={usage} away={false} />);
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).toContain("resets 14:12");
+    act(() => vi.advanceTimersByTime(2 * 60_000));
+    expect(widget.textContent).toContain("5-hour limitreset since last reading");
+    expect(widget.textContent).not.toContain("40%");
+    // The reading was taken at 14:09; at 14:24 it is stale.
+    expect(widget.textContent).not.toContain("Limits as of");
+    act(() => vi.advanceTimersByTime(13 * 60_000));
+    expect(widget.textContent).toContain("Limits as of 14:09");
+    unmount();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("shows nothing for limits without a reading or a window", () => {
+    const { container, rerender } = render(<UsageWidget usage={USAGE} away={false} />);
+    expect(container.querySelector(".rf-limits")).toBeNull();
+    rerender(<UsageWidget usage={{ ...USAGE, limits: { updatedAt: local(30, 14, 9) } }} away={false} />);
+    expect(container.querySelector(".rf-limits")).toBeNull();
+    expect(screen.queryAllByRole("meter")).toEqual([]);
   });
 });

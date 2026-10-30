@@ -518,6 +518,7 @@ impl Response {
 mod tests {
     use super::*;
     use crate::classify::{InterruptReason, LiveState};
+    use crate::limits::{LimitWindow, PlanLimits};
     use crate::usage::{ModelUsage, ModelWindows, RepoUsage, TokenTotals};
     use serde_json::json;
 
@@ -974,6 +975,14 @@ mod tests {
                 last_7_days: vec![],
                 last_5_hours: vec![],
             },
+            limits: Some(Box::new(PlanLimits {
+                five_hour: Some(LimitWindow {
+                    used_percent: 37.5,
+                    resets_at: "2026-03-14T20:30:00Z".parse().unwrap(),
+                }),
+                seven_day: None,
+                updated_at: "2026-03-14T17:59:00Z".parse().unwrap(),
+            })),
             computed_at: "2026-03-14T18:00:00Z".parse().unwrap(),
             ready: true,
         }
@@ -998,15 +1007,26 @@ mod tests {
                         "cacheRead": 56000, "cacheWrite": 7800, "cacheWrite1h": 800}],
                     "last7Days": [],
                     "last5Hours": []},
+                "limits": {
+                    "fiveHour": {"usedPercent": 37.5, "resetsAt": "2026-03-14T20:30:00Z"},
+                    "updatedAt": "2026-03-14T17:59:00Z"},
                 "computedAt": "2026-03-14T18:00:00Z",
                 "ready": true}})
         );
+        // With no reading, `limits` is left out rather than sent as null.
+        let none = serde_json::to_value(UsageSummary {
+            limits: None,
+            ..usage()
+        })
+        .unwrap();
+        assert!(none.get("limits").is_none());
         // A summary from a helper older than `byModel` still reads.
         let old: UsageSummary = serde_json::from_value(json!({
             "today": totals, "last7Days": totals, "last5Hours": totals, "liveAgents": 0,
             "byRepo": [], "computedAt": "2026-03-14T18:00:00Z", "ready": true}))
         .unwrap();
         assert_eq!(old.by_model, ModelWindows::default());
+        assert_eq!(old.limits, None);
     }
 
     #[test]

@@ -6,6 +6,7 @@ pub mod config;
 pub mod git;
 pub mod hook;
 pub mod launch;
+pub mod limits;
 pub mod procs;
 pub mod repos;
 pub mod scan;

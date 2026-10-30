@@ -8,6 +8,8 @@
 //! extra = ["~/work/tidepool-api"]    # single repos outside the roots
 //! hidden = ["~/projects/old-thing"]  # repos never reported
 //! depth = 3                          # how deep to look under each root
+//! limits_file = "~/.claude/usage-state.json"  # plan limits from the status line
+//!                                             # (default: in $CLAUDE_CONFIG_DIR or ~/.claude)
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -31,6 +33,10 @@ pub struct Config {
     pub depth: usize,
     /// Claude Code's `projects` directory.
     pub claude_projects: PathBuf,
+    /// The file a status line script writes plan limits to (see
+    /// [`refract_core::limits`]), by default `usage-state.json` in Claude Code's config
+    /// directory, like `claude_projects`. Only ever read.
+    pub limits_file: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -40,6 +46,7 @@ struct FileConfig {
     extra: Vec<String>,
     hidden: Vec<String>,
     depth: Option<usize>,
+    limits_file: Option<String>,
 }
 
 impl Config {
@@ -88,6 +95,10 @@ impl Config {
             hidden: expand(file.hidden),
             depth: file.depth.unwrap_or(DEFAULT_DEPTH),
             claude_projects: claude_dir.join("projects"),
+            limits_file: file.limits_file.map_or_else(
+                || claude_dir.join("usage-state.json"),
+                |p| expand_home(&p, home),
+            ),
         })
     }
 }
@@ -243,6 +254,30 @@ mod tests {
             c.claude_projects,
             PathBuf::from("/home/dev/.claude/projects")
         );
+        assert_eq!(
+            c.limits_file,
+            PathBuf::from("/home/dev/.claude/usage-state.json")
+        );
+    }
+
+    #[test]
+    fn limits_file_can_be_moved() {
+        let c = parse("limits_file = \"~/state/limits.json\"");
+        assert_eq!(c.limits_file, PathBuf::from("/home/dev/state/limits.json"));
+        let other_dir = Config::parse("", Path::new(HOME), Path::new("/srv/claude"), || None);
+        assert_eq!(
+            other_dir.unwrap().limits_file,
+            PathBuf::from("/srv/claude/usage-state.json")
+        );
+        let c = parse("limits_file = \"/srv/limits.json\"");
+        assert_eq!(c.limits_file, PathBuf::from("/srv/limits.json"));
+        let err = Config::parse(
+            "limit_file = \"x\"",
+            Path::new(HOME),
+            Path::new("/c"),
+            || None,
+        );
+        assert!(err.is_err());
     }
 
     #[test]

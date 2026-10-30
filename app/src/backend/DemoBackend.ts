@@ -10,6 +10,7 @@ import type {
   LaunchStep,
   LaunchTicket,
   ModelUsage,
+  PlanLimits,
   Preselect,
   RemoteDetails,
   RemoteKind,
@@ -319,6 +320,34 @@ function byModel(scale: number): ModelUsage[] {
   });
 }
 
+/**
+ * Invented plan limits, as a status line would relay them: about 37% of the 5-hour
+ * window and 58% of the week, creeping up, read on the last whole minute. The 5-hour
+ * window first resets a little over 2 hours after the demo starts and every 5 hours
+ * after that, starting again from 0; the week resets 3 days and 9 hours in.
+ */
+function demoLimits(started: number): PlanLimits {
+  const now = Date.now();
+  const FIVE_HOURS = 5 * 3600_000;
+  const firstReset = started + 133 * 60_000;
+  const windows = Math.max(0, Math.ceil((now - firstReset) / FIVE_HOURS));
+  const fiveReset = firstReset + windows * FIVE_HOURS;
+  const fiveStart = windows === 0 ? started : fiveReset - FIVE_HOURS;
+  const fiveBase = windows === 0 ? 37 : 0;
+  const minutes = (now - started) / 60_000;
+  return {
+    fiveHour: {
+      usedPercent: Math.min(99, fiveBase + ((now - fiveStart) / 60_000) * 0.2),
+      resetsAt: new Date(fiveReset).toISOString(),
+    },
+    sevenDay: {
+      usedPercent: Math.min(99, 58 + minutes * 0.02),
+      resetsAt: new Date(started + 81 * 3600_000).toISOString(),
+    },
+    updatedAt: new Date(now - (now % 60_000)).toISOString(),
+  };
+}
+
 const USAGE_REPOS: [name: string, share: number][] = [
   ["tidepool", 0.34],
   ["atlas-api", 0.24],
@@ -581,6 +610,7 @@ export class DemoBackend implements Backend {
         last7Days: totals(week * share),
       })),
       byModel: { today: byModel(today), last7Days: byModel(week), last5Hours: byModel(five) },
+      limits: demoLimits(this.started),
       computedAt: new Date().toISOString(),
       ready: true,
     });
