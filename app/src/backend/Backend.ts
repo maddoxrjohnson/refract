@@ -69,4 +69,18 @@ export interface Backend {
   usage(): Promise<UsageSummary>;
   /** Machine load about every 2 s while the window is visible. */
   onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe;
+
+  /**
+   * Demo only: launches that were simulated instead of started, for the pretend terminal.
+   * `TauriBackend` leaves this out, so the desktop app never shows it.
+   */
+  onDemoLaunch?(cb: (launch: DemoLaunch) => void): Unsubscribe;
+}
+
+/** A launch the web demo pretends to have made (spec §8). */
+export interface DemoLaunch {
+  repoName: string;
+  path: string;
+  mode: LaunchMode;
+  sessionId: string;
 }

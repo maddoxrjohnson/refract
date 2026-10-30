@@ -1,4 +1,4 @@
-import type { Backend, Unsubscribe } from "./Backend";
+import type { Backend, DemoLaunch, Unsubscribe } from "./Backend";
 import type {
   AgentEvent,
   AgentStatus,
@@ -217,6 +217,16 @@ function demoRemote(s: RemoteSeed): RemoteRepo {
   };
 }
 
+const DEMO_HOME = "https://github.com/maddoxrjohnson/refract";
+
+function isGithubUrl(url: string): boolean {
+  try {
+    return new URL(url).hostname === "github.com";
+  } catch {
+    return false;
+  }
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 // Status hook (spec §6.2): what installing would change in an invented settings.json.
@@ -295,11 +305,15 @@ const USAGE_REPOS: [name: string, share: number][] = [
   ["ledger-sync", 0.05],
 ];
 
-/** A backend with invented data. Launching only walks through the progress steps. */
+/**
+ * A backend with invented data. Launching only walks through the progress steps and
+ * tells `onDemoLaunch` listeners, which show a pretend terminal.
+ */
 export class DemoBackend implements Backend {
   private repos = demoRepos();
   private progress = new Set<(step: LaunchStep) => void>();
   private events = new Set<(event: AgentEvent) => void>();
+  private demoLaunches = new Set<(launch: DemoLaunch) => void>();
   private settings: Settings = {
     gitlabUrl: DEMO_GITLAB,
     showForks: false,
@@ -341,11 +355,19 @@ export class DemoBackend implements Backend {
       await sleep(400);
       for (const cb of this.progress) cb(step);
     }
+    const sessionId = mode.kind === "resume" ? mode.sessionId : crypto.randomUUID();
+    const repoName = this.repos.find((r) => r.path === path)?.name ?? path.split("/").pop() ?? path;
+    for (const cb of this.demoLaunches) cb({ repoName, path, mode, sessionId });
     return {
       requestId: crypto.randomUUID(),
-      sessionId: mode.kind === "resume" ? mode.sessionId : crypto.randomUUID(),
+      sessionId,
       folderUri: `vscode-remote://wsl+Demo${path}`,
     };
+  }
+
+  onDemoLaunch(cb: (launch: DemoLaunch) => void): Unsubscribe {
+    this.demoLaunches.add(cb);
+    return () => this.demoLaunches.delete(cb);
   }
 
   onLaunchProgress(cb: (step: LaunchStep) => void): Unsubscribe {
@@ -365,8 +387,11 @@ export class DemoBackend implements Backend {
     return Promise.resolve();
   }
 
+  // The demo's repos, owners and pull requests are invented, but their github.com
+  // links would land on whoever owns those names. GitHub links open Refract's own page
+  // instead, and any other link opens nothing.
   openUrl(url: string): Promise<void> {
-    window.open(url, "_blank", "noopener");
+    if (isGithubUrl(url)) window.open(DEMO_HOME, "_blank", "noopener");
     return Promise.resolve();
   }
 

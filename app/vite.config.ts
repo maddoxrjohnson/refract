@@ -1,5 +1,5 @@
 /// <reference types="vitest/config" />
-import { defineConfig } from "vite";
+import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // The WebView2 window on Windows reaches this dev server through WSL's localhost
@@ -18,5 +18,7 @@ export default defineConfig({
   },
   test: {
     environment: "jsdom",
+    // Playwright's browser tests of the demo build run with `npm run test:e2e`.
+    exclude: [...configDefaults.exclude, "e2e/**"],
   },
 });

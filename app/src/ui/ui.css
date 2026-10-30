@@ -1149,3 +1149,118 @@
     opacity: 0;
   }
 }
+
+/* Web demo only: the pretend VS Code terminal a launch shows, and the invented-repos badge. */
+
+.rf-term-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  padding: 16px;
+  background: rgb(4 5 9 / 0.35);
+  animation: rf-term-fade 180ms var(--ease-out);
+}
+
+.rf-term {
+  width: min(720px, 100%);
+  overflow: hidden;
+  border-radius: 12px;
+  background: rgb(14 16 23 / 0.88);
+  animation: rf-term-rise 240ms var(--ease-out);
+}
+
+.rf-term__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 6px 8px 6px 14px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+
+.rf-term__title {
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.rf-term__screen {
+  min-height: 220px;
+  margin: 0;
+  padding: 14px 16px;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #d4d7e2;
+}
+
+.rf-term__prompt {
+  color: var(--halo);
+}
+
+.rf-term__cursor {
+  display: inline-block;
+  width: 0.6em;
+  height: 1.1em;
+  vertical-align: text-bottom;
+  background: #d4d7e2;
+  animation: rf-term-blink 1s steps(1) infinite;
+}
+
+.rf-term__note {
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  color: var(--amber);
+}
+
+.rf-demo-badge {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--muted);
+  text-decoration: none;
+}
+
+.rf-demo-badge:hover {
+  color: var(--fg);
+}
+
+/* The launch toast shares the corner; the badge steps aside while it shows. */
+body:has(.rf-toast) .rf-demo-badge {
+  visibility: hidden;
+}
+
+@keyframes rf-term-fade {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes rf-term-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+}
+
+@keyframes rf-term-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rf-term-backdrop,
+  .rf-term,
+  .rf-term__cursor {
+    animation: none;
+  }
+}

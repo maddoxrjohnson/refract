@@ -28,7 +28,8 @@
     "active": true,
     "targets": ["nsis"],
     "resources": {
-      "../../vscode-extension/refract.vsix": "refract.vsix"
+      "../../vscode-extension/refract.vsix": "refract.vsix",
+      "resources/refract-agent": "refract-agent"
     },
     "icon": [
       "icons/32x32.png",

@@ -1,7 +1,7 @@
 //! Runs refract-agent inside WSL and exposes it to the interface.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -9,8 +9,10 @@ use std::time::Duration;
 
 use crate::process::output_with_deadline;
 use refract_client::{AgentClient, AgentStatus, Backoff, ClientEvent, RequestError, Spawn};
+use refract_core::launch::wsl_path;
 use refract_core::protocol::{self, code, Method, Reply};
 use serde_json::Value;
+use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
 
 /// Emitted with each [`AgentStatus`].
@@ -29,8 +31,23 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// through their own commands, which check what they send.
 const INTERFACE_METHODS: &[&str] = &["ping", "listRepos", "getRepo"];
 
-/// Where the installer puts the helper, used when `REFRACT_AGENT` is not set.
+/// Where the app installs the helper, used when `REFRACT_AGENT` is not set.
 const INSTALLED_HELPER: &str = "$HOME/.local/share/refract/bin/refract-agent";
+
+/// The Linux helper bundled as a Tauri resource. The release workflow puts the real
+/// build there; elsewhere it is an empty placeholder (`app/scripts/ensure-helper.mjs`),
+/// and the installed helper is used as it is.
+const BUNDLED_HELPER: &str = "refract-agent";
+
+/// What the bundled helper prints for `--version`. Its crate version is kept equal to
+/// the app's (a test below checks), so an installed helper that prints anything else
+/// is replaced.
+const HELPER_VERSION: &str = concat!("refract-agent ", env!("CARGO_PKG_VERSION"));
+
+/// How long `refract-agent --version` gets. WSL may still be starting.
+const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long copying the bundled helper into WSL gets.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Hides the console window a child process would otherwise open.
 #[cfg(windows)]
@@ -189,10 +206,7 @@ fn pick_distro() -> Option<Option<String>> {
 /// process on the other end of the pipes is the helper itself. The path is passed as
 /// `$1` rather than spliced into the script, so it needs no quoting.
 pub fn wsl_args(helper: Option<&str>, distro: Option<&str>) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(distro) = distro.filter(|d| !d.is_empty()) {
-        args.extend(["-d".to_owned(), distro.to_owned()]);
-    }
+    let mut args = distro_args(distro);
     args.extend([
         "--cd".to_owned(),
         "~".to_owned(),
@@ -206,6 +220,154 @@ pub fn wsl_args(helper: Option<&str>, distro: Option<&str>) -> Vec<String> {
         args.push(helper.to_owned());
     }
     args
+}
+
+/// `-d <distro>`, or nothing when the choice is left to `wsl.exe`.
+fn distro_args(distro: Option<&str>) -> Vec<String> {
+    match distro.filter(|d| !d.is_empty()) {
+        Some(distro) => vec!["-d".to_owned(), distro.to_owned()],
+        None => Vec::new(),
+    }
+}
+
+/// Which helper to start: `REFRACT_AGENT` as it is, else the installed one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperSource {
+    /// A Linux path from `REFRACT_AGENT`, used in development. Nothing is installed.
+    Path(String),
+    /// [`INSTALLED_HELPER`], first replaced by `bundled` (the Linux path of the
+    /// bundled helper) unless it already prints [`HELPER_VERSION`].
+    Installed { bundled: Option<String> },
+}
+
+/// `REFRACT_AGENT` wins when set and not empty; otherwise the installed helper, kept in
+/// step with `bundled`.
+pub fn helper_source(from_env: Option<String>, bundled: Option<String>) -> HelperSource {
+    match from_env.filter(|path| !path.is_empty()) {
+        Some(path) => HelperSource::Path(path),
+        None => HelperSource::Installed { bundled },
+    }
+}
+
+/// The Linux path of the bundled helper at `resource` (a Windows path, maybe
+/// verbatim), or `None` when it is missing or the empty placeholder (`len` 0).
+pub fn bundled_helper(resource: Option<&Path>, len: Option<u64>) -> Option<String> {
+    let resource = resource?;
+    if len.unwrap_or(0) == 0 {
+        return None;
+    }
+    wsl_path(&resource.to_string_lossy())
+}
+
+/// Whether the installed helper is the bundled one: `refract-agent --version` exited
+/// successfully and printed `want`.
+pub fn installed_is_current(success: bool, stdout: &str, want: &str) -> bool {
+    success && stdout.trim() == want
+}
+
+/// Whether a command that failed to run means `wsl.exe` is not there at all.
+fn wsl_missing(err: &io::Error) -> bool {
+    err.kind() == io::ErrorKind::NotFound
+}
+
+/// Why a command failed: its stderr, else its stdout (`wsl.exe` reports some errors
+/// there), else its exit `status`. NULs are dropped, as in [`parse_distros`], in case
+/// `wsl.exe` wrote UTF-16.
+fn failure_reason(stderr: &str, stdout: &str, status: &str) -> String {
+    let clean = |text: &str| text.replace('\0', "").trim().to_owned();
+    [clean(stderr), clean(stdout)]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .unwrap_or_else(|| status.to_owned())
+}
+
+/// Arguments for `wsl.exe` that print the installed helper's version.
+pub fn version_args(distro: Option<&str>) -> Vec<String> {
+    let mut args = distro_args(distro);
+    args.extend([
+        "--exec".to_owned(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        format!("exec \"{INSTALLED_HELPER}\" --version"),
+    ]);
+    args
+}
+
+/// Arguments for `wsl.exe` that copy the helper at `source` (a Linux path) to
+/// [`INSTALLED_HELPER`]: into a temporary file next to it, made executable, then
+/// renamed over it, so a helper still running keeps its old file and a failed copy
+/// leaves the old one in place. `source` is passed as `$1`, so it needs no quoting.
+pub fn install_args(distro: Option<&str>, source: &str) -> Vec<String> {
+    let script = format!(
+        "set -e; dest=\"{INSTALLED_HELPER}\"; dir=\"${{dest%/*}}\"; mkdir -p \"$dir\"; \
+         tmp=\"$dir/.refract-agent.$$\"; trap 'rm -f \"$tmp\"' EXIT; \
+         cp \"$1\" \"$tmp\"; chmod 755 \"$tmp\"; mv -f \"$tmp\" \"$dest\""
+    );
+    let mut args = distro_args(distro);
+    args.extend([
+        "--exec".to_owned(),
+        "sh".to_owned(),
+        "-c".to_owned(),
+        script,
+        "sh".to_owned(),
+        source.to_owned(),
+    ]);
+    args
+}
+
+/// Makes sure [`INSTALLED_HELPER`] in `distro` is the bundled helper at `source`,
+/// copying it in when it is missing or prints another version. Errors say why the
+/// copy failed and end up in the helper status's `lastError`.
+fn ensure_installed(distro: Option<&str>, source: &str) -> io::Result<()> {
+    let mut check = wsl_command();
+    check.args(version_args(distro)).stdin(Stdio::null());
+    match output_with_deadline(&mut check, VERSION_TIMEOUT) {
+        Ok(out)
+            if installed_is_current(
+                out.status.success(),
+                &String::from_utf8_lossy(&out.stdout),
+                HELPER_VERSION,
+            ) =>
+        {
+            return Ok(());
+        }
+        Ok(out) => eprintln!(
+            "refract: the installed helper is missing or out of date ({}); installing {source}",
+            String::from_utf8_lossy(&out.stdout).trim()
+        ),
+        // No `wsl.exe`: installing would fail the same way.
+        Err(err) if wsl_missing(&err) => {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "WSL is not installed (wsl.exe was not found)",
+            ));
+        }
+        Err(err) => {
+            eprintln!("refract: cannot check the installed helper: {err}; installing {source}")
+        }
+    }
+    let mut install = wsl_command();
+    install
+        .args(install_args(distro, source))
+        .stdin(Stdio::null());
+    let out = output_with_deadline(&mut install, INSTALL_TIMEOUT).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("cannot install the helper into WSL: {err}"),
+        )
+    })?;
+    if !out.status.success() {
+        let reason = failure_reason(
+            &String::from_utf8_lossy(&out.stderr),
+            &String::from_utf8_lossy(&out.stdout),
+            &out.status.to_string(),
+        );
+        return Err(io::Error::other(format!(
+            "cannot install the helper into WSL: {reason}"
+        )));
+    }
+    eprintln!("refract: installed the helper at {INSTALLED_HELPER}");
+    Ok(())
 }
 
 /// The helper's distro as [`pick_distro`] returned it, shared by the spawner and
@@ -225,15 +387,26 @@ fn chosen_distro(slot: &DistroSlot) -> Option<String> {
 /// Starts the helper through [`wsl_command`] with piped stdio. Runs on the client's
 /// supervisor thread, so choosing the distro there keeps `wsl.exe --list` off the
 /// main thread.
+/// Installing the bundled helper happens here too, before each start, so a failed copy
+/// is retried with the same backoff.
 struct WslSpawner {
-    helper: Option<String>,
+    helper: HelperSource,
     distro: DistroSlot,
 }
 
 impl Spawn for WslSpawner {
     fn spawn(&mut self) -> io::Result<Child> {
         let distro = chosen_distro(&self.distro);
-        let args = wsl_args(self.helper.as_deref(), distro.as_deref());
+        let path = match &self.helper {
+            HelperSource::Path(path) => Some(path.as_str()),
+            HelperSource::Installed { bundled } => {
+                if let Some(source) = bundled {
+                    ensure_installed(distro.as_deref(), source)?;
+                }
+                None
+            }
+        };
+        let args = wsl_args(path, distro.as_deref());
         eprintln!("refract: starting the helper: wsl.exe {}", args.join(" "));
         wsl_command()
             .args(&args)
@@ -273,7 +446,22 @@ impl Agent {
 
 /// Starts the helper and forwards its status and events to the interface.
 pub fn start(app: &AppHandle) {
-    let helper = std::env::var("REFRACT_AGENT").ok();
+    let resource = app
+        .path()
+        .resolve(BUNDLED_HELPER, BaseDirectory::Resource)
+        .ok();
+    let len = resource
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .filter(|meta| meta.is_file())
+        .map(|meta| meta.len());
+    let helper = helper_source(
+        std::env::var("REFRACT_AGENT").ok(),
+        bundled_helper(resource.as_deref(), len),
+    );
+    if let HelperSource::Installed { bundled: None } = &helper {
+        eprintln!("refract: no helper bundled; using the installed one as it is");
+    }
     let handle = app.clone();
     let distro = DistroSlot::default();
     let client = AgentClient::start(
@@ -390,6 +578,118 @@ mod tests {
                 "/home/dev/refract/target/debug/refract-agent"
             ]
         );
+    }
+
+    #[test]
+    fn refract_agent_from_the_environment_wins() {
+        let bundled = Some("/mnt/c/Program Files/Refract/refract-agent".to_owned());
+        assert_eq!(
+            helper_source(Some("/home/dev/refract-agent".into()), bundled.clone()),
+            HelperSource::Path("/home/dev/refract-agent".into())
+        );
+        assert_eq!(
+            helper_source(Some(String::new()), bundled.clone()),
+            HelperSource::Installed {
+                bundled: bundled.clone()
+            }
+        );
+        assert_eq!(
+            helper_source(None, None),
+            HelperSource::Installed { bundled: None }
+        );
+    }
+
+    #[test]
+    fn bundled_helper_is_used_from_its_linux_path() {
+        let resource = PathBuf::from(r"\\?\C:\Program Files\Refract\refract-agent");
+        assert_eq!(
+            bundled_helper(Some(&resource), Some(5_000_000)).as_deref(),
+            Some("/mnt/c/Program Files/Refract/refract-agent")
+        );
+        // The empty placeholder of a build without the real helper, or no file.
+        assert_eq!(bundled_helper(Some(&resource), Some(0)), None);
+        assert_eq!(bundled_helper(Some(&resource), None), None);
+        assert_eq!(bundled_helper(None, Some(5)), None);
+        // A path with no Linux form.
+        let volume = PathBuf::from(r"\\?\Volume{1234}\refract-agent");
+        assert_eq!(bundled_helper(Some(&volume), Some(5)), None);
+    }
+
+    #[test]
+    fn failures_are_explained_from_stderr_then_stdout_then_status() {
+        assert_eq!(failure_reason(" no space\n", "out", "exit 1"), "no space");
+        assert_eq!(
+            failure_reason("", "n\0o \0distro\0\r\n", "exit 1"),
+            "no distro"
+        );
+        assert_eq!(failure_reason(" \n", "\0", "exit code: 1"), "exit code: 1");
+        assert!(wsl_missing(&io::Error::from(io::ErrorKind::NotFound)));
+        assert!(!wsl_missing(&io::Error::from(io::ErrorKind::TimedOut)));
+    }
+
+    #[test]
+    fn installed_helper_is_replaced_unless_it_prints_this_version() {
+        let want = "refract-agent 0.2.0";
+        assert!(installed_is_current(true, "refract-agent 0.2.0\n", want));
+        assert!(!installed_is_current(true, "refract-agent 0.1.0\n", want));
+        // Missing: `sh` cannot run it and prints nothing on stdout.
+        assert!(!installed_is_current(false, "", want));
+        // A helper from before `--version`, which ignored it and served stdin.
+        assert!(!installed_is_current(true, "", want));
+        assert!(!installed_is_current(false, "refract-agent 0.2.0\n", want));
+        assert_eq!(
+            HELPER_VERSION,
+            format!("refract-agent {}", env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    /// The `version` of the first `[package]` in a Cargo.toml, or the top-level one
+    /// in tauri.conf.json.
+    fn version_in(text: &str, prefix: &str) -> String {
+        text.lines()
+            .find_map(|line| line.trim().strip_prefix(prefix))
+            .map(|rest| rest.trim_matches(|c: char| c == '"' || c == ',' || c == ' '))
+            .unwrap()
+            .to_owned()
+    }
+
+    #[test]
+    fn app_and_helper_versions_match() {
+        // The installed helper is compared with the app's version, so a release must
+        // bump both together.
+        let app = env!("CARGO_PKG_VERSION");
+        let helper = include_str!("../../../crates/refract-agent/Cargo.toml");
+        assert_eq!(version_in(helper, "version = "), app);
+        let conf: Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(conf["version"], app);
+    }
+
+    #[test]
+    fn checks_and_installs_the_helper_in_the_chosen_distro() {
+        assert_eq!(
+            version_args(Some("Ubuntu")),
+            [
+                "-d",
+                "Ubuntu",
+                "--exec",
+                "sh",
+                "-c",
+                "exec \"$HOME/.local/share/refract/bin/refract-agent\" --version"
+            ]
+        );
+        assert_eq!(version_args(None)[..2], ["--exec", "sh"]);
+        let args = install_args(Some("Ubuntu"), "/mnt/c/Program Files/Refract/refract-agent");
+        assert_eq!(args[..5], ["-d", "Ubuntu", "--exec", "sh", "-c"]);
+        assert_eq!(
+            args[6..],
+            ["sh", "/mnt/c/Program Files/Refract/refract-agent"]
+        );
+        let script = &args[5];
+        assert!(
+            script.starts_with("set -e; dest=\"$HOME/.local/share/refract/bin/refract-agent\";")
+        );
+        assert!(script.contains("cp \"$1\" \"$tmp\"; chmod 755 \"$tmp\"; mv -f \"$tmp\" \"$dest\""));
+        assert_eq!(install_args(None, "/x")[..2], ["--exec", "sh"]);
     }
 
     #[test]

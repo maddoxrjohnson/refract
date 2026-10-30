@@ -823,3 +823,21 @@ fn clone_repo_clones_reports_and_reuses_the_clone() {
     assert_eq!(agent.response()["id"], 8);
     assert!(agent.child.wait().unwrap().success());
 }
+
+#[test]
+fn prints_its_version() {
+    let out = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!("refract-agent {}\n", env!("CARGO_PKG_VERSION"))
+    );
+    assert_eq!(
+        format!("{}\n", refract_agent::VERSION_LINE),
+        format!("refract-agent {}\n", env!("CARGO_PKG_VERSION"))
+    );
+}

@@ -19,6 +19,8 @@ notes/
 target/
 node_modules/
 dist/
+# The Linux helper the release bundles (app/scripts/ensure-helper.mjs)
+app/src-tauri/resources/refract-agent
 app/src-tauri/gen/
 *.vsix
 coverage/
@@ -30,3 +32,6 @@ test-results/
 Thumbs.db
 .vscode/*
 !.vscode/extensions.json
+
+# Web demo build
+app/dist-demo/

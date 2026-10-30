@@ -15,3 +15,7 @@ pub mod setup;
 pub mod state;
 pub mod usage;
 pub mod watch;
+
+/// What `refract-agent --version` prints: the name and the crate version, which is
+/// kept equal to the app's.
+pub const VERSION_LINE: &str = concat!("refract-agent ", env!("CARGO_PKG_VERSION"));

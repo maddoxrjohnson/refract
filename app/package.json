@@ -6,12 +6,17 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
+    "build:demo": "vite build --mode demo --base ./ --outDir dist-demo",
+    "preview:demo": "vite preview --outDir dist-demo --host 127.0.0.1 --port 4173 --strictPort",
     "test": "vitest run",
-    "test:rust": "npm run vsix && cd src-tauri && CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=env cargo xwin test --target x86_64-pc-windows-msvc",
-    "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
+    "test:e2e": "npm run build:demo && playwright test",
+    "record:demo": "npm run build:demo && node scripts/record-demo.mjs && python3 scripts/make-gif.py",
+    "test:rust": "npm run resources && cd src-tauri && CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUNNER=env cargo xwin test --target x86_64-pc-windows-msvc",
+    "lint": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p e2e/tsconfig.json",
     "tauri": "tauri",
-    "tauri:dev": "npm run vsix && tauri dev --runner cargo-xwin --target x86_64-pc-windows-msvc",
-    "tauri:build": "npm run vsix && tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle",
+    "tauri:dev": "npm run resources && tauri dev --runner cargo-xwin --target x86_64-pc-windows-msvc",
+    "tauri:build": "npm run resources && tauri build --runner cargo-xwin --target x86_64-pc-windows-msvc --no-bundle",
+    "resources": "node scripts/ensure-vsix.mjs && node scripts/ensure-helper.mjs",
     "vsix": "node scripts/ensure-vsix.mjs"
   },
   "dependencies": {
@@ -26,6 +31,7 @@
     "three": "^0.186.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.64.1",
     "@tauri-apps/cli": "^2.12.4",
     "@testing-library/react": "^16.3.3",
     "@types/react": "^19.3.0",
