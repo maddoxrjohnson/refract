@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::io;
 use std::path::Path;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use refract_core::language::main_language;
 use refract_core::protocol::LastCommit;
@@ -40,19 +41,93 @@ pub struct HeadInfo {
 
 /// Reads `git status`. Fails if git cannot run or `path` is not a repo.
 pub fn read_status(path: &Path) -> io::Result<Status> {
-    let out = git(
-        path,
-        &[
-            "status",
-            "--porcelain=v2",
-            "--branch",
-            "-z",
-            "--ignore-submodules=dirty",
-            untracked_arg(path),
-        ],
-    )?
-    .ok_or_else(|| io::Error::other("git status failed"))?;
+    let mut args = status_config(path).to_vec();
+    args.extend([
+        "status",
+        "--porcelain=v2",
+        "--branch",
+        "-z",
+        "--ignore-submodules=dirty",
+        untracked_arg(path),
+    ]);
+    let out = git(path, &args)?.ok_or_else(|| io::Error::other("git status failed"))?;
     Ok(parse_status(&out))
+}
+
+/// Config for `git status` in `repo`.
+///
+/// On a Windows drive the index is usually written by Git for Windows, which leaves
+/// inode, device and owner at zero. Linux git then takes every file for touched and
+/// reads it in full, which on `/mnt/c` can nearly double the time `git status` takes.
+/// There, files are compared by size and whole-second modification time only
+/// (`core.checkStat=minimal`), which is what Git for Windows compares anyway. Contents
+/// are still read for files changed in the second the index was written.
+fn status_config(repo: &Path) -> &'static [&'static str] {
+    if on_windows_drive(repo) {
+        &["-c", "core.checkStat=minimal"]
+    } else {
+        &[]
+    }
+}
+
+/// True when `path` is under `/mnt/` on a Windows drive mounted through drvfs (9p with
+/// `aname=drvfs`, or `drvfs` itself on WSL 1), by the deepest mount in `/proc/mounts`
+/// that holds it. Disks attached with `wsl --mount` (under `/mnt/wsl/`) are not. Without
+/// `/proc/mounts`, any path under `/mnt/` counts.
+pub fn on_windows_drive(path: &Path) -> bool {
+    if !is_windows_mount(&path.to_string_lossy()) {
+        return false;
+    }
+    match std::fs::read_to_string("/proc/mounts") {
+        Ok(mounts) => drvfs_holds(&mounts, path),
+        Err(_) => true,
+    }
+}
+
+/// Whether the deepest mount in `mounts` (as `/proc/mounts` lists them) that holds
+/// `path` is a drvfs one. The last of equally deep mounts wins, as it covers the others.
+fn drvfs_holds(mounts: &str, path: &Path) -> bool {
+    mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let (_, point, kind, options) = (
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+                fields.next()?,
+            );
+            let point = unescape_mount(point);
+            let drvfs = kind == "drvfs"
+                || (kind == "9p" && options.split(',').any(|o| o.starts_with("aname=drvfs")));
+            path.starts_with(&point).then_some((point.len(), drvfs))
+        })
+        .max_by_key(|(depth, _)| *depth)
+        .is_some_and(|(_, drvfs)| drvfs)
+}
+
+/// Undoes the octal escapes (`\040` for a space) of a `/proc/mounts` field.
+fn unescape_mount(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let code = bytes
+            .get(i + 1..i + 4)
+            .filter(|_| bytes[i] == b'\\')
+            .and_then(|d| u8::from_str_radix(std::str::from_utf8(d).ok()?, 8).ok());
+        match code {
+            Some(byte) => {
+                out.push(byte);
+                i += 4;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// How `git status` reports untracked files in `repo`.
@@ -73,6 +148,18 @@ pub fn untracked_arg(repo: &Path) -> &'static str {
 /// Reads the origin URL, last commit, tracked files and recent commit count. A repo with
 /// no commits gives empty values rather than an error.
 pub fn read_head(path: &Path) -> io::Result<HeadInfo> {
+    read_head_unless(path, &AtomicBool::new(false))
+}
+
+/// Like [`read_head`], but fails instead of starting the next git call once `cancel` is
+/// set.
+pub fn read_head_unless(path: &Path, cancel: &AtomicBool) -> io::Result<HeadInfo> {
+    let git = |path: &Path, args: &[&str]| {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        git(path, args)
+    };
     let origin_url = git(path, &["config", "--get", "remote.origin.url"])?
         .map(|out| redact_userinfo(String::from_utf8_lossy(&out).trim()))
         .filter(|url| !url.is_empty());
@@ -300,6 +387,33 @@ mod tests {
             untracked_arg(Path::new("/mnt/c/Users/dev/tidepool-api")),
             "-uno"
         );
+    }
+
+    #[test]
+    fn stat_checks_are_minimal_only_on_windows_drives() {
+        assert!(status_config(Path::new("/home/dev/projects/tidepool-api")).is_empty());
+    }
+
+    #[test]
+    fn windows_drives_are_drvfs_mounts() {
+        let mounts = "\
+none / ext4 rw,relatime 0 0
+C:\\134 /mnt/c 9p rw,noatime,aname=drvfs;path=C:\\;uid=1000;gid=1000,cache=0x5 0 0
+D:\\134 /mnt/d drvfs rw,noatime 0 0
+/dev/sdd1 /mnt/wsl/kelp\\040disk ext4 rw,relatime 0 0
+none /mnt/wsl tmpfs rw,relatime 0 0
+";
+        for (path, drvfs) in [
+            ("/mnt/c/Users/dev/tidepool-api", true),
+            ("/mnt/d/aurora-notes", true),
+            ("/mnt/wsl/kelp disk/kelp-cli", false),
+            ("/mnt/wsl/aurora-notes", false),
+            ("/mnt/cache/tidepool-api", false),
+            ("/home/dev/projects/kelp-cli", false),
+        ] {
+            assert_eq!(drvfs_holds(mounts, Path::new(path)), drvfs, "{path}");
+        }
+        assert!(!on_windows_drive(Path::new("/home/dev/projects/kelp-cli")));
     }
 
     #[test]

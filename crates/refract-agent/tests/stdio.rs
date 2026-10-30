@@ -606,6 +606,258 @@ fn an_edit_made_while_git_is_still_loading_is_seen() {
     assert_eq!(agent.response()["result"]["changedFiles"], 1);
 }
 
+/// What the `git` of [`shim_git`] does for some calls.
+enum Shim<'a> {
+    /// Runs the real git, then holds its output back while the file exists.
+    HoldWhile(&'a Path),
+    /// Fails without running git while the file exists.
+    FailWhile(&'a Path),
+}
+
+/// A `PATH` with a `git` first that, for calls whose arguments match a shell `case`
+/// pattern, does what the matching [`Shim`] says, and otherwise runs the real git.
+fn shim_git(tmp: &Path, arms: &[(&str, Shim)]) -> std::ffi::OsString {
+    use std::os::unix::fs::PermissionsExt;
+    let real_git = Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let real_git = real_git.trim();
+    let mut script = String::from("#!/bin/sh\ncase \"$*\" in\n");
+    for (pattern, shim) in arms {
+        script += &match shim {
+            Shim::HoldWhile(file) => format!(
+                "{pattern})\n  out=$(mktemp)\n  {real_git} \"$@\" >\"$out\"\n  code=$?\n  while [ -e {file:?} ]; do sleep 0.05; done\n  cat \"$out\"; rm -f \"$out\"; exit $code;;\n"
+            ),
+            Shim::FailWhile(file) => format!("{pattern})\n  [ -e {file:?} ] && exit 128;;\n"),
+        };
+    }
+    script += &format!("esac\nexec {real_git} \"$@\"\n");
+    let bin = tmp.join("bin");
+    let shim = bin.join("git");
+    write(&shim, &script);
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::env::join_paths(
+        std::iter::once(bin).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap()
+}
+
+/// A config with one root for repos loaded as if on a Windows drive, plus an empty Claude
+/// `projects` directory.
+fn setup_drive(tmp: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let (home, _, config) = setup(tmp);
+    let drive = tmp.join("drive");
+    std::fs::create_dir_all(&drive).unwrap();
+    write(
+        &config,
+        &format!("roots = [{:?}]\ndepth = 3\n", drive.to_str().unwrap()),
+    );
+    (home, drive, config)
+}
+
+fn spawn_on_drive(home: &Path, config: &Path, drive: &Path, path: &std::ffi::OsStr) -> Agent {
+    Agent::spawn_with(
+        home,
+        config,
+        &[
+            ("PATH", path),
+            ("REFRACT_AGENT_TEST_SLOW_PREFIX", drive.as_os_str()),
+        ],
+    )
+}
+
+/// Every message up to the response to a `ping`, which must not include `loadComplete`.
+#[track_caller]
+fn assert_no_more_load_complete(agent: &mut Agent, id: u64) {
+    agent.send(json!({"id": id, "method": "ping"}));
+    loop {
+        let message = agent.next(Duration::from_secs(10));
+        assert_ne!(message["event"], "loadComplete");
+        if message["id"] == id {
+            return;
+        }
+    }
+}
+
+#[test]
+fn repos_on_a_slow_drive_are_reported_one_at_a_time() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    init_repo(&root.join("aurora-notes"));
+    // Loaded as if under `/mnt/`.
+    let drive = tmp.path().join("drive");
+    let kelp = drive.join("kelp-cli");
+    init_repo(&kelp);
+    init_repo(&drive.join("tidepool-api"));
+    write(
+        &config,
+        &format!(
+            "roots = [{:?}, {:?}]\ndepth = 3\n",
+            root.to_str().unwrap(),
+            drive.to_str().unwrap()
+        ),
+    );
+    // kelp-cli's `git status` is held back until `gate` is removed.
+    let gate = tmp.path().join("gate");
+    write(&gate, "");
+    let path = shim_git(
+        tmp.path(),
+        &[("*kelp-cli*\" status \"*", Shim::HoldWhile(&gate))],
+    );
+    let mut agent = Agent::spawn_with(
+        &home,
+        &config,
+        &[
+            ("PATH", path.as_os_str()),
+            ("REFRACT_AGENT_TEST_SLOW_PREFIX", drive.as_os_str()),
+        ],
+    );
+
+    agent.send(json!({"id": 1, "method": "listRepos"}));
+    assert_eq!(agent.response()["result"]["loading"], true);
+    let mut reported = Vec::new();
+    while !reported.iter().any(|name| name == "tidepool-api") {
+        let message = agent.next(Duration::from_secs(20));
+        assert_ne!(
+            message["event"], "loadComplete",
+            "kelp-cli is still loading"
+        );
+        if message["event"] == "repoChanged" {
+            reported.push(message["data"]["name"].as_str().unwrap().to_owned());
+        }
+    }
+    // The Linux repo first, then each slow repo once it is read.
+    assert_eq!(reported.first().map(String::as_str), Some("aurora-notes"));
+    assert!(!reported.iter().any(|name| name == "kelp-cli"));
+
+    // The list so far, still loading.
+    agent.send(json!({"id": 2, "method": "listRepos"}));
+    let list = agent.response();
+    assert_eq!(list["result"]["loading"], true);
+    let mut names: Vec<&str> = list["result"]["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(names, ["aurora-notes", "tidepool-api"]);
+
+    // An edit after git read kelp-cli, before its facts arrive, is not lost.
+    write(&kelp.join("README.md"), "# kelp\n");
+    std::thread::sleep(Duration::from_secs(1));
+    std::fs::remove_file(&gate).unwrap();
+    let kelp_event =
+        agent.event(|e| e["event"] == "repoChanged" && e["data"]["name"] == "kelp-cli");
+    assert_eq!(kelp_event["data"]["changedFiles"], 1);
+    agent.event(|e| e["event"] == "loadComplete");
+
+    // loadComplete comes once.
+    assert_no_more_load_complete(&mut agent, 3);
+    let list = agent.list_when_loaded(4);
+    assert_eq!(list["result"]["repos"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn a_held_get_repo_is_answered_when_its_slow_repo_arrives() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, drive, config) = setup_drive(tmp.path());
+    let kelp = drive.join("kelp-cli");
+    init_repo(&kelp);
+    init_repo(&drive.join("tidepool-api"));
+    let (kelp_gate, tidepool_gate) = (tmp.path().join("kelp-gate"), tmp.path().join("tide-gate"));
+    write(&kelp_gate, "");
+    write(&tidepool_gate, "");
+    let path = shim_git(
+        tmp.path(),
+        &[
+            ("*kelp-cli*\" status \"*", Shim::HoldWhile(&kelp_gate)),
+            (
+                "*tidepool-api*\" status \"*",
+                Shim::HoldWhile(&tidepool_gate),
+            ),
+        ],
+    );
+    let mut agent = spawn_on_drive(&home, &config, &drive, &path);
+
+    agent.send(json!({"id": 1, "method": "listRepos"}));
+    assert_eq!(agent.response()["result"]["loading"], true);
+    agent.send(json!({"id": 2, "method": "getRepo", "params": {"path": kelp.to_str().unwrap()}}));
+    std::thread::sleep(Duration::from_millis(300));
+    std::fs::remove_file(&kelp_gate).unwrap();
+    // Answered while tidepool-api is still held, so before loadComplete.
+    let answer = loop {
+        let message = agent.next(Duration::from_secs(20));
+        assert_ne!(message["event"], "loadComplete");
+        if message["id"] == 2 {
+            break message;
+        }
+    };
+    assert_eq!(answer["result"]["name"], "kelp-cli");
+    std::fs::remove_file(&tidepool_gate).unwrap();
+    agent.event(|e| e["event"] == "loadComplete");
+}
+
+#[test]
+fn a_slow_repo_git_cannot_read_still_completes_the_load_and_is_found_later() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, drive, config) = setup_drive(tmp.path());
+    init_repo(&drive.join("kelp-cli"));
+    init_repo(&drive.join("tidepool-api"));
+    let broken = tmp.path().join("broken");
+    write(&broken, "");
+    let path = shim_git(
+        tmp.path(),
+        &[("*kelp-cli*\" status \"*", Shim::FailWhile(&broken))],
+    );
+    let mut agent = spawn_on_drive(&home, &config, &drive, &path);
+
+    let list = agent.list_when_loaded(1);
+    let names: Vec<&str> = list["result"]["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["tidepool-api"]);
+    std::fs::remove_file(&broken).unwrap();
+    // Tried again on a timer.
+    agent.event_within(Duration::from_secs(20), |e| {
+        e["event"] == "repoChanged" && e["data"]["name"] == "kelp-cli"
+    });
+}
+
+#[test]
+fn a_load_of_only_slow_repos_reports_each_and_completes_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, drive, config) = setup_drive(tmp.path());
+    init_repo(&drive.join("kelp-cli"));
+    init_repo(&drive.join("group/tidepool-api"));
+    let path = std::env::var_os("PATH").unwrap();
+    let mut agent = spawn_on_drive(&home, &config, &drive, &path);
+
+    agent.send(json!({"id": 1, "method": "listRepos"}));
+    agent.response();
+    let mut reported = Vec::new();
+    loop {
+        let message = agent.next(Duration::from_secs(20));
+        if message["event"] == "loadComplete" {
+            break;
+        }
+        if message["event"] == "repoChanged" {
+            reported.push(message["data"]["name"].as_str().unwrap().to_owned());
+        }
+    }
+    reported.sort_unstable();
+    reported.dedup();
+    assert_eq!(reported, ["kelp-cli", "tidepool-api"]);
+    assert_no_more_load_complete(&mut agent, 2);
+    let list = agent.list_when_loaded(3);
+    assert_eq!(list["result"]["repos"].as_array().unwrap().len(), 2);
+}
+
 #[test]
 fn prepare_launch_writes_a_request_file() {
     let tmp = tempfile::tempdir().unwrap();

@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{TimeDelta, Utc};
 use refract_agent::config::Config;
-use refract_agent::state::Agent;
+use refract_agent::state::{read_git_with, Agent};
 use refract_core::classify::{FinishKind, InterruptReason, SessionState};
 use refract_core::preselect::Preselect;
 use refract_core::protocol::{LastCommit, RemoteId, RepoSnapshot};
@@ -348,4 +348,23 @@ fn preselect_is_recomputed_as_time_passes() {
     assert_eq!(agent.snapshots()[0].preselect, Preselect::NewAgent);
     let state = agent.repo(&repo).unwrap();
     assert_eq!(state.snapshot.preselect, Preselect::NewAgent);
+}
+
+#[test]
+fn status_and_head_read_together_or_in_turn_agree() {
+    hermetic_git();
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("kelp-cli");
+    init_repo(&repo);
+    write(&repo.join("README.md"), "# kelp\n");
+    let together = read_git_with(&repo, true).unwrap();
+    let in_turn = read_git_with(&repo, false).unwrap();
+    assert_eq!(together, in_turn);
+    assert_eq!(together.0.paths, ["README.md"]);
+    assert!(together.1.last_commit.is_some());
+
+    let not_a_repo = tmp.path().join("aurora-notes");
+    std::fs::create_dir_all(not_a_repo.join(".git")).unwrap();
+    assert!(read_git_with(&not_a_repo, true).is_err());
+    assert!(read_git_with(&not_a_repo, false).is_err());
 }

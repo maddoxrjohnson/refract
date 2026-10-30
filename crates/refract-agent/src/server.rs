@@ -28,9 +28,9 @@ use chrono::Utc;
 use refract_core::launch::wsl_path;
 use refract_core::protocol::{
     code, parse_request, ErrorBody, Event, Hello, HookInfo, Id, Method, Outcome, Reply, RepoList,
-    Response, PROTOCOL_VERSION,
+    RepoSnapshot, Response, PROTOCOL_VERSION,
 };
-use refract_core::sessions::{paths_match, project_dir_matches};
+use refract_core::sessions::{is_windows_mount, paths_match, project_dir_matches};
 use serde::Serialize;
 
 use crate::config::{self, Config};
@@ -40,7 +40,7 @@ use crate::procs;
 use crate::repos;
 use crate::scan;
 use crate::setup;
-use crate::state::{self, path_str, Agent, Refresh};
+use crate::state::{self, path_str, Agent, GitResult, Refresh};
 use crate::usage::Usage;
 use crate::watch::{self, Change, FsEvent, Watcher};
 
@@ -82,13 +82,17 @@ pub const MAX_LINE: usize = 1024 * 1024;
 /// Messages waiting for the main thread before the threads feeding it block.
 const CHANNEL_CAPACITY: usize = 64;
 
+/// Repos under `/mnt/` the first load reads at once. Each read waits on the Windows file
+/// system, which serves several at once well but slows them all if asked too many.
+pub const SLOW_READERS: usize = 4;
+
 enum Msg {
     Line(Line),
     Eof,
     Fs(Vec<FsEvent>),
-    /// The loading thread finished a phase; `last` when this is the full set.
+    /// The loading thread read some repos; `last` when it has read them all.
     Loaded {
-        agent: Box<Agent>,
+        repos: Vec<(PathBuf, GitResult)>,
         last: bool,
     },
     /// A response the setup thread finished.
@@ -268,11 +272,7 @@ struct Server<W: Write> {
     setup_jobs: Option<Sender<setup::Job>>,
     /// Queues `cloneRepo` jobs for the clone thread, once it is started.
     clone_jobs: Option<Sender<repos::Job>>,
-    /// Repos added to `extra` while running, re-applied to each loaded phase.
-    added_extra: Vec<PathBuf>,
-    /// Repos removed from `hidden` while running, re-applied to each loaded phase.
-    unhidden: Vec<PathBuf>,
-    /// Refreshes asked for since the load started, re-applied to each loaded phase.
+    /// Refreshes asked for since the load started, re-applied to each repo it reads.
     touched: HashMap<PathBuf, Refresh>,
     /// `getRepo` requests for repos not loaded yet, answered when they are.
     waiting: Vec<(Id, String)>,
@@ -337,7 +337,7 @@ where
             }
             Ok(Msg::Eof) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
             Ok(Msg::Fs(batch)) => server.queue(&batch),
-            Ok(Msg::Loaded { agent, last }) => server.loaded(*agent, last)?,
+            Ok(Msg::Loaded { repos, last }) => server.loaded(repos, last)?,
             Ok(Msg::Answer(response)) => server.send(&response)?,
             Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
             Err(RecvTimeoutError::Timeout) => {}
@@ -406,21 +406,23 @@ pub fn read_line<R: BufRead>(input: &mut R, buf: &mut Vec<u8>) -> io::Result<Opt
     }))
 }
 
-/// The configs loaded one after the other: Linux repos first when some roots are under
-/// `/mnt/`, where git is much slower, then everything.
-fn load_phases(config: &Config) -> Vec<Config> {
-    let slow = |p: &PathBuf| p.starts_with("/mnt/");
-    let has_slow = config.roots.iter().chain(&config.extra).any(slow);
-    let has_fast = config.roots.iter().chain(&config.extra).any(|p| !slow(p));
-    let mut phases = Vec::new();
-    if has_slow && has_fast {
-        let mut fast = config.clone();
-        fast.roots.retain(|p| !slow(p));
-        fast.extra.retain(|p| !slow(p));
-        phases.push(fast);
+/// True for repos the first load reads after the others, one report each: those under
+/// `/mnt/`, where git is much slower.
+fn is_slow(repo: &Path) -> bool {
+    is_windows_mount(&path_str(repo)) || state::under_test_slow_prefix(repo)
+}
+
+/// Ends the first load when dropped, also when the loading thread panics, so the main
+/// thread always sends `loadComplete` and answers the `getRepo` requests it holds.
+struct LoadDone(SyncSender<Msg>);
+
+impl Drop for LoadDone {
+    fn drop(&mut self) {
+        let _ = self.0.send(Msg::Loaded {
+            repos: Vec::new(),
+            last: true,
+        });
     }
-    phases.push(config.clone());
-    phases
 }
 
 fn error_response(id: Option<Id>, code: i32, message: impl Into<String>) -> Response {
@@ -454,8 +456,6 @@ impl<W: Write> Server<W> {
             tx,
             setup_jobs: None,
             clone_jobs: None,
-            added_extra: Vec::new(),
-            unhidden: Vec::new(),
             touched: HashMap::new(),
             waiting: Vec::new(),
             prewatched: Vec::new(),
@@ -677,14 +677,12 @@ impl<W: Write> Server<W> {
                 return Ok(Err(message));
             }
             self.agent.add_extra(repo.to_owned());
-            self.added_extra.push(repo.to_owned());
         }
         if self.agent.config().hidden.iter().any(|p| p == repo) {
             if let Err(message) = config::remove_hidden(&config::file_path(), repo) {
                 return Ok(Err(message));
             }
             self.agent.unhide(repo);
-            self.unhidden.push(repo.to_owned());
         }
         // Before the first load starts, it will find the repo itself.
         if self.load == Load::NotStarted {
@@ -765,79 +763,76 @@ impl<W: Write> Server<W> {
                 );
             }
         }
-        self.prewatched = walk.repos;
+        self.prewatched = walk.repos.clone();
         self.watch_hook_dir();
         self.agent
             .set_hooks(hook::statuses(&hook::Paths::from_env()));
-        let phases = load_phases(&config);
+        let (slow, fast): (Vec<PathBuf>, Vec<PathBuf>) =
+            walk.repos.into_iter().partition(|p| is_slow(p));
         let tx = self.tx.clone();
         std::thread::Builder::new()
             .name("load".into())
             .spawn(move || {
-                let count = phases.len();
-                for (i, config) in phases.into_iter().enumerate() {
-                    let mut agent = Agent::new(config);
-                    agent.load_all();
-                    let last = i + 1 == count;
+                let done = LoadDone(tx);
+                let tx = &done.0;
+                // Linux repos in one report, so their masses settle at once.
+                if !fast.is_empty() {
+                    let read = state::read_git_parallel(&fast);
                     let msg = Msg::Loaded {
-                        agent: Box::new(agent),
-                        last,
+                        repos: fast.into_iter().zip(read).collect(),
+                        last: false,
                     };
                     if tx.send(msg).is_err() {
                         return;
                     }
                 }
+                // Each slow repo as soon as it is read.
+                state::read_git_each(&slow, SLOW_READERS, |i, result| {
+                    let msg = Msg::Loaded {
+                        repos: vec![(slow[i].clone(), result)],
+                        last: false,
+                    };
+                    tx.send(msg).is_ok()
+                });
             })?;
         Ok(())
     }
 
-    /// Takes in one loaded phase: reports what it adds or changes, re-applies refreshes
-    /// asked for since the load started, and watches the repos fully.
-    fn loaded(&mut self, agent: Agent, last: bool) -> io::Result<()> {
-        let old = std::mem::replace(&mut self.agent, agent);
-        // What the new statuses change is reported below, against the old snapshots.
-        self.agent.set_hooks(old.hooks().clone());
-        for repo in &self.added_extra {
-            self.agent.add_extra(repo.clone());
-        }
-        for repo in &self.unhidden {
-            self.agent.unhide(repo);
-        }
-        let mut events = Vec::new();
-        let gone: Vec<PathBuf> = old
+    /// Takes in repos the load read: reports them and the repos whose snapshots they
+    /// change (masses move), re-applies refreshes asked for while they were read, and
+    /// watches them fully. Once `last`, the load is done.
+    fn loaded(&mut self, repos: Vec<(PathBuf, GitResult)>, last: bool) -> io::Result<()> {
+        let before: HashMap<PathBuf, RepoSnapshot> = self
+            .agent
             .repo_paths()
-            .filter(|p| self.agent.repo(p).is_none())
-            .cloned()
+            .filter_map(|p| Some((p.clone(), self.agent.repo(p)?.snapshot.clone())))
             .collect();
-        for path in &gone {
-            events.push(Event::RepoRemoved {
-                path: path_str(path),
-            });
-        }
-        let repos: Vec<PathBuf> = self.agent.repo_paths().cloned().collect();
-        for path in &repos {
+        let inserted = self.agent.insert_loaded(repos);
+        for path in &inserted {
             self.watch_repo(path);
         }
         // Only the root and git directory were watched while git ran, so an edit deeper
         // in the tree could have been missed: read status again now that the tree is
-        // watched. Skipped under `/mnt/`, where it is slow and would block requests.
-        let mut again = self.touched.clone();
-        for path in repos.iter().filter(|p| old.repo(p).is_none()) {
-            if !path.starts_with("/mnt/") {
-                let entry = again.entry(path.clone()).or_default();
-                entry.status = true;
+        // watched. Skipped for slow repos, where it would take as long again.
+        for path in &inserted {
+            let mut what = self.touched.remove(path).unwrap_or_default();
+            what.status |= !is_slow(path);
+            if what != Refresh::default() {
+                // What changed is reported below, against what the app saw before.
+                self.agent.refresh(path, what);
+                if what.head {
+                    // A checkout while git ran can have added tracked directories.
+                    self.watch_repo(path);
+                }
             }
         }
-        let mut again: Vec<(PathBuf, Refresh)> = again.into_iter().collect();
-        again.sort_by(|a, b| a.0.cmp(&b.0));
-        for (path, what) in again {
-            // What changed is reported below, against what the app saw before.
-            self.agent.refresh(&path, what);
-        }
-        for path in &repos {
-            let new = &self.agent.repo(path).expect("listed repo").snapshot;
-            match old.repo(path) {
-                Some(before) => events.extend(state::diff(&before.snapshot, new)),
+        let mut events = Vec::new();
+        for path in self.agent.repo_paths() {
+            let Some(new) = self.agent.repo(path).map(|r| &r.snapshot) else {
+                continue;
+            };
+            match before.get(path) {
+                Some(old) => events.extend(state::diff(old, new)),
                 None => events.push(Event::RepoChanged(Box::new(new.clone()))),
             }
         }
@@ -848,13 +843,12 @@ impl<W: Write> Server<W> {
                 .into_iter()
                 .filter(|p| self.agent.repo(p).is_none())
                 .collect();
-            self.forget_repos(&gone);
             self.forget_repos(&unloaded);
             self.watch_search();
             if let Some(watcher) = &self.watcher {
                 eprintln!(
                     "refract-agent: {} repos, {} watches",
-                    repos.len(),
+                    self.agent.repo_paths().count(),
                     watcher.len()
                 );
             }
@@ -1366,28 +1360,10 @@ mod tests {
     }
 
     #[test]
-    fn linux_repos_load_first() {
-        let config = Config {
-            roots: vec![
-                "/home/dev/projects".into(),
-                "/mnt/c/Users/dev/Desktop".into(),
-            ],
-            extra: vec!["/mnt/d/aurora-notes".into()],
-            hidden: vec![],
-            depth: 3,
-            claude_projects: "/home/dev/.claude/projects".into(),
-        };
-        let phases = load_phases(&config);
-        assert_eq!(phases.len(), 2);
-        assert_eq!(phases[0].roots, [PathBuf::from("/home/dev/projects")]);
-        assert!(phases[0].extra.is_empty());
-        assert_eq!(phases[1], config);
-
-        let linux_only = Config {
-            roots: vec!["/home/dev/projects".into()],
-            extra: vec![],
-            ..config
-        };
-        assert_eq!(load_phases(&linux_only), [linux_only]);
+    fn repos_on_windows_drives_load_last() {
+        assert!(is_slow(Path::new("/mnt/c/Users/dev/Desktop/tidepool-api")));
+        assert!(is_slow(Path::new("/mnt/d/aurora-notes")));
+        assert!(!is_slow(Path::new("/home/dev/projects/kelp-cli")));
+        assert!(!is_slow(Path::new("/home/dev/mnt/kelp-cli")));
     }
 }

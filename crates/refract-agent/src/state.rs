@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, Utc};
@@ -148,16 +148,32 @@ impl Agent {
     /// Finds and reads every repo. Git runs for several repos at once.
     pub fn load_all(&mut self) {
         let paths = scan::find_repos(&self.config);
-        self.procs = procs::scan();
         let gits = read_git_parallel(&paths);
         self.repos.clear();
-        for (path, git) in paths.into_iter().zip(gits) {
+        self.insert_loaded(paths.into_iter().zip(gits).collect());
+    }
+
+    /// Takes in repos whose git facts were read elsewhere, as the first load does, reads
+    /// their sessions, and recomputes every mass. Returns the repos taken in; one whose
+    /// facts could not be read is skipped. Reports no events: the caller compares
+    /// snapshots, since other repos' masses can move too.
+    pub fn insert_loaded(&mut self, loaded: Vec<(PathBuf, GitResult)>) -> Vec<PathBuf> {
+        if loaded.is_empty() {
+            return Vec::new();
+        }
+        self.procs = procs::scan();
+        let mut inserted = Vec::new();
+        for (path, git) in loaded {
             match git {
-                Ok((status, head)) => self.insert(path, status, head),
+                Ok((status, head)) => {
+                    self.insert(path.clone(), status, head);
+                    inserted.push(path);
+                }
                 Err(e) => eprintln!("refract-agent: skipping {}: {e}", path.display()),
             }
         }
         self.update_masses();
+        inserted
     }
 
     /// Paths of known repos.
@@ -418,27 +434,65 @@ impl Agent {
 }
 
 /// Git facts for one repo, or why they could not be read.
-type GitResult = std::io::Result<(Status, HeadInfo)>;
+pub type GitResult = std::io::Result<(Status, HeadInfo)>;
 
-fn read_git_parallel(paths: &[PathBuf]) -> Vec<GitResult> {
+/// Tests set this to a path prefix to have repos under it loaded and read as if on a
+/// Windows drive.
+pub const TEST_SLOW_PREFIX: &str = "REFRACT_AGENT_TEST_SLOW_PREFIX";
+
+/// True when `path` is under [`TEST_SLOW_PREFIX`].
+pub fn under_test_slow_prefix(path: &Path) -> bool {
+    std::env::var_os(TEST_SLOW_PREFIX).is_some_and(|p| !p.is_empty() && path.starts_with(p))
+}
+
+/// Reads one repo's git facts. On a Windows drive the status and the HEAD facts are
+/// read at the same time: there each git call mostly waits on the file system, one
+/// file at a time, so two calls take little longer than one.
+pub fn read_git(path: &Path) -> GitResult {
+    read_git_with(
+        path,
+        git::on_windows_drive(path) || under_test_slow_prefix(path),
+    )
+}
+
+/// Reads one repo's git facts, the status and the HEAD facts at the same time when
+/// `concurrent`, else one after the other. Either way the HEAD reads not started yet are
+/// skipped once the status cannot be read. If no thread can be started, the reads run
+/// one after the other.
+pub fn read_git_with(path: &Path, concurrent: bool) -> GitResult {
+    if concurrent {
+        let cancel = AtomicBool::new(false);
+        let read = std::thread::scope(|scope| {
+            let head = std::thread::Builder::new()
+                .name("git-head".into())
+                .spawn_scoped(scope, || git::read_head_unless(path, &cancel))
+                .ok()?;
+            let status = git::read_status(path);
+            if status.is_err() {
+                cancel.store(true, Ordering::Relaxed);
+            }
+            let head = head
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("reading HEAD panicked")));
+            Some(status.and_then(|s| Ok((s, head?))))
+        });
+        if let Some(read) = read {
+            return read;
+        }
+    }
+    git::read_status(path).and_then(|s| Ok((s, git::read_head(path)?)))
+}
+
+/// Reads every repo in `paths`, several at once.
+pub fn read_git_parallel(paths: &[PathBuf]) -> Vec<GitResult> {
     let workers = std::thread::available_parallelism()
         .map_or(4, |n| n.get())
-        .clamp(1, 8)
-        .min(paths.len().max(1));
-    let next = AtomicUsize::new(0);
+        .clamp(1, 8);
     let results: Mutex<Vec<Option<GitResult>>> =
         Mutex::new((0..paths.len()).map(|_| None).collect());
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            scope.spawn(|| loop {
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                let Some(path) = paths.get(i) else {
-                    break;
-                };
-                let result = git::read_status(path).and_then(|s| Ok((s, git::read_head(path)?)));
-                results.lock().expect("results lock")[i] = Some(result);
-            });
-        }
+    read_git_each(paths, workers, |i, result| {
+        results.lock().expect("results lock")[i] = Some(result);
+        true
     });
     results
         .into_inner()
@@ -446,6 +500,44 @@ fn read_git_parallel(paths: &[PathBuf]) -> Vec<GitResult> {
         .into_iter()
         .map(|r| r.expect("every repo read"))
         .collect()
+}
+
+/// Reads every repo in `paths`, at most `workers` at once, in order, and hands each
+/// result to `done` with its index as soon as it is read, from the thread that read it.
+/// Once `done` returns false, no further repo is started. If no worker thread can be
+/// started, the repos are read on this one.
+pub fn read_git_each(
+    paths: &[PathBuf],
+    workers: usize,
+    done: impl Fn(usize, GitResult) -> bool + Sync,
+) {
+    let workers = workers.clamp(1, paths.len().max(1));
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
+    let work = || {
+        while !stop.load(Ordering::Relaxed) {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            let Some(path) = paths.get(i) else {
+                break;
+            };
+            if !done(i, read_git(path)) {
+                stop.store(true, Ordering::Relaxed);
+            }
+        }
+    };
+    std::thread::scope(|scope| {
+        let started = (0..workers)
+            .take_while(|_| {
+                std::thread::Builder::new()
+                    .name("git".into())
+                    .spawn_scoped(scope, work)
+                    .is_ok()
+            })
+            .count();
+        if started == 0 {
+            work();
+        }
+    });
 }
 
 fn live_set(procs: &[ClaudeProcess], repo: &Path, sessions: &[SessionSummary]) -> HashSet<String> {
