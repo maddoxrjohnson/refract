@@ -7,6 +7,7 @@ mod gpu;
 mod hotkey;
 mod launch;
 mod logfile;
+mod migrate;
 mod open;
 mod process;
 mod remote;
@@ -47,7 +48,9 @@ pub fn run() {
             Some(vec![HIDDEN_ARG]),
         ))
         .plugin(hotkey::plugin())
+        .plugin(tauri_plugin_notification::init())
         .manage(remote::Remote::new())
+        .manage(migrate::Migrations::default())
         .setup(|app| {
             let handle = app.handle();
             // First, so everything after it is logged.
@@ -83,6 +86,17 @@ pub fn run() {
             agent::agent_status,
             agent::agent_request,
             launch::launch,
+            migrate::migrate_preflight,
+            migrate::migrate_start,
+            migrate::migrate_cancel_snapshot,
+            migrate::migrate_cancel,
+            migrate::migrate_windows,
+            migrate::migrate_close_window,
+            migrate::migrate_stop_agent,
+            migrate::migrate_resync,
+            migrate::migrate_delete,
+            migrate::migrate_finish,
+            migrate::migrate_pending,
             open::open_folder,
             open::open_url,
             open::open_log_folder,

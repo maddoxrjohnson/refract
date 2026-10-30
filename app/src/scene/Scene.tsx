@@ -42,7 +42,7 @@ import { createTicker } from "./ticker";
 // scene through the post-processing chain, with the shells sampling `back` to refract.
 // Frames are drawn on demand only: on a prop change, pointer movement or resize, and
 // while something animates, paced to the tier's frame cap by ./ticker.ts. The loop body
-// allocates nothing per frame beyond the label's transform string.
+// allocates nothing per frame beyond the style strings of the label and the marks.
 
 export interface SceneProps {
   repos: RepoSnapshot[];
@@ -61,6 +61,12 @@ export interface SceneProps {
   zoomed: string | null;
   /** Shown beside the focused gem; the scene moves it each frame. */
   focusLabel?: ReactNode;
+  /**
+   * Small overlays on gems, by path (the Windows-drive marker, the Move to WSL ring).
+   * Each is centred on its gem in the frames the scene draws anyway, with `--r` set to
+   * the gem's radius in pixels; they take no pointer events.
+   */
+  marks?: ReadonlyMap<string, ReactNode>;
   /** Magnet focus: the gem nearest the pointer within ~130 px, or null. */
   onPointerFocus(path: string | null): void;
   /** A click while a gem is in magnet range. */
@@ -112,6 +118,7 @@ const CAMERA = { fov: FOV, near: 0.1, far: 120, position: [0, 0, 12] as [number,
 
 export function Scene(props: SceneProps) {
   const label = useRef<HTMLDivElement>(null);
+  const markEls = useRef(new Map<string, HTMLDivElement>());
   const dpr = Math.min(window.devicePixelRatio || 1, TIERS[props.quality].maxPixelRatio);
   return (
     <div className="scene">
@@ -127,8 +134,23 @@ export function Scene(props: SceneProps) {
           </div>
         }
       >
-        <SceneContents {...props} label={label} />
+        <SceneContents {...props} label={label} markEls={markEls} />
       </Canvas>
+      {props.marks &&
+        [...props.marks].map(([path, node]) => (
+          <div
+            key={path}
+            className="scene-mark"
+            hidden
+            ref={(el) => {
+              if (!el) return;
+              markEls.current.set(path, el);
+              return () => void markEls.current.delete(path);
+            }}
+          >
+            {node}
+          </div>
+        ))}
       <div className="scene-label" ref={label} hidden>
         {props.focusLabel}
       </div>
@@ -138,6 +160,7 @@ export function Scene(props: SceneProps) {
 
 interface ContentsProps extends SceneProps {
   label: RefObject<HTMLDivElement | null>;
+  markEls: RefObject<Map<string, HTMLDivElement>>;
 }
 
 interface Post {
@@ -262,6 +285,35 @@ function nearestGem(
   return best;
 }
 
+/** Centres each mark on its gem and sets `--r` to the gem's radius in pixels; hides marks without one. */
+function placeMarks(
+  els: Map<string, HTMLDivElement>,
+  gems: Map<string, GemHandle>,
+  camera: Camera,
+  W: number,
+  H: number,
+  tv: number,
+) {
+  for (const [path, el] of els) {
+    const g = gems.get(path);
+    if (!g) {
+      el.hidden = true;
+      continue;
+    }
+    tmp.setFromMatrixPosition(g.outer.matrixWorld);
+    const dist = camera.position.distanceTo(tmp);
+    tmp.project(camera);
+    if (!(dist > 0) || tmp.z > 1) {
+      el.hidden = true;
+      continue;
+    }
+    const radiusPx = ((g.radius * g.outer.scale.x * g.spinner.scale.x) / (dist * tv)) * (H / 2);
+    el.hidden = false;
+    el.style.transform = `translate(${((tmp.x * 0.5 + 0.5) * W).toFixed(1)}px, ${((-tmp.y * 0.5 + 0.5) * H).toFixed(1)}px)`;
+    el.style.setProperty("--r", `${radiusPx.toFixed(1)}px`);
+  }
+}
+
 /** Puts the label beside the gem, clear of its edge and inside the canvas; hides it without one. */
 function placeLabel(
   el: HTMLDivElement | null,
@@ -291,7 +343,7 @@ function placeLabel(
 }
 
 function SceneContents(props: ContentsProps) {
-  const { repos, remoteOnly, quality, reducedMotion, matches, focused, zoomed, focusLabel, visible } =
+  const { repos, remoteOnly, quality, reducedMotion, matches, focused, zoomed, focusLabel, visible, marks } =
     props;
   const tier = TIERS[quality];
   const gl = useThree((s) => s.gl);
@@ -417,12 +469,13 @@ function SceneContents(props: ContentsProps) {
   }, [ticker, visible]);
 
   // Any change worth showing draws a frame, within the frame cap; the loop keeps going
-  // while things settle. The label's content is React's job; only whether there is one
-  // matters here.
+  // while things settle. The label's and the marks' content is React's job; only whether
+  // there is a label, and which gems have marks, matter here.
   const hasLabel = focusLabel != null;
+  const markKeys = marks ? [...marks.keys()].join("\n") : "";
   useEffect(() => {
     ticker.request(tier.fpsCap, loop.current.lastStart);
-  }, [ticker, tier, repos, remoteOnly, reducedMotion, matches, focused, zoomed, hasLabel, visible]);
+  }, [ticker, tier, repos, remoteOnly, reducedMotion, matches, focused, zoomed, hasLabel, markKeys, visible]);
 
   useEffect(() => {
     const el = gl.domElement;
@@ -560,6 +613,7 @@ function SceneContents(props: ContentsProps) {
       H,
       tv,
     );
+    placeMarks(props.markEls.current, gems, camera, W, H, tv);
 
     if (post.dof) post.dof.cocMaterial.focusDistance = camera.position.distanceTo(s.look);
 

@@ -2,7 +2,17 @@ import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
 import { EVENTS, TauriBackend } from "./TauriBackend";
-import type { AgentStatus, GpuUsage, HookInfo, RemoteRepo, Settings, SystemStats, UsageSummary } from "./types";
+import type {
+  AgentStatus,
+  DeleteOutcome,
+  GpuUsage,
+  HookInfo,
+  MigrateSnapshotProgress,
+  RemoteRepo,
+  Settings,
+  SystemStats,
+  UsageSummary,
+} from "./types";
 
 afterEach(() => clearMocks());
 
@@ -245,5 +255,65 @@ describe("TauriBackend", () => {
     await settle();
     await emit(EVENTS.stats, { ...stats, cpuPercent: 90 });
     expect(seen).toEqual([stats]);
+  });
+
+  it("moves a repo to WSL through the migrate commands", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const deleted: DeleteOutcome = { kind: "wontFit", reason: "too large" };
+    mockIPC(
+      (cmd, args) => {
+        calls.push({ cmd, args });
+        if (cmd === "migrate_start") return { id: "m-1" };
+        if (cmd === "migrate_delete") return deleted;
+        if (cmd === "migrate_windows" || cmd === "migrate_pending") return [];
+        if (cmd === "migrate_cancel_snapshot" || cmd === "migrate_close_window") return true;
+      },
+      { shouldMockEvents: true },
+    );
+    const backend = new TauriBackend();
+    const seen: MigrateSnapshotProgress[] = [];
+    const stop = backend.onMigrateSnapshot((p) => seen.push(p));
+    await settle();
+    const path = "/mnt/c/Users/dev/Desktop/aurora-notes";
+    const dest = "/home/dev/projects/aurora-notes";
+    await backend.migratePreflight(path);
+    await backend.migratePreflight(path, dest);
+    expect(await backend.migrateStart(path, dest)).toEqual({ id: "m-1" });
+    expect(await backend.migrateCancelSnapshot(path)).toBe(true);
+    expect(await backend.migrateWindows(path)).toEqual([]);
+    expect(await backend.migrateCloseWindow(path, 42)).toBe(true);
+    await backend.migrateStopAgent(path, "0b7e");
+    await backend.migrateResync("m-1");
+    expect(await backend.migrateDelete("m-1", false)).toEqual(deleted);
+    await backend.migrateFinish("m-1", "keep");
+    await backend.migrateCancel("m-1");
+    expect(await backend.migratePending()).toEqual([]);
+    const progress: MigrateSnapshotProgress = {
+      path,
+      phase: "hashing",
+      filesDone: 1,
+      filesTotal: 2,
+      bytesDone: 3,
+      bytesTotal: 4,
+    };
+    await emit(EVENTS.migrateSnapshot, progress);
+    stop();
+    await settle();
+    await emit(EVENTS.migrateSnapshot, { ...progress, filesDone: 2 });
+    expect(seen).toEqual([progress]);
+    expect(calls).toEqual([
+      { cmd: "migrate_preflight", args: { path, dest: null } },
+      { cmd: "migrate_preflight", args: { path, dest } },
+      { cmd: "migrate_start", args: { path, dest } },
+      { cmd: "migrate_cancel_snapshot", args: { path } },
+      { cmd: "migrate_windows", args: { path } },
+      { cmd: "migrate_close_window", args: { path, id: 42 } },
+      { cmd: "migrate_stop_agent", args: { path, sessionId: "0b7e" } },
+      { cmd: "migrate_resync", args: { id: "m-1" } },
+      { cmd: "migrate_delete", args: { id: "m-1", permanent: false } },
+      { cmd: "migrate_finish", args: { id: "m-1", action: "keep" } },
+      { cmd: "migrate_cancel", args: { id: "m-1" } },
+      { cmd: "migrate_pending", args: {} },
+    ]);
   });
 });

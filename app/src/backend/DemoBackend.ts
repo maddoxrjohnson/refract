@@ -25,6 +25,19 @@ import type {
   TokenTotals,
   UsageSummary,
 } from "./types";
+import type {
+  DeleteOutcome,
+  FinishAction,
+  InstallStep,
+  MigrateError,
+  MigratePreflight,
+  MigrateSnapshotProgress,
+  MigrateStep,
+  MigrationReport,
+  PendingMigration,
+  SkippedFolder,
+  VsCodeWindow,
+} from "./types";
 import { DEFAULT_PRICES } from "../usage/cost";
 
 // Invented repos covering every state a gem can show, for running the interface in a
@@ -45,7 +58,12 @@ interface Seed {
   commit: [string, number];
   sessions?: SessionInfo[];
   preselect?: Preselect;
+  /** Where it is cloned; `~/projects/<name>` by default. */
+  path?: string;
 }
+
+/** The demo's repo on a Windows drive. */
+export const DEMO_WINDOWS_REPO = "/mnt/c/Users/demo/Desktop/marigold-site";
 
 const session = (
   id: string,
@@ -140,11 +158,23 @@ const SEEDS: Seed[] = [
   },
   { name: "notebook-lab", host: "gitlab.example.com", language: "Python", mass: 0.24, commit: ["Problem set 4", 3 * 24 * HOUR] },
   { name: "scratch", host: null, language: null, mass: 0.12, commit: ["wip", 40 * 24 * HOUR] },
+  // On a Windows drive, for Move to WSL.
+  {
+    name: "marigold-site",
+    host: "github.com",
+    language: "JavaScript",
+    mass: 0.48,
+    commit: ["Gallery page and image sizes", 5 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-000000000007", { kind: "finished", detail: "completed" }, 6 * HOUR, "The gallery builds and the links work.", 96_000),
+    ],
+    path: DEMO_WINDOWS_REPO,
+  },
 ];
 
 export function demoRepos(): RepoSnapshot[] {
   return SEEDS.map((s) => {
-    const path = `/home/demo/projects/${s.name}`;
+    const path = s.path ?? `/home/demo/projects/${s.name}`;
     const remote = s.host ? { host: s.host, owner: "demo-user", name: s.name } : null;
     const changedFiles = s.changedFiles ?? 0;
     return {
@@ -190,6 +220,7 @@ const REMOTE_SEEDS: RemoteSeed[] = [
   { name: "ledger-sync", language: "Python", sizeKb: 12_000, pushedDaysAgo: 4, prs: 0, ci: "pending" },
   { name: "quill", language: "Go", sizeKb: 6_400, pushedDaysAgo: 2, prs: 2, ci: "none" },
   { name: "shell-kit", host: "gitlab.example.com", language: "C", sizeKb: 2_200, pushedDaysAgo: 0, prs: 1, ci: "success" },
+  { name: "marigold-site", language: "JavaScript", sizeKb: 14_000, pushedDaysAgo: 0, prs: 0, ci: "success" },
   { name: "orbit-cli", language: "Rust", sizeKb: 9_800, pushedDaysAgo: 12, prs: 1, ci: "success", description: "A small command line for orbital mechanics." },
   { name: "lumen-docs", language: "TypeScript", sizeKb: 2_600, pushedDaysAgo: 30, prs: 0, ci: "failure", description: "Documentation site." },
   { name: "pixel-garden", language: "JavaScript", sizeKb: 640, pushedDaysAgo: 90, prs: 0, ci: "none" },
@@ -379,6 +410,27 @@ export class DemoBackend implements Backend {
   private creds: Credentials = { github: "ghCli", gitlab: "stored" };
   private hookInstalled = false;
   private started = Date.now();
+  // Move to WSL: snapshots running by path (true once cancelled), migrations by id.
+  private snapshotting = new Map<string, boolean>();
+  private snapshotListeners = new Set<(progress: MigrateSnapshotProgress) => void>();
+  private demoMoves = new Map<string, DemoMove>();
+  private moveCount = 0;
+  private moveWindows: VsCodeWindow[] = [{ id: 4242, title: "marigold-site - Visual Studio Code" }];
+  private moveOutcome: DemoMoveOutcome;
+
+  /**
+   * `moveOutcome` is what Delete original first says; by default the original goes to the
+   * Recycle Bin. The page's `?move=wontfit` asks for the permanent-delete question instead.
+   */
+  constructor(options: { moveOutcome?: DemoMoveOutcome } = {}) {
+    let fromPage: DemoMoveOutcome | undefined;
+    try {
+      if (new URLSearchParams(globalThis.location?.search ?? "").get("move") === "wontfit") fromPage = "wontFit";
+    } catch {
+      // No page address: the default.
+    }
+    this.moveOutcome = options.moveOutcome ?? fromPage ?? "deleted";
+  }
 
   private emit(event: AgentEvent) {
     for (const cb of this.events) cb(event);
@@ -624,4 +676,277 @@ export class DemoBackend implements Backend {
     const timer = setInterval(tick, 2000);
     return () => clearInterval(timer);
   }
+
+  // Move to WSL, simulated (spec §7): a preflight with one VS Code window to close, a
+  // snapshot, every helper step, a passing report and the Recycle Bin. Nothing is copied.
+
+  private moveFail(kind: MigrateError["kind"], message: string): never {
+    const error: MigrateError = { kind, message };
+    throw error;
+  }
+
+  /** Sends `migrate://snapshot` ticks through `phases`; stops on `migrateCancelSnapshot`. */
+  private async demoSnapshot(path: string, phases: MigrateSnapshotProgress["phase"][], tickMs: number) {
+    if (this.snapshotting.has(path)) this.moveFail("busy", "This folder is already being checked.");
+    this.snapshotting.set(path, false);
+    try {
+      const bytesTotal = DEMO_MOVE_TOTALS.bytes;
+      const filesTotal = DEMO_MOVE_TOTALS.files;
+      for (const phase of phases) {
+        for (let i = 1; i <= DEMO_TICKS; i++) {
+          if (this.snapshotting.get(path)) this.moveFail("cancelled", "Cancelled.");
+          const share = i / DEMO_TICKS;
+          const progress: MigrateSnapshotProgress = {
+            path,
+            phase,
+            filesDone: Math.round(filesTotal * share),
+            filesTotal,
+            bytesDone: phase === "hashing" ? Math.round(bytesTotal * share) : 0,
+            bytesTotal: phase === "hashing" ? bytesTotal : 0,
+          };
+          for (const cb of this.snapshotListeners) cb(progress);
+          await sleep(tickMs);
+        }
+      }
+      if (this.snapshotting.get(path)) this.moveFail("cancelled", "Cancelled.");
+    } finally {
+      this.snapshotting.delete(path);
+    }
+  }
+
+  private demoRefusals(dest: string) {
+    if (!dest.startsWith("/") || /^\/mnt\/[a-z](\/|$)/i.test(dest)) {
+      return [{ kind: "destNotLinux" as const, message: "The destination isn't on the Linux filesystem." }];
+    }
+    if (this.repos.some((r) => r.path === dest.replace(/\/+$/, ""))) {
+      return [{ kind: "destExists" as const, message: "The destination already exists. Pick another folder." }];
+    }
+    return [];
+  }
+
+  async migratePreflight(path: string, dest?: string): Promise<MigratePreflight> {
+    const repo = this.repos.find((r) => r.path === path);
+    if (!repo || !path.startsWith("/mnt/")) {
+      const error: MigrateError = {
+        kind: "refused",
+        message: "This repo isn't on a Windows drive.",
+        refusals: [{ kind: "notOnWindowsDrive", message: "This repo isn't on a Windows drive." }],
+      };
+      throw error;
+    }
+    await this.demoSnapshot(path, ["walking", "probing"], 120);
+    const target = dest ?? `/home/demo/projects/${repo.name}`;
+    return {
+      source: path,
+      windowsPath: DEMO_WINDOWS_PATH,
+      name: repo.name,
+      dest: target,
+      refusals: this.demoRefusals(target),
+      warnings: [],
+      ...DEMO_MOVE_TOTALS,
+      skipped: DEMO_MOVE_SKIPPED,
+      install: [DEMO_MOVE_INSTALL],
+      droppedStreams: 1,
+      vscodeWindows: [...this.moveWindows],
+      linuxGit: false,
+    };
+  }
+
+  async migrateStart(path: string, dest: string): Promise<{ id: string }> {
+    if ([...this.demoMoves.values()].some((m) => m.source === path)) {
+      this.moveFail("busy", "This folder is already being moved.");
+    }
+    if (this.moveWindows.length > 0) {
+      this.moveFail("busy", "Close the VS Code windows that have this folder open first.");
+    }
+    const refusals = this.demoRefusals(dest);
+    if (refusals.length > 0) {
+      const error: MigrateError = { kind: "refused", message: refusals[0].message, refusals };
+      throw error;
+    }
+    await this.demoSnapshot(path, ["git", "hashing", "blobs"], 120);
+    const move: DemoMove = { id: `demo-move-${++this.moveCount}`, source: path, dest, report: null, cancelled: false };
+    this.demoMoves.set(move.id, move);
+    void this.runMove(move, DEMO_MOVE_STEPS);
+    return { id: move.id };
+  }
+
+  /** Walks `steps` with progress events, then sends a passing report. */
+  private async runMove(move: DemoMove, steps: [MigrateStep, number][]) {
+    for (const [step, total] of steps) {
+      for (let i = 1; i <= DEMO_TICKS; i++) {
+        await sleep(step === "copying" ? 260 : 130);
+        if (move.cancelled) return;
+        this.emit({ event: "migrateProgress", data: { id: move.id, step, done: Math.round((total * i) / DEMO_TICKS), total } });
+      }
+    }
+    move.report = demoMoveReport(move);
+    this.emit({ event: "migrateReady", data: { id: move.id, report: move.report } });
+  }
+
+  private readyMove(id: string): DemoMove & { report: MigrationReport } {
+    const move = this.demoMoves.get(id);
+    if (!move) this.moveFail("notReady", `No migration ${id} is known.`);
+    if (!move.report) this.moveFail("notReady", "The move hasn't finished its checks yet.");
+    return move as DemoMove & { report: MigrationReport };
+  }
+
+  migrateCancelSnapshot(path: string): Promise<boolean> {
+    if (!this.snapshotting.has(path)) return Promise.resolve(false);
+    this.snapshotting.set(path, true);
+    return Promise.resolve(true);
+  }
+
+  async migrateCancel(id: string): Promise<void> {
+    const move = this.demoMoves.get(id);
+    if (move) move.cancelled = true;
+    this.demoMoves.delete(id);
+    await sleep(300);
+  }
+
+  migrateWindows(_path: string): Promise<VsCodeWindow[]> {
+    return Promise.resolve([...this.moveWindows]);
+  }
+
+  async migrateCloseWindow(_path: string, id: number): Promise<boolean> {
+    await sleep(300);
+    const before = this.moveWindows.length;
+    this.moveWindows = this.moveWindows.filter((w) => w.id !== id);
+    return this.moveWindows.length < before;
+  }
+
+  async migrateStopAgent(path: string, sessionId: string): Promise<void> {
+    await sleep(300);
+    const repo = this.repos.find((r) => r.path === path);
+    if (!repo) return;
+    const next: RepoSnapshot = {
+      ...repo,
+      sessions: repo.sessions.map((s) =>
+        s.id === sessionId ? { ...s, state: { kind: "finished", detail: "userInterrupted" } } : s,
+      ),
+    };
+    this.repos = this.repos.map((r) => (r.path === path ? next : r));
+    this.emit({ event: "repoChanged", data: next });
+  }
+
+  async migrateResync(id: string): Promise<void> {
+    const move: DemoMove = this.readyMove(id);
+    move.report = null;
+    void this.runMove(move, [["rechecking", 12]]);
+  }
+
+  async migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome> {
+    const move = this.readyMove(id);
+    await sleep(700);
+    if (this.moveOutcome === "wontFit" && !permanent) {
+      return { kind: "wontFit", reason: "The Recycle Bin on C: holds 1.5 GB, and this needs 1.8 GB." };
+    }
+    this.demoMoves.delete(id);
+    const original = this.repos.find((r) => r.path === move.source);
+    this.repos = this.repos.filter((r) => r.path !== move.source);
+    this.emit({ event: "repoRemoved", data: { path: move.source } });
+    if (original) {
+      const moved: RepoSnapshot = { ...original, path: move.dest, name: move.dest.split("/").pop() ?? original.name };
+      this.repos = [...this.repos, moved];
+      this.emit({ event: "repoChanged", data: moved });
+    }
+    return { kind: "deleted", permanent, shortcut: `${DEMO_WINDOWS_PATH}.lnk` };
+  }
+
+  async migrateFinish(id: string, _action: FinishAction): Promise<void> {
+    this.readyMove(id);
+    await sleep(300);
+    this.demoMoves.delete(id);
+  }
+
+  migratePending(): Promise<PendingMigration[]> {
+    return Promise.resolve(
+      [...this.demoMoves.values()].flatMap((m) => (m.report ? [{ id: m.id, report: m.report }] : [])),
+    );
+  }
+
+  onMigrateSnapshot(cb: (progress: MigrateSnapshotProgress) => void): Unsubscribe {
+    this.snapshotListeners.add(cb);
+    return () => this.snapshotListeners.delete(cb);
+  }
+}
+
+// Move to WSL in the demo: an invented web project on the Windows desktop.
+
+const MB = 1024 ** 2;
+const DEMO_WINDOWS_PATH = "C:\\Users\\demo\\Desktop\\marigold-site";
+/** Progress events per step. */
+const DEMO_TICKS = 4;
+const DEMO_MOVE_TOTALS = { files: 2_418, dirs: 212, bytes: Math.round(1.3 * GB) };
+const DEMO_MOVE_SKIPPED: SkippedFolder[] = [
+  { path: "node_modules", rule: "nodeModules", bytes: 412 * MB, files: 38_210 },
+  { path: ".next", rule: "toolCache", bytes: 38 * MB, files: 1_204 },
+];
+const DEMO_MOVE_INSTALL: InstallStep = {
+  folder: "node_modules",
+  tool: "npm",
+  command: "npm ci",
+  installHint: "curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.3/install.sh | bash && nvm install --lts",
+};
+/** The helper's steps, with what each counts (bytes for copying, items otherwise). */
+const DEMO_MOVE_STEPS: [MigrateStep, number][] = [
+  ["copying", DEMO_MOVE_TOTALS.bytes],
+  ["normalising", 1_906],
+  ["hashing", DEMO_MOVE_TOTALS.files],
+  ["checkingGit", 6],
+  ["rechecking", DEMO_MOVE_TOTALS.files],
+  ["movingHistory", 1],
+  ["installing", 1],
+];
+
+interface DemoMove {
+  id: string;
+  source: string;
+  dest: string;
+  /** Set once the checks are done. */
+  report: MigrationReport | null;
+  cancelled: boolean;
+}
+
+/** What `migrateDelete` says short of deleting: `wontFit` shows the permanent-delete question. */
+export type DemoMoveOutcome = "deleted" | "wontFit";
+
+/** A report where every check passed and `npm ci` ran. */
+function demoMoveReport(move: DemoMove): MigrationReport {
+  const name = move.dest.split("/").pop() ?? "repo";
+  const stamp = new Date();
+  return {
+    version: 1,
+    id: move.id,
+    source: move.source,
+    dest: move.dest,
+    startedAt: new Date(stamp.getTime() - 9_000).toISOString(),
+    finishedAt: stamp.toISOString(),
+    checks: (["files", "gitState", "nothingSkipped", "unchanged", "history"] as const).map((check) => ({
+      check,
+      status: "passed",
+      problems: [],
+    })),
+    skipped: DEMO_MOVE_SKIPPED,
+    droppedStreams: [{ path: "assets/hero.jpg", stream: "Zone.Identifier", size: 26 }],
+    newObjects: 312,
+    sourceTotals: DEMO_MOVE_TOTALS,
+    copyTotals: DEMO_MOVE_TOTALS,
+    installChanges: { created: [], changed: [], removed: [] },
+    install: [
+      {
+        step: DEMO_MOVE_INSTALL,
+        status: "succeeded",
+        exitCode: 0,
+        logPath: `/home/demo/.local/share/refract/migrations/demo-${name}-install.log`,
+      },
+    ],
+    history: {
+      sessions: 1,
+      fromDirs: ["/home/demo/.claude/projects/-mnt-c-Users-demo-Desktop-marigold-site"],
+      toDirs: [`/home/demo/.claude/projects/${move.dest.replace(/[/.]/g, "-")}`],
+    },
+    linuxGit: false,
+    warnings: [],
+  };
 }

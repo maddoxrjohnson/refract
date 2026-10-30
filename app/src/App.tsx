@@ -1,4 +1,14 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import type { Backend } from "./backend/Backend";
 import type {
   AgentStatus,
@@ -11,6 +21,8 @@ import type {
   UsageSummary,
 } from "./backend/types";
 import { useHook } from "./hooks/useHook";
+import { useMigrations } from "./hooks/useMigrations";
+import { isWindowsDrive, stepText } from "./migrations";
 import { useRemoteDetails } from "./hooks/useRemoteDetails";
 import { useVisibility } from "./hooks/useVisibility";
 import { hideKey, mergeProjects } from "./projects";
@@ -22,6 +34,9 @@ import { SceneBoundary } from "./scene/SceneBoundary";
 import { DetailPanel } from "./ui/DetailPanel";
 import { FilterBar } from "./ui/FilterBar";
 import { FocusLabel } from "./ui/FocusLabel";
+import { GemMark } from "./ui/GemMark";
+import { MoveDialog } from "./ui/MoveDialog";
+import { MoveSection } from "./ui/MoveSection";
 import { HookOffer, loadHookOfferDismissed, saveHookOfferDismissed } from "./ui/HookOffer";
 import {
   initialNavState,
@@ -201,7 +216,9 @@ export function App({ backend }: { backend: Backend }) {
   }, [visible]);
 
   // Refetch whenever the helper (re)enters running: a restarted helper starts empty.
+  // `relist` asks again after a repo moved to WSL.
   const running = status?.state === "running";
+  const [relist, setRelist] = useState(0);
   useEffect(() => {
     if (!running) return;
     let live = true;
@@ -217,9 +234,11 @@ export function App({ backend }: { backend: Backend }) {
     return () => {
       live = false;
     };
-  }, [backend, running, shown]);
+  }, [backend, running, shown, relist]);
 
   useEffect(() => backend.onAgentEvent((event) => dispatch({ type: "event", event })), [backend]);
+  // Move to WSL (spec §2): pending reports are asked for again on each show.
+  const moves = useMigrations(backend, running, shown);
 
   const widgets = useWidgets(backend, visible, running);
   // The status hook (spec §6.2): offered once, after the repos are in, until installed
@@ -380,6 +399,24 @@ export function App({ backend }: { backend: Backend }) {
     else gear.current?.focus();
   }, []);
 
+  // The Move to WSL dialog, by source path; it takes the detail panel's place while open.
+  const [moveSource, setMoveSource] = useState<string | null>(null);
+  const moveOpenRef = useRef(false);
+  moveOpenRef.current = moveSource !== null;
+  const closeMove = useCallback(() => {
+    setMoveSource(null);
+    (document.activeElement as HTMLElement | null)?.blur();
+  }, []);
+  // Keep both: the original stays on Windows and its gem is hidden, by path, so the WSL
+  // copy with the same remote still shows.
+  const hidePath = (path: string) => {
+    const current = settingsRef.current;
+    if (!current || current.hidden.includes(path)) return;
+    saveSettings({ ...current, hidden: [...current.hidden, path] }).catch((err: unknown) =>
+      setOpenError(describeError(err)),
+    );
+  };
+
   // Navigation is a pure state machine; the ref lets window listeners read the latest
   // state without re-subscribing, and effects run outside the state update.
   const [nav, setNav] = useState<NavState>(initialNavState);
@@ -409,6 +446,8 @@ export function App({ backend }: { backend: Backend }) {
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === "Enter" && ev.repeat) return;
+      // The Move to WSL dialog handles its own keys, Escape included.
+      if (moveOpenRef.current) return;
       if (settingsOpenRef.current) {
         // Escape from outside the dialog (the dialog handles its own) still closes it.
         if (ev.key === "Escape") {
@@ -438,10 +477,31 @@ export function App({ backend }: { backend: Backend }) {
   const matches = useMemo(() => matchingPaths(repoList, nav.filter), [repoList, nav.filter]);
   const focusedRepo = nav.focused ? repos.get(nav.focused) : undefined;
   const focusNotCloned = !!focusedRepo && projects.remoteOnly.has(focusedRepo.path);
+  const focusMigration = focusedRepo ? moves.state.get(focusedRepo.path) : undefined;
+  const focusMove = focusMigration ? stepText(focusMigration.phase) : null;
   const focusLabel = useMemo(
-    () => focusedRepo && <FocusLabel repo={focusedRepo} notCloned={focusNotCloned} />,
-    [focusedRepo, focusNotCloned],
+    () =>
+      focusedRepo && (
+        <FocusLabel
+          repo={focusedRepo}
+          notCloned={focusNotCloned}
+          windowsDrive={!focusNotCloned && isWindowsDrive(focusedRepo.path)}
+          move={focusMove}
+        />
+      ),
+    [focusedRepo, focusNotCloned, focusMove],
   );
+  // The Windows-drive marker and the Move to WSL ring, on cloned gems only.
+  const marks = useMemo(() => {
+    const out = new Map<string, ReactNode>();
+    for (const repo of repoList) {
+      if (projects.remoteOnly.has(repo.path)) continue;
+      const migration = moves.state.get(repo.path);
+      const windows = isWindowsDrive(repo.path);
+      if (windows || migration) out.set(repo.path, <GemMark windows={windows} migration={migration} />);
+    }
+    return out;
+  }, [repoList, projects.remoteOnly, moves.state]);
   const zoomedRepo = nav.zoomed ? repos.get(nav.zoomed) : undefined;
   const zoomedRemote = zoomedRepo ? (projects.remotes.get(zoomedRepo.path) ?? null) : null;
   const zoomedRemoteOnly = !!zoomedRepo && projects.remoteOnly.has(zoomedRepo.path);
@@ -460,6 +520,7 @@ export function App({ backend }: { backend: Backend }) {
     localRepos.size > 0 &&
     !reposLoading &&
     !settingsOpen &&
+    !moveSource &&
     // Out of the way while a repo is zoomed or the picker is up.
     !nav.zoomed &&
     !nav.picker;
@@ -489,6 +550,7 @@ export function App({ backend }: { backend: Backend }) {
             focused={nav.focused}
             zoomed={nav.zoomed}
             focusLabel={focusLabel}
+            marks={marks}
             onPointerFocus={onPointerFocus}
             onSelect={onSelect}
             onBackgroundClick={onBackgroundClick}
@@ -502,7 +564,7 @@ export function App({ backend }: { backend: Backend }) {
         total={repoList.length}
         onClear={() => send({ type: "clearFilter" })}
       />
-      {zoomedRepo && (
+      {zoomedRepo && !moveSource && (
         <DetailPanel
           repo={zoomedRepo}
           now={now}
@@ -516,6 +578,35 @@ export function App({ backend }: { backend: Backend }) {
           remoteOnly={zoomedRemoteOnly}
           details={details.state}
           onRefreshDetails={details.refresh}
+          move={
+            !zoomedRemoteOnly &&
+            (isWindowsDrive(zoomedRepo.path) || moves.state.has(zoomedRepo.path)) && (
+              <MoveSection
+                migration={moves.state.get(zoomedRepo.path)}
+                onOpen={() => {
+                  if (nav.picker) send({ type: "pickerClose" });
+                  setMoveSource(zoomedRepo.path);
+                }}
+                onCancel={() => moves.cancel(zoomedRepo.path)}
+              />
+            )
+          }
+        />
+      )}
+      {moveSource && (
+        <MoveDialog
+          backend={backend}
+          source={moveSource}
+          name={repos.get(moveSource)?.name ?? moveSource.split("/").pop() ?? moveSource}
+          repo={repos.get(moveSource)}
+          migration={moves.state.get(moveSource)}
+          moves={moves}
+          onClose={closeMove}
+          onKeep={hidePath}
+          onMoved={(source, dest) => {
+            send({ type: "rekey", from: source, to: dest });
+            setRelist((n) => n + 1);
+          }}
         />
       )}
       {nav.picker && pickerRepo && (

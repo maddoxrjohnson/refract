@@ -5,11 +5,16 @@ import type {
   AgentEvent,
   AgentStatus,
   Credentials,
+  DeleteOutcome,
+  FinishAction,
   GpuUsage,
   HookInfo,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
+  MigratePreflight,
+  MigrateSnapshotProgress,
+  PendingMigration,
   RemoteDetails,
   RemoteKind,
   RemoteList,
@@ -20,6 +25,7 @@ import type {
   Settings,
   SystemStats,
   UsageSummary,
+  VsCodeWindow,
 } from "./types";
 
 /** Event names the Rust side emits. */
@@ -30,6 +36,7 @@ export const EVENTS = {
   launchProgress: "launch://progress",
   gpu: "system://gpu",
   stats: "system://stats",
+  migrateSnapshot: "migrate://snapshot",
 } as const;
 
 /**
@@ -164,5 +171,55 @@ export class TauriBackend implements Backend {
 
   onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe {
     return subscribe<SystemStats>(EVENTS.stats, (e) => cb(e.payload));
+  }
+
+  // Move to WSL: each rejects with `MigrateError` (`{kind, message, refusals?}`).
+
+  migratePreflight(path: string, dest?: string): Promise<MigratePreflight> {
+    return invoke<MigratePreflight>("migrate_preflight", { path, dest: dest ?? null });
+  }
+
+  migrateStart(path: string, dest: string): Promise<{ id: string }> {
+    return invoke<{ id: string }>("migrate_start", { path, dest });
+  }
+
+  migrateCancelSnapshot(path: string): Promise<boolean> {
+    return invoke<boolean>("migrate_cancel_snapshot", { path });
+  }
+
+  migrateCancel(id: string): Promise<void> {
+    return invoke<void>("migrate_cancel", { id });
+  }
+
+  migrateWindows(path: string): Promise<VsCodeWindow[]> {
+    return invoke<VsCodeWindow[]>("migrate_windows", { path });
+  }
+
+  migrateCloseWindow(path: string, id: number): Promise<boolean> {
+    return invoke<boolean>("migrate_close_window", { path, id });
+  }
+
+  migrateStopAgent(path: string, sessionId: string): Promise<void> {
+    return invoke<void>("migrate_stop_agent", { path, sessionId });
+  }
+
+  migrateResync(id: string): Promise<void> {
+    return invoke<void>("migrate_resync", { id });
+  }
+
+  migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome> {
+    return invoke<DeleteOutcome>("migrate_delete", { id, permanent });
+  }
+
+  migrateFinish(id: string, action: FinishAction): Promise<void> {
+    return invoke<void>("migrate_finish", { id, action });
+  }
+
+  migratePending(): Promise<PendingMigration[]> {
+    return invoke<PendingMigration[]>("migrate_pending");
+  }
+
+  onMigrateSnapshot(cb: (progress: MigrateSnapshotProgress) => void): Unsubscribe {
+    return subscribe<MigrateSnapshotProgress>(EVENTS.migrateSnapshot, (e) => cb(e.payload));
   }
 }

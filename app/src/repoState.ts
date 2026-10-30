@@ -61,6 +61,8 @@ export function repoReducer(state: RepoState, action: RepoAction): RepoState {
         case "loadComplete":
           return { ...state, loading: false, loadComplete: true };
         case "sessionChanged":
+        case "migrateProgress":
+        case "migrateReady":
           return state;
       }
     }

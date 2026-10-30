@@ -92,7 +92,11 @@ export type AgentEvent =
       event: "sessionChanged";
       data: { repoPath: string; session: SessionInfo; preselect: Preselect };
     }
-  | { event: "loadComplete" };
+  | { event: "loadComplete" }
+  /** A Move to WSL migration moved on. */
+  | { event: "migrateProgress"; data: MigrateProgress }
+  /** A migration finished its checks and waits for an answer; also re-sent after a restart. */
+  | { event: "migrateReady"; data: { id: string; report: MigrationReport } };
 
 /** How to start the agent, from refract-core's `LaunchMode`. */
 export type LaunchMode =
@@ -316,4 +320,219 @@ export interface SystemStats {
   gpuPercent: number;
   /** Refract's own share: the app, its WebView2 processes and the helper's wsl.exe. */
   own: { cpuPercent: number; memBytes: number; gpuPercent: number };
+}
+
+// Move to WSL (.plans/wsl-migration-spec.md). The commands are documented in
+// app/src-tauri/src/migrate/mod.rs; the report types mirror refract-core's migrate module.
+
+/** Why a folder counts as a build folder that is left out of the copy. */
+export type BuildFolder =
+  | "nodeModules"
+  | "pythonVenv"
+  | "pythonCache"
+  | "cargoTarget"
+  | "toolCache"
+  | "output";
+
+/** A build folder left out of the copy, with its size. */
+export interface SkippedFolder {
+  /** Relative to the repo, `/`-separated. */
+  path: string;
+  rule: BuildFolder;
+  bytes: number;
+  files: number;
+}
+
+/** A command run in the copy after the checks pass. */
+export interface InstallStep {
+  folder: string;
+  /** Must exist in WSL. */
+  tool: string;
+  command: string;
+  /** What to run to get `tool` when it is missing. */
+  installHint: string;
+}
+
+export type GitOperation = "merge" | "rebase" | "cherryPick" | "revert" | "bisect";
+
+/** One reason a migration can't start. */
+export type Refusal =
+  | { kind: "notARepo" }
+  | { kind: "notOnWindowsDrive" }
+  | { kind: "linkedWorktree" }
+  | { kind: "hasLinkedWorktrees" }
+  | { kind: "operationInProgress"; operation: GitOperation }
+  | { kind: "externalLinks"; paths: string[] }
+  | { kind: "unreadable"; paths: string[] }
+  | { kind: "lfsMissing" }
+  | { kind: "destNotLinux" }
+  | { kind: "destExists" }
+  | { kind: "notEnoughSpace"; needed: number; free: number };
+
+/** A refusal with the sentence the dialog shows. */
+export type RefusalView = Refusal & { message: string };
+
+/** A VS Code window that has the folder open; `id` is for `migrateCloseWindow`. */
+export interface VsCodeWindow {
+  id: number;
+  title: string;
+}
+
+/** What the dialog shows before Start, from `migratePreflight`. */
+export interface MigratePreflight {
+  /** The source's WSL path (`/mnt/c/...`). */
+  source: string;
+  windowsPath: string;
+  name: string;
+  /** The destination asked for, else the default one; `null` when none was found. */
+  dest: string | null;
+  /** Empty when the move may start. */
+  refusals: RefusalView[];
+  warnings: string[];
+  /** What will be copied. */
+  files: number;
+  dirs: number;
+  bytes: number;
+  skipped: SkippedFolder[];
+  install: InstallStep[];
+  /** Alternate data streams (such as Zone.Identifier) that will be dropped. */
+  droppedStreams: number;
+  /** Each one blocks Start until closed. */
+  vscodeWindows: VsCodeWindow[];
+  /** `git.exe` is missing, so Linux git reads the source. */
+  linuxGit: boolean;
+}
+
+/** What a preflight or snapshot is doing. */
+export type SnapshotPhase = "git" | "walking" | "probing" | "hashing" | "blobs";
+
+/** Sent as `migrate://snapshot` while a preflight or snapshot reads the source. */
+export interface MigrateSnapshotProgress {
+  /** The source's WSL path. */
+  path: string;
+  phase: SnapshotPhase;
+  filesDone: number;
+  filesTotal: number;
+  bytesDone: number;
+  bytesTotal: number;
+}
+
+/** A step of a running migration in the helper. */
+export type MigrateStep =
+  | "copying"
+  | "normalising"
+  | "hashing"
+  | "checkingGit"
+  | "rechecking"
+  | "movingHistory"
+  | "installing";
+
+/** Data of a `migrateProgress` event. `copying` counts bytes; the others count items. */
+export interface MigrateProgress {
+  id: string;
+  step: MigrateStep;
+  done: number;
+  total: number;
+}
+
+export interface MigrateProblem {
+  path?: string;
+  message: string;
+}
+
+export type MigrateCheck = "files" | "gitState" | "nothingSkipped" | "unchanged" | "history";
+
+export interface MigrateCheckResult {
+  check: MigrateCheck;
+  status: "passed" | "failed" | "notRun";
+  problems: MigrateProblem[];
+  /** What to do; set when it failed. */
+  advice?: string;
+}
+
+export interface MigrateInstallResult {
+  step: InstallStep;
+  status: "succeeded" | "failed" | "timedOut" | "toolMissing";
+  exitCode?: number;
+  /** WSL path of the log. */
+  logPath?: string;
+}
+
+export interface MigrateTotals {
+  files: number;
+  dirs: number;
+  bytes: number;
+}
+
+export interface DroppedStream {
+  path: string;
+  stream: string;
+  size: number;
+}
+
+/** The migration report (spec §2.4). */
+export interface MigrationReport {
+  version: number;
+  id: string;
+  /** WSL path of the original (`/mnt/...`). */
+  source: string;
+  /** WSL path of the copy. */
+  dest: string;
+  /** RFC 3339. */
+  startedAt: string;
+  finishedAt: string;
+  /** The five checks, in order. Delete original needs the first four passed. */
+  checks: MigrateCheckResult[];
+  skipped: SkippedFolder[];
+  droppedStreams: DroppedStream[];
+  newObjects: number;
+  sourceTotals: MigrateTotals;
+  copyTotals: MigrateTotals;
+  install: MigrateInstallResult[];
+  /** Repo-relative paths the install created, changed or removed; they don't block delete. */
+  installChanges?: { created: string[]; changed: string[]; removed: string[] };
+  history: { sessions: number; fromDirs: string[]; toDirs: string[] };
+  linuxGit: boolean;
+  warnings: string[];
+}
+
+/** A report still waiting for an answer, from `migratePending`. */
+export interface PendingMigration {
+  id: string;
+  report: MigrationReport;
+}
+
+/** What Delete original did; only `deleted` removed anything. */
+export type DeleteOutcome =
+  /** The source changed or agents still run in it: offer Re-sync. */
+  | {
+      kind: "changed";
+      changed: string[];
+      /** Sentences to show as they are, one per agent still running in the folder. */
+      busyAgents: string[];
+    }
+  /** Close these first. */
+  | { kind: "windowsOpen"; windows: VsCodeWindow[] }
+  /** Ask "Delete permanently?" (default No, which is Keep both). */
+  | { kind: "wontFit"; reason: string }
+  | { kind: "deleted"; permanent: boolean; shortcut?: string; shortcutError?: string };
+
+/** Keep both, or discard the copy. Deleting the original goes through `migrateDelete`. */
+export type FinishAction = "keep" | "discard";
+
+/** Why a migration command failed; `message` is meant for a person. */
+export interface MigrateError {
+  kind:
+    | "invalid"
+    | "refused"
+    | "busy"
+    | "cancelled"
+    | "git"
+    | "agent"
+    | "io"
+    | "notReady"
+    | "internal";
+  message: string;
+  /** Set for `refused`. */
+  refusals?: RefusalView[];
 }
