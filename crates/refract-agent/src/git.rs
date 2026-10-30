@@ -132,13 +132,18 @@ fn unescape_mount(field: &str) -> String {
 
 /// How `git status` reports untracked files in `repo`.
 ///
-/// On the Linux file system every untracked file is listed (`all`), so an edit inside a
-/// new directory matches a dirty entry. Repos under `/mnt/` live on a Windows drive,
-/// where `git status` is slow (about 3 s per repo on `/mnt/c`, and listing untracked
-/// files costs most of it), so there untracked files are not listed at all (`-uno`) and
-/// only changes to tracked files count as dirty. A deliberate trade-off.
+/// On a Linux file system every untracked file is listed (`all`), so an edit inside a
+/// new directory matches a dirty entry. On a Windows drive ([`on_windows_drive`])
+/// `git status` is slow (about 3 s per repo on `/mnt/c`, and listing untracked files
+/// costs most of it), so there untracked files are not listed at all (`-uno`) and only
+/// changes to tracked files count as dirty. A deliberate trade-off. Linux disks attached
+/// under `/mnt/wsl/` list them as usual.
 pub fn untracked_arg(repo: &Path) -> &'static str {
-    if is_windows_mount(&repo.to_string_lossy()) {
+    untracked_arg_on(on_windows_drive(repo))
+}
+
+fn untracked_arg_on(windows_drive: bool) -> &'static str {
+    if windows_drive {
         "-uno"
     } else {
         "--untracked-files=all"
@@ -383,10 +388,8 @@ mod tests {
             untracked_arg(Path::new("/home/dev/projects/tidepool-api")),
             "--untracked-files=all"
         );
-        assert_eq!(
-            untracked_arg(Path::new("/mnt/c/Users/dev/tidepool-api")),
-            "-uno"
-        );
+        assert_eq!(untracked_arg_on(true), "-uno");
+        assert_eq!(untracked_arg_on(false), "--untracked-files=all");
     }
 
     #[test]
