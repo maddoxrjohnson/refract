@@ -11,8 +11,12 @@ export interface MigrationControls {
   start(source: string, dest: string): Promise<void>;
   /** Stops a snapshot or a running copy of `source`; the original is untouched. */
   cancel(source: string): Promise<void>;
+  /** Shown as running from the moment it is asked for; back to the report if it fails. */
   resync(id: string): Promise<void>;
-  /** Delete original; the entry is dropped once it says `deleted`. */
+  /**
+   * Delete original; the entry is dropped once it says `deleted`, and marked deleting once
+   * it says the delete has begun.
+   */
   remove(id: string, permanent: boolean): Promise<DeleteOutcome>;
   /** Keep both or discard the copy; the entry is dropped once it answers. */
   finish(id: string, action: FinishAction): Promise<void>;
@@ -87,8 +91,14 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
 
   const resync = useCallback(
     async (id: string) => {
-      await backend.migrateResync(id);
+      const before = [...stateRef.current.values()].find((m) => m.id === id)?.phase;
       dispatch({ type: "resyncing", id });
+      try {
+        await backend.migrateResync(id);
+      } catch (err) {
+        if (before?.kind === "ready") dispatch({ type: "ready", id, report: before.report });
+        throw err;
+      }
     },
     [backend],
   );
@@ -99,7 +109,11 @@ export function useMigrations(backend: Backend, enabled: boolean, refresh: numbe
     async (id: string, permanent: boolean) => {
       const outcome = await backend.migrateDelete(id, permanent);
       const source = sourceOf(id);
-      if (outcome.kind === "deleted" && source) dispatch({ type: "gone", source });
+      if (outcome.kind === "deleted") {
+        if (source) dispatch({ type: "gone", source });
+      } else if (outcome.kind === "unfinished" || outcome.deleting) {
+        dispatch({ type: "deleting", id });
+      }
       return outcome;
     },
     [backend],

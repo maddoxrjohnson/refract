@@ -97,6 +97,7 @@ pub fn run() {
             migrate::migrate_delete,
             migrate::migrate_finish,
             migrate::migrate_pending,
+            migrate::migrate_source_exists,
             open::open_folder,
             open::open_url,
             open::open_log_folder,

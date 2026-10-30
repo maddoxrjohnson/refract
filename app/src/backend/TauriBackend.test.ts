@@ -259,7 +259,7 @@ describe("TauriBackend", () => {
 
   it("moves a repo to WSL through the migrate commands", async () => {
     const calls: Array<{ cmd: string; args: unknown }> = [];
-    const deleted: DeleteOutcome = { kind: "wontFit", reason: "too large" };
+    const deleted: DeleteOutcome = { kind: "wontFit", reason: "too large", deleting: false };
     mockIPC(
       (cmd, args) => {
         calls.push({ cmd, args });

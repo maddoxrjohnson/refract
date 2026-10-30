@@ -8,7 +8,13 @@
 //! (no suffix) count too: they hold the same files. Only the name shows, so another
 //! folder of the same name also matches; the dialog shows each window's title next
 //! to its **Close** button. The windows themselves are found by `win`, among the
-//! visible top-level windows of `Code.exe` processes.
+//! visible top-level windows of VS Code and the editors built on it.
+//!
+//! After the copy, a WSL window on the new folder (`aurora-notes [WSL: Ubuntu]`) has
+//! the same title as a WSL window on the original through `/mnt/c`, so it blocks
+//! **Delete original** too and the dialog offers to close it. The titles can't tell
+//! them apart, and closing one too many is the safe side; a destination with another
+//! name doesn't match.
 
 use serde::Serialize;
 
@@ -39,11 +45,18 @@ pub fn title_matches(title: &str, folder: &str) -> bool {
     })
 }
 
-/// The executable names of VS Code's windows.
+/// The executable names of VS Code's windows, and of the editors built on it, whose
+/// titles have the same shape.
 pub fn is_vscode_exe(file_name: &str) -> bool {
-    ["Code.exe", "Code - Insiders.exe"]
-        .iter()
-        .any(|exe| file_name.eq_ignore_ascii_case(exe))
+    [
+        "Code.exe",
+        "Code - Insiders.exe",
+        "VSCodium.exe",
+        "Cursor.exe",
+        "Windsurf.exe",
+    ]
+    .iter()
+    .any(|exe| file_name.eq_ignore_ascii_case(exe))
 }
 
 #[cfg(test)]
@@ -59,6 +72,7 @@ mod tests {
             "aurora-notes [WSL: Ubuntu] - Visual Studio Code",
             "Welcome - aurora-notes - Visual Studio Code",
             "aurora-notes - Visual Studio Code",
+            "main.rs - aurora-notes [WSL: Ubuntu] - Cursor",
         ] {
             assert!(title_matches(title, folder), "{title}");
         }
@@ -79,6 +93,7 @@ mod tests {
         assert!(is_vscode_exe("Code.exe"));
         assert!(is_vscode_exe("code.EXE"));
         assert!(is_vscode_exe("Code - Insiders.exe"));
+        assert!(is_vscode_exe("Cursor.exe"));
         assert!(!is_vscode_exe("notepad.exe"));
     }
 }

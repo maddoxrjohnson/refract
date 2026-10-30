@@ -22,6 +22,7 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -406,7 +407,9 @@ impl GitRun for WslGit {
 }
 
 /// Runs `command` with piped stdio, writing `stdin` on its own thread, until it exits,
-/// `cancel` is set or `timeout` passes; the last two kill it and fail.
+/// `cancel` is set or `timeout` passes; the last two kill it and fail. Its output is
+/// waited for under the same deadline and cancel flag, since a process it started can
+/// keep the pipes open after it exits.
 pub fn run_cancellable(
     command: &mut Command,
     stdin: Option<&[u8]>,
@@ -429,9 +432,12 @@ pub fn run_cancellable(
         (Some(mut pipe), Some(bytes)) => {
             let bytes = bytes.to_vec();
             // A write error means git exited early; its status says why.
-            Some(thread::spawn(move || {
+            let (done, finished) = mpsc::channel();
+            thread::spawn(move || {
                 let _ = pipe.write_all(&bytes);
-            }))
+                let _ = done.send(());
+            });
+            Some(finished)
         }
         _ => None,
     };
@@ -455,14 +461,42 @@ pub fn run_cancellable(
         }
         thread::sleep(POLL);
     };
+    let wait = |pipe: Receiver<()>| bounded(pipe, cancel, started, timeout);
     if let Some(writer) = writer {
-        let _ = writer.join();
+        wait(writer)?;
     }
+    let read = |pipe: Receiver<Vec<u8>>| bounded(pipe, cancel, started, timeout);
     Ok(GitOutput {
         success: status.success(),
-        stdout: stdout.join().unwrap_or_default(),
-        stderr: stderr.join().unwrap_or_default(),
+        stdout: read(stdout)?,
+        stderr: read(stderr)?,
     })
+}
+
+/// What a pipe thread sends, waited for until `cancel` is set or `timeout` from
+/// `started` passes. A thread that ended without sending gave nothing.
+fn bounded<T: Default>(
+    pipe: Receiver<T>,
+    cancel: &AtomicBool,
+    started: Instant,
+    timeout: Duration,
+) -> io::Result<T> {
+    loop {
+        match pipe.recv_timeout(POLL) {
+            Ok(value) => return Ok(value),
+            Err(RecvTimeoutError::Disconnected) => return Ok(T::default()),
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        if started.elapsed() > timeout {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("its output was still open after {timeout:?}"),
+            ));
+        }
+    }
 }
 
 fn kill(child: &mut Child) {
@@ -471,15 +505,17 @@ fn kill(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn read_on_thread(pipe: Option<impl Read + Send + 'static>) -> thread::JoinHandle<Vec<u8>> {
+fn read_on_thread(pipe: Option<impl Read + Send + 'static>) -> Receiver<Vec<u8>> {
+    let (send, receive) = mpsc::channel();
     thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
             // A read error keeps what was read before it.
             let _ = pipe.read_to_end(&mut bytes);
         }
-        bytes
-    })
+        let _ = send.send(bytes);
+    });
+    receive
 }
 
 #[cfg(test)]
@@ -706,6 +742,25 @@ pub mod tests {
             .unwrap_err()
             .contains("2 ids for 1 files"));
         assert_eq!(clean_blobs(&git, "", &[]).unwrap(), Vec::<String>::new());
+    }
+
+    /// A process left behind with the output pipe (here `ping`, started by `cmd`, which
+    /// exits at once) does not hold the run past its deadline.
+    #[cfg(windows)]
+    #[test]
+    fn output_held_open_after_exit_times_out() {
+        let mut command = Command::new("cmd.exe");
+        command.args(["/c", "start", "/b", "ping", "-n", "6", "127.0.0.1"]);
+        let started = Instant::now();
+        let err = run_cancellable(
+            &mut command,
+            None,
+            &AtomicBool::new(false),
+            Duration::from_millis(800),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     #[test]

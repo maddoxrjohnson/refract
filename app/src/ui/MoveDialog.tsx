@@ -13,6 +13,7 @@ import type {
 import { isCancelled, type MigrationControls } from "../hooks/useMigrations";
 import {
   busyAgents,
+  type BusyAgent,
   canDelete,
   installText,
   overallProgress,
@@ -51,6 +52,8 @@ export interface MoveDialogProps {
 
 /** The selector for what Tab moves between inside the dialog. */
 const FOCUSABLE = 'button:not(:disabled), input:not(:disabled), [href], [tabindex]:not([tabindex="-1"])';
+/** The control that takes focus when a view appears; the heading when it is disabled. */
+const PRIMARY = "[data-primary]:not(:disabled)";
 
 /**
  * Move to WSL (spec §2.2–2.4): the preflight and Start, the progress, the report with its
@@ -62,6 +65,7 @@ export function MoveDialog(props: MoveDialogProps) {
   const { source, name, migration, moves, onClose } = props;
   const titleId = useId();
   const root = useRef<HTMLDivElement>(null);
+  const heading = useRef<HTMLHeadingElement>(null);
   // Escape is ignored while an answer to the report is in flight.
   const [locked, setLocked] = useState(false);
   const [done, setDone] = useState<{ outcome: Extract<DeleteOutcome, { kind: "deleted" }>; dest: string } | null>(
@@ -69,10 +73,37 @@ export function MoveDialog(props: MoveDialogProps) {
   );
   // Why the last Start failed, shown over the fresh preflight.
   const [notice, setNotice] = useState<{ message: string; refusals: RefusalView[] } | null>(null);
+  // Why the last Re-sync failed, shown on the report it went back to.
+  const [resyncError, setResyncError] = useState<string | null>(null);
 
+  // Each new view (preflight, progress, report, done) moves focus to its main control, or
+  // to the heading, so the keyboard (and Escape) never ends up on the page behind.
+  const view = done ? "done" : migration?.phase.kind === "ready" ? `report-${migration.id}` : migration ? "progress" : "preflight";
   useEffect(() => {
-    if (!root.current?.contains(document.activeElement)) root.current?.focus();
-  }, []);
+    const primary = root.current?.querySelector<HTMLElement>(PRIMARY);
+    (primary ?? heading.current ?? root.current)?.focus();
+  }, [view]);
+
+  // Escape still closes if focus was lost to the page.
+  const lockedRef = useRef(locked);
+  lockedRef.current = locked;
+  useEffect(() => {
+    const onWindowKey = (ev: globalThis.KeyboardEvent) => {
+      if (ev.key !== "Escape" || root.current?.contains(document.activeElement)) return;
+      ev.preventDefault();
+      if (!lockedRef.current) onClose();
+    };
+    window.addEventListener("keydown", onWindowKey);
+    return () => window.removeEventListener("keydown", onWindowKey);
+  }, [onClose]);
+
+  // A held Enter must not press the button that takes focus next.
+  const onKeyDownCapture = (ev: KeyboardEvent<HTMLDivElement>) => {
+    if (ev.key === "Enter" && ev.repeat) {
+      ev.preventDefault();
+      ev.stopPropagation();
+    }
+  };
 
   const onKeyDown = (ev: KeyboardEvent<HTMLDivElement>) => {
     ev.stopPropagation();
@@ -117,6 +148,11 @@ export function MoveDialog(props: MoveDialogProps) {
         backend={props.backend}
         id={migration.id}
         report={migration.phase.report}
+        deleting={migration.phase.deleting}
+        agents={busyAgents(props.repo)}
+        resyncError={resyncError}
+        onResyncError={setResyncError}
+        onClose={onClose}
         moves={moves}
         setLocked={setLocked}
         onKeep={() => {
@@ -158,9 +194,10 @@ export function MoveDialog(props: MoveDialogProps) {
         aria-labelledby={titleId}
         tabIndex={-1}
         onKeyDown={onKeyDown}
+        onKeyDownCapture={onKeyDownCapture}
       >
         <header className="rf-move__header">
-          <h2 id={titleId} className="rf-move__title">
+          <h2 id={titleId} ref={heading} tabIndex={-1} className="rf-move__title">
             {title}
           </h2>
           <button
@@ -242,6 +279,63 @@ function isLinuxPath(dest: string): boolean {
   return dest.startsWith("/") && !/^\/mnt\/[a-z](\/|$)/i.test(dest);
 }
 
+/** The repo's agents with **Stop** for those finished or waiting; a working one can't be stopped. */
+function AgentRows({
+  backend,
+  source,
+  agents,
+  onError,
+}: {
+  backend: Backend;
+  source: string;
+  agents: BusyAgent[];
+  onError(message: string | null): void;
+}) {
+  const [confirmStop, setConfirmStop] = useState<string | null>(null);
+  const [stopping, setStopping] = useState<string | null>(null);
+  const stopAgent = (sessionId: string) => {
+    setConfirmStop(null);
+    setStopping(sessionId);
+    onError(null);
+    backend
+      .migrateStopAgent(source, sessionId)
+      .catch((err: unknown) => onError(describeError(err)))
+      .finally(() => setStopping(null));
+  };
+  return (
+    <>
+      {agents.map(({ session, working }) => (
+        <li key={`a-${session.id}`}>
+          <span className="rf-move-busy__name">Agent · {sessionStateLabel(session.state)}</span>
+          {working ? (
+            <button type="button" className="rf-button" disabled>
+              Agent is working
+            </button>
+          ) : confirmStop === session.id ? (
+            <span className="rf-move-confirm">
+              <button type="button" className="rf-button" onClick={() => stopAgent(session.id)}>
+                Stop agent
+              </button>
+              <button type="button" className="rf-button rf-button--ghost" onClick={() => setConfirmStop(null)}>
+                Keep
+              </button>
+            </span>
+          ) : (
+            <button
+              type="button"
+              className="rf-button"
+              disabled={stopping === session.id}
+              onClick={() => setConfirmStop(session.id)}
+            >
+              {stopping === session.id ? "Stopping…" : "Stop"}
+            </button>
+          )}
+        </li>
+      ))}
+    </>
+  );
+}
+
 interface PreflightViewProps {
   backend: Backend;
   source: string;
@@ -268,8 +362,6 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
   const requested = useRef<string | null>(null);
   const seq = useRef(0);
   const inFlight = useRef<Promise<unknown> | null>(null);
-  const [confirmStop, setConfirmStop] = useState<string | null>(null);
-  const [stopping, setStopping] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
 
   /** Runs the preflight, after stopping one still running: only one may run per folder. */
@@ -356,16 +448,6 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
       () => refreshWindows(),
       (err: unknown) => setNote(describeError(err)),
     );
-  };
-
-  const stopAgent = (sessionId: string) => {
-    setConfirmStop(null);
-    setStopping(sessionId);
-    setNote(null);
-    backend
-      .migrateStopAgent(source, sessionId)
-      .catch((err: unknown) => setNote(describeError(err)))
-      .finally(() => setStopping(null));
   };
 
   const agents = busyAgents(repo);
@@ -466,6 +548,13 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
           </section>
         )}
 
+        {preflight?.cloudSynced && (
+          <p className="rf-move-notice rf-move-warn" role="note">
+            This folder is synced by OneDrive. Deleting the original after the move also deletes it from OneDrive and
+            your other devices.
+          </p>
+        )}
+
         {preflight &&
           (preflight.warnings.length > 0 || preflight.linuxGit || preflight.droppedStreams > 0) && (
             <section className="rf-section" aria-label="Warnings">
@@ -504,34 +593,7 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
                   </button>
                 </li>
               ))}
-              {agents.map(({ session, working }) => (
-                <li key={`a-${session.id}`}>
-                  <span className="rf-move-busy__name">Agent · {sessionStateLabel(session.state)}</span>
-                  {working ? (
-                    <button type="button" className="rf-button" disabled>
-                      Agent is working
-                    </button>
-                  ) : confirmStop === session.id ? (
-                    <span className="rf-move-confirm">
-                      <button type="button" className="rf-button" onClick={() => stopAgent(session.id)}>
-                        Stop agent
-                      </button>
-                      <button type="button" className="rf-button rf-button--ghost" onClick={() => setConfirmStop(null)}>
-                        Keep
-                      </button>
-                    </span>
-                  ) : (
-                    <button
-                      type="button"
-                      className="rf-button"
-                      disabled={stopping === session.id}
-                      onClick={() => setConfirmStop(session.id)}
-                    >
-                      {stopping === session.id ? "Stopping…" : "Stop"}
-                    </button>
-                  )}
-                </li>
-              ))}
+              <AgentRows backend={backend} source={source} agents={agents} onError={setNote} />
             </ul>
             <p className="rf-move-note rf-muted">A window with unsaved files still asks before it closes.</p>
           </section>
@@ -553,6 +615,7 @@ function PreflightView({ backend, source, name, repo, notice, onStart, onClose }
           <button
             type="button"
             className="rf-button rf-button--accent"
+            data-primary
             disabled={!canStart}
             onClick={() => onStart(draft)}
           >
@@ -616,7 +679,7 @@ function ProgressView({
         )}
       </div>
       <footer className="rf-move__actions">
-        <button type="button" className="rf-button" onClick={cancel} disabled={cancelling}>
+        <button type="button" className="rf-button" data-primary onClick={cancel} disabled={cancelling}>
           {cancelling ? "Cancelling…" : "Cancel the move"}
         </button>
         <button type="button" className="rf-button" onClick={onClose}>
@@ -635,8 +698,16 @@ interface ReportViewProps {
   backend: Backend;
   id: string;
   report: MigrationReport;
+  /** Delete original has begun: only finishing it is offered. */
+  deleting: boolean;
+  /** The repo's live agents, for Stop when the recheck finds them. */
+  agents: BusyAgent[];
+  /** Why the last Re-sync failed; the report shows again when it does. */
+  resyncError: string | null;
+  onResyncError(message: string | null): void;
   moves: MigrationControls;
   setLocked(locked: boolean): void;
+  onClose(): void;
   onKeep(): void;
   onDiscarded(): void;
   onDeleted(outcome: Extract<DeleteOutcome, { kind: "deleted" }>): void;
@@ -644,8 +715,19 @@ interface ReportViewProps {
 
 const STATUS_LABEL = { passed: "Passed", failed: "Failed", notRun: "Not run" } as const;
 
+/** Paths, the first few of them, with how many more. */
+function PathList({ paths }: { paths: string[] }) {
+  return (
+    <div className="rf-mono rf-muted rf-move-paths">
+      {paths.slice(0, MAX_PROBLEMS).join("\n")}
+      {paths.length > MAX_PROBLEMS && `\nand ${paths.length - MAX_PROBLEMS} more`}
+    </div>
+  );
+}
+
 /** The report and the final OK (spec §2.4, §6). */
-function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded, onDeleted }: ReportViewProps) {
+function ReportView(props: ReportViewProps) {
+  const { backend, id, report, moves, setLocked, onKeep, onDiscarded, onDeleted } = props;
   const ok = canDelete(report);
   const changes = report.installChanges;
   const installChanges: [string, string][] = changes
@@ -657,11 +739,26 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
     : [];
   const [pending, setPending] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<DeleteState>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(props.resyncError);
+  const [note, setNote] = useState<string | null>(null);
+  // The original folder is gone (deleted by hand): the move only needs finishing.
+  const [sourceGone, setSourceGone] = useState(false);
+  const deleting = props.deleting || outcome?.kind === "unfinished" || (outcome !== null && "deleting" in outcome && outcome.deleting);
+  useEffect(() => {
+    if (!ok || props.deleting) return;
+    let live = true;
+    backend.migrateSourceExists(id).then(
+      (exists) => live && setSourceGone(!exists),
+      () => {},
+    );
+    return () => {
+      live = false;
+    };
+  }, [backend, id, ok, props.deleting]);
   // The default answer (Delete original, or No, …) takes focus when it appears, and again
   // when an answer in flight disabled the focused button.
   const defaultAction = useRef<HTMLButtonElement>(null);
-  const outcomeKind = outcome?.kind ?? null;
+  const outcomeKind = `${outcome?.kind ?? "none"}-${deleting}-${sourceGone}`;
   useEffect(() => {
     if (pending) return;
     const active = document.activeElement as HTMLButtonElement | null;
@@ -691,7 +788,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
   };
 
   const deleteOriginal = (permanent: boolean) =>
-    act(permanent ? "Deleting permanently…" : "Deleting the original…", async () => {
+    act(permanent ? "Deleting permanently…" : deleting ? "Finishing the delete…" : "Deleting the original…", async () => {
       const answer = await moves.remove(id, permanent);
       if (answer.kind === "deleted") onDeleted(answer);
       else setOutcome(answer);
@@ -700,7 +797,16 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
   const discard = () => act("Discarding the copy…", () => moves.finish(id, "discard").then(onDiscarded));
   // The dialog shows a fresh preflight once the entry is gone.
   const retry = () => act("Discarding the copy…", () => moves.finish(id, "discard"));
-  const resync = () => act("Re-syncing…", () => moves.resync(id));
+  // The report goes away while it runs, so a refusal is shown by the report that returns.
+  const resync = () => {
+    props.onResyncError(null);
+    void act("Re-syncing…", () =>
+      moves.resync(id).catch((err: unknown) => {
+        props.onResyncError(describeError(err));
+        throw err;
+      }),
+    );
+  };
   const closeWindow = (w: VsCodeWindow) =>
     backend.migrateCloseWindow(report.source, w.id).then(
       () =>
@@ -711,16 +817,41 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
     );
 
   const disabled = pending !== null;
+  const finishButton = (
+    <button
+      type="button"
+      className="rf-button rf-button--accent"
+      ref={defaultAction}
+      data-primary
+      disabled={disabled}
+      onClick={() => void deleteOriginal(false)}
+    >
+      Finish deleting
+    </button>
+  );
   let actions: ReactNode;
   if (outcome?.kind === "wontFit") {
     actions = (
       <div className="rf-move-ask" role="alertdialog" aria-label="Delete permanently?">
-        <p className="rf-move-ask__question">This won't fit in the Recycle Bin. Delete permanently?</p>
+        <p className="rf-move-ask__question">
+          {deleting
+            ? "What's left won't fit in the Recycle Bin. Delete it permanently?"
+            : "This won't fit in the Recycle Bin. Delete permanently?"}
+        </p>
         {outcome.reason && <p className="rf-move-note rf-muted">{outcome.reason}</p>}
-        <p className="rf-move-note rf-muted">No keeps both copies.</p>
+        <p className="rf-move-note rf-muted">
+          {deleting ? "Not now leaves it as it is; the copy is safe." : "No keeps both copies."}
+        </p>
         <div className="rf-row">
-          <button type="button" className="rf-button rf-button--accent" ref={defaultAction} disabled={disabled} onClick={keep}>
-            No
+          <button
+            type="button"
+            className="rf-button rf-button--accent"
+            ref={defaultAction}
+            data-primary
+            disabled={disabled}
+            onClick={deleting ? props.onClose : keep}
+          >
+            {deleting ? "Not now" : "No"}
           </button>
           <button type="button" className="rf-button rf-button--danger" disabled={disabled} onClick={() => void deleteOriginal(true)}>
             Yes, delete permanently
@@ -729,27 +860,80 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
       </div>
     );
   } else if (outcome?.kind === "changed") {
+    const resyncable = outcome.changed.length > 0 && outcome.copyChanged.length === 0;
     actions = (
       <div className="rf-move-ask" role="alert">
-        <p className="rf-move-ask__question">The original changed after the check, so nothing was deleted.</p>
+        <p className="rf-move-ask__question">
+          {deleting
+            ? "The original changed while it was being deleted, so nothing more was deleted."
+            : "Something changed after the check, so nothing was deleted."}
+        </p>
         {outcome.changed.length > 0 && (
-          <div className="rf-mono rf-muted rf-move-paths">
-            {outcome.changed.slice(0, MAX_PROBLEMS).join("\n")}
-            {outcome.changed.length > MAX_PROBLEMS && `\nand ${outcome.changed.length - MAX_PROBLEMS} more`}
-          </div>
+          <>
+            <p className="rf-move-note">Changed or added in the original:</p>
+            <PathList paths={outcome.changed} />
+          </>
+        )}
+        {outcome.copyChanged.length > 0 && (
+          <>
+            <p className="rf-move-note">
+              The copy in WSL changed after it was checked, so it may hold work the original doesn't:
+            </p>
+            <PathList paths={outcome.copyChanged} />
+          </>
+        )}
+        {outcome.unreadable.length > 0 && (
+          <>
+            <p className="rf-move-note">These couldn't be read to check them. Close the program using them:</p>
+            <PathList paths={outcome.unreadable} />
+          </>
         )}
         {outcome.busyAgents.map((sentence) => (
           <p key={sentence} className="rf-move-note">
             {sentence}
           </p>
         ))}
+        {outcome.busyAgents.length > 0 && props.agents.length > 0 && (
+          <ul className="rf-move-busy">
+            <AgentRows backend={backend} source={report.source} agents={props.agents} onError={setNote} />
+          </ul>
+        )}
+        {deleting && (
+          <p className="rf-move-note rf-muted">
+            Undo the change, or move those files out of the folder, then finish deleting.
+          </p>
+        )}
         <div className="rf-row">
-          <button type="button" className="rf-button rf-button--accent" ref={defaultAction} disabled={disabled} onClick={resync}>
-            Re-sync
-          </button>
-          <button type="button" className="rf-button" disabled={disabled} onClick={keep}>
-            Keep both
-          </button>
+          {deleting ? (
+            finishButton
+          ) : resyncable ? (
+            <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={resync}>
+              Re-sync
+            </button>
+          ) : outcome.copyChanged.length === 0 ? (
+            <button
+              type="button"
+              className="rf-button rf-button--accent"
+              ref={defaultAction}
+              data-primary
+              disabled={disabled}
+              onClick={() => void deleteOriginal(false)}
+            >
+              Try again
+            </button>
+          ) : null}
+          {!deleting && (
+            <button
+              type="button"
+              className={`rf-button${outcome.copyChanged.length > 0 ? " rf-button--accent" : ""}`}
+              ref={outcome.copyChanged.length > 0 ? defaultAction : undefined}
+              data-primary={outcome.copyChanged.length > 0 || undefined}
+              disabled={disabled}
+              onClick={keep}
+            >
+              Keep both
+            </button>
+          )}
         </div>
       </div>
     );
@@ -772,17 +956,53 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
             </li>
           ))}
         </ul>
+        <p className="rf-move-note rf-muted">
+          A WSL window on the new copy has the same name, so it's listed too.
+        </p>
         <div className="rf-row">
           <button
             type="button"
             className="rf-button rf-button--accent"
+            ref={defaultAction}
+            data-primary
             disabled={disabled}
             onClick={() => void deleteOriginal(false)}
           >
-            Try again
+            {deleting ? "Finish deleting" : "Try again"}
           </button>
           <button type="button" className="rf-button" disabled={disabled} onClick={() => setOutcome(null)}>
             Back
+          </button>
+        </div>
+      </div>
+    );
+  } else if (deleting) {
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-ask__question">Deleting the original didn't finish.</p>
+        {outcome?.kind === "unfinished" && <p className="rf-move-note">{outcome.reason}</p>}
+        <p className="rf-move-note rf-muted">
+          The copy in WSL is complete. Part of the original may already be in the Recycle Bin; finishing deletes the
+          rest.
+        </p>
+        <div className="rf-row">{finishButton}</div>
+      </div>
+    );
+  } else if (ok && sourceGone) {
+    actions = (
+      <div className="rf-move-ask" role="alert">
+        <p className="rf-move-ask__question">The original folder is already gone.</p>
+        <p className="rf-move-note rf-muted">The copy in WSL is complete. Finishing moves its history and settings over.</p>
+        <div className="rf-row">
+          <button
+            type="button"
+            className="rf-button rf-button--accent"
+            ref={defaultAction}
+            data-primary
+            disabled={disabled}
+            onClick={() => void deleteOriginal(false)}
+          >
+            Finish the move
           </button>
         </div>
       </div>
@@ -794,6 +1014,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
           type="button"
           className="rf-button rf-button--accent"
           ref={defaultAction}
+          data-primary
           disabled={disabled}
           onClick={() => void deleteOriginal(false)}
         >
@@ -810,7 +1031,7 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
   } else {
     actions = (
       <div className="rf-row">
-        <button type="button" className="rf-button rf-button--accent" ref={defaultAction} disabled={disabled} onClick={discard}>
+        <button type="button" className="rf-button rf-button--accent" ref={defaultAction} data-primary disabled={disabled} onClick={discard}>
           Discard the copy
         </button>
         <button type="button" className="rf-button" disabled={disabled} onClick={retry}>
@@ -825,9 +1046,11 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
       <div className="rf-move__body">
         <section className="rf-section" aria-label="Summary">
           <p className={`rf-move-verdict rf-move-verdict--${ok ? "ok" : "failed"}`}>
-            {ok
-              ? "The copy passed every check. Nothing has been deleted yet."
-              : "A check failed, so the original can't be deleted. Nothing was changed on Windows."}
+            {!ok
+              ? "A check failed, so the original can't be deleted. Nothing was changed on Windows."
+              : deleting
+                ? "The copy passed every check. Deleting the original has begun."
+                : "The copy passed every check. Nothing has been deleted yet."}
           </p>
           <dl className="rf-facts rf-move-facts">
             <dt>From</dt>
@@ -953,9 +1176,9 @@ function ReportView({ backend, id, report, moves, setLocked, onKeep, onDiscarded
             {pending}
           </p>
         )}
-        {error && (
+        {(error ?? note) && (
           <p className="rf-error" role="alert">
-            {error}
+            {error ?? note}
           </p>
         )}
       </footer>
@@ -978,7 +1201,11 @@ function DoneView({
       <div className="rf-move__body">
         <section className="rf-section" aria-label="Done">
           <p className="rf-move-verdict rf-move-verdict--ok">
-            {outcome.permanent ? "The original was deleted permanently." : "The original is in the Recycle Bin."}
+            {outcome.alreadyGone
+              ? "The original folder was already gone. The move is finished."
+              : outcome.permanent
+                ? "The original was deleted permanently."
+                : "The original is in the Recycle Bin."}
           </p>
           <dl className="rf-facts rf-move-facts">
             <dt>Now at</dt>
@@ -996,7 +1223,7 @@ function DoneView({
         </section>
       </div>
       <footer className="rf-move__actions">
-        <button type="button" className="rf-button rf-button--accent" autoFocus onClick={onClose}>
+        <button type="button" className="rf-button rf-button--accent" data-primary onClick={onClose}>
           Done
         </button>
       </footer>

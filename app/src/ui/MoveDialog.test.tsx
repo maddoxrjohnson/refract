@@ -24,9 +24,12 @@ const PREFLIGHT: MigratePreflight = {
   historySessions: 2,
   vscodeWindows: [],
   linuxGit: false,
+  cloudSynced: false,
 };
 
-function fakeBackend(preflight: Partial<MigratePreflight> = {}, pending: MigrationReport[] = []) {
+const RECHECK = { changed: [], removed: [], unreadable: [], copyChanged: [], busyAgents: [], sourceMissing: false };
+
+function fakeBackend(preflight: Partial<MigratePreflight> = {}, pending: MigrationReport[] = [], deleting = false) {
   const listeners = new Set<(e: AgentEvent) => void>();
   return {
     onAgentEvent: vi.fn((cb: (e: AgentEvent) => void) => {
@@ -34,7 +37,8 @@ function fakeBackend(preflight: Partial<MigratePreflight> = {}, pending: Migrati
       return () => listeners.delete(cb);
     }),
     onMigrateSnapshot: vi.fn(() => () => {}),
-    migratePending: vi.fn().mockResolvedValue(pending.map((report) => ({ id: report.id, report }))),
+    migratePending: vi.fn().mockResolvedValue(pending.map((report) => ({ id: report.id, report, deleting }))),
+    migrateSourceExists: vi.fn().mockResolvedValue(true),
     migratePreflight: vi.fn().mockResolvedValue({ ...PREFLIGHT, ...preflight }),
     migrateCancelSnapshot: vi.fn().mockResolvedValue(false),
     migrateStart: vi.fn().mockResolvedValue({ id: "m-1" }),
@@ -170,7 +174,7 @@ describe("MoveDialog report", () => {
 
   it("asks before deleting permanently, with No as the default", async () => {
     const backend = fakeBackend({}, [testReport()]);
-    backend.migrateDelete.mockResolvedValueOnce({ kind: "wontFit", reason: "The bin is full." });
+    backend.migrateDelete.mockResolvedValueOnce({ kind: "wontFit", reason: "The bin is full.", deleting: false });
     const { props } = await setup(backend);
     expect(document.activeElement).toBe(button("Delete original"));
     fireEvent.click(button("Delete original"));
@@ -191,7 +195,9 @@ describe("MoveDialog report", () => {
     fireEvent.click(button("Delete original"));
     fireEvent.keyDown(dialog, { key: "Escape" });
     expect(props.onClose).not.toHaveBeenCalled();
-    await act(async () => answer({ kind: "deleted", permanent: false, shortcut: "C:\\x\\aurora-notes.lnk" }));
+    await act(async () =>
+      answer({ kind: "deleted", permanent: false, alreadyGone: false, shortcut: "C:\\x\\aurora-notes.lnk" }),
+    );
     expect(dialog.textContent).toContain("The original is in the Recycle Bin.");
     expect(dialog.textContent).toContain("C:\\x\\aurora-notes.lnk");
     fireEvent.keyDown(dialog, { key: "Escape" });
@@ -201,11 +207,17 @@ describe("MoveDialog report", () => {
   it("offers Re-sync when the original changed, and Close for open windows", async () => {
     const backend = fakeBackend({}, [testReport()]);
     backend.migrateDelete
-      .mockResolvedValueOnce({ kind: "windowsOpen", windows: [{ id: 3, title: "aurora-notes - VS Code" }] })
       .mockResolvedValueOnce({
+        kind: "windowsOpen",
+        windows: [{ id: 3, title: "aurora-notes - VS Code" }],
+        deleting: false,
+      })
+      .mockResolvedValueOnce({
+        ...RECHECK,
         kind: "changed",
         changed: ["src/main.ts"],
         busyAgents: ["An agent is still working in aurora-notes."],
+        deleting: false,
       });
     const { dialog } = await setup(backend);
     fireEvent.click(button("Delete original"));
@@ -221,5 +233,117 @@ describe("MoveDialog report", () => {
     await act(async () => {});
     expect(backend.migrateResync).toHaveBeenCalledWith("m-1");
     expect(button("Cancel the move")).toBeTruthy();
+    // Focus follows the new view, so Escape still reaches the dialog.
+    expect(document.activeElement).toBe(button("Cancel the move"));
+  });
+
+  it("goes back to the report when Re-sync is refused", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete.mockResolvedValueOnce({ ...RECHECK, kind: "changed", changed: ["a.txt"], deleting: false });
+    backend.migrateResync.mockRejectedValueOnce({ kind: "agent", message: "Cannot re-sync: the helper said no" });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    fireEvent.click(button("Re-sync"));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: "Cancel the move" })).toBeNull();
+    expect(dialog.textContent).toContain("the helper said no");
+    expect(button("Delete original")).toBeTruthy();
+  });
+
+  it("offers Stop for an idle agent and Try again, not Re-sync, when only agents block", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete.mockResolvedValueOnce({
+      ...RECHECK,
+      kind: "changed",
+      busyAgents: ["An agent (pid 7) is running in aurora-notes."],
+      deleting: false,
+    });
+    const repo = testRepo({ sessions: [testSession("idle", { kind: "live", detail: "waitingOnUser" }, 1)] });
+    await setup(backend, repo);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(screen.queryByRole("button", { name: "Re-sync" })).toBeNull();
+    fireEvent.click(button("Stop"));
+    fireEvent.click(button("Stop agent"));
+    await act(async () => {});
+    expect(backend.migrateStopAgent).toHaveBeenCalledWith(TEST_SOURCE, repo.sessions[0].id);
+    expect(button("Try again")).toBeTruthy();
+    expect(button("Keep both")).toBeTruthy();
+  });
+
+  it("offers only Keep both when the copy changed after the check", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete.mockResolvedValueOnce({
+      ...RECHECK,
+      kind: "changed",
+      changed: ["a.txt"],
+      copyChanged: ["notes.md"],
+      deleting: false,
+    });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("The copy in WSL changed");
+    expect(screen.queryByRole("button", { name: "Re-sync" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Discard the copy" })).toBeNull();
+    expect(document.activeElement).toBe(button("Keep both"));
+  });
+
+  it("after a partial delete offers only Finish deleting, which finishes", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateDelete
+      .mockResolvedValueOnce({ kind: "unfinished", reason: "Cannot delete the original: a file is in use" })
+      .mockResolvedValueOnce({ kind: "deleted", permanent: false, alreadyGone: false });
+    const { dialog } = await setup(backend);
+    fireEvent.click(button("Delete original"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("Deleting the original didn't finish.");
+    expect(dialog.textContent).toContain("a file is in use");
+    expect(dialog.textContent).not.toContain("nothing was deleted");
+    for (const name of ["Re-sync", "Keep both", "Discard the copy", "Delete original"]) {
+      expect(screen.queryByRole("button", { name })).toBeNull();
+    }
+    expect(document.activeElement).toBe(button("Finish deleting"));
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(backend.migrateDelete).toHaveBeenLastCalledWith("m-1", false);
+    expect(dialog.textContent).toContain("The original is in the Recycle Bin.");
+  });
+
+  it("comes back as Finish deleting after a restart", async () => {
+    const backend = fakeBackend({}, [testReport()], true);
+    const { dialog } = await setup(backend);
+    expect(dialog.textContent).toContain("Deleting the original didn't finish.");
+    expect(button("Finish deleting")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Keep both" })).toBeNull();
+    backend.migrateDelete.mockResolvedValueOnce({ ...RECHECK, kind: "changed", changed: ["new.txt"], deleting: true });
+    fireEvent.click(button("Finish deleting"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("new.txt");
+    expect(screen.queryByRole("button", { name: "Re-sync" })).toBeNull();
+    expect(button("Finish deleting")).toBeTruthy();
+  });
+
+  it("offers to finish when the original was deleted by hand", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    backend.migrateSourceExists.mockResolvedValue(false);
+    backend.migrateDelete.mockResolvedValueOnce({ kind: "deleted", permanent: false, alreadyGone: true });
+    const { dialog } = await setup(backend);
+    expect(dialog.textContent).toContain("The original folder is already gone.");
+    expect(screen.queryByRole("button", { name: "Discard the copy" })).toBeNull();
+    fireEvent.click(button("Finish the move"));
+    await act(async () => {});
+    expect(dialog.textContent).toContain("was already gone");
+  });
+
+  it("ignores a held Enter", async () => {
+    const backend = fakeBackend({}, [testReport()]);
+    const { dialog } = await setup(backend);
+    fireEvent.keyDown(dialog, { key: "Enter", repeat: true });
+    expect(backend.migrateDelete).not.toHaveBeenCalled();
+    const ev = new KeyboardEvent("keydown", { key: "Enter", repeat: true, bubbles: true, cancelable: true });
+    button("Delete original").dispatchEvent(ev);
+    expect(ev.defaultPrevented).toBe(true);
   });
 });

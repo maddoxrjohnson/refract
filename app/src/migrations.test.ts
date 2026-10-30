@@ -48,9 +48,24 @@ describe("migrationsReducer", () => {
     expect(s.get(SOURCE)).toMatchObject({ id: "m-1", phase: { kind: "running", step: "copying" } });
     const report = testReport();
     s = run([{ type: "ready", id: "m-1", report }], s);
-    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report });
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: false });
     s = run([{ type: "gone", source: SOURCE }], s);
     expect(s.size).toBe(0);
+  });
+
+  it("keeps a begun delete through new reports, and brings it back from the pending list", () => {
+    const report = testReport();
+    let s = run([
+      { type: "ready", id: "m-1", report },
+      { type: "deleting", id: "m-1" },
+      { type: "ready", id: "m-1", report },
+      { type: "pending", list: [{ id: "m-1", report }] },
+    ]);
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: true });
+    s = run([{ type: "pending", list: [{ id: "m-1", report, deleting: true }] }]);
+    expect(s.get(SOURCE)?.phase).toEqual({ kind: "ready", report, deleting: true });
+    // Only a report can be marked; a running copy is left alone.
+    expect(run([{ type: "deleting", id: "m-9" }])).toBe(initialMigrations);
   });
 
   it("places progress of a migration this window didn't start by its source", () => {
@@ -135,11 +150,12 @@ describe("the step line", () => {
   });
 
   it("says whether the report waits for an OK", () => {
-    expect(stepText({ kind: "ready", report: testReport() })).toBe("Ready for your OK");
+    expect(stepText({ kind: "ready", report: testReport(), deleting: false })).toBe("Ready for your OK");
     const failed = testReport({
       checks: testReport().checks.map((c) => (c.check === "files" ? { ...c, status: "failed" } : c)),
     });
-    expect(stepText({ kind: "ready", report: failed })).toBe("A check failed");
+    expect(stepText({ kind: "ready", report: failed, deleting: false })).toBe("A check failed");
+    expect(stepText({ kind: "ready", report: testReport(), deleting: true })).toBe("Deleting didn't finish");
   });
 
   it("only moves forward across the steps", () => {
@@ -156,7 +172,7 @@ describe("the step line", () => {
       }
     }
     expect(last).toBeLessThanOrEqual(1);
-    expect(overallProgress({ kind: "ready", report: testReport() })).toBe(1);
+    expect(overallProgress({ kind: "ready", report: testReport(), deleting: false })).toBe(1);
   });
 });
 

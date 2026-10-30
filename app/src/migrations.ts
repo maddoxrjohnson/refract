@@ -32,8 +32,11 @@ export type MigrationPhase =
   | { kind: "snapshot"; progress: MigrateSnapshotProgress | null }
   /** The helper copies and checks; `step` is `null` until its first progress event. */
   | { kind: "running"; step: MigrateStep | null; done: number; total: number }
-  /** The report waits for an answer. */
-  | { kind: "ready"; report: MigrationReport };
+  /**
+   * The report waits for an answer. `deleting` once Delete original has begun (the helper's
+   * deleting state): then only finishing the delete is offered.
+   */
+  | { kind: "ready"; report: MigrationReport; deleting: boolean };
 
 export interface Migration {
   /** The source's WSL path; the key. */
@@ -60,6 +63,8 @@ export type MigrationAction =
   | { type: "pending"; list: PendingMigration[] }
   /** Re-sync was asked for: copying and checking start again. */
   | { type: "resyncing"; id: string }
+  /** Delete original began but didn't finish. */
+  | { type: "deleting"; id: string }
   /** The helper stopped: a running copy is gone with it (it deletes the copy when it starts again). */
   | { type: "helperStopped" }
   /** Cancelled, failed to start, or finished. */
@@ -76,8 +81,16 @@ function byId(state: MigrationsState, id: string): Migration | undefined {
   return undefined;
 }
 
-function ready(state: MigrationsState, id: string, report: MigrationReport): MigrationsState {
-  return withEntry(state, { source: report.source, dest: report.dest, id, phase: { kind: "ready", report } });
+function ready(state: MigrationsState, id: string, report: MigrationReport, deleting = false): MigrationsState {
+  // A delete that has begun stays begun: only the helper's finish ends it.
+  const before = byId(state, id)?.phase;
+  const stillDeleting = deleting || (before?.kind === "ready" && before.deleting);
+  return withEntry(state, {
+    source: report.source,
+    dest: report.dest,
+    id,
+    phase: { kind: "ready", report, deleting: stillDeleting },
+  });
 }
 
 export function migrationsReducer(state: MigrationsState, action: MigrationAction): MigrationsState {
@@ -110,11 +123,16 @@ export function migrationsReducer(state: MigrationsState, action: MigrationActio
     case "ready":
       return ready(state, action.id, action.report);
     case "pending":
-      return action.list.reduce((s, p) => ready(s, p.id, p.report), state);
+      return action.list.reduce((s, p) => ready(s, p.id, p.report, p.deleting ?? false), state);
     case "resyncing": {
       const m = byId(state, action.id);
       if (!m) return state;
       return withEntry(state, { ...m, phase: { kind: "running", step: "rechecking", done: 0, total: 0 } });
+    }
+    case "deleting": {
+      const m = byId(state, action.id);
+      if (m?.phase.kind !== "ready") return state;
+      return withEntry(state, { ...m, phase: { ...m.phase, deleting: true } });
     }
     case "helperStopped": {
       const running = [...state.values()].filter((m) => m.phase.kind === "running");
@@ -182,6 +200,7 @@ export function stepText(phase: MigrationPhase): string {
       if (phase.step === "copying" && phase.total > 0) return `Copying ${byteRange(phase.done, phase.total)}`;
       return STEP_TEXT[phase.step];
     case "ready":
+      if (phase.deleting) return "Deleting didn't finish";
       return canDelete(phase.report) ? "Ready for your OK" : "A check failed";
   }
 }

@@ -18,7 +18,9 @@ use super::git::{
     autocrlf, clean_blobs, git_snapshot, ignored_dirs, ignored_dirs_quick, link_blob,
     submodule_repos, tracked_paths, GitRun,
 };
-use super::walk::{read_files, walk, Cancelled, ReadMode, ReadProgress, SourceFs, Walk};
+use super::walk::{
+    read_files, scan, walk, Cancelled, ReadMode, ReadProgress, Scan, SourceFs, Walk,
+};
 
 /// What the snapshot is doing, sent to the interface with its counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -51,9 +53,9 @@ pub enum SnapshotError {
     Cancelled,
     /// git failed or printed something unreadable.
     Git(String),
-    /// The source changed since the preflight in a way that refuses the move: a link
-    /// leaves the repo, or a file or folder can't be read.
-    Refused(Vec<Refusal>),
+    /// The source refuses the move: a link leaves the repo, a file or folder can't be
+    /// read or is only in the cloud, or a name ends in a dot or a space.
+    Refused(Vec<RefusalView>),
 }
 
 impl From<Cancelled> for SnapshotError {
@@ -77,6 +79,7 @@ pub fn take_snapshot(
         read: ReadProgress::default(),
     };
     progress(phase(SnapshotPhase::Git));
+    refuse(scan_refusals(&scan(fs, cancel)?))?;
     let repo_git = |path: String| -> Result<RepoGit, SnapshotError> {
         Ok(RepoGit {
             snapshot: git_snapshot(git, &path).map_err(SnapshotError::Git)?,
@@ -95,12 +98,9 @@ pub fn take_snapshot(
         .collect();
 
     progress(phase(SnapshotPhase::Walking));
-    let Walk {
-        mut manifest,
-        external_links,
-        unreadable,
-    } = walk(fs, &ignored, cancel)?;
-    refuse_links_or_unreadable(&external_links, &unreadable)?;
+    let walked = walk(fs, &ignored, cancel)?;
+    refuse(walk_refusals(&walked))?;
+    let mut manifest = walked.manifest;
 
     let unreadable = read_files(
         fs,
@@ -115,7 +115,9 @@ pub fn take_snapshot(
             })
         },
     )?;
-    refuse_links_or_unreadable(&[], &unreadable)?;
+    if !unreadable.is_empty() {
+        refuse(vec![Refusal::Unreadable { paths: unreadable }.into()])?;
+    }
 
     progress(phase(SnapshotPhase::Blobs));
     for repo in &repos {
@@ -143,26 +145,61 @@ fn check(cancel: &AtomicBool) -> Result<(), SnapshotError> {
     }
 }
 
-fn refuse_links_or_unreadable(
-    external_links: &[String],
-    unreadable: &[String],
-) -> Result<(), SnapshotError> {
-    let mut refused = Vec::new();
-    if !external_links.is_empty() {
-        refused.push(Refusal::ExternalLinks {
-            paths: external_links.to_vec(),
-        });
-    }
-    if !unreadable.is_empty() {
-        refused.push(Refusal::Unreadable {
-            paths: unreadable.to_vec(),
-        });
-    }
+fn refuse(refused: Vec<RefusalView>) -> Result<(), SnapshotError> {
     if refused.is_empty() {
         Ok(())
     } else {
         Err(SnapshotError::Refused(refused))
     }
+}
+
+/// The refusals of [`scan`]'s findings.
+pub fn scan_refusals(scan: &Scan) -> Vec<RefusalView> {
+    let mut refused = Vec::new();
+    if !scan.cloud_only.is_empty() {
+        refused.push(
+            WindowsRefusal::CloudOnly {
+                paths: scan.cloud_only.clone(),
+            }
+            .into(),
+        );
+    }
+    if !scan.bad_names.is_empty() {
+        refused.push(
+            WindowsRefusal::TrailingDotOrSpace {
+                paths: scan.bad_names.clone(),
+            }
+            .into(),
+        );
+    }
+    refused
+}
+
+/// The refusals of what the walk found: links that leave the repo, folders that can't
+/// be listed, what is only in the cloud and names ending in a dot or a space.
+fn walk_refusals(walk: &Walk) -> Vec<RefusalView> {
+    let mut refused = Vec::new();
+    if !walk.external_links.is_empty() {
+        refused.push(
+            Refusal::ExternalLinks {
+                paths: walk.external_links.clone(),
+            }
+            .into(),
+        );
+    }
+    if !walk.unreadable.is_empty() {
+        refused.push(
+            Refusal::Unreadable {
+                paths: walk.unreadable.clone(),
+            }
+            .into(),
+        );
+    }
+    refused.extend(scan_refusals(&Scan {
+        cloud_only: walk.cloud_only.clone(),
+        bad_names: walk.bad_names.clone(),
+    }));
+    refused
 }
 
 /// Sets the clean blob id on the manifest entry of each tracked path of the repo at
@@ -388,12 +425,71 @@ pub fn preflight_facts(
     }
 }
 
+/// Refusals only the Windows side can see, besides refract-core's [`Refusal`]s.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WindowsRefusal {
+    /// Files only in the cloud (OneDrive placeholders): reading them would download
+    /// them, so they are never opened.
+    CloudOnly { paths: Vec<String> },
+    /// Names ending in a dot or a space, which Win32 paths strip.
+    TrailingDotOrSpace { paths: Vec<String> },
+    /// The folder itself is a symlink or junction: deleting it would remove only the
+    /// link.
+    SourceIsLink,
+}
+
+impl WindowsRefusal {
+    pub fn message(&self) -> String {
+        let list = |paths: &[String]| {
+            let shown: Vec<&str> = paths.iter().take(5).map(String::as_str).collect();
+            let more = paths.len().saturating_sub(5);
+            if more > 0 {
+                format!("{} and {more} more", shown.join(", "))
+            } else {
+                shown.join(", ")
+            }
+        };
+        match self {
+            WindowsRefusal::CloudOnly { paths } => format!(
+                "{} only in the cloud: {}. Right-click the folder and choose \"Always keep on this device\", wait for it to download, then try again.",
+                if paths.len() == 1 {
+                    "1 file is".to_owned()
+                } else {
+                    format!("{} files are", paths.len())
+                },
+                list(paths)
+            ),
+            WindowsRefusal::TrailingDotOrSpace { paths } => format!(
+                "Windows can't safely handle names that end in a dot or a space: {}. Rename them first.",
+                list(paths)
+            ),
+            WindowsRefusal::SourceIsLink => {
+                "This folder is a link (a symlink or junction). Move the folder it points to instead."
+                    .into()
+            }
+        }
+    }
+}
+
+/// Either kind of refusal, as `{"kind": ..., ...}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum AnyRefusal {
+    Core(Refusal),
+    Windows(WindowsRefusal),
+}
+
 /// A refusal with the sentence the dialog shows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RefusalView {
     #[serde(flatten)]
-    pub refusal: Refusal,
+    pub refusal: AnyRefusal,
     pub message: String,
 }
 
@@ -401,7 +497,16 @@ impl From<Refusal> for RefusalView {
     fn from(refusal: Refusal) -> RefusalView {
         RefusalView {
             message: refusal.message(),
-            refusal,
+            refusal: AnyRefusal::Core(refusal),
+        }
+    }
+}
+
+impl From<WindowsRefusal> for RefusalView {
+    fn from(refusal: WindowsRefusal) -> RefusalView {
+        RefusalView {
+            message: refusal.message(),
+            refusal: AnyRefusal::Windows(refusal),
         }
     }
 }
@@ -462,8 +567,14 @@ pub fn summarize(
     linux: &LinuxFacts,
 ) -> PreflightSummary {
     let totals = walk.manifest.totals();
+    let mut refused: Vec<RefusalView> =
+        refusals(facts).into_iter().map(RefusalView::from).collect();
+    refused.extend(scan_refusals(&Scan {
+        cloud_only: walk.cloud_only.clone(),
+        bad_names: walk.bad_names.clone(),
+    }));
     PreflightSummary {
-        refusals: refusals(facts).into_iter().map(RefusalView::from).collect(),
+        refusals: refused,
         warnings: windows_tool_warnings(
             walk.manifest
                 .entries
@@ -501,6 +612,7 @@ pub fn preflight_walk(
         phase: SnapshotPhase::Git,
         read: ReadProgress::default(),
     });
+    refuse(scan_refusals(&scan(fs, cancel)?))?;
     let ignored = ignored_dirs_quick(git).map_err(SnapshotError::Git)?;
     progress(SnapshotProgress {
         phase: SnapshotPhase::Walking,
@@ -649,7 +761,8 @@ mod tests {
             err,
             SnapshotError::Refused(vec![Refusal::ExternalLinks {
                 paths: vec!["shared".into()]
-            }])
+            }
+            .into()])
         );
         fs.nodes.remove("shared");
         let err = take_snapshot(&fs, &git(), 2, &AtomicBool::new(false), &|_| {}).unwrap_err();
@@ -657,8 +770,34 @@ mod tests {
             err,
             SnapshotError::Refused(vec![Refusal::Unreadable {
                 paths: vec!["data.db (locked)".into()]
-            }])
+            }
+            .into()])
         );
+    }
+
+    #[test]
+    fn cloud_only_files_refuse_before_git_reads_anything() {
+        let mut fs = source();
+        fs.nodes.insert("plan.docx".into(), FakeNode::Cloud);
+        let git = git();
+        let err = take_snapshot(&fs, &git, 2, &AtomicBool::new(false), &|_| {}).unwrap_err();
+        let SnapshotError::Refused(views) = err else {
+            panic!("{err:?}")
+        };
+        assert_eq!(
+            views[0].refusal,
+            AnyRefusal::Windows(WindowsRefusal::CloudOnly {
+                paths: vec!["plan.docx".into()]
+            })
+        );
+        assert!(views[0].message.contains("Always keep on this device"));
+        assert!(git.calls.lock().unwrap().is_empty());
+        let err = preflight_walk(&fs, &git, 2, &AtomicBool::new(false), &|_| {}).unwrap_err();
+        assert!(matches!(err, SnapshotError::Refused(_)));
+        assert!(git.calls.lock().unwrap().is_empty());
+        let value = serde_json::to_value(&views[0]).unwrap();
+        assert_eq!(value["kind"], "cloudOnly");
+        assert_eq!(value["paths"][0], "plan.docx");
     }
 
     #[test]

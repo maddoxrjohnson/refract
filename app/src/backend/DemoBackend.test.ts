@@ -65,6 +65,7 @@ describe("DemoBackend's Move to WSL", () => {
     expect(outcome).toEqual({
       kind: "deleted",
       permanent: false,
+      alreadyGone: false,
       shortcut: "C:\\Users\\demo\\Desktop\\marigold-site.lnk",
     });
     expect(events).toContainEqual({ event: "repoRemoved", data: { path: DEMO_WINDOWS_REPO } });

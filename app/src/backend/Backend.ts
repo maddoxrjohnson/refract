@@ -103,6 +103,8 @@ export interface Backend {
   migrateFinish(id: string, action: FinishAction): Promise<void>;
   /** Reports still waiting for an answer, after a restart. */
   migratePending(): Promise<PendingMigration[]>;
+  /** False once the original folder is gone (deleted by hand, or partly by Delete original). */
+  migrateSourceExists(id: string): Promise<boolean>;
   onMigrateSnapshot(cb: (progress: MigrateSnapshotProgress) => void): Unsubscribe;
 
   /**

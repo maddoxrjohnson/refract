@@ -7,6 +7,12 @@
 //! does not know a request answers `METHOD_NOT_FOUND`, which makes **Delete original**
 //! refuse rather than skip its recheck. [`MigrateError::agent`] maps the helper's
 //! error codes to [`MigrateErrorKind`]s.
+//!
+//! `migrateBeginDelete` rechecks the original and, when that passes, puts the migration
+//! in the helper's *deleting* state in one step. From then on the helper refuses
+//! `migrateResync`, `migrateFinish keep`/`discard` and `migrateCancel`: only
+//! `migrateFinish delete` ends it, so a removal that stops halfway can only be
+//! finished, never "re-synced" from a half-deleted original.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -27,7 +33,7 @@ use crate::agent::Agent;
 /// The helper's method names, in one place so they can follow the protocol.
 pub mod method {
     pub const MIGRATE: &str = "migrate";
-    pub const RECHECK: &str = "migrateRecheck";
+    pub const BEGIN_DELETE: &str = "migrateBeginDelete";
     pub const RESYNC: &str = "migrateResync";
     pub const FINISH: &str = "migrateFinish";
     pub const CANCEL: &str = "migrateCancel";
@@ -41,8 +47,9 @@ const START_TIMEOUT: Duration = Duration::from_secs(60);
 const FINISH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long `migrateCancel` waits: it deletes the partial copy.
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(5 * 60);
-/// How long `migrateRecheck` waits: it stats every file of the source over `/mnt`.
-const RECHECK_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// How long `migrateBeginDelete` waits: it stats every file of the source over `/mnt`.
+#[allow(dead_code)] // until refract-core can send it
+const BEGIN_DELETE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// How long the quick requests wait: `migrateResync` answers before it copies,
 /// `migratePending` and `stopAgent` read state the helper holds.
 const QUICK_TIMEOUT: Duration = Duration::from_secs(30);
@@ -92,7 +99,10 @@ impl MigrateError {
     }
 
     pub fn refused(refusals: Vec<Refusal>) -> MigrateError {
-        let views: Vec<RefusalView> = refusals.into_iter().map(RefusalView::from).collect();
+        MigrateError::refused_views(refusals.into_iter().map(RefusalView::from).collect())
+    }
+
+    pub fn refused_views(views: Vec<RefusalView>) -> MigrateError {
         let message = views
             .iter()
             .map(|r| r.message.as_str())
@@ -145,22 +155,41 @@ impl MigrateError {
     }
 }
 
-/// The answer to `migrateRecheck`: what changed in the source since the final
-/// snapshot, and the agents still running on it. Both empty means deleting is safe.
+/// The recheck inside the answer to `migrateBeginDelete` (as `migrateRecheck` answers): what
+/// changed in the source and in the copy since the final check, and the agents still
+/// running on the source. Paths are relative to the source (or the copy), sorted.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Recheck {
+    /// Changed or added in the source.
     #[serde(default)]
     pub changed: Vec<String>,
-    /// Session ids of agents still running in the folder.
+    /// Gone from the source: deleting is still safe, the copy has them.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// Could not be read to check them.
+    #[serde(default)]
+    pub unreadable: Vec<String>,
+    /// Changed in the copy after it was checked.
+    #[serde(default)]
+    pub copy_changed: Vec<String>,
+    /// One sentence per agent still running in the folder.
     #[serde(default)]
     pub busy_agents: Vec<String>,
+    /// The source folder itself is gone.
+    #[serde(default)]
+    pub source_missing: bool,
 }
 
-impl Recheck {
-    pub fn is_safe(&self) -> bool {
-        self.changed.is_empty() && self.busy_agents.is_empty()
-    }
+/// The answer to `migrateBeginDelete`: `ok` when the recheck passed (nothing changed or
+/// unreadable in the source, the copy as checked, no agent running; removed paths and a
+/// missing source are fine) and the helper is now in the deleting state (also when it
+/// already was).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BeginDelete {
+    pub ok: bool,
+    pub recheck: Recheck,
 }
 
 /// One migration whose report waits for an answer, from `migratePending`.
@@ -169,14 +198,17 @@ impl Recheck {
 pub struct PendingMigration {
     pub id: String,
     pub report: Report,
+    /// The helper is in the deleting state: only finishing the delete is left.
+    #[serde(default)]
+    pub deleting: bool,
 }
 
 /// The helper's side of a migration (see the module docs).
 pub trait MigrateHelper: Send + Sync {
     /// `migrate`: answers with the migration's id.
     fn start(&self, params: MigrateParams) -> Result<String, RequestError>;
-    /// `migrateRecheck`.
-    fn recheck(&self, id: &str) -> Result<Recheck, RequestError>;
+    /// `migrateBeginDelete`: the recheck, and the deleting state when it passes.
+    fn begin_delete(&self, id: &str) -> Result<BeginDelete, RequestError>;
     /// `migrateResync`: re-copies what changed; progress and a new `migrateReady` follow.
     fn resync(&self, id: &str) -> Result<(), RequestError>;
     /// `migrateFinish`.
@@ -207,18 +239,16 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    fn recheck(&self, id: &str) -> Result<Recheck, RequestError> {
-        let params = MigrateIdParams { id: id.to_owned() };
-        match self
-            .0
-            .request(Method::MigrateRecheck(params), RECHECK_TIMEOUT)?
-        {
-            Reply::Recheck(recheck) => Ok(Recheck {
-                changed: recheck.changed,
-                busy_agents: recheck.busy_agents,
-            }),
-            other => Err(unexpected(method::RECHECK, &other)),
-        }
+    fn begin_delete(&self, _id: &str) -> Result<BeginDelete, RequestError> {
+        // refract-core's protocol has no `migrateBeginDelete` yet, so it can't be sent;
+        // answering as an older helper does makes Delete original refuse.
+        Err(RequestError::Agent {
+            code: code::METHOD_NOT_FOUND,
+            message: format!(
+                "this helper does not support {} yet; update it",
+                method::BEGIN_DELETE
+            ),
+        })
     }
 
     fn resync(&self, id: &str) -> Result<(), RequestError> {
@@ -264,6 +294,7 @@ impl MigrateHelper for AgentHelper<'_> {
                 .map(|p| PendingMigration {
                     id: p.id,
                     report: *p.report,
+                    deleting: false,
                 })
                 .collect()),
             other => Err(unexpected(method::PENDING, &other)),
@@ -345,7 +376,8 @@ pub fn fits(bytes: u64, nuke: bool, max_bytes: Option<u64>, volume_bytes: Option
     }
 }
 
-/// What **Delete original** did, sent as `{"kind": "...", ...}`.
+/// What **Delete original** did, sent as `{"kind": "...", ...}`. `deleting` says
+/// whether the helper is in the deleting state, where the only way on is to finish.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(
     tag = "kind",
@@ -353,22 +385,33 @@ pub fn fits(bytes: u64, nuke: bool, max_bytes: Option<u64>, volume_bytes: Option
     rename_all_fields = "camelCase"
 )]
 pub enum DeleteOutcome {
-    /// The source changed since the report, or agents still run in it: nothing was
-    /// deleted. The interface offers **Re-sync**.
+    /// The recheck did not pass: nothing more was deleted. Before the deleting state
+    /// the interface offers **Re-sync** for changed files, **Keep both** for a changed
+    /// copy and **Stop** for agents; in it, only **Finish deleting** once fixed.
     Changed {
-        changed: Vec<String>,
-        busy_agents: Vec<String>,
+        #[serde(flatten)]
+        recheck: Recheck,
+        deleting: bool,
     },
     /// VS Code windows still have the folder open: nothing was deleted. The interface
     /// offers **Close** for each.
-    WindowsOpen { windows: Vec<VsCodeWindow> },
+    WindowsOpen {
+        windows: Vec<VsCodeWindow>,
+        deleting: bool,
+    },
     /// The Recycle Bin can't take the folder: nothing was deleted. The interface asks
-    /// "Delete permanently?" (default **No**, which is **Keep both**).
-    WontFit { reason: String },
+    /// "Delete permanently?" (default **No**, which is **Keep both**, or, in the
+    /// deleting state, leaving it for later).
+    WontFit { reason: String, deleting: bool },
+    /// The helper is in the deleting state but the original is not (all) gone, or the
+    /// helper did not finish: the interface offers only **Finish deleting**.
+    Unfinished { reason: String },
     /// The original is gone and the helper finished the migration.
     Deleted {
         /// Deleted for good rather than recycled.
         permanent: bool,
+        /// The original folder was already gone (deleted by hand) before this.
+        already_gone: bool,
         /// The `.lnk` left at the old location.
         #[serde(skip_serializing_if = "Option::is_none")]
         shortcut: Option<String>,
@@ -376,6 +419,19 @@ pub enum DeleteOutcome {
         #[serde(skip_serializing_if = "Option::is_none")]
         shortcut_error: Option<String>,
     },
+}
+
+impl DeleteOutcome {
+    /// The helper is left in the deleting state.
+    pub fn deleting(&self) -> bool {
+        match self {
+            DeleteOutcome::Changed { deleting, .. }
+            | DeleteOutcome::WindowsOpen { deleting, .. }
+            | DeleteOutcome::WontFit { deleting, .. } => *deleting,
+            DeleteOutcome::Unfinished { .. } => true,
+            DeleteOutcome::Deleted { .. } => false,
+        }
+    }
 }
 
 /// The migration **Delete original** acts on.
@@ -392,16 +448,8 @@ pub struct DeleteTarget {
     /// Files and bytes of the original, skipped folders included.
     pub files: u64,
     pub bytes: u64,
-    /// An earlier attempt already removed the original.
-    pub removed: bool,
-}
-
-/// A failed **Delete original**: `removed` says whether the original is already gone
-/// (so the next attempt only finishes).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DeleteFailure {
-    pub error: MigrateError,
-    pub removed: bool,
+    /// The helper is already in the deleting state: an earlier attempt began.
+    pub deleting: bool,
 }
 
 /// The `.lnk` for a folder at `source`: `<name>.lnk` beside it.
@@ -409,62 +457,73 @@ pub fn shortcut_path(source: &Path, name: &str) -> Option<PathBuf> {
     Some(source.parent()?.join(format!("{name}.lnk")))
 }
 
-/// **Delete original** (spec §6): the recheck, the VS Code windows, the fit (unless
-/// `permanent`), the removal and a check that the folder is gone, the shortcut, then
-/// `migrateFinish delete`. Each check that fails stops before anything is deleted and
-/// says why in the outcome. When `target.removed`, only the shortcut and the finish
-/// are left to do.
+/// **Delete original** (spec §6). Before the deleting state: the VS Code windows and
+/// the fit (unless `permanent`), each of which stops before anything changes, then
+/// `migrateBeginDelete`. Once that passes, the removal (whatever is left of the
+/// folder; skipped when it is already gone) and a check that it is gone, the shortcut,
+/// then `migrateFinish delete`; a failure there is [`DeleteOutcome::Unfinished`], and
+/// calling this again with `target.deleting` picks up where it stopped. Only a
+/// failure before the helper took the deleting state is an error.
 pub fn delete_original(
     helper: &dyn MigrateHelper,
     os: &dyn WindowsOps,
     target: &DeleteTarget,
     permanent: bool,
-) -> Result<DeleteOutcome, DeleteFailure> {
-    let fail = |kind, message: String, removed| DeleteFailure {
-        error: MigrateError::new(kind, message),
-        removed,
-    };
-    if !target.removed {
-        let recheck = helper.recheck(&target.id).map_err(|err| DeleteFailure {
-            error: MigrateError::agent("Cannot check the original again", err),
-            removed: false,
-        })?;
-        if !recheck.is_safe() {
-            return Ok(DeleteOutcome::Changed {
-                changed: recheck.changed,
-                busy_agents: recheck.busy_agents,
-            });
-        }
+) -> Result<DeleteOutcome, MigrateError> {
+    let deleting = target.deleting;
+    let present = os.exists(&target.source);
+    // A window or a full bin stops here before the deleting state, so **Keep both**
+    // is still open.
+    let checks = |deleting: bool| -> Option<DeleteOutcome> {
         let windows = os.vscode_windows(&target.name);
         if !windows.is_empty() {
-            return Ok(DeleteOutcome::WindowsOpen { windows });
+            return Some(DeleteOutcome::WindowsOpen { windows, deleting });
         }
         if !permanent {
             if let Fit::WontFit(reason) = os.recycle_fit(&target.source, target.files, target.bytes)
             {
-                return Ok(DeleteOutcome::WontFit { reason });
+                return Some(DeleteOutcome::WontFit { reason, deleting });
+            }
+        }
+        None
+    };
+    if present && !deleting {
+        if let Some(outcome) = checks(false) {
+            return Ok(outcome);
+        }
+    }
+    let begin = helper
+        .begin_delete(&target.id)
+        .map_err(|err| MigrateError::agent("Cannot check the original again", err))?;
+    if !begin.ok {
+        return Ok(DeleteOutcome::Changed {
+            recheck: begin.recheck,
+            deleting,
+        });
+    }
+
+    // The helper now only lets this migration finish deleting.
+    let unfinished = |reason: String| Ok(DeleteOutcome::Unfinished { reason });
+    if os.exists(&target.source) {
+        if deleting {
+            if let Some(outcome) = checks(true) {
+                return Ok(outcome);
             }
         }
         match os.remove(&target.source, !permanent) {
             Ok(Removal::Done) => {}
-            Ok(Removal::WontFit(reason)) => return Ok(DeleteOutcome::WontFit { reason }),
-            Err(err) => {
-                let gone = !os.exists(&target.source);
-                return Err(fail(
-                    MigrateErrorKind::Io,
-                    format!("Cannot delete the original: {err}"),
-                    gone,
-                ));
+            Ok(Removal::WontFit(reason)) => {
+                return Ok(DeleteOutcome::WontFit {
+                    reason,
+                    deleting: true,
+                })
             }
+            Err(err) => return unfinished(format!("Cannot delete the original: {err}")),
         }
         if os.exists(&target.source) {
-            return Err(fail(
-                MigrateErrorKind::Io,
-                format!(
-                    "{} is still there after deleting it. Close any program using it and try again.",
-                    target.source.display()
-                ),
-                false,
+            return unfinished(format!(
+                "{} is still there after deleting it. Close any program using it and finish deleting.",
+                target.source.display()
             ));
         }
     }
@@ -489,17 +548,13 @@ pub fn delete_original(
         (_, None) => shortcut_error = Some("The original had no parent folder.".into()),
     }
 
-    helper
-        .finish(&target.id, FinishAction::Delete)
-        .map_err(|err| DeleteFailure {
-            error: MigrateError::agent(
-                "The original is in the Recycle Bin, but the helper could not finish",
-                err,
-            ),
-            removed: true,
-        })?;
+    if let Err(err) = helper.finish(&target.id, FinishAction::Delete) {
+        let err = MigrateError::agent("The original is gone, but the helper could not finish", err);
+        return unfinished(err.message);
+    }
     Ok(DeleteOutcome::Deleted {
         permanent,
+        already_gone: !present && !deleting,
         shortcut,
         shortcut_error,
     })
@@ -521,7 +576,8 @@ mod tests {
 
     #[derive(Default)]
     struct FakeHelper {
-        recheck: Option<Recheck>,
+        /// What `migrateBeginDelete` answers; `None` is an older helper.
+        begin: Option<BeginDelete>,
         finish_fails: bool,
         log: Mutex<Vec<String>>,
     }
@@ -534,11 +590,11 @@ mod tests {
                 .push(format!("start {}", params.path));
             Ok("m-1".into())
         }
-        fn recheck(&self, id: &str) -> Result<Recheck, RequestError> {
-            self.log.lock().unwrap().push(format!("recheck {id}"));
-            self.recheck
+        fn begin_delete(&self, id: &str) -> Result<BeginDelete, RequestError> {
+            self.log.lock().unwrap().push(format!("begin {id}"));
+            self.begin
                 .clone()
-                .ok_or_else(|| not_supported(method::RECHECK))
+                .ok_or_else(|| not_supported(method::BEGIN_DELETE))
         }
         fn resync(&self, _: &str) -> Result<(), RequestError> {
             Ok(())
@@ -572,6 +628,8 @@ mod tests {
         removal: Option<Result<Removal, String>>,
         /// The folder survives removal.
         sticky: bool,
+        /// Removal deletes part of the folder, then fails.
+        partial: bool,
         existing: RefCell<Vec<PathBuf>>,
         log: RefCell<Vec<String>>,
     }
@@ -599,6 +657,9 @@ mod tests {
             self.log
                 .borrow_mut()
                 .push(format!("remove recycle={recycle}"));
+            if self.partial {
+                return Err("a file is in use".into());
+            }
             let result = self.removal.clone().unwrap_or(Ok(Removal::Done));
             if matches!(result, Ok(Removal::Done)) && !self.sticky {
                 self.existing.borrow_mut().retain(|p| p != path);
@@ -625,15 +686,25 @@ mod tests {
             dest: Some(r"\\wsl.localhost\Ubuntu\home\dev\projects\aurora-notes".into()),
             files: 3,
             bytes: 100,
-            removed: false,
+            deleting: false,
         }
     }
 
     fn safe_helper() -> FakeHelper {
         FakeHelper {
-            recheck: Some(Recheck::default()),
+            begin: Some(BeginDelete {
+                ok: true,
+                recheck: Recheck::default(),
+            }),
             ..FakeHelper::default()
         }
+    }
+
+    fn lnk() -> String {
+        PathBuf::from(r"C:\dev")
+            .join("aurora-notes.lnk")
+            .display()
+            .to_string()
     }
 
     #[test]
@@ -645,12 +716,8 @@ mod tests {
             outcome,
             DeleteOutcome::Deleted {
                 permanent: false,
-                shortcut: Some(
-                    PathBuf::from(r"C:\dev")
-                        .join("aurora-notes.lnk")
-                        .display()
-                        .to_string()
-                ),
+                already_gone: false,
+                shortcut: Some(lnk()),
                 shortcut_error: None,
             }
         );
@@ -662,83 +729,92 @@ mod tests {
                 "remove recycle=true".into(),
                 format!(
                     "shortcut {} -> \\\\wsl.localhost\\Ubuntu\\home\\dev\\projects\\aurora-notes",
-                    PathBuf::from(r"C:\dev").join("aurora-notes.lnk").display()
+                    lnk()
                 ),
             ]
         );
         assert_eq!(
             *helper.log.lock().unwrap(),
-            ["recheck m-1", "finish m-1 Delete"]
+            ["begin m-1", "finish m-1 Delete"]
         );
     }
 
     #[test]
-    fn changes_or_busy_agents_stop_before_anything_is_touched() {
+    fn a_failed_recheck_stops_before_anything_is_touched() {
         let helper = FakeHelper {
-            recheck: Some(Recheck {
-                changed: vec!["notes.txt".into()],
-                busy_agents: vec!["0b7e".into()],
+            begin: Some(BeginDelete {
+                ok: false,
+                recheck: Recheck {
+                    changed: vec!["notes.txt".into()],
+                    busy_agents: vec!["claude (pid 7) is working in aurora-notes.".into()],
+                    ..Recheck::default()
+                },
             }),
             ..FakeHelper::default()
         };
         let os = FakeOs::with_source();
-        assert_eq!(
-            delete_original(&helper, &os, &target(), false).unwrap(),
-            DeleteOutcome::Changed {
-                changed: vec!["notes.txt".into()],
-                busy_agents: vec!["0b7e".into()],
-            }
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert!(
+            matches!(&outcome, DeleteOutcome::Changed { recheck, deleting: false }
+                if recheck.changed == ["notes.txt"] && recheck.busy_agents.len() == 1)
         );
-        assert!(os.log.borrow().is_empty());
+        assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
+        assert!(os.exists(Path::new(r"C:\dev\aurora-notes")));
     }
 
     #[test]
-    fn a_helper_without_recheck_refuses_to_delete() {
+    fn a_helper_without_begin_delete_refuses_to_delete() {
         let os = FakeOs::with_source();
-        let failure = delete_original(&FakeHelper::default(), &os, &target(), false).unwrap_err();
-        assert_eq!(failure.error.kind, MigrateErrorKind::Agent);
-        assert!(failure.error.message.contains("migrateRecheck"));
-        assert!(!failure.removed);
-        assert!(os.log.borrow().is_empty());
+        let err = delete_original(&FakeHelper::default(), &os, &target(), false).unwrap_err();
+        assert_eq!(err.kind, MigrateErrorKind::Agent);
+        assert!(err.message.contains("migrateBeginDelete"));
+        assert!(!os.log.borrow().iter().any(|l| l.starts_with("remove")));
     }
 
     #[test]
-    fn open_windows_stop_before_the_fit_check() {
+    fn open_windows_and_a_full_bin_stop_before_the_deleting_state() {
         let os = FakeOs {
             windows: vec![VsCodeWindow {
                 id: 7,
-                title: "aurora-notes [WSL: Ubuntu] - Visual Studio Code".into(),
+                title: "aurora-notes - Visual Studio Code".into(),
             }],
             ..FakeOs::with_source()
         };
-        let outcome = delete_original(&safe_helper(), &os, &target(), false).unwrap();
-        assert!(matches!(outcome, DeleteOutcome::WindowsOpen { windows } if windows[0].id == 7));
+        let helper = safe_helper();
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert!(
+            matches!(outcome, DeleteOutcome::WindowsOpen { ref windows, deleting: false } if windows[0].id == 7)
+        );
         assert_eq!(*os.log.borrow(), ["windows aurora-notes"]);
-    }
-
-    #[test]
-    fn a_folder_too_large_for_the_bin_is_kept_unless_permanent() {
         let os = FakeOs {
             fit: Some(Fit::WontFit("too large".into())),
             ..FakeOs::with_source()
         };
-        let helper = safe_helper();
         assert_eq!(
             delete_original(&helper, &os, &target(), false).unwrap(),
             DeleteOutcome::WontFit {
-                reason: "too large".into()
+                reason: "too large".into(),
+                deleting: false,
             }
         );
         assert!(os.exists(Path::new(r"C:\dev\aurora-notes")));
-        // The guard in the removal itself says the same.
+        // Neither began the delete.
+        assert!(helper.log.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_folder_too_large_for_the_bin_is_kept_unless_permanent() {
+        let helper = safe_helper();
+        // The guard in the removal itself: nothing deleted, but the delete has begun.
         let os = FakeOs {
             removal: Some(Ok(Removal::WontFit("would be deleted for good".into()))),
             ..FakeOs::with_source()
         };
         assert!(matches!(
             delete_original(&helper, &os, &target(), false).unwrap(),
-            DeleteOutcome::WontFit { .. }
+            DeleteOutcome::WontFit { deleting: true, .. }
         ));
+        assert!(os.exists(Path::new(r"C:\dev\aurora-notes")));
         // Asked to delete for good, no fit check and no recycling.
         let os = FakeOs {
             fit: Some(Fit::WontFit("too large".into())),
@@ -757,15 +833,101 @@ mod tests {
     }
 
     #[test]
-    fn a_folder_that_survives_is_an_error_and_finish_is_not_sent() {
+    fn a_partial_removal_is_unfinished_and_is_finished_later() {
+        let helper = safe_helper();
+        let os = FakeOs {
+            partial: true,
+            ..FakeOs::with_source()
+        };
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert!(
+            matches!(&outcome, DeleteOutcome::Unfinished { reason } if reason.contains("in use"))
+        );
+        assert!(outcome.deleting());
+        assert!(!helper
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.starts_with("finish")));
+
+        // Finishing begins again (the helper allows it in the deleting state), checks
+        // the windows and the bin, and removes what is left.
+        let os = FakeOs::with_source();
+        let helper = safe_helper();
+        let resume = DeleteTarget {
+            deleting: true,
+            ..target()
+        };
+        let outcome = delete_original(&helper, &os, &resume, false).unwrap();
+        assert!(matches!(
+            outcome,
+            DeleteOutcome::Deleted {
+                already_gone: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            os.log.borrow()[..3],
+            [
+                "windows aurora-notes".to_owned(),
+                "fit 3 100".into(),
+                "remove recycle=true".into()
+            ]
+        );
+        assert_eq!(
+            *helper.log.lock().unwrap(),
+            ["begin m-1", "finish m-1 Delete"]
+        );
+
+        // A window opened meanwhile still blocks, and says the delete has begun.
+        let os = FakeOs {
+            windows: vec![VsCodeWindow {
+                id: 3,
+                title: "aurora-notes - Visual Studio Code".into(),
+            }],
+            ..FakeOs::with_source()
+        };
+        assert!(matches!(
+            delete_original(&safe_helper(), &os, &resume, false).unwrap(),
+            DeleteOutcome::WindowsOpen { deleting: true, .. }
+        ));
+    }
+
+    #[test]
+    fn a_failed_recheck_while_deleting_stays_deleting() {
+        let helper = FakeHelper {
+            begin: Some(BeginDelete {
+                ok: false,
+                recheck: Recheck {
+                    changed: vec!["notes.txt".into()],
+                    ..Recheck::default()
+                },
+            }),
+            ..FakeHelper::default()
+        };
+        let os = FakeOs::with_source();
+        let resume = DeleteTarget {
+            deleting: true,
+            ..target()
+        };
+        let outcome = delete_original(&helper, &os, &resume, false).unwrap();
+        assert!(matches!(
+            outcome,
+            DeleteOutcome::Changed { deleting: true, .. }
+        ));
+        assert!(os.log.borrow().is_empty());
+    }
+
+    #[test]
+    fn a_folder_that_survives_is_unfinished_and_finish_is_not_sent() {
         let helper = safe_helper();
         let os = FakeOs {
             sticky: true,
             ..FakeOs::with_source()
         };
-        let failure = delete_original(&helper, &os, &target(), false).unwrap_err();
-        assert_eq!(failure.error.kind, MigrateErrorKind::Io);
-        assert!(!failure.removed);
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert!(matches!(outcome, DeleteOutcome::Unfinished { .. }));
         assert!(!helper
             .log
             .lock()
@@ -781,13 +943,14 @@ mod tests {
             ..safe_helper()
         };
         let os = FakeOs::with_source();
-        let failure = delete_original(&helper, &os, &target(), false).unwrap_err();
-        assert!(failure.removed);
-        assert_eq!(failure.error.kind, MigrateErrorKind::Agent);
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert!(
+            matches!(&outcome, DeleteOutcome::Unfinished { reason } if reason.contains("could not finish"))
+        );
 
         let helper = safe_helper();
         let retry = DeleteTarget {
-            removed: true,
+            deleting: true,
             ..target()
         };
         os.log.borrow_mut().clear();
@@ -796,12 +959,40 @@ mod tests {
             outcome,
             DeleteOutcome::Deleted {
                 shortcut: Some(_),
+                already_gone: false,
                 ..
             }
         ));
-        // No recheck, no removal, and the shortcut from the first attempt is kept.
+        // No removal, and the shortcut from the first attempt is kept.
         assert!(os.log.borrow().is_empty());
-        assert_eq!(*helper.log.lock().unwrap(), ["finish m-1 Delete"]);
+        assert_eq!(
+            *helper.log.lock().unwrap(),
+            ["begin m-1", "finish m-1 Delete"]
+        );
+    }
+
+    #[test]
+    fn an_original_deleted_by_hand_is_finished_without_removing() {
+        let helper = safe_helper();
+        let os = FakeOs::default();
+        let outcome = delete_original(&helper, &os, &target(), false).unwrap();
+        assert!(matches!(
+            outcome,
+            DeleteOutcome::Deleted {
+                already_gone: true,
+                shortcut: Some(_),
+                ..
+            }
+        ));
+        assert!(!os
+            .log
+            .borrow()
+            .iter()
+            .any(|l| l.starts_with("remove") || l.starts_with("windows")));
+        assert_eq!(
+            *helper.log.lock().unwrap(),
+            ["begin m-1", "finish m-1 Delete"]
+        );
     }
 
     #[test]
@@ -846,24 +1037,42 @@ mod tests {
     #[test]
     fn outcomes_and_errors_have_the_wire_shape() {
         let value = serde_json::to_value(DeleteOutcome::Changed {
-            changed: vec!["a".into()],
-            busy_agents: vec![],
+            recheck: Recheck {
+                changed: vec!["a".into()],
+                ..Recheck::default()
+            },
+            deleting: false,
         })
         .unwrap();
         assert_eq!(
             value,
-            serde_json::json!({"kind": "changed", "changed": ["a"], "busyAgents": []})
+            serde_json::json!({"kind": "changed", "changed": ["a"], "removed": [],
+                "unreadable": [], "copyChanged": [], "busyAgents": [], "sourceMissing": false,
+                "deleting": false})
         );
         let value = serde_json::to_value(DeleteOutcome::Deleted {
             permanent: false,
+            already_gone: false,
             shortcut: None,
             shortcut_error: Some("x".into()),
         })
         .unwrap();
         assert_eq!(
             value,
-            serde_json::json!({"kind": "deleted", "permanent": false, "shortcutError": "x"})
+            serde_json::json!({"kind": "deleted", "permanent": false, "alreadyGone": false,
+                "shortcutError": "x"})
         );
+        let value = serde_json::to_value(DeleteOutcome::Unfinished { reason: "x".into() }).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"kind": "unfinished", "reason": "x"})
+        );
+        // What the helper sends: missing lists read as empty.
+        let begin: BeginDelete = serde_json::from_value(serde_json::json!(
+            {"ok": false, "recheck": {"changed": ["a"], "sourceMissing": true}}
+        ))
+        .unwrap();
+        assert!(!begin.ok && begin.recheck.source_missing && begin.recheck.removed.is_empty());
         let err = MigrateError::refused(vec![Refusal::LinkedWorktree]);
         let value = serde_json::to_value(&err).unwrap();
         assert_eq!(value["kind"], "refused");

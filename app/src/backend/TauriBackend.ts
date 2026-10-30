@@ -219,6 +219,10 @@ export class TauriBackend implements Backend {
     return invoke<PendingMigration[]>("migrate_pending");
   }
 
+  migrateSourceExists(id: string): Promise<boolean> {
+    return invoke<boolean>("migrate_source_exists", { id });
+  }
+
   onMigrateSnapshot(cb: (progress: MigrateSnapshotProgress) => void): Unsubscribe {
     return subscribe<MigrateSnapshotProgress>(EVENTS.migrateSnapshot, (e) => cb(e.payload));
   }

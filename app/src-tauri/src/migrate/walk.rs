@@ -6,8 +6,12 @@
 //! in-memory folder; `win::NtfsFs` reads NTFS natively.
 //!
 //! Links are reparse points whose tag is a name surrogate (symlinks, junctions and the
-//! like). Other reparse points, such as OneDrive placeholders, are read through as the
-//! files and folders they stand for. A link is kept as a symlink entry only when its
+//! like). Other reparse points, such as OneDrive files, are read through as the files
+//! and folders they stand for, unless their data is not on this machine: opening a
+//! cloud placeholder downloads it, so those are never opened, only listed in
+//! [`Walk::cloud_only`], which refuses the migration. [`scan`] finds them, and names
+//! ending in a dot or a space (which Win32 paths strip, so the Recycle Bin would miss
+//! or mistake them), before git or anything else opens a file. A link is kept as a symlink entry only when its
 //! target is relative and stays inside the repo; any other one is listed in
 //! [`Walk::external_links`], which refuses the migration. That includes absolute
 //! targets inside the repo, and so every junction: after the move they would point
@@ -28,6 +32,14 @@ pub const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
 pub const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 /// Set in the tag of reparse points that name another file or folder.
 const NAME_SURROGATE: u32 = 0x2000_0000;
+/// `FILE_ATTRIBUTE_OFFLINE`, `FILE_ATTRIBUTE_RECALL_ON_OPEN` and
+/// `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS`: the data is elsewhere, and opening or
+/// reading the file fetches it.
+pub const CLOUD_ONLY_ATTRIBUTES: u32 = 0x1000 | 0x4_0000 | 0x40_0000;
+/// `IO_REPARSE_TAG_CLOUD` and its sixteen variants (`_1` to `_F`), with the variant
+/// nibble masked out.
+const CLOUD_TAG: u32 = 0x9000_001A;
+const CLOUD_TAG_MASK: u32 = 0xFFFF_0FFF;
 
 /// How often hashing reports progress.
 const PROGRESS_EVERY: Duration = Duration::from_millis(200);
@@ -59,6 +71,29 @@ impl RawEntry {
         self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
             && self.reparse_tag & NAME_SURROGATE != 0
     }
+
+    /// Its data is not on this machine; see [`is_cloud_only`].
+    pub fn is_cloud_only(&self) -> bool {
+        is_cloud_only(self.attributes)
+    }
+
+    /// A cloud sync engine's file or folder (OneDrive and the like), present or not.
+    pub fn is_cloud(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            && self.reparse_tag & CLOUD_TAG_MASK == CLOUD_TAG
+    }
+}
+
+/// Attributes of a file whose data is not on this machine: a cloud placeholder that
+/// reading would download, or offline storage. A cloud file kept on this device has
+/// none of them and is read like any other.
+pub fn is_cloud_only(attributes: u32) -> bool {
+    attributes & CLOUD_ONLY_ATTRIBUTES != 0
+}
+
+/// A name Win32 paths would change: one ending in a dot or a space.
+pub fn bad_win32_name(name: &str) -> bool {
+    name.ends_with('.') || name.ends_with(' ')
 }
 
 /// Why a file could not be read.
@@ -99,6 +134,47 @@ pub struct Walk {
     pub external_links: Vec<String>,
     /// Folders that could not be listed.
     pub unreadable: Vec<String>,
+    /// Files and folders whose data is only in the cloud; never opened.
+    pub cloud_only: Vec<String>,
+    /// Names ending in a dot or a space.
+    pub bad_names: Vec<String>,
+}
+
+/// What [`scan`] found that refuses the migration.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Scan {
+    pub cloud_only: Vec<String>,
+    pub bad_names: Vec<String>,
+}
+
+/// Lists the whole source, build folders included, without opening any file or
+/// following links, for files only in the cloud and names ending in a dot or a space.
+/// Runs before git reads the source, since git would open (and so download) files.
+/// Folders that can't be listed are left to the walk.
+pub fn scan(fs: &dyn SourceFs, cancel: &AtomicBool) -> Result<Scan, Cancelled> {
+    let mut out = Scan::default();
+    let mut stack = vec![String::new()];
+    while let Some(dir) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled);
+        }
+        let Ok(listing) = fs.list(&dir) else {
+            continue;
+        };
+        for raw in listing {
+            let path = join(&dir, &String::from_utf16_lossy(&raw.name));
+            if bad_win32_name(&String::from_utf16_lossy(&raw.name)) {
+                out.bad_names.push(path);
+            } else if raw.is_cloud_only() {
+                out.cloud_only.push(path);
+            } else if raw.is_dir() && !raw.is_link() {
+                stack.push(path);
+            }
+        }
+    }
+    out.cloud_only.sort();
+    out.bad_names.sort();
+    Ok(out)
 }
 
 /// The walk was stopped.
@@ -142,6 +218,14 @@ pub fn walk(
                 out.manifest.unrepresentable.push(join(&dir, &name));
                 continue;
             };
+            if bad_win32_name(&name) {
+                out.bad_names.push(path.to_string());
+                continue;
+            }
+            if raw.is_cloud_only() {
+                out.cloud_only.push(path.to_string());
+                continue;
+            }
             if raw.is_link() {
                 match fs.read_link(path.as_str()) {
                     Ok(target) => match link_inside(&path, &target) {
@@ -212,6 +296,8 @@ pub fn walk(
     out.manifest.unrepresentable.sort();
     out.external_links.sort();
     out.unreadable.sort();
+    out.cloud_only.sort();
+    out.bad_names.sort();
     Ok(out)
 }
 
@@ -429,6 +515,9 @@ pub mod tests {
         Locked(u64),
         /// A name that is not valid UTF-16 (an unpaired surrogate) inside this folder.
         BadName,
+        /// A OneDrive placeholder: its data is only in the cloud. Reading it fails the
+        /// test.
+        Cloud,
     }
 
     impl FakeFs {
@@ -479,6 +568,11 @@ pub mod tests {
                         raw.reparse_tag = 0xA000_000C;
                     }
                     FakeNode::BadName => raw.name = vec![0xD800, b'x' as u16],
+                    FakeNode::Cloud => {
+                        raw.attributes = 0x20 | FILE_ATTRIBUTE_REPARSE_POINT | 0x40_0000;
+                        raw.reparse_tag = 0x9000_301A;
+                        raw.size = 5;
+                    }
                 }
                 out.push(raw);
             }
@@ -507,6 +601,7 @@ pub mod tests {
             read: &dyn Fn(u64),
         ) -> Result<String, ReadError> {
             match self.nodes.get(rel) {
+                Some(FakeNode::Cloud) => panic!("{rel} is only in the cloud and was opened"),
                 Some(FakeNode::File(bytes)) => {
                     read(bytes.len() as u64);
                     Ok(format!("sha:{}", String::from_utf8_lossy(bytes)))
@@ -690,6 +785,41 @@ pub mod tests {
         .unwrap();
         assert_eq!(unreadable, ["data/big.bin (locked)"]);
         assert!(walk.manifest.entries.iter().all(|e| e.sha256.is_none()));
+    }
+
+    #[test]
+    fn cloud_only_files_and_trailing_dots_are_listed_never_read() {
+        let fs = FakeFs::with(&[
+            ("src/main.rs", file("fn main() {}")),
+            ("photos/beach.jpg", FakeNode::Cloud),
+            ("node_modules/x/readme.", file("x")),
+            ("notes /a.txt", file("a")),
+        ]);
+        let cancel = AtomicBool::new(false);
+        let found = scan(&fs, &cancel).unwrap();
+        assert_eq!(found.cloud_only, ["photos/beach.jpg"]);
+        assert_eq!(found.bad_names, ["node_modules/x/readme.", "notes "]);
+        let mut walked = walk(&fs, &BTreeSet::new(), &cancel).unwrap();
+        assert_eq!(walked.cloud_only, ["photos/beach.jpg"]);
+        assert_eq!(walked.bad_names, ["node_modules/x/readme.", "notes "]);
+        assert!(!paths(&walked).contains(&"photos/beach.jpg"));
+        // Reading every file never opens the placeholder (the fake panics if it does).
+        read_files(
+            &fs,
+            &mut walked.manifest,
+            ReadMode::Hash,
+            2,
+            &cancel,
+            &|_| {},
+        )
+        .unwrap();
+        assert!(bad_win32_name("a.") && bad_win32_name("a ") && !bad_win32_name(".git"));
+        let tagged = RawEntry {
+            attributes: FILE_ATTRIBUTE_REPARSE_POINT,
+            reparse_tag: 0x9000_101A,
+            ..RawEntry::default()
+        };
+        assert!(tagged.is_cloud() && !tagged.is_cloud_only() && !tagged.is_link());
     }
 
     #[test]

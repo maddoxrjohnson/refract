@@ -420,12 +420,15 @@ export class DemoBackend implements Backend {
 
   /**
    * `moveOutcome` is what Delete original first says; by default the original goes to the
-   * Recycle Bin. The page's `?move=wontfit` asks for the permanent-delete question instead.
+   * Recycle Bin. The page's `?move=wontfit` asks for the permanent-delete question instead,
+   * and `?move=unfinished` stops the first delete halfway, as a file in use would.
    */
   constructor(options: { moveOutcome?: DemoMoveOutcome } = {}) {
     let fromPage: DemoMoveOutcome | undefined;
     try {
-      if (new URLSearchParams(globalThis.location?.search ?? "").get("move") === "wontfit") fromPage = "wontFit";
+      const move = new URLSearchParams(globalThis.location?.search ?? "").get("move");
+      if (move === "wontfit") fromPage = "wontFit";
+      else if (move === "unfinished") fromPage = "unfinished";
     } catch {
       // No page address: the default.
     }
@@ -750,6 +753,7 @@ export class DemoBackend implements Backend {
       historySessions: 1,
       vscodeWindows: [...this.moveWindows],
       linuxGit: false,
+      cloudSynced: false,
     };
   }
 
@@ -766,7 +770,7 @@ export class DemoBackend implements Backend {
       throw error;
     }
     await this.demoSnapshot(path, ["git", "hashing", "blobs"], 120);
-    const move: DemoMove = { id: `demo-move-${++this.moveCount}`, source: path, dest, report: null, cancelled: false };
+    const move: DemoMove = { id: `demo-move-${++this.moveCount}`, source: path, dest, report: null, cancelled: false, deleting: false };
     this.demoMoves.set(move.id, move);
     void this.runMove(move, DEMO_MOVE_STEPS);
     return { id: move.id };
@@ -799,8 +803,15 @@ export class DemoBackend implements Backend {
     return Promise.resolve(true);
   }
 
+  /** As the helper refuses everything but finishing once the delete has begun. */
+  private notDeleting(move: DemoMove) {
+    if (move.deleting) this.moveFail("notReady", "The original is being deleted; finish deleting it.");
+  }
+
   async migrateCancel(id: string): Promise<void> {
     const move = this.demoMoves.get(id);
+    if (move) this.notDeleting(move);
+    if (move?.report) this.moveFail("notReady", "The copy is no longer running; answer its report instead.");
     if (move) move.cancelled = true;
     this.demoMoves.delete(id);
     await sleep(300);
@@ -833,6 +844,7 @@ export class DemoBackend implements Backend {
 
   async migrateResync(id: string): Promise<void> {
     const move: DemoMove = this.readyMove(id);
+    this.notDeleting(move);
     move.report = null;
     void this.runMove(move, [["rechecking", 12]]);
   }
@@ -840,8 +852,17 @@ export class DemoBackend implements Backend {
   async migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome> {
     const move = this.readyMove(id);
     await sleep(700);
-    if (this.moveOutcome === "wontFit" && !permanent) {
-      return { kind: "wontFit", reason: "The Recycle Bin on C: holds 1.5 GB, and this needs 1.8 GB." };
+    if (this.moveOutcome === "wontFit" && !permanent && !move.deleting) {
+      return { kind: "wontFit", reason: "The Recycle Bin on C: holds 1.5 GB, and this needs 1.8 GB.", deleting: false };
+    }
+    // migrateBeginDelete: the recheck passes and the delete begins.
+    const firstTry = !move.deleting;
+    move.deleting = true;
+    if (this.moveOutcome === "unfinished" && firstTry) {
+      return {
+        kind: "unfinished",
+        reason: "Cannot delete the original: The process cannot access the file because it is being used by another process.",
+      };
     }
     this.demoMoves.delete(id);
     const original = this.repos.find((r) => r.path === move.source);
@@ -852,19 +873,25 @@ export class DemoBackend implements Backend {
       this.repos = [...this.repos, moved];
       this.emit({ event: "repoChanged", data: moved });
     }
-    return { kind: "deleted", permanent, shortcut: `${DEMO_WINDOWS_PATH}.lnk` };
+    return { kind: "deleted", permanent, alreadyGone: false, shortcut: `${DEMO_WINDOWS_PATH}.lnk` };
   }
 
   async migrateFinish(id: string, _action: FinishAction): Promise<void> {
-    this.readyMove(id);
+    this.notDeleting(this.readyMove(id));
     await sleep(300);
     this.demoMoves.delete(id);
   }
 
   migratePending(): Promise<PendingMigration[]> {
     return Promise.resolve(
-      [...this.demoMoves.values()].flatMap((m) => (m.report ? [{ id: m.id, report: m.report }] : [])),
+      [...this.demoMoves.values()].flatMap((m) =>
+        m.report ? [{ id: m.id, report: m.report, ...(m.deleting ? { deleting: true } : {}) }] : [],
+      ),
     );
+  }
+
+  migrateSourceExists(id: string): Promise<boolean> {
+    return Promise.resolve(this.demoMoves.has(id));
   }
 
   onMigrateSnapshot(cb: (progress: MigrateSnapshotProgress) => void): Unsubscribe {
@@ -908,10 +935,15 @@ interface DemoMove {
   /** Set once the checks are done. */
   report: MigrationReport | null;
   cancelled: boolean;
+  /** Delete original has begun (the helper's deleting state). */
+  deleting: boolean;
 }
 
-/** What `migrateDelete` says short of deleting: `wontFit` shows the permanent-delete question. */
-export type DemoMoveOutcome = "deleted" | "wontFit";
+/**
+ * What `migrateDelete` first says: `wontFit` shows the permanent-delete question, and
+ * `unfinished` stops the first delete halfway, so the next one finishes it.
+ */
+export type DemoMoveOutcome = "deleted" | "wontFit" | "unfinished";
 
 /** The checks as the helper names them (refract-core `Check::title`). */
 const DEMO_CHECKS = [

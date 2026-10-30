@@ -471,7 +471,10 @@ pub fn start(app: &AppHandle) {
         },
         move |event| {
             let result = match event {
-                ClientEvent::Status(status) => handle.emit(STATUS_EVENT, status),
+                ClientEvent::Status(status) => {
+                    crate::migrate::on_helper_status(&handle, &status);
+                    handle.emit(STATUS_EVENT, status)
+                }
                 ClientEvent::Event(event) => {
                     crate::migrate::on_helper_event(&handle, &event);
                     handle.emit(EVENT_EVENT, event)

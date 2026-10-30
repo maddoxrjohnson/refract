@@ -367,7 +367,13 @@ export type Refusal =
   | { kind: "lfsMissing" }
   | { kind: "destNotLinux" }
   | { kind: "destExists" }
-  | { kind: "notEnoughSpace"; needed: number; free: number };
+  | { kind: "notEnoughSpace"; needed: number; free: number }
+  // What only the Windows side sees.
+  /** Only in the cloud (OneDrive placeholders): never opened, since that downloads them. */
+  | { kind: "cloudOnly"; paths: string[] }
+  | { kind: "trailingDotOrSpace"; paths: string[] }
+  /** The folder itself is a symlink or junction. */
+  | { kind: "sourceIsLink" };
 
 /** A refusal with the sentence the dialog shows. */
 export type RefusalView = Refusal & { message: string };
@@ -408,6 +414,8 @@ export interface MigratePreflight {
   vscodeWindows: VsCodeWindow[];
   /** `git.exe` is missing, so Linux git reads the source. */
   linuxGit: boolean;
+  /** In a folder OneDrive (or another cloud service) syncs: deleting the original deletes it there too. */
+  cloudSynced: boolean;
 }
 
 /** What a preflight or snapshot is doing. */
@@ -512,22 +520,47 @@ export interface MigrationReport {
 export interface PendingMigration {
   id: string;
   report: MigrationReport;
+  /** The delete has begun (the helper's deleting state): only finishing it is left. */
+  deleting?: boolean;
 }
 
-/** What Delete original did; only `deleted` removed anything. */
+/** What the helper found checking the original again, right before deleting it. */
+export interface Recheck {
+  /** Modified or added in the original since the check. */
+  changed: string[];
+  /** Gone from the original: still in the copy, so deleting stays safe. */
+  removed: string[];
+  /** Couldn't be read, so whether they changed is unknown. */
+  unreadable: string[];
+  /** Changed in the copy after it was checked. */
+  copyChanged: string[];
+  /** Sentences to show as they are, one per agent still running in the folder. */
+  busyAgents: string[];
+  /** The original folder itself is gone. */
+  sourceMissing: boolean;
+}
+
+/**
+ * What Delete original did. `deleting` says the delete has begun (the helper's deleting
+ * state): from then on only finishing it is offered, never Re-sync, Keep both or Discard.
+ */
 export type DeleteOutcome =
-  /** The source changed or agents still run in it: offer Re-sync. */
-  | {
-      kind: "changed";
-      changed: string[];
-      /** Sentences to show as they are, one per agent still running in the folder. */
-      busyAgents: string[];
-    }
+  /** The recheck failed, so nothing (more) was deleted. */
+  | ({ kind: "changed"; deleting: boolean } & Recheck)
   /** Close these first. */
-  | { kind: "windowsOpen"; windows: VsCodeWindow[] }
-  /** Ask "Delete permanently?" (default No, which is Keep both). */
-  | { kind: "wontFit"; reason: string }
-  | { kind: "deleted"; permanent: boolean; shortcut?: string; shortcutError?: string };
+  | { kind: "windowsOpen"; windows: VsCodeWindow[]; deleting: boolean }
+  /** Ask "Delete permanently?" (default No: Keep both, or later while deleting). */
+  | { kind: "wontFit"; reason: string; deleting: boolean }
+  /** The delete began but didn't finish (a file was in use, or the helper didn't answer). */
+  | { kind: "unfinished"; reason: string }
+  | {
+      kind: "deleted";
+      permanent: boolean;
+      /** The original folder was already gone (deleted by hand). */
+      alreadyGone: boolean;
+      shortcut?: string;
+      shortcutError?: string;
+    };
 
 /** Keep both, or discard the copy. Deleting the original goes through `migrateDelete`. */
 export type FinishAction = "keep" | "discard";

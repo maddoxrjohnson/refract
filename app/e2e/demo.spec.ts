@@ -264,6 +264,36 @@ test.describe("Move to WSL at 1280×800", () => {
     await expect(page.getByRole("complementary", { name: "marigold-site details" })).toBeVisible();
     await expect(page.getByRole("button", { name: "Move to WSL…" })).toBeHidden();
   });
+
+  test("a delete stopped halfway only offers Finish deleting, which finishes", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.goto("./?move=unfinished");
+    await expect(page.locator(".rf-widget--usage")).toBeVisible();
+    await page.keyboard.type("marigold");
+    await page.keyboard.press("Enter");
+    const panel = page.getByRole("complementary", { name: "marigold-site details" });
+    await panel.getByRole("button", { name: "Move to WSL…" }).click();
+    const dialog = page.getByRole("dialog", { name: "Move marigold-site to WSL" });
+    await dialog.getByRole("button", { name: /Close VS Code window/ }).click();
+    await dialog.getByRole("button", { name: "Start" }).click();
+    const remove = dialog.getByRole("button", { name: "Delete original" });
+    await expect(remove).toBeFocused({ timeout: 60_000 });
+    await remove.click();
+
+    const finish = dialog.getByRole("button", { name: "Finish deleting" });
+    await expect(finish).toBeFocused({ timeout: 30_000 });
+    await expect(dialog.getByText("Deleting the original didn't finish.")).toBeVisible();
+    for (const name of ["Keep both", "Discard the copy", "Re-sync"]) {
+      await expect(dialog.getByRole("button", { name })).toHaveCount(0);
+    }
+    // Closed and opened again, it still only offers finishing.
+    await page.keyboard.press("Escape");
+    await expect(dialog).toBeHidden();
+    await panel.getByRole("button", { name: "Finish deleting…" }).click();
+    await finish.click();
+    const done = page.getByRole("dialog", { name: "Moved marigold-site to WSL" });
+    await expect(done.getByText("The original is in the Recycle Bin.")).toBeVisible({ timeout: 30_000 });
+  });
 });
 
 test.describe("at 1280×480", () => {

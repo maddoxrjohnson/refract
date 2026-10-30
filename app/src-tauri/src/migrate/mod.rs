@@ -21,6 +21,7 @@
 //! | `migrate_delete` | `id`, `permanent` | [`DeleteOutcome`] |
 //! | `migrate_finish` | `id`, `action` (`keep` or `discard`) | `null` |
 //! | `migrate_pending` | | [`PendingMigration`]`[]`, after a restart |
+//! | `migrate_source_exists` | `id` | `false` once the original folder is gone |
 //!
 //! `migrate_preflight` and `migrate_start` walk and read the whole source, so they
 //! can take a while; both send `migrate://snapshot` events and stop on
@@ -29,17 +30,31 @@
 //! VS Code window has the folder open or a migration of it runs. Agents that are busy
 //! block **Start** in the dialog; the interface knows them from the repo's sessions.
 //!
-//! **Delete original** is `migrate_delete {id, permanent: false}`. Its outcome:
-//! - `changed {changed, busyAgents}`: offer **Re-sync** (`migrate_resync`);
+//! **Delete original** is `migrate_delete {id, permanent: false}`. It checks the VS
+//! Code windows and the Recycle Bin, then sends `migrateBeginDelete`, which rechecks
+//! the original and puts the helper in its *deleting* state, then removes the folder
+//! and finishes (see `flow`). Its outcome, each but `deleted` and `unfinished` with
+//! `deleting` (the helper is in the deleting state):
+//! - `changed {changed, removed, unreadable, copyChanged, busyAgents, sourceMissing}`:
+//!   the recheck failed and nothing was deleted. Not deleting: offer **Re-sync**
+//!   (`migrate_resync`) for changed files, **Keep both** for a changed copy, **Stop**
+//!   for idle agents, then try again. Deleting: only **Finish deleting** once fixed;
 //! - `windowsOpen {windows}`: offer **Close** for each, then try again;
 //! - `wontFit {reason}`: ask "Delete permanently?" (default **No**, which is
-//!   `migrate_finish keep`), and on **Yes** call `migrate_delete {id, permanent: true}`;
-//! - `deleted {permanent, shortcut?, shortcutError?}`: done; the gem moves to `dest`.
+//!   `migrate_finish keep`, or, while deleting, leaving it), and on **Yes** call
+//!   `migrate_delete {id, permanent: true}`;
+//! - `unfinished {reason}`: the helper is in the deleting state but the original is not
+//!   all gone (a file was in use) or the helper did not finish. Offer only **Finish
+//!   deleting** (`migrate_delete` again), never Re-sync, Keep or Discard;
+//! - `deleted {permanent, alreadyGone, shortcut?, shortcutError?}`: done; the gem moves
+//!   to `dest`. `alreadyGone` when the original had been deleted by hand.
 //!
-//! An error from `migrate_delete` after the original was removed (the helper's
-//! `migrateFinish` failed) leaves the migration marked removed, and calling it again
-//! only finishes. **Keep both** is `migrate_finish keep` (the interface then hides the
-//! old gem); **Discard the copy** is `migrate_finish discard`.
+//! The deleting state is the helper's and survives restarts: `migrate_pending` marks it
+//! `deleting`. While in it, `migrate_resync`, `migrate_finish` and `migrate_cancel`
+//! refuse here too. **Keep both** is `migrate_finish keep` (the interface then hides
+//! the old gem); **Discard the copy** is `migrate_finish discard`, refused once the
+//! original is gone, as is `migrate_resync`. `migrate_cancel` works only while the copy
+//! runs. One command at a time runs per migration (`busy` otherwise).
 //!
 //! # Events
 //!
@@ -61,7 +76,14 @@
 //! The snapshot file goes to `%LOCALAPPDATA%\<identifier>\migrate`, written under a
 //! temporary name and renamed into place before `migrate` is sent, and is deleted when
 //! the migration is cancelled, finished or fails to start. Files no migration of this
-//! run uses are swept at each start, since the helper reads its file only once.
+//! run uses are swept at each start, since the helper reads its file only once; a
+//! start registers its file's name before writing it, under the same lock as the
+//! sweep, so one start never sweeps another's file.
+//!
+//! A source whose root is a link (symlink or junction), that has names ending in a dot
+//! or a space, or files that are only in the cloud (OneDrive placeholders, which
+//! reading would download) is refused. A source inside a OneDrive folder gets a warning
+//! in the preflight: deleting the original deletes it from OneDrive too.
 
 mod flow;
 mod git;
@@ -76,6 +98,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use refract_client::AgentStatus;
 use refract_core::launch::wsl_path;
 use refract_core::migrate::preflight::{default_destination, Refusal};
 use refract_core::migrate::report::Report;
@@ -88,13 +111,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::agent::{distro_args, wsl_command, Agent};
 use crate::open::windows_folder;
 use crate::process::output_with_deadline;
-use flow::{delete_original, AgentHelper, DeleteTarget, MigrateHelper};
+use flow::{delete_original, AgentHelper, DeleteTarget, MigrateHelper, WindowsOps};
 pub use flow::{DeleteOutcome, MigrateError, MigrateErrorKind, PendingMigration};
 use git::{find_git_exe, GitExe, GitRun, WslGit};
 use snapshot::{
     default_roots, install_steps, install_tools, parse_linux_facts, preflight_facts,
     preflight_walk, repo_shape, summarize, take_snapshot, LinuxFacts, PreflightSummary,
-    SnapshotError, SnapshotProgress, LINUX_FACTS_SCRIPT,
+    SnapshotError, SnapshotProgress, WindowsRefusal, LINUX_FACTS_SCRIPT,
 };
 pub use vscode::VsCodeWindow;
 use walk::{SourceFs as _, Walk};
@@ -107,6 +130,8 @@ const LINUX_FACTS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Deletes run one at a time.
 static DELETES: Mutex<()> = Mutex::new(());
+/// Held while the snapshot folder is swept and a new file's name registered.
+static SWEEP: Mutex<()> = Mutex::new(());
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -125,6 +150,8 @@ struct Inner {
     running: HashMap<String, Arc<AtomicBool>>,
     /// Snapshot files written and not yet handed over.
     files: HashSet<PathBuf>,
+    /// Migrations a command is acting on.
+    busy: HashSet<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,13 +173,15 @@ enum Phase {
     Ready {
         can_delete: bool,
     },
-    /// The original was removed but `migrateFinish delete` did not go through.
-    Removed,
+    /// The helper is in the deleting state (`migrateBeginDelete` passed): only finishing
+    /// the delete is left.
+    Deleting,
 }
 
 impl Migrations {
-    /// Records a report from `migrateReady` or `migratePending`.
-    fn ready(&self, id: &str, report: &Report) {
+    /// Records a report from `migrateReady` or `migratePending`; `deleting` when the
+    /// helper says it is in the deleting state.
+    fn ready(&self, id: &str, report: &Report, deleting: bool) {
         let files =
             report.source_totals.files + report.skipped.iter().map(|s| s.files).sum::<u64>();
         let bytes =
@@ -171,11 +200,45 @@ impl Migrations {
             });
         migration.files = files;
         migration.bytes = bytes;
-        if migration.phase != Phase::Removed {
+        if deleting {
+            migration.phase = Phase::Deleting;
+        } else if migration.phase != Phase::Deleting {
             migration.phase = Phase::Ready {
                 can_delete: report.can_delete(),
             };
         }
+    }
+
+    /// The helper stopped: the copies it was making are gone with it (it deletes them
+    /// when it starts again), so they no longer block **Start**.
+    fn helper_stopped(&self) {
+        let stale: Vec<Migration> = {
+            let mut inner = lock(&self.inner);
+            let ids: Vec<String> = inner
+                .by_id
+                .iter()
+                .filter(|(_, m)| m.phase == Phase::Running)
+                .map(|(id, _)| id.clone())
+                .collect();
+            ids.iter().filter_map(|id| inner.by_id.remove(id)).collect()
+        };
+        for file in stale.into_iter().filter_map(|m| m.snapshot_file) {
+            remove_snapshot_file(&file);
+        }
+    }
+
+    /// Marks `id` busy until the guard drops; `busy` when another command acts on it.
+    fn claim(&self, id: &str) -> Result<Claim<'_>, MigrateError> {
+        if !lock(&self.inner).busy.insert(id.to_owned()) {
+            return Err(MigrateError::new(
+                MigrateErrorKind::Busy,
+                "Another answer to this move is still being carried out.",
+            ));
+        }
+        Ok(Claim {
+            migrations: self,
+            id: id.to_owned(),
+        })
     }
 
     fn get(&self, id: &str) -> Result<Migration, MigrateError> {
@@ -202,13 +265,34 @@ impl Migrations {
     }
 }
 
+/// A migration a command acts on; see [`Migrations::claim`].
+struct Claim<'a> {
+    migrations: &'a Migrations,
+    id: String,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        lock(&self.migrations.inner).busy.remove(&self.id);
+    }
+}
+
+/// Called with every helper status change.
+pub fn on_helper_status(app: &AppHandle, status: &AgentStatus) {
+    if *status != AgentStatus::Running {
+        if let Some(migrations) = app.try_state::<Migrations>() {
+            migrations.helper_stopped();
+        }
+    }
+}
+
 /// Called with every helper event before it is forwarded to the interface.
 pub fn on_helper_event(app: &AppHandle, event: &Event) {
     let Event::MigrateReady { id, report } = event else {
         return;
     };
     if let Some(migrations) = app.try_state::<Migrations>() {
-        migrations.ready(id, report);
+        migrations.ready(id, report, false);
     }
     if !crate::window::window_visible(app) {
         let name = report.source.rsplit('/').next().unwrap_or(&report.source);
@@ -262,6 +346,9 @@ pub struct Preflight {
     pub vscode_windows: Vec<VsCodeWindow>,
     /// `git.exe` is missing, so Linux git reads the source.
     pub linux_git: bool,
+    /// The source is in a folder OneDrive (or another cloud engine) syncs: deleting the
+    /// original deletes it from the cloud and the other devices too.
+    pub cloud_synced: bool,
 }
 
 /// The source's Windows path (`C:\dev\aurora-notes`) and folder name from its Linux
@@ -273,6 +360,17 @@ fn source_paths(path: &str) -> Result<(String, String), MigrateError> {
         return Err(MigrateError::refused(vec![Refusal::NotOnWindowsDrive]));
     }
     let windows = windows_folder(path, None).map_err(|err| invalid(&err.message))?;
+    // Win32 paths drop a trailing dot or space, so the folder Windows would act on is
+    // another one.
+    if path
+        .trim_end_matches('/')
+        .split('/')
+        .any(walk::bad_win32_name)
+    {
+        return Err(invalid(
+            "Windows can't safely handle folder names that end in a dot or a space",
+        ));
+    }
     let name = path
         .trim_end_matches('/')
         .rsplit('/')
@@ -283,6 +381,22 @@ fn source_paths(path: &str) -> Result<(String, String), MigrateError> {
         return Err(invalid("Cannot move a whole drive"));
     }
     Ok((windows, name))
+}
+
+/// Refuses a source whose folder is itself a link: recycling it would remove only the
+/// link and leave the files it points to.
+fn check_root(windows: &str) -> Result<(), MigrateError> {
+    if win::root_facts(windows).is_link {
+        return Err(MigrateError::refused_views(vec![
+            WindowsRefusal::SourceIsLink.into(),
+        ]));
+    }
+    Ok(())
+}
+
+/// The source is in a folder OneDrive or another cloud engine syncs.
+fn cloud_synced(windows: &str) -> bool {
+    win::root_facts(windows).cloud || win::inside_any(windows, &win::onedrive_roots())
 }
 
 /// Threads that hash at once.
@@ -352,7 +466,7 @@ fn snapshot_error(err: SnapshotError) -> MigrateError {
     match err {
         SnapshotError::Cancelled => MigrateError::new(MigrateErrorKind::Cancelled, "Cancelled."),
         SnapshotError::Git(message) => MigrateError::new(MigrateErrorKind::Git, message),
-        SnapshotError::Refused(refusals) => MigrateError::refused(refusals),
+        SnapshotError::Refused(refusals) => MigrateError::refused_views(refusals),
     }
 }
 
@@ -437,6 +551,7 @@ pub async fn migrate_preflight(
 ) -> Result<Preflight, MigrateError> {
     blocking(move || {
         let (windows, name) = source_paths(&path)?;
+        check_root(&windows)?;
         let migrations = app.state::<Migrations>();
         let running = Running::start(&migrations, &path)?;
         let distro = app.state::<Agent>().distro();
@@ -477,6 +592,7 @@ pub async fn migrate_preflight(
         };
         let facts = preflight_facts(&shape, true, &walked, &unreadable, &linux, dest.as_deref());
         let summary = summarize(&facts, &walked, steps, &linux);
+        let cloud_synced = cloud_synced(&windows);
         Ok(Preflight {
             source: path,
             windows_path: windows,
@@ -485,33 +601,36 @@ pub async fn migrate_preflight(
             dest,
             summary,
             linux_git: git.linux(),
+            cloud_synced,
         })
     })
     .await
 }
 
-/// Writes `snapshot` under a temporary name in `dir`, renames it into place and
-/// returns its path.
-fn write_snapshot(dir: &Path, snapshot: &SourceSnapshot) -> Result<PathBuf, MigrateError> {
+/// A new snapshot file's path in `dir`, and the temporary name it is written under.
+fn new_snapshot_path(dir: &Path) -> (PathBuf, PathBuf) {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let file = dir.join(format!("snapshot-{}-{stamp}.json", std::process::id()));
+    let tmp = file.with_extension("json.tmp");
+    (file, tmp)
+}
+
+/// Writes `snapshot` to `tmp` and renames it to `file`.
+fn write_snapshot(file: &Path, tmp: &Path, snapshot: &SourceSnapshot) -> Result<(), MigrateError> {
     let io = |err: std::io::Error| {
         MigrateError::new(
             MigrateErrorKind::Io,
             format!("Cannot write the snapshot file: {err}"),
         )
     };
-    std::fs::create_dir_all(dir).map_err(io)?;
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    let file = dir.join(format!("snapshot-{}-{stamp}.json", std::process::id()));
-    let tmp = file.with_extension("json.tmp");
     let bytes = serde_json::to_vec(snapshot).map_err(|err| io(std::io::Error::other(err)))?;
-    std::fs::write(&tmp, bytes).map_err(io)?;
-    std::fs::rename(&tmp, &file).map_err(|err| {
-        let _ = std::fs::remove_file(&tmp);
+    std::fs::write(tmp, bytes).map_err(io)?;
+    std::fs::rename(tmp, file).map_err(|err| {
+        let _ = std::fs::remove_file(tmp);
         io(err)
-    })?;
-    Ok(file)
+    })
 }
 
 fn remove_snapshot_file(file: &Path) {
@@ -556,6 +675,7 @@ pub async fn migrate_start(
 ) -> Result<MigrationTicket, MigrateError> {
     blocking(move || {
         let (windows, name) = source_paths(&path)?;
+        check_root(&windows)?;
         let migrations = app.state::<Migrations>();
         if lock(&migrations.inner)
             .by_id
@@ -587,19 +707,36 @@ pub async fn migrate_start(
         .map_err(snapshot_error)?;
 
         let dir = snapshot_dir(&app)?;
-        {
-            let inner = lock(&migrations.inner);
-            let mut keep = inner.files.clone();
-            keep.extend(inner.by_id.values().filter_map(|m| m.snapshot_file.clone()));
-            drop(inner);
+        std::fs::create_dir_all(&dir).map_err(|err| {
+            MigrateError::new(
+                MigrateErrorKind::Io,
+                format!("Cannot create the snapshot folder: {err}"),
+            )
+        })?;
+        // The sweep and this file's registration happen under one lock, so no other
+        // start sweeps it away before it is written.
+        let (file, tmp) = {
+            let _sweeping = lock(&SWEEP);
+            let mut keep = {
+                let inner = lock(&migrations.inner);
+                let mut keep = inner.files.clone();
+                keep.extend(inner.by_id.values().filter_map(|m| m.snapshot_file.clone()));
+                keep
+            };
+            keep.extend(keep.clone().iter().map(|f| f.with_extension("json.tmp")));
             sweep_snapshots(&dir, &keep);
-        }
-        let file = write_snapshot(&dir, &snapshot)?;
-        lock(&migrations.inner).files.insert(file.clone());
+            let (file, tmp) = new_snapshot_path(&dir);
+            lock(&migrations.inner).files.insert(file.clone());
+            (file, tmp)
+        };
         let forget_file = || {
             lock(&migrations.inner).files.remove(&file);
             remove_snapshot_file(&file);
         };
+        if let Err(err) = write_snapshot(&file, &tmp, &snapshot) {
+            forget_file();
+            return Err(err);
+        }
         let Some(linux_file) = wsl_path(&file.to_string_lossy()) else {
             forget_file();
             return Err(MigrateError::new(
@@ -652,15 +789,24 @@ pub fn migrate_cancel_snapshot(migrations: State<'_, Migrations>, path: String) 
     }
 }
 
-/// Cancels a migration before its report: the helper deletes the partial copy.
+/// Cancels a migration before its report: the helper deletes the partial copy. Only
+/// while the copy runs; a ready one is answered with Keep both or Discard.
 #[tauri::command]
 pub async fn migrate_cancel(app: AppHandle, id: String) -> Result<(), MigrateError> {
     blocking(move || {
+        let migrations = app.state::<Migrations>();
+        let _busy = migrations.claim(&id)?;
+        if migrations.get(&id)?.phase != Phase::Running {
+            return Err(MigrateError::new(
+                MigrateErrorKind::NotReady,
+                "The copy is no longer running; answer its report instead.",
+            ));
+        }
         let agent = app.state::<Agent>();
         AgentHelper(&agent)
             .cancel(&id)
             .map_err(|err| MigrateError::agent("Cannot cancel the move", err))?;
-        app.state::<Migrations>().forget(&id);
+        migrations.forget(&id);
         Ok(())
     })
     .await
@@ -703,21 +849,54 @@ pub async fn migrate_stop_agent(
     .await
 }
 
-/// Re-copies what changed since the report; progress and a new report follow.
+/// Whether the original folder of migration `id` is still there (when unsure, true).
+fn source_present(migration: &Migration) -> Result<bool, MigrateError> {
+    let (windows, _) = source_paths(&migration.source)?;
+    Ok(win::Os.exists(Path::new(&windows)))
+}
+
+fn deleting_refused() -> MigrateError {
+    MigrateError::new(
+        MigrateErrorKind::NotReady,
+        "The original is being deleted; finish deleting it.",
+    )
+}
+
+fn source_gone_refused() -> MigrateError {
+    MigrateError::new(
+        MigrateErrorKind::NotReady,
+        "The original folder is gone; finish the move instead.",
+    )
+}
+
+/// Re-copies what changed since the report; progress and a new report follow. The
+/// migration counts as running from before the request, and goes back to its report
+/// if the helper refuses.
 #[tauri::command]
 pub async fn migrate_resync(app: AppHandle, id: String) -> Result<(), MigrateError> {
     blocking(move || {
         let migrations = app.state::<Migrations>();
-        if !matches!(migrations.get(&id)?.phase, Phase::Ready { .. }) {
-            return Err(MigrateError::new(
-                MigrateErrorKind::NotReady,
-                "The move has no report to re-sync yet.",
-            ));
+        let _busy = migrations.claim(&id)?;
+        let migration = migrations.get(&id)?;
+        let before = migration.phase;
+        match before {
+            Phase::Ready { .. } => {}
+            Phase::Deleting => return Err(deleting_refused()),
+            Phase::Running => {
+                return Err(MigrateError::new(
+                    MigrateErrorKind::NotReady,
+                    "The move has no report to re-sync yet.",
+                ))
+            }
         }
-        AgentHelper(&app.state::<Agent>())
-            .resync(&id)
-            .map_err(|err| MigrateError::agent("Cannot re-sync", err))?;
+        if !source_present(&migration)? {
+            return Err(source_gone_refused());
+        }
         migrations.set_phase(&id, Phase::Running);
+        if let Err(err) = AgentHelper(&app.state::<Agent>()).resync(&id) {
+            migrations.set_phase(&id, before);
+            return Err(MigrateError::agent("Cannot re-sync", err));
+        }
         Ok(())
     })
     .await
@@ -733,10 +912,11 @@ pub async fn migrate_delete(
     blocking(move || {
         let _one_at_a_time = lock(&DELETES);
         let migrations = app.state::<Migrations>();
+        let _busy = migrations.claim(&id)?;
         let migration = migrations.get(&id)?;
-        let removed = match migration.phase {
+        let deleting = match migration.phase {
             Phase::Ready { can_delete: true } => false,
-            Phase::Removed => true,
+            Phase::Deleting => true,
             Phase::Ready { can_delete: false } => {
                 return Err(MigrateError::new(
                     MigrateErrorKind::NotReady,
@@ -751,6 +931,7 @@ pub async fn migrate_delete(
             }
         };
         let (windows, name) = source_paths(&migration.source)?;
+        check_root(&windows)?;
         let agent = app.state::<Agent>();
         let distro = agent.distro();
         let target = DeleteTarget {
@@ -760,27 +941,21 @@ pub async fn migrate_delete(
             dest: windows_folder(&migration.dest, distro.as_deref()).ok(),
             files: migration.files,
             bytes: migration.bytes,
-            removed,
+            deleting,
         };
-        match delete_original(&AgentHelper(&agent), &win::Os, &target, permanent) {
-            Ok(outcome) => {
-                if matches!(outcome, DeleteOutcome::Deleted { .. }) {
-                    migrations.forget(&id);
-                }
-                Ok(outcome)
-            }
-            Err(failure) => {
-                if failure.removed {
-                    migrations.set_phase(&id, Phase::Removed);
-                }
-                Err(failure.error)
-            }
+        let outcome = delete_original(&AgentHelper(&agent), &win::Os, &target, permanent)?;
+        if matches!(outcome, DeleteOutcome::Deleted { .. }) {
+            migrations.forget(&id);
+        } else if outcome.deleting() {
+            migrations.set_phase(&id, Phase::Deleting);
         }
+        Ok(outcome)
     })
     .await
 }
 
-/// **Keep both** (`keep`) or **Discard the copy** (`discard`).
+/// **Keep both** (`keep`) or **Discard the copy** (`discard`). Neither once the delete
+/// has begun; discarding the copy also not once the original is gone.
 #[tauri::command]
 pub async fn migrate_finish(
     app: AppHandle,
@@ -795,20 +970,20 @@ pub async fn migrate_finish(
             ));
         }
         let migrations = app.state::<Migrations>();
-        match migrations.get(&id)?.phase {
+        let _busy = migrations.claim(&id)?;
+        let migration = migrations.get(&id)?;
+        match migration.phase {
             Phase::Ready { .. } => {}
-            Phase::Removed => {
-                return Err(MigrateError::new(
-                    MigrateErrorKind::NotReady,
-                    "The original is already deleted; finish with Delete original.",
-                ))
-            }
+            Phase::Deleting => return Err(deleting_refused()),
             Phase::Running => {
                 return Err(MigrateError::new(
                     MigrateErrorKind::NotReady,
                     "The move hasn't finished its checks yet; cancel it instead.",
                 ))
             }
+        }
+        if action == FinishAction::Discard && !source_present(&migration)? {
+            return Err(source_gone_refused());
         }
         AgentHelper(&app.state::<Agent>())
             .finish(&id, action)
@@ -817,6 +992,13 @@ pub async fn migrate_finish(
         Ok(())
     })
     .await
+}
+
+/// Whether the original folder of migration `id` is still there; `false` once it is
+/// gone, deleted by hand or by an earlier **Delete original**.
+#[tauri::command]
+pub async fn migrate_source_exists(app: AppHandle, id: String) -> Result<bool, MigrateError> {
+    blocking(move || source_present(&app.state::<Migrations>().get(&id)?)).await
 }
 
 /// Reports still waiting for an answer, from an earlier run of the app or helper.
@@ -828,7 +1010,7 @@ pub async fn migrate_pending(app: AppHandle) -> Result<Vec<PendingMigration>, Mi
             .map_err(|err| MigrateError::agent("Cannot list pending moves", err))?;
         let migrations = app.state::<Migrations>();
         for p in &pending {
-            migrations.ready(&p.id, &p.report);
+            migrations.ready(&p.id, &p.report, p.deleting);
         }
         Ok(pending)
     })
@@ -865,6 +1047,17 @@ mod tests {
             source_paths("/mnt/c/../etc").unwrap_err().kind,
             MigrateErrorKind::Invalid
         );
+        for odd in [
+            "/mnt/c/dev/aurora-notes.",
+            "/mnt/c/dev /aurora-notes",
+            "/mnt/c/dev/notes /",
+        ] {
+            assert_eq!(
+                source_paths(odd).unwrap_err().kind,
+                MigrateErrorKind::Invalid,
+                "{odd}"
+            );
+        }
     }
 
     fn report(id: &str, pass: bool) -> Report {
@@ -908,6 +1101,7 @@ mod tests {
             copy_totals: Totals::default(),
             install: vec![],
             install_changes: Default::default(),
+            install_backup: None,
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
@@ -919,25 +1113,60 @@ mod tests {
     #[test]
     fn reports_mark_migrations_ready_with_their_full_size() {
         let migrations = Migrations::default();
-        migrations.ready("m-1", &report("m-1", true));
+        migrations.ready("m-1", &report("m-1", true), false);
         let m = migrations.get("m-1").unwrap();
         assert_eq!(m.phase, Phase::Ready { can_delete: true });
         assert_eq!((m.files, m.bytes), (19, 1000));
         assert_eq!(m.source, "/mnt/c/dev/aurora-notes");
-        migrations.ready("m-2", &report("m-2", false));
+        migrations.ready("m-2", &report("m-2", false), false);
         assert_eq!(
             migrations.get("m-2").unwrap().phase,
             Phase::Ready { can_delete: false }
         );
-        // A removed original stays removed whatever the helper says again.
-        migrations.set_phase("m-1", Phase::Removed);
-        migrations.ready("m-1", &report("m-1", true));
-        assert_eq!(migrations.get("m-1").unwrap().phase, Phase::Removed);
+        // A delete that has begun stays begun whatever the helper says again, and the
+        // pending list brings it back after a restart.
+        migrations.set_phase("m-1", Phase::Deleting);
+        migrations.ready("m-1", &report("m-1", true), false);
+        assert_eq!(migrations.get("m-1").unwrap().phase, Phase::Deleting);
+        migrations.ready("m-3", &report("m-3", true), true);
+        assert_eq!(migrations.get("m-3").unwrap().phase, Phase::Deleting);
         migrations.forget("m-1");
         assert_eq!(
             migrations.get("m-1").unwrap_err().kind,
             MigrateErrorKind::NotReady
         );
+    }
+
+    #[test]
+    fn a_stopped_helper_drops_running_copies_and_claims_are_exclusive() {
+        let migrations = Migrations::default();
+        migrations.ready("m-1", &report("m-1", true), false);
+        lock(&migrations.inner).by_id.insert(
+            "m-2".into(),
+            Migration {
+                source: "/mnt/c/dev/reef-notes".into(),
+                dest: "/home/dev/projects/reef-notes".into(),
+                snapshot_file: None,
+                files: 0,
+                bytes: 0,
+                phase: Phase::Running,
+            },
+        );
+        migrations.helper_stopped();
+        assert!(migrations.get("m-1").is_ok());
+        assert_eq!(
+            migrations.get("m-2").unwrap_err().kind,
+            MigrateErrorKind::NotReady
+        );
+
+        let claim = migrations.claim("m-1").unwrap();
+        assert_eq!(
+            migrations.claim("m-1").err().unwrap().kind,
+            MigrateErrorKind::Busy
+        );
+        assert!(migrations.claim("m-3").is_ok());
+        drop(claim);
+        assert!(migrations.claim("m-1").is_ok());
     }
 
     #[test]
@@ -949,11 +1178,18 @@ mod tests {
             git: vec![],
             linux_git: false,
         };
-        let file = write_snapshot(&dir, &snapshot).unwrap();
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = || {
+            let (file, tmp) = new_snapshot_path(&dir);
+            write_snapshot(&file, &tmp, &snapshot).unwrap();
+            assert!(!tmp.exists());
+            file
+        };
+        let file = write();
         assert!(file.extension().is_some_and(|e| e == "json"));
         let back: SourceSnapshot = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
         assert_eq!(back, snapshot);
-        let other = write_snapshot(&dir, &snapshot).unwrap();
+        let other = write();
         sweep_snapshots(&dir, &HashSet::from([file.clone()]));
         assert!(file.exists());
         assert!(!other.exists());
@@ -1032,7 +1268,8 @@ mod tests {
         assert_eq!(snapshot.git[0].snapshot.index_flags, ["S index.html"]);
         assert!(snapshot.git[0].autocrlf.is_some());
         assert_eq!(snapshot.manifest.skipped[0].path.as_str(), "node_modules");
-        let file = write_snapshot(&base, &snapshot).unwrap();
+        let (file, tmp) = new_snapshot_path(&base);
+        write_snapshot(&file, &tmp, &snapshot).unwrap();
         println!("autocrlf={}", snapshot.git[0].autocrlf.as_deref().unwrap());
         println!("source={}", wsl_path(&repo.to_string_lossy()).unwrap());
         println!("snapshot={}", wsl_path(&file.to_string_lossy()).unwrap());

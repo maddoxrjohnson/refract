@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 
 use super::flow::{Fit, Removal, WindowsOps};
 use super::vscode::VsCodeWindow;
-use super::walk::{RawEntry, ReadError, SourceFs};
+use super::walk::{is_cloud_only, RawEntry, ReadError, SourceFs};
 
 /// The parts of a path the shell and NTFS calls need: `\\?\`-prefixed for long paths.
 pub fn verbatim(path: &str) -> String {
@@ -50,6 +50,57 @@ impl NtfsFs {
             PathBuf::from(format!("{}\\{}", self.root, rel.replace('/', "\\")))
         }
     }
+
+    /// The file at `rel`, unless its data is only in the cloud: opening it would
+    /// download it, so it is refused without opening.
+    fn open(&self, rel: &str) -> io::Result<std::fs::File> {
+        let path = self.path(rel);
+        if imp::attributes(&path).is_some_and(is_cloud_only) {
+            return Err(io::Error::other(
+                "only in the cloud; keep it on this device first",
+            ));
+        }
+        std::fs::File::open(path)
+    }
+}
+
+/// What the source folder itself is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RootFacts {
+    /// A symlink or junction.
+    pub is_link: bool,
+    /// Kept by a cloud sync engine (OneDrive and the like).
+    pub cloud: bool,
+}
+
+/// Looks at the folder at `windows_path` without opening it.
+pub fn root_facts(windows_path: &str) -> RootFacts {
+    let path = PathBuf::from(verbatim(windows_path.trim_end_matches('\\')));
+    let is_link = std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_symlink());
+    let cloud = imp::entry(&path).is_ok_and(|e| e.is_cloud());
+    RootFacts { is_link, cloud }
+}
+
+/// True when `path` is one of `roots` or inside one, ignoring case (Windows paths).
+pub fn inside_any(path: &str, roots: &[String]) -> bool {
+    let path = path.trim_end_matches('\\').to_lowercase();
+    roots.iter().any(|root| {
+        let root = root.trim_end_matches('\\').to_lowercase();
+        !root.is_empty()
+            && (path == root
+                || path
+                    .strip_prefix(&root)
+                    .is_some_and(|rest| rest.starts_with('\\')))
+    })
+}
+
+/// The folders OneDrive syncs, from the variables it sets for each account.
+pub fn onedrive_roots() -> Vec<String> {
+    ["OneDrive", "OneDriveConsumer", "OneDriveCommercial"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .filter(|root| !root.is_empty())
+        .collect()
 }
 
 /// Bytes read at a time while hashing.
@@ -79,7 +130,7 @@ impl SourceFs for NtfsFs {
         use std::sync::atomic::Ordering;
 
         let unreadable = |err: io::Error| ReadError::Unreadable(err.to_string());
-        let mut file = std::fs::File::open(self.path(rel)).map_err(unreadable)?;
+        let mut file = self.open(rel).map_err(unreadable)?;
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; CHUNK];
         loop {
@@ -105,7 +156,7 @@ impl SourceFs for NtfsFs {
     fn probe(&self, rel: &str) -> Result<(), ReadError> {
         use std::io::Read;
         let unreadable = |err: io::Error| ReadError::Unreadable(err.to_string());
-        let mut file = std::fs::File::open(self.path(rel)).map_err(unreadable)?;
+        let mut file = self.open(rel).map_err(unreadable)?;
         let mut buf = [0u8; 4096];
         file.read(&mut buf).map(|_| ()).map_err(unreadable)
     }
@@ -113,9 +164,7 @@ impl SourceFs for NtfsFs {
     fn read_text(&self, rel: &str, max: usize) -> io::Result<String> {
         use std::io::Read;
         let mut bytes = Vec::new();
-        std::fs::File::open(self.path(rel))?
-            .take(max as u64)
-            .read_to_end(&mut bytes)?;
+        self.open(rel)?.take(max as u64).read_to_end(&mut bytes)?;
         Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 }
@@ -196,7 +245,8 @@ mod imp {
     use windows::Win32::Storage::FileSystem::{
         FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindFirstStreamW,
         FindNextFileW, FindNextStreamW, FindStreamInfoStandard, GetDiskFreeSpaceExW, GetDriveTypeW,
-        GetVolumeNameForVolumeMountPointW, FIND_FIRST_EX_LARGE_FETCH, WIN32_FIND_DATAW,
+        GetFileAttributesW, GetVolumeNameForVolumeMountPointW, FIND_FIRST_EX_FLAGS,
+        FIND_FIRST_EX_LARGE_FETCH, INVALID_FILE_ATTRIBUTES, WIN32_FIND_DATAW,
         WIN32_FIND_STREAM_DATA,
     };
     use windows::Win32::System::Com::{
@@ -243,6 +293,45 @@ mod imp {
         &chars[..end]
     }
 
+    fn raw_entry(data: &WIN32_FIND_DATAW) -> RawEntry {
+        let write = (u64::from(data.ftLastWriteTime.dwHighDateTime) << 32)
+            | u64::from(data.ftLastWriteTime.dwLowDateTime);
+        RawEntry {
+            name: until_nul(&data.cFileName).to_vec(),
+            attributes: data.dwFileAttributes,
+            size: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
+            mtime_ns: (write as i64 - FILETIME_UNIX_EPOCH).saturating_mul(100),
+            reparse_tag: data.dwReserved0,
+        }
+    }
+
+    /// The attributes of `path`, read without opening it; `None` when unknown.
+    pub fn attributes(path: &Path) -> Option<u32> {
+        // SAFETY: a plain call with a NUL-terminated path.
+        let attributes = unsafe { GetFileAttributesW(&HSTRING::from(path.as_os_str())) };
+        (attributes != INVALID_FILE_ATTRIBUTES).then_some(attributes)
+    }
+
+    /// The directory entry of `path` itself (its reparse tag too), without opening it.
+    pub fn entry(path: &Path) -> io::Result<RawEntry> {
+        let mut data = WIN32_FIND_DATAW::default();
+        // SAFETY: `data` outlives the call and is the struct FindExInfoBasic fills.
+        let handle = unsafe {
+            FindFirstFileExW(
+                &HSTRING::from(path.as_os_str()),
+                FindExInfoBasic,
+                &mut data as *mut _ as *mut c_void,
+                FindExSearchNameMatch,
+                None,
+                FIND_FIRST_EX_FLAGS(0),
+            )
+        }
+        .map_err(io_error)?;
+        // SAFETY: closed once, right after the only call that used it.
+        let _ = unsafe { FindClose(handle) };
+        Ok(raw_entry(&data))
+    }
+
     pub fn list(dir: &Path) -> io::Result<Vec<RawEntry>> {
         let pattern = HSTRING::from(dir.join("*").as_os_str());
         let mut data = WIN32_FIND_DATAW::default();
@@ -267,15 +356,7 @@ mod imp {
             let name = until_nul(&data.cFileName);
             let dot = name == [b'.' as u16] || name == [b'.' as u16, b'.' as u16];
             if !dot {
-                let write = (u64::from(data.ftLastWriteTime.dwHighDateTime) << 32)
-                    | u64::from(data.ftLastWriteTime.dwLowDateTime);
-                out.push(RawEntry {
-                    name: name.to_vec(),
-                    attributes: data.dwFileAttributes,
-                    size: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
-                    mtime_ns: (write as i64 - FILETIME_UNIX_EPOCH).saturating_mul(100),
-                    reparse_tag: data.dwReserved0,
-                });
+                out.push(raw_entry(&data));
             }
             // SAFETY: `handle` is a live find handle and `data` is its struct.
             match unsafe { FindNextFileW(handle, &mut data) } {
@@ -350,7 +431,7 @@ mod imp {
     }
 
     /// The drive's root, `C:\`, of a drive path.
-    fn drive_root(path: &Path) -> Option<String> {
+    pub fn drive_root(path: &Path) -> Option<String> {
         let text = path.to_str()?;
         let text = text.strip_prefix(r"\\?\").unwrap_or(text);
         let bytes = text.as_bytes();
@@ -358,7 +439,7 @@ mod imp {
             .then(|| format!("{}:\\", &text[..1]))
     }
 
-    fn reg_dword(key: &str, value: &str) -> Option<u32> {
+    pub fn reg_dword(key: &str, value: &str) -> Option<u32> {
         let mut data = 0u32;
         let mut size = std::mem::size_of::<u32>() as u32;
         // SAFETY: `data` and `size` describe a DWORD buffer that outlives the call.
@@ -377,7 +458,7 @@ mod imp {
     }
 
     /// `{guid}` of the volume mounted at `root`.
-    fn volume_guid(root: &str) -> Option<String> {
+    pub fn volume_guid(root: &str) -> Option<String> {
         let mut name = [0u16; 64];
         // SAFETY: `name` is large enough for `\\?\Volume{GUID}\` and its NUL.
         unsafe { GetVolumeNameForVolumeMountPointW(&HSTRING::from(root), &mut name) }.ok()?;
@@ -694,6 +775,14 @@ mod imp {
         Err(unsupported())
     }
 
+    pub fn attributes(_: &Path) -> Option<u32> {
+        None
+    }
+
+    pub fn entry(_: &Path) -> io::Result<RawEntry> {
+        Err(unsupported())
+    }
+
     pub fn streams(_: &Path) -> io::Result<Vec<(String, u64)>> {
         Ok(Vec::new())
     }
@@ -839,6 +928,147 @@ mod tests {
             .unwrap();
         assert!(os.exists(&lnk));
         // The recycled folder stays in the bin; the test leaves only that behind.
+    }
+
+    /// A DWORD under `HKCU\<key>` set for a test, put back as it was on drop (also when
+    /// the test panics): the old value restored, or the value removed, and the key too
+    /// when the test created it.
+    struct RegSetting {
+        key: String,
+        value: &'static str,
+        old: Option<u32>,
+        key_existed: bool,
+    }
+
+    impl RegSetting {
+        fn set(key: &str, value: &'static str, data: u32) -> RegSetting {
+            use windows::core::HSTRING;
+            use windows::Win32::System::Registry::{
+                RegCloseKey, RegOpenKeyExW, RegSetKeyValueW, HKEY, HKEY_CURRENT_USER, KEY_READ,
+                REG_DWORD,
+            };
+            let mut hkey = HKEY::default();
+            // SAFETY: `hkey` outlives the call and is closed right after.
+            let key_existed = unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    &HSTRING::from(key),
+                    None,
+                    KEY_READ,
+                    &mut hkey,
+                )
+            }
+            .is_ok();
+            if key_existed {
+                // SAFETY: opened above.
+                let _ = unsafe { RegCloseKey(hkey) };
+            }
+            let setting = RegSetting {
+                key: key.to_owned(),
+                value,
+                old: imp::reg_dword(key, value),
+                key_existed,
+            };
+            // SAFETY: `data` is a DWORD that outlives the call.
+            let status = unsafe {
+                RegSetKeyValueW(
+                    HKEY_CURRENT_USER,
+                    &HSTRING::from(key),
+                    &HSTRING::from(value),
+                    REG_DWORD.0,
+                    Some(&data as *const u32 as *const std::ffi::c_void),
+                    4,
+                )
+            };
+            assert!(status.is_ok(), "cannot set {key}\\{value}: {status:?}");
+            setting
+        }
+    }
+
+    impl Drop for RegSetting {
+        fn drop(&mut self) {
+            use windows::core::HSTRING;
+            use windows::Win32::System::Registry::{
+                RegDeleteKeyValueW, RegDeleteKeyW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_DWORD,
+            };
+            let key = HSTRING::from(self.key.as_str());
+            let value = HSTRING::from(self.value);
+            // SAFETY: plain registry calls; `old` outlives the call.
+            let status = unsafe {
+                match self.old {
+                    Some(old) => RegSetKeyValueW(
+                        HKEY_CURRENT_USER,
+                        &key,
+                        &value,
+                        REG_DWORD.0,
+                        Some(&old as *const u32 as *const std::ffi::c_void),
+                        4,
+                    ),
+                    None => RegDeleteKeyValueW(HKEY_CURRENT_USER, &key, &value),
+                }
+            };
+            if !self.key_existed {
+                // SAFETY: a plain call; it only removes the key when it is empty.
+                let _ = unsafe { RegDeleteKeyW(HKEY_CURRENT_USER, &key) };
+            }
+            if status.is_err() {
+                eprintln!(
+                    "RESTORE BY HAND: HKCU\\{}\\{} should be {:?} ({status:?})",
+                    self.key, self.value, self.old
+                );
+            }
+        }
+    }
+
+    /// The Recycle Bin turned off for the temp folder's drive (`NukeOnDelete`, for the
+    /// current user): the fit check says so, and the progress sink in the removal itself
+    /// refuses the delete Windows would make for good, so the folder stays. Changes the
+    /// user's Recycle Bin setting for that drive while it runs and always restores it;
+    /// run by hand (`--ignored`).
+    #[test]
+    #[ignore]
+    fn a_bin_turned_off_keeps_the_folder() {
+        let dir = TempDir::new("nuke-guard");
+        let victim = dir.0.join("reef-keep");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("a.txt"), b"keep me").unwrap();
+        let root = imp::drive_root(&victim).expect("temp is on a drive");
+        let guid = imp::volume_guid(&root).expect("the drive's volume");
+        let key =
+            format!(r"Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\Volume\{guid}");
+        let _nuke = RegSetting::set(&key, "NukeOnDelete", 1);
+        assert!(
+            matches!(Os.recycle_fit(&victim, 1, 7), Fit::WontFit(ref r) if r.contains("turned off"))
+        );
+        // Past the fit check (as a bin turned off after it would be), the removal's own
+        // guard refuses.
+        assert!(
+            matches!(Os.remove(&victim, true), Ok(Removal::WontFit(_))),
+            "the folder was not kept"
+        );
+        assert_eq!(std::fs::read(victim.join("a.txt")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn root_facts_see_links_and_onedrive_paths() {
+        let dir = TempDir::new("rootlink");
+        let target = dir.0.join("real");
+        std::fs::create_dir_all(&target).unwrap();
+        let link = dir.0.join("linked");
+        let made = std::process::Command::new("cmd.exe")
+            .args(["/c", "mklink", "/J"])
+            .arg(&link)
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        assert!(root_facts(&link.to_string_lossy()).is_link);
+        assert!(!root_facts(&target.to_string_lossy()).is_link);
+        let roots = vec![r"C:\Users\dev\OneDrive".to_owned()];
+        assert!(inside_any(r"c:\users\dev\onedrive\code\reef", &roots));
+        assert!(inside_any(r"C:\Users\dev\OneDrive", &roots));
+        assert!(!inside_any(r"C:\Users\dev\OneDrive2\reef", &roots));
+        assert!(!inside_any(r"C:\dev\reef", &[String::new()]));
     }
 
     #[test]

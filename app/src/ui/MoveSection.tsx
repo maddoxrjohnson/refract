@@ -39,13 +39,17 @@ export function MoveSection({ migration, onOpen, onCancel }: MoveSectionProps) {
         </>
       ) : phase.kind === "ready" ? (
         <>
-          <p className={`rf-move-section__line${canDelete(phase.report) ? "" : " rf-move-section__line--failed"}`}>
-            {canDelete(phase.report)
-              ? "The copy passed every check and waits for your OK."
-              : "A check failed. Nothing was deleted."}
+          <p
+            className={`rf-move-section__line${canDelete(phase.report) && !phase.deleting ? "" : " rf-move-section__line--failed"}`}
+          >
+            {phase.deleting
+              ? "Deleting the original didn't finish. The copy is safe."
+              : canDelete(phase.report)
+                ? "The copy passed every check and waits for your OK."
+                : "A check failed. Nothing was deleted."}
           </p>
           <button type="button" className="rf-button rf-button--accent" aria-haspopup="dialog" onClick={onOpen}>
-            Review…
+            {phase.deleting ? "Finish deleting…" : "Review…"}
           </button>
         </>
       ) : (
