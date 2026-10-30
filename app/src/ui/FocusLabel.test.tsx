@@ -17,6 +17,12 @@ describe("FocusLabel", () => {
     const { container } = render(<FocusLabel repo={testRepo({ remote: null, language: null })} />);
     expect(container.textContent).toContain("Local · Unknown language");
   });
+
+  it("says when a repo is not cloned", () => {
+    const { container } = render(<FocusLabel repo={testRepo()} notCloned />);
+    expect(container.textContent).toContain("Not cloned");
+    expect(container.textContent).not.toContain("Clean");
+  });
 });
 
 describe("stateLine", () => {

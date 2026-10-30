@@ -112,6 +112,18 @@ impl Agent {
         &self.config
     }
 
+    /// Reports `repo` from the next [`Agent::rescan`] on, though it is under no root.
+    pub fn add_extra(&mut self, repo: PathBuf) {
+        if !self.config.extra.contains(&repo) {
+            self.config.extra.push(repo);
+        }
+    }
+
+    /// Reports `repo` from the next [`Agent::rescan`] on, though the config hides it.
+    pub fn unhide(&mut self, repo: &Path) {
+        self.config.hidden.retain(|p| p != repo);
+    }
+
     pub fn reader(&self) -> &SessionReader {
         &self.reader
     }

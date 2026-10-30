@@ -30,12 +30,15 @@ pub mod code {
     pub const INVALID_PARAMS: i32 = -32602;
     /// The helper failed while handling the request.
     pub const INTERNAL_ERROR: i32 = -32603;
-    /// `getRepo` named a path that is not a known repo, or `prepareLaunch` a path that
-    /// is not a directory.
+    /// `getRepo` named a path that is not a known repo, `prepareLaunch` a path that is
+    /// not a directory, or `addRepo` a path that is not in a git working tree.
     pub const REPO_NOT_FOUND: i32 = 1;
     /// `setupServer` failed to read or change the WSL server's files, or `code-server`
     /// failed.
     pub const SETUP_FAILED: i32 = 2;
+    /// `cloneRepo` failed: the destination already exists and is not a clone of the
+    /// same URL, or `git clone` failed or took too long.
+    pub const CLONE_FAILED: i32 = 3;
 }
 
 /// A request from the app.
@@ -69,6 +72,15 @@ pub enum Method {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         commit: Option<String>,
     },
+    /// Clones `url` into `~/projects/<name>` and reports the new repo: answered with
+    /// the clone's path as a [`Reply::Path`]. When that directory is already a clone of
+    /// `url`, nothing is cloned and its path is the answer. `url` must be `https://`
+    /// and `name` a plain folder name (see [`check_clone`]).
+    CloneRepo { url: String, name: String },
+    /// Reports the repo whose working tree holds `path` from now on, adding it to the
+    /// config's `extra` when no root covers it: answered with `null`. `path` is a
+    /// Linux, Windows drive or `\\wsl.localhost\<distro>\…` path.
+    AddRepo { path: String },
     /// Answered with `null`, then the helper exits.
     Shutdown,
 }
@@ -113,6 +125,8 @@ pub enum Reply {
     Repo(Box<RepoSnapshot>),
     Launch(LaunchTicket),
     ServerSetup(ServerSetup),
+    /// A Linux path: the result of `cloneRepo`.
+    Path(String),
     /// `null`, for methods with nothing to return.
     Done,
 }
@@ -362,9 +376,41 @@ impl RequestError {
     }
 }
 
+/// Checks `cloneRepo` params before anything reaches `git`: `url` must be `https://`
+/// with a host, no user part (no `@` before the first `/` after the scheme) and no
+/// whitespace or control characters, and `name` a single folder
+/// name that is not `.`, holds no `..`, `/`, `\` or control characters and does not
+/// start with `-`. Returns why when they are not.
+pub fn check_clone(url: &str, name: &str) -> Result<(), String> {
+    let https = url
+        .get(..8)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"));
+    let host = url.get(8..).unwrap_or("");
+    if !https || host.is_empty() || host.starts_with('/') {
+        return Err(format!("url is not an https:// URL: {url:?}"));
+    }
+    if host[..host.find('/').unwrap_or(host.len())].contains('@') {
+        return Err("url must not hold a user name or token".into());
+    }
+    if url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(format!("url contains whitespace: {url:?}"));
+    }
+    let bad_name = name.is_empty()
+        || name == "."
+        || name.contains("..")
+        || name.starts_with('-')
+        || name
+            .chars()
+            .any(|c| matches!(c, '/' | '\\') || c.is_control());
+    if bad_name {
+        return Err(format!("name is not a plain folder name: {name:?}"));
+    }
+    Ok(())
+}
+
 /// Parses one request line, telling apart bad JSON, a missing or unreadable id, an
 /// unknown method and bad params. Methods without params also accept `"params": {}`
-/// and `"params": null`.
+/// and `"params": null`. `cloneRepo` params are also checked with [`check_clone`].
 pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     let fail = |id, code, message: String| RequestError {
         id,
@@ -389,7 +435,7 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         ));
     };
     let takes_params = match method {
-        "getRepo" | "prepareLaunch" | "setupServer" => true,
+        "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" => true,
         "ping" | "listRepos" | "shutdown" => false,
         _ => {
             return Err(fail(
@@ -407,8 +453,17 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     if !takes_params && empty {
         object.remove("params");
     }
-    serde_json::from_value(value)
-        .map_err(|e| fail(Some(id), code::INVALID_PARAMS, format!("bad params: {e}")))
+    let request: Request = serde_json::from_value(value).map_err(|e| {
+        fail(
+            Some(id.clone()),
+            code::INVALID_PARAMS,
+            format!("bad params: {e}"),
+        )
+    })?;
+    if let Method::CloneRepo { url, name } = &request.method {
+        check_clone(url, name).map_err(|e| fail(Some(id), code::INVALID_PARAMS, e))?;
+    }
+    Ok(request)
 }
 
 impl Response {
@@ -685,6 +740,105 @@ mod tests {
         );
     }
 
+    #[test]
+    fn clone_and_add_repo_round_trip() {
+        let clone = Request {
+            id: 12.into(),
+            method: Method::CloneRepo {
+                url: "https://example.com/dev/kelp-cli.git".into(),
+                name: "kelp-cli".into(),
+            },
+        };
+        let value = round_trip(&clone);
+        assert_eq!(
+            value,
+            json!({"id": 12, "method": "cloneRepo", "params": {
+                "url": "https://example.com/dev/kelp-cli.git", "name": "kelp-cli"}})
+        );
+        assert_eq!(parse_request(&value.to_string()).unwrap(), clone);
+
+        let add = Request {
+            id: 13.into(),
+            method: Method::AddRepo {
+                path: "/home/dev/work/aurora-notes".into(),
+            },
+        };
+        let value = round_trip(&add);
+        assert_eq!(
+            value,
+            json!({"id": 13, "method": "addRepo", "params": {"path": "/home/dev/work/aurora-notes"}})
+        );
+        assert_eq!(parse_request(&value.to_string()).unwrap(), add);
+
+        let cloned = Response::ok(12, Reply::Path("/home/dev/projects/kelp-cli".into()));
+        assert_eq!(
+            round_trip(&cloned),
+            json!({"id": 12, "result": "/home/dev/projects/kelp-cli"})
+        );
+        for line in [
+            r#"{"id":14,"method":"cloneRepo","params":{"url":"https://example.com/dev/kelp-cli"}}"#,
+            r#"{"id":14,"method":"addRepo"}"#,
+            r#"{"id":14,"method":"addRepo","params":{}}"#,
+        ] {
+            let err = parse_request(line).unwrap_err();
+            assert_eq!(err.error.code, code::INVALID_PARAMS, "{line}");
+        }
+    }
+
+    #[test]
+    fn clone_params_are_checked() {
+        let parse = |url: &str, name: &str| {
+            let line =
+                json!({"id": 15, "method": "cloneRepo", "params": {"url": url, "name": name}});
+            parse_request(&line.to_string())
+        };
+        for (url, name) in [
+            ("https://example.com/dev/kelp-cli.git", "kelp-cli"),
+            (
+                "HTTPS://git.example.com/example-group/reef-maps",
+                "reef-maps",
+            ),
+            ("https://example.com/dev/tidepool.api", "tidepool.api"),
+            ("https://example.com/dev/kelp-cli@v2", "kelp-cli"),
+        ] {
+            assert!(parse(url, name).is_ok(), "{url} {name}");
+        }
+        for (url, name) in [
+            ("http://example.com/dev/kelp-cli.git", "kelp-cli"),
+            ("git@example.com:dev/kelp-cli.git", "kelp-cli"),
+            ("ssh://git@example.com/dev/kelp-cli.git", "kelp-cli"),
+            ("file:///srv/git/kelp-cli.git", "kelp-cli"),
+            ("--upload-pack=touch /tmp/x", "kelp-cli"),
+            ("/srv/git/kelp-cli.git", "kelp-cli"),
+            ("https://", "kelp-cli"),
+            ("https:///srv/git/kelp-cli.git", "kelp-cli"),
+            ("https://token@example.com/dev/kelp-cli.git", "kelp-cli"),
+            (
+                "https://dev:secret@example.com/dev/kelp-cli.git",
+                "kelp-cli",
+            ),
+            ("https://@example.com/dev/kelp-cli.git", "kelp-cli"),
+            ("https://example.com/dev/kelp cli.git", "kelp-cli"),
+            ("https://example.com/dev/kelp-cli.git\n", "kelp-cli"),
+            ("https://example.com/dev/kelp-cli.git", ""),
+            ("https://example.com/dev/kelp-cli.git", "."),
+            ("https://example.com/dev/kelp-cli.git", ".."),
+            ("https://example.com/dev/kelp-cli.git", "../kelp-cli"),
+            ("https://example.com/dev/kelp-cli.git", "dev/kelp-cli"),
+            ("https://example.com/dev/kelp-cli.git", "dev\\kelp-cli"),
+            ("https://example.com/dev/kelp-cli.git", "-kelp-cli"),
+            ("https://example.com/dev/kelp-cli.git", "--template=/tmp"),
+            ("https://example.com/dev/kelp-cli.git", "kelp\u{0}cli"),
+        ] {
+            let err = parse(url, name).unwrap_err();
+            assert_eq!(
+                (err.id, err.error.code),
+                (Some(15.into()), code::INVALID_PARAMS),
+                "{url:?} {name:?}"
+            );
+        }
+    }
+
     /// `Reply` is untagged, so each variant must read back as itself, as the app reads
     /// it: inside a [`Message`].
     #[test]
@@ -719,6 +873,7 @@ mod tests {
                 application_scoped: false,
                 skipped: Some("no VS Code server".into()),
             }),
+            Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
         for reply in replies {
@@ -957,8 +1112,8 @@ mod tests {
             expect("github.com", "dev", "tidepool-api")
         );
         assert_eq!(
-            RemoteId::parse("ssh://git@git.example.edu:2222/course/team-7/aurora-notes.git"),
-            expect("git.example.edu", "course/team-7", "aurora-notes")
+            RemoteId::parse("ssh://git@git.example.com:2222/example-group/app/aurora-notes.git"),
+            expect("git.example.com", "example-group/app", "aurora-notes")
         );
     }
 

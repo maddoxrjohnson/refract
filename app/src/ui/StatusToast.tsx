@@ -38,9 +38,9 @@ export function describeError(err: unknown): string {
   return String(err);
 }
 
-/** Where a launch is: just sent, a progress step, or failed with a message. */
+/** Where a launch is: cloning first, just sent, a progress step, or failed with a message. */
 export type LaunchProgress =
-  | { repoName: string; step: "starting" | LaunchStep }
+  | { repoName: string; step: "cloning" | "starting" | LaunchStep }
   | { repoName: string; step: "failed"; message: string };
 
 export interface StatusToastProps {
@@ -54,6 +54,7 @@ export interface StatusToastProps {
 function launchText(launch: LaunchProgress): string {
   if (launch.step === "failed") return launch.message;
   if (launch.step === "starting") return "starting…";
+  if (launch.step === "cloning") return "cloning…";
   return LAUNCH_STEP_LABELS[launch.step];
 }
 

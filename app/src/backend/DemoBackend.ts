@@ -2,14 +2,22 @@ import type { Backend, Unsubscribe } from "./Backend";
 import type {
   AgentEvent,
   AgentStatus,
+  CiStatus,
+  Credentials,
   GpuUsage,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
   Preselect,
+  RemoteDetails,
+  RemoteKind,
+  RemoteList,
+  RemoteRef,
+  RemoteRepo,
   RepoList,
   RepoSnapshot,
   SessionInfo,
+  Settings,
 } from "./types";
 
 // Invented repos covering every state a gem can show, for running the interface in a
@@ -113,7 +121,7 @@ const SEEDS: Seed[] = [
     preselect: { kind: "newAgent" },
   },
   {
-    name: "os-shell-lab",
+    name: "shell-kit",
     host: "gitlab.example.com",
     language: "C",
     mass: 0.62,
@@ -121,7 +129,7 @@ const SEEDS: Seed[] = [
     commit: ["Pipes between built-ins", 8 * HOUR],
     preselect: { kind: "newAgent" },
   },
-  { name: "ml-homework", host: "gitlab.example.com", language: "Python", mass: 0.24, commit: ["Problem set 4", 3 * 24 * HOUR] },
+  { name: "notebook-lab", host: "gitlab.example.com", language: "Python", mass: 0.24, commit: ["Problem set 4", 3 * 24 * HOUR] },
   { name: "scratch", host: null, language: null, mass: 0.12, commit: ["wip", 40 * 24 * HOUR] },
 ];
 
@@ -151,12 +159,78 @@ export function demoRepos(): RepoSnapshot[] {
   });
 }
 
+interface RemoteSeed {
+  name: string;
+  host?: "github.com" | "gitlab.example.com";
+  owner?: string;
+  language: string | null;
+  sizeKb: number;
+  pushedDaysAgo: number;
+  fork?: boolean;
+  archived?: boolean;
+  description?: string;
+  /** Open pull or merge requests and CI on the default branch, for the detail panel. */
+  prs: number;
+  ci: CiStatus;
+}
+
+// Remote repos: some match the local seeds above, the rest are not cloned.
+const REMOTE_SEEDS: RemoteSeed[] = [
+  { name: "atlas-api", language: "TypeScript", sizeKb: 48_000, pushedDaysAgo: 0, prs: 3, ci: "success" },
+  { name: "tidepool", language: "TypeScript", sizeKb: 31_000, pushedDaysAgo: 1, prs: 1, ci: "failure" },
+  { name: "ledger-sync", language: "Python", sizeKb: 12_000, pushedDaysAgo: 4, prs: 0, ci: "pending" },
+  { name: "quill", language: "Go", sizeKb: 6_400, pushedDaysAgo: 2, prs: 2, ci: "none" },
+  { name: "shell-kit", host: "gitlab.example.com", language: "C", sizeKb: 2_200, pushedDaysAgo: 0, prs: 1, ci: "success" },
+  { name: "orbit-cli", language: "Rust", sizeKb: 9_800, pushedDaysAgo: 12, prs: 1, ci: "success", description: "A small command line for orbital mechanics." },
+  { name: "lumen-docs", language: "TypeScript", sizeKb: 2_600, pushedDaysAgo: 30, prs: 0, ci: "failure", description: "Documentation site." },
+  { name: "pixel-garden", language: "JavaScript", sizeKb: 640, pushedDaysAgo: 90, prs: 0, ci: "none" },
+  { name: "chart-kit", owner: "example-org", language: "TypeScript", sizeKb: 21_000, pushedDaysAgo: 200, fork: true, prs: 0, ci: "success" },
+  { name: "old-portfolio", language: null, sizeKb: 310, pushedDaysAgo: 900, archived: true, prs: 0, ci: "none" },
+  { name: "parser-project", host: "gitlab.example.com", owner: "example-group/platform", language: "Kotlin", sizeKb: 4_100, pushedDaysAgo: 3, prs: 2, ci: "pending", description: "Shared project in a nested group." },
+  { name: "storage-lab", host: "gitlab.example.com", language: "C", sizeKb: 1_300, pushedDaysAgo: 18, prs: 0, ci: "failure" },
+];
+
+const DEMO_GITLAB = "https://gitlab.example.com";
+
+function demoRemote(s: RemoteSeed): RemoteRepo {
+  const host = s.host ?? "github.com";
+  const owner = s.owner ?? "demo-user";
+  return {
+    kind: host === "github.com" ? "github" : "gitlab",
+    host,
+    owner,
+    name: s.name,
+    webUrl: `https://${host}/${owner}/${s.name}`,
+    cloneUrl: `https://${host}/${owner}/${s.name}.git`,
+    defaultBranch: "main",
+    language: s.language,
+    sizeKb: s.sizeKb,
+    pushedAt: iso(s.pushedDaysAgo * 24 * HOUR),
+    fork: s.fork ?? false,
+    archived: s.archived ?? false,
+    private: host !== "github.com",
+    description: s.description ?? null,
+  };
+}
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** A backend with invented data. Launching only walks through the progress steps. */
 export class DemoBackend implements Backend {
   private repos = demoRepos();
   private progress = new Set<(step: LaunchStep) => void>();
+  private events = new Set<(event: AgentEvent) => void>();
+  private settings: Settings = {
+    gitlabUrl: DEMO_GITLAB,
+    showForks: false,
+    showArchived: false,
+    hidden: [],
+  };
+  private creds: Credentials = { github: "ghCli", gitlab: "stored" };
+
+  private emit(event: AgentEvent) {
+    for (const cb of this.events) cb(event);
+  }
 
   agentStatus(): Promise<AgentStatus> {
     return Promise.resolve({ state: "running" });
@@ -175,8 +249,9 @@ export class DemoBackend implements Backend {
     return repo ? Promise.resolve(repo) : Promise.reject(new Error(`no repo at ${path}`));
   }
 
-  onAgentEvent(_cb: (event: AgentEvent) => void): Unsubscribe {
-    return () => {};
+  onAgentEvent(cb: (event: AgentEvent) => void): Unsubscribe {
+    this.events.add(cb);
+    return () => this.events.delete(cb);
   }
 
   async launch(path: string, mode: LaunchMode): Promise<LaunchTicket> {
@@ -215,5 +290,119 @@ export class DemoBackend implements Backend {
 
   onGpuUsage(_cb: (usage: GpuUsage) => void): Unsubscribe {
     return () => {};
+  }
+
+  async listRemotes(): Promise<RemoteList> {
+    await sleep(250);
+    const gitlab = this.settings.gitlabUrl === DEMO_GITLAB && this.creds.gitlab === "stored";
+    const github = this.creds.github !== "missing";
+    const repos = REMOTE_SEEDS.map(demoRemote).filter((r) => (r.kind === "github" ? github : gitlab));
+    return {
+      repos,
+      sources: [
+        { kind: "github", host: "github.com", configured: github, error: null },
+        ...(this.settings.gitlabUrl
+          ? [
+              {
+                kind: "gitlab" as const,
+                host: new URL(this.settings.gitlabUrl).host,
+                configured: this.creds.gitlab === "stored",
+                error:
+                  this.settings.gitlabUrl === DEMO_GITLAB ? null : "The demo only knows gitlab.example.com.",
+              },
+            ]
+          : []),
+      ],
+      fetchedAt: new Date().toISOString(),
+    };
+  }
+
+  async remoteDetails(repo: RemoteRef): Promise<RemoteDetails> {
+    await sleep(500);
+    const seed = REMOTE_SEEDS.find(
+      (s) => s.name === repo.name && (s.host ?? "github.com") === repo.host,
+    );
+    if (!seed) throw { kind: "notFound", message: `${repo.owner}/${repo.name} is not on ${repo.host}.` };
+    const remote = demoRemote(seed);
+    return {
+      openPullRequests: seed.prs,
+      ci: seed.ci,
+      ciUrl: seed.ci === "none" ? null : `${remote.webUrl}/actions`,
+      fetchedAt: iso(7 * 60),
+    };
+  }
+
+  getSettings(): Promise<Settings> {
+    return Promise.resolve(structuredClone(this.settings));
+  }
+
+  setSettings(settings: Settings): Promise<void> {
+    this.settings = structuredClone(settings);
+    return Promise.resolve();
+  }
+
+  credentials(): Promise<Credentials> {
+    return Promise.resolve({ ...this.creds });
+  }
+
+  setToken(kind: RemoteKind, token: string | null): Promise<void> {
+    if (kind === "github") this.creds.github = token ? "stored" : "ghCli";
+    else this.creds.gitlab = token ? "stored" : "missing";
+    return Promise.resolve();
+  }
+
+  /** Resolves after a moment and adds the clone as a local repo. */
+  async cloneRepo(repo: RemoteRepo): Promise<string> {
+    const path = `/home/demo/projects/${repo.name}`;
+    await sleep(1200);
+    if (this.repos.some((r) => r.path === path)) return path;
+    const snapshot: RepoSnapshot = {
+      path,
+      name: repo.name,
+      originUrl: repo.cloneUrl,
+      remote: { host: repo.host, owner: repo.owner, name: repo.name },
+      branch: repo.defaultBranch,
+      ahead: 0,
+      behind: 0,
+      changedFiles: 0,
+      dirtyPaths: [],
+      lastCommit: { summary: "Initial commit", time: now() - 3 * 24 * HOUR },
+      language: repo.language,
+      trackedBytes: repo.sizeKb * 1024,
+      commits30d: 4,
+      mass: 0.3,
+      sessions: [],
+      preselect: { kind: "noPicker" },
+    };
+    this.repos = [...this.repos, snapshot];
+    this.emit({ event: "repoChanged", data: snapshot });
+    return path;
+  }
+
+  async addRepo(path: string): Promise<void> {
+    await sleep(300);
+    const name = path.replace(/\/+$/, "").split("/").pop();
+    if (!path.startsWith("/") || !name) throw { kind: "invalid", message: `Not a folder: ${path}` };
+    if (this.repos.some((r) => r.path === path)) return;
+    const snapshot: RepoSnapshot = {
+      path,
+      name,
+      originUrl: null,
+      remote: null,
+      branch: "main",
+      ahead: null,
+      behind: null,
+      changedFiles: 0,
+      dirtyPaths: [],
+      lastCommit: { summary: "Initial commit", time: now() - HOUR },
+      language: null,
+      trackedBytes: 0,
+      commits30d: 1,
+      mass: 0.15,
+      sessions: [],
+      preselect: { kind: "noPicker" },
+    };
+    this.repos = [...this.repos, snapshot];
+    this.emit({ event: "repoChanged", data: snapshot });
   }
 }

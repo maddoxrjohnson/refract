@@ -1,12 +1,14 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
+import type { RemoteRepo } from "../backend/types";
+import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
 import { DetailPanel, type DetailPanelProps } from "./DetailPanel";
-import { NOW, testRepo, testSession } from "./testRepo";
+import { hoursAgo, NOW, testRepo, testSession } from "./testRepo";
 
 afterEach(cleanup);
 
-function setup(repo = testRepo()) {
+function setup(repo = testRepo(), extra: Partial<DetailPanelProps> = {}) {
   const props: DetailPanelProps = {
     repo,
     now: NOW,
@@ -15,6 +17,8 @@ function setup(repo = testRepo()) {
     onOpenFolder: vi.fn(),
     onOpenUrl: vi.fn(),
     onClose: vi.fn(),
+    onHide: vi.fn(),
+    ...extra,
   };
   const view = render(<DetailPanel {...props} />);
   return { props, panel: screen.getByRole("complementary", { name: `${repo.name} details` }), view };
@@ -90,5 +94,93 @@ describe("DetailPanel", () => {
     expect(props.onOpenUrl).toHaveBeenCalledWith("https://github.com/demo-user/tidepool");
     fireEvent.click(screen.getByRole("button", { name: /Close details/ }));
     expect(props.onClose).toHaveBeenCalledOnce();
+  });
+
+  it("hides the gem", () => {
+    const { props } = setup();
+    fireEvent.click(screen.getByRole("button", { name: "Hide" }));
+    expect(props.onHide).toHaveBeenCalledOnce();
+  });
+});
+
+const REMOTE: RemoteRepo = {
+  kind: "gitlab",
+  host: "gitlab.example.com",
+  owner: "example-group/platform",
+  name: "parser-project",
+  webUrl: "https://gitlab.example.com/example-group/platform/parser-project",
+  cloneUrl: "https://gitlab.example.com/example-group/platform/parser-project.git",
+  defaultBranch: "main",
+  language: "Kotlin",
+  sizeKb: 4100,
+  pushedAt: hoursAgo(3),
+  fork: false,
+  archived: false,
+  private: true,
+  description: "Shared project in a nested group.",
+};
+
+const ready = (extra: Partial<Extract<RemoteDetailsState, { status: "ready" }>["details"]> = {}): RemoteDetailsState => ({
+  status: "ready",
+  details: { openPullRequests: 2, ci: "failure", ciUrl: "https://gitlab.example.com/p/-/pipelines/7", fetchedAt: hoursAgo(0.2), ...extra },
+});
+
+describe("DetailPanel remote details", () => {
+  it("shows loading, then pull request count, CI with a link and when it was fetched", () => {
+    const { props, view } = setup(testRepo(), { details: { status: "loading", details: null } });
+    expect(screen.getByRole("region", { name: "Pull requests and CI" }).textContent).toContain("Loading…");
+    view.rerender(<DetailPanel {...props} details={ready()} />);
+    const section = screen.getByRole("region", { name: "Pull requests and CI" });
+    expect(section.textContent).toContain("2 pull requests");
+    expect(section.textContent).toContain("Failing");
+    expect(section.textContent).toContain("Updated 12 minutes ago");
+    fireEvent.click(screen.getByRole("button", { name: "View run" }));
+    expect(props.onOpenUrl).toHaveBeenCalledWith("https://gitlab.example.com/p/-/pipelines/7");
+  });
+
+  it("says merge requests for GitLab and handles none, no CI and refresh", () => {
+    const onRefreshDetails = vi.fn();
+    setup(testRepo(), {
+      remote: REMOTE,
+      details: ready({ openPullRequests: 0, ci: "none", ciUrl: null }),
+      onRefreshDetails,
+    });
+    const section = screen.getByRole("region", { name: "Merge requests and CI" });
+    expect(section.textContent).toContain("No open merge requests");
+    expect(section.textContent).toContain("No CI");
+    expect(screen.queryByRole("button", { name: "View run" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(onRefreshDetails).toHaveBeenCalledOnce();
+  });
+
+  it("shows errors", () => {
+    setup(testRepo(), { details: { status: "error", message: "GitHub said 401.", details: null } });
+    expect(screen.getByRole("alert").textContent).toContain("GitHub said 401.");
+  });
+
+  it("opens the remote's own web address when it is known", () => {
+    const { props } = setup(testRepo(), { remote: REMOTE });
+    fireEvent.click(screen.getByRole("button", { name: "Open on GitLab" }));
+    expect(props.onOpenUrl).toHaveBeenCalledWith(REMOTE.webUrl);
+  });
+
+  it("offers Clone and launch for a remote-only repo, without Open folder", () => {
+    const repo = testRepo({
+      path: "remote:gitlab.example.com/example-group/platform/parser-project",
+      name: "parser-project",
+      remote: { host: REMOTE.host, owner: REMOTE.owner, name: REMOTE.name },
+      ahead: null,
+      behind: null,
+      lastCommit: null,
+    });
+    const { props, panel } = setup(repo, { remote: REMOTE, remoteOnly: true });
+    expect(panel.textContent).toContain("Not cloned");
+    expect(panel.textContent).toContain("Shared project in a nested group.");
+    expect(panel.textContent).toContain("~/projects/parser-project");
+    expect(screen.queryByRole("button", { name: "Open folder" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Clone and launch/ }));
+    expect(props.onPrimary).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Hide" }));
+    expect(props.onHide).toHaveBeenCalledOnce();
   });
 });

@@ -67,6 +67,8 @@ The first `listRepos` starts loading in the background and answers immediately w
 
 `prepareLaunch` leaves a request file for the VS Code extension and answers with the folder URI to open. `setupServer` installs the Refract extension in the WSL VS Code server. It runs on a separate thread inside the helper, so other requests are still answered while it runs, and its response can arrive after theirs. [launch.md](launch.md) describes both.
 
+`cloneRepo {url, name}` clones an `https://` URL into `~/projects/<name>` and answers with the clone's path; when that folder is already a clone of the same URL it answers with the path without cloning, and any other folder in the way is an error. Clones run one at a time on their own thread with a ten-minute limit and never prompt for credentials. `addRepo {path}` takes any folder inside a working tree. Either way the repo is added to `extra` in `agent.toml` unless a root already covers it, and is reported with `repoChanged`: before the response once the first load is done, otherwise by the load.
+
 Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
 
 The helper never writes anything else to standard output; logs go to standard error.

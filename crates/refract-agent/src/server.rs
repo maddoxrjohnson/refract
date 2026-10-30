@@ -3,9 +3,10 @@
 //! Three threads: one reads stdin, one reads inotify, and this one owns all state and is
 //! the only writer to stdout. It blocks on a channel, waking only for input, for a
 //! debounce deadline, or for the liveness timer while some session is live or recent.
-//! A fourth thread runs the first load, so requests are answered while it runs, and a
+//! A fourth thread runs the first load, so requests are answered while it runs, a
 //! fifth runs `setupServer` requests one at a time, sending each response back through
-//! the channel for this thread to write.
+//! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
+//! time, sending each result back for this thread to report and answer.
 //!
 //! Backpressure: the channel is bounded and writes to stdout block. If the app stops
 //! reading stdout, this thread stops; the stdin and inotify threads then block on the
@@ -29,8 +30,9 @@ use refract_core::protocol::{
 use refract_core::sessions::{paths_match, project_dir_matches};
 use serde::Serialize;
 
-use crate::config::Config;
+use crate::config::{self, Config};
 use crate::launch;
+use crate::repos;
 use crate::scan;
 use crate::setup;
 use crate::state::{self, path_str, Agent, Refresh};
@@ -62,6 +64,11 @@ enum Msg {
     },
     /// A response the setup thread finished.
     Answer(Response),
+    /// A clone the clone thread finished: the repo's path, or why it failed.
+    Cloned {
+        id: Id,
+        result: Result<PathBuf, String>,
+    },
 }
 
 /// One line of input, without its newline.
@@ -137,6 +144,12 @@ struct Server<W: Write> {
     tx: SyncSender<Msg>,
     /// Queues `setupServer` jobs for the setup thread, once it is started.
     setup_jobs: Option<Sender<setup::Job>>,
+    /// Queues `cloneRepo` jobs for the clone thread, once it is started.
+    clone_jobs: Option<Sender<repos::Job>>,
+    /// Repos added to `extra` while running, re-applied to each loaded phase.
+    added_extra: Vec<PathBuf>,
+    /// Repos removed from `hidden` while running, re-applied to each loaded phase.
+    unhidden: Vec<PathBuf>,
     /// Refreshes asked for since the load started, re-applied to each loaded phase.
     touched: HashMap<PathBuf, Refresh>,
     /// `getRepo` requests for repos not loaded yet, answered when they are.
@@ -184,6 +197,9 @@ where
         load: Load::NotStarted,
         tx,
         setup_jobs: None,
+        clone_jobs: None,
+        added_extra: Vec::new(),
+        unhidden: Vec::new(),
         touched: HashMap::new(),
         waiting: Vec::new(),
         prewatched: Vec::new(),
@@ -210,6 +226,7 @@ where
             Ok(Msg::Fs(batch)) => server.queue(&batch),
             Ok(Msg::Loaded { agent, last }) => server.loaded(*agent, last)?,
             Ok(Msg::Answer(response)) => server.send(&response)?,
+            Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
@@ -384,6 +401,24 @@ impl<W: Write> Server<W> {
                     format!("vsix is not an absolute Linux, Windows or WSL path: {vsix:?}"),
                 ),
             },
+            Method::CloneRepo { url, name } => {
+                self.start_clone(repos::Job { id, url, name })?;
+                return Ok(true);
+            }
+            Method::AddRepo { path } => match wsl_path(&path) {
+                Some(linux) => match repos::work_tree_root(Path::new(&linux)) {
+                    Ok(repo) => match self.add_repo(&repo)? {
+                        Ok(()) => Response::ok(id, Reply::Done),
+                        Err(message) => Response::err(id, code::INTERNAL_ERROR, message),
+                    },
+                    Err(message) => Response::err(id, code::REPO_NOT_FOUND, message),
+                },
+                None => Response::err(
+                    id,
+                    code::INVALID_PARAMS,
+                    format!("path is not an absolute Linux, Windows or WSL path: {path:?}"),
+                ),
+            },
             Method::Shutdown => {
                 self.send(&Response::ok(id, Reply::Done))?;
                 return Ok(false);
@@ -418,6 +453,86 @@ impl<W: Write> Server<W> {
         let _ = jobs.send(job);
         self.setup_jobs = Some(jobs);
         Ok(())
+    }
+
+    /// Queues `job` for the clone thread, starting it on first use. Clones run one at a
+    /// time, so two clones never race for one folder, and each result arrives as
+    /// [`Msg::Cloned`]. If the thread cannot start, `job` is answered with
+    /// `CLONE_FAILED` at once.
+    fn start_clone(&mut self, job: repos::Job) -> io::Result<()> {
+        let job = match &self.clone_jobs {
+            Some(jobs) => match jobs.send(job) {
+                Ok(()) => return Ok(()),
+                // The thread is gone (it panicked); start another.
+                Err(mpsc::SendError(job)) => job,
+            },
+            None => job,
+        };
+        let (jobs, rx) = mpsc::channel::<repos::Job>();
+        let tx = self.tx.clone();
+        let started = std::thread::Builder::new()
+            .name("clone".into())
+            .spawn(move || run_clone_jobs(rx, &tx, repos::run));
+        if let Err(e) = started {
+            let message = format!("cannot start the clone thread: {e}");
+            return self.send(&Response::err(job.id, code::CLONE_FAILED, message));
+        }
+        // The thread holds the receiver until it has run a job, so this cannot fail.
+        let _ = jobs.send(job);
+        self.clone_jobs = Some(jobs);
+        Ok(())
+    }
+
+    /// Reports a finished clone, then answers its request with the path.
+    fn cloned(&mut self, id: Id, result: Result<PathBuf, String>) -> io::Result<()> {
+        let path = match result {
+            Ok(path) => path,
+            Err(message) => return self.send(&Response::err(id, code::CLONE_FAILED, message)),
+        };
+        if let Err(message) = self.add_repo(&path)? {
+            // The clone is there either way; outside the roots it is just not kept.
+            eprintln!("refract-agent: {message}");
+        }
+        self.send(&Response::ok(id, Reply::Path(path_str(&path))))
+    }
+
+    /// Reports `repo` from now on. Unless a root covers it, it is added to `extra`, in
+    /// memory and in the config file; if `hidden` names it, it is removed from there,
+    /// since the user asked for it. Then the repos are searched again, so a new one
+    /// is reported now, or once the first load is done; one already reported is sent
+    /// again as `repoChanged`. The inner error, from the config file, is a message for
+    /// the app.
+    fn add_repo(&mut self, repo: &Path) -> io::Result<Result<(), String>> {
+        let config = self.agent.config();
+        if !config.extra.iter().any(|p| p == repo) && !scan::under_roots(config, repo) {
+            if let Err(message) = config::add_extra(&config::file_path(), repo) {
+                return Ok(Err(message));
+            }
+            self.agent.add_extra(repo.to_owned());
+            self.added_extra.push(repo.to_owned());
+        }
+        if self.agent.config().hidden.iter().any(|p| p == repo) {
+            if let Err(message) = config::remove_hidden(&config::file_path(), repo) {
+                return Ok(Err(message));
+            }
+            self.agent.unhide(repo);
+            self.unhidden.push(repo.to_owned());
+        }
+        // Before the first load starts, it will find the repo itself.
+        if self.load == Load::NotStarted {
+            return Ok(Ok(()));
+        }
+        let known = self.agent.repo(repo).is_some();
+        self.pending.rescan = true;
+        self.pending.touch(Instant::now());
+        self.flush()?;
+        if known {
+            if let Some(state) = self.agent.repo(repo) {
+                let event = Event::RepoChanged(Box::new(state.snapshot.clone()));
+                self.send(&event)?;
+            }
+        }
+        Ok(Ok(()))
     }
 
     /// Answers `getRepo`, or returns `None` and holds the request when the repo may
@@ -509,6 +624,12 @@ impl<W: Write> Server<W> {
     /// asked for since the load started, and watches the repos fully.
     fn loaded(&mut self, agent: Agent, last: bool) -> io::Result<()> {
         let old = std::mem::replace(&mut self.agent, agent);
+        for repo in &self.added_extra {
+            self.agent.add_extra(repo.clone());
+        }
+        for repo in &self.unhidden {
+            self.agent.unhide(repo);
+        }
         let mut events = Vec::new();
         let gone: Vec<PathBuf> = old
             .repo_paths()
@@ -758,6 +879,23 @@ fn run_setup_jobs(
         let response = catch_unwind(AssertUnwindSafe(|| run(job)))
             .unwrap_or_else(|_| Response::err(id, code::SETUP_FAILED, "internal error"));
         if tx.send(Msg::Answer(response)).is_err() {
+            return;
+        }
+    }
+}
+
+/// The clone thread: runs each job with `run` and sends its result to the main thread,
+/// until either side goes away. A job that panics fails with "internal error" and the
+/// thread goes on to the next.
+fn run_clone_jobs(
+    jobs: Receiver<repos::Job>,
+    tx: &SyncSender<Msg>,
+    run: impl Fn(&repos::Job) -> Result<PathBuf, String>,
+) {
+    for job in jobs {
+        let result = catch_unwind(AssertUnwindSafe(|| run(&job)))
+            .unwrap_or_else(|_| Err("internal error".into()));
+        if tx.send(Msg::Cloned { id: job.id, result }).is_err() {
             return;
         }
     }

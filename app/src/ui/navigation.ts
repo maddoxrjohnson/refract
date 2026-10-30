@@ -55,12 +55,17 @@ export type NavInput =
   /** Repos changed: forget paths that are gone. */
   | { type: "sync" };
 
-export type NavEffect = { kind: "launch"; path: string; mode: LaunchMode };
+export type NavEffect =
+  | { kind: "launch"; path: string; mode: LaunchMode }
+  /** Clone a remote-only repo, then launch a new agent in it. `key` is its gem path. */
+  | { kind: "clone"; key: string };
 
 export interface NavContext {
   repos: ReadonlyMap<string, RepoSnapshot>;
   /** Gem centres in world units, y up. */
   positions: ReadonlyMap<string, { x: number; y: number }>;
+  /** Paths of gems that are not cloned yet; launching one clones it first. */
+  remoteOnly?: ReadonlySet<string>;
 }
 
 export interface NavResult {
@@ -202,6 +207,9 @@ function step(state: NavState, dir: { x: number; y: number }, ctx: NavContext): 
 function launch(state: NavState, path: string | null, ctx: NavContext): NavResult {
   const repo = path ? ctx.repos.get(path) : undefined;
   if (!repo) return unhandled(state);
+  if (ctx.remoteOnly?.has(repo.path)) {
+    return result({ ...state, picker: null }, [{ kind: "clone", key: repo.path }]);
+  }
   if (repo.preselect.kind === "noPicker") {
     return result({ ...state, picker: null }, [
       { kind: "launch", path: repo.path, mode: newAgentMode(repo) },

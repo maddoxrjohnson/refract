@@ -51,6 +51,8 @@ export interface SceneProps {
   quality: QualityLevel;
   /** No spin or breathing; camera moves still ease, but quickly. */
   reducedMotion: boolean;
+  /** Paths of gems that are not cloned; they draw dimmed, without a lit core. */
+  remoteOnly: ReadonlySet<string>;
   /** Filter result; `null` is no filter. Gems outside it dim and shrink a little. */
   matches: ReadonlySet<string> | null;
   /** Path of the gem that lifts, brightens and shows `focusLabel`. */
@@ -171,6 +173,10 @@ function ease(k: number, rate: number): number {
   return Math.min(1, k * rate);
 }
 
+/** Brightness of a gem that is not cloned, before filter dimming; focus lifts it a little. */
+const REMOTE_DIM = 0.42;
+const REMOTE_FOCUS_LIFT = 0.25;
+
 /** A slow pulse between 0 and 1. */
 function wave(T: number, speed: number, phase: number): number {
   return 0.5 + 0.5 * Math.sin(T * speed + phase);
@@ -191,7 +197,7 @@ function updateGem(this: GemFrame, g: GemHandle) {
   g.outer.scale.setScalar(1 - 0.15 * (1 - g.m));
   g.spinner.rotation.y += g.spin * this.dt;
   g.spinner.scale.setScalar(1 + 0.18 * g.f);
-  const dim = 0.25 + 0.75 * g.m;
+  const dim = (0.25 + 0.75 * g.m) * (g.remoteOnly ? REMOTE_DIM + REMOTE_FOCUS_LIFT * g.f : 1);
   const T = this.T;
   const u = g.shell.uniforms;
   u.uFocus.value = g.f;
@@ -264,7 +270,8 @@ function placeLabel(
 }
 
 function SceneContents(props: ContentsProps) {
-  const { repos, quality, reducedMotion, matches, focused, zoomed, focusLabel, visible } = props;
+  const { repos, remoteOnly, quality, reducedMotion, matches, focused, zoomed, focusLabel, visible } =
+    props;
   const tier = TIERS[quality];
   const gl = useThree((s) => s.gl);
   const scene = useThree((s) => s.scene);
@@ -394,7 +401,7 @@ function SceneContents(props: ContentsProps) {
   const hasLabel = focusLabel != null;
   useEffect(() => {
     ticker.request(tier.fpsCap, loop.current.lastStart);
-  }, [ticker, tier, repos, reducedMotion, matches, focused, zoomed, hasLabel, visible]);
+  }, [ticker, tier, repos, remoteOnly, reducedMotion, matches, focused, zoomed, hasLabel, visible]);
 
   useEffect(() => {
     const el = gl.domElement;
@@ -567,6 +574,7 @@ function SceneContents(props: ContentsProps) {
             interrupted={st.interrupted}
             working={st.working}
             waiting={st.waiting}
+            remoteOnly={remoteOnly.has(repo.path)}
             tier={tier}
             back={back.texture}
             res={res}

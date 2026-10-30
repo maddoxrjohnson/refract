@@ -415,11 +415,60 @@
 
 /* Quality control */
 
-/* A compact corner control, top left, clear of the filter bar and detail panel. */
-.rf-quality {
+/* Top-left corner: the quality control and settings gear, with the settings dialog
+   below them. Kept clear of the filter bar, the detail panel and the toast's line. The
+   container passes pointer events through its empty space to the scene. */
+.rf-corner {
   position: fixed;
   top: 16px;
   left: 16px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  max-height: calc(100vh - 96px);
+  pointer-events: none;
+}
+
+.rf-corner > *,
+.rf-corner__row > * {
+  pointer-events: auto;
+}
+
+.rf-corner__row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  pointer-events: none;
+}
+
+.rf-gear {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 10px;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    color 140ms var(--ease-out),
+    border-color 140ms var(--ease-out);
+}
+
+.rf-gear:hover,
+.rf-gear[aria-expanded="true"] {
+  color: var(--fg);
+  border-color: #313850;
+}
+
+.rf-gear:focus-visible {
+  outline: 2px solid var(--halo);
+  outline-offset: 2px;
+}
+
+/* A compact corner control, clear of the filter bar and detail panel. */
+.rf-quality {
   min-width: 0;
   margin: 0;
   padding: 10px 12px;
@@ -489,6 +538,238 @@
   color: var(--muted);
 }
 
+/* Remote details in the detail panel */
+
+.rf-ci {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.rf-ci__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.rf-ci__status::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.rf-ci__status--success::before {
+  background: #7ee2a8;
+}
+
+.rf-ci__status--failure {
+  color: var(--danger);
+}
+
+.rf-ci__status--failure::before {
+  background: var(--danger);
+}
+
+.rf-ci__status--pending::before {
+  background: var(--amber);
+}
+
+.rf-updated {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.rf-link {
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  color: var(--glass);
+  background: none;
+  border: 0;
+  text-decoration: underline;
+  text-decoration-color: rgb(169 216 255 / 0.4);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.rf-link:hover {
+  text-decoration-color: currentColor;
+}
+
+.rf-error {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--danger);
+  overflow-wrap: anywhere;
+}
+
+.rf-ok {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--glass);
+  overflow-wrap: anywhere;
+}
+
+.rf-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.rf-badge {
+  padding: 1px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.rf-description {
+  margin: 0 0 10px;
+}
+
+/* Settings dialog */
+
+.rf-settings {
+  display: flex;
+  flex-direction: column;
+  width: min(360px, calc(100vw - 32px));
+  min-height: 0;
+  border-radius: 16px;
+  background: var(--panel-strong);
+  overflow: hidden;
+  animation: rf-rise 200ms var(--ease-out);
+}
+
+.rf-settings:focus-visible {
+  outline: none;
+}
+
+.rf-settings__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px 10px 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.rf-settings__title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.rf-settings__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0;
+  padding: 2px 18px 12px;
+}
+
+.rf-settings__line {
+  margin: 0 0 8px;
+}
+
+.rf-field {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 0 4px;
+}
+
+.rf-field label {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rf-field__row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+
+.rf-input {
+  flex: 1;
+  min-width: 0;
+  min-height: 32px;
+  padding: 6px 10px;
+  font: 13px/1.2 var(--sans);
+  color: var(--fg);
+  background: rgb(0 0 0 / 0.25);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.rf-input.rf-mono {
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.rf-input::placeholder {
+  color: rgb(151 157 176 / 0.6);
+}
+
+.rf-input:focus-visible {
+  outline: 2px solid var(--halo);
+  outline-offset: 0;
+  border-color: transparent;
+}
+
+.rf-check {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 8px;
+  cursor: pointer;
+}
+
+.rf-check input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+  accent-color: var(--glass);
+}
+
+.rf-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.rf-hidden-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rf-hidden-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.rf-hidden-list__name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Status toast */
 
 .rf-toast {
@@ -551,6 +832,7 @@
 @media (prefers-reduced-motion: reduce) {
   .rf-detail,
   .rf-picker,
+  .rf-settings,
   .rf-toast {
     animation: rf-fade 120ms linear;
   }
@@ -560,6 +842,7 @@
   }
 
   .rf-button,
+  .rf-gear,
   .rf-quality__option span {
     transition: none;
   }

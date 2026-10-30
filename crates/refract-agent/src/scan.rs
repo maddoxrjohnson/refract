@@ -86,6 +86,29 @@ fn walk(
     }
 }
 
+/// True when a search of the roots reaches `repo`, hidden or not: it is at most
+/// `config.depth` levels below a root, with no repo or skipped directory on the way.
+/// Symlinks on the way are not checked.
+pub fn under_roots(config: &Config, repo: &Path) -> bool {
+    config.roots.iter().any(|root| {
+        let Ok(rel) = repo.strip_prefix(root) else {
+            return false;
+        };
+        let parts: Vec<_> = rel.components().collect();
+        if parts.len() > config.depth {
+            return false;
+        }
+        let mut dir = root.clone();
+        for part in parts {
+            if is_repo(&dir) || is_skipped(&part.as_os_str().to_string_lossy()) {
+                return false;
+            }
+            dir.push(part);
+        }
+        true
+    })
+}
+
 /// True when `dir` has a `.git` directory or file.
 pub fn is_repo(dir: &Path) -> bool {
     fs::symlink_metadata(dir.join(".git")).is_ok()
@@ -160,6 +183,30 @@ mod tests {
             git_dir(&worktree),
             Some(worktree.join("../elsewhere/.git/worktrees/kelp"))
         );
+    }
+
+    #[test]
+    fn under_roots_agrees_with_the_search() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("root");
+        let repos = [
+            "tidepool-api",
+            "tidepool-api/nested-inside-repo",
+            "group/aurora-notes",
+            "a/b/c/too-deep",
+            "node_modules/dep",
+            ".hidden/secret",
+        ];
+        for repo in repos {
+            mkrepo(&root.join(repo));
+        }
+        let outside = tmp.path().join("outside/kelp-cli");
+        mkrepo(&outside);
+        let c = config(vec![root.clone()], 3);
+        let found = find_repos(&c);
+        for repo in repos.iter().map(|r| root.join(r)).chain([outside]) {
+            assert_eq!(under_roots(&c, &repo), found.contains(&repo), "{repo:?}");
+        }
     }
 
     #[test]

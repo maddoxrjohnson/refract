@@ -17,11 +17,13 @@ export function stateLine(repo: RepoSnapshot): { text: string; tone: "attention"
 
 export interface FocusLabelProps {
   repo: RepoSnapshot;
+  /** The repo exists only on GitHub or GitLab. */
+  notCloned?: boolean;
 }
 
 /** The small label beside the focused gem: name, host, language and state (spec §3.3). */
-export function FocusLabel({ repo }: FocusLabelProps) {
-  const state = stateLine(repo);
+export function FocusLabel({ repo, notCloned = false }: FocusLabelProps) {
+  const state = notCloned ? { text: "Not cloned", tone: "calm" } : stateLine(repo);
   return (
     <div className="rf-glass rf-focus-label" role="status" aria-live="polite">
       <div className="rf-focus-label__name">{repo.name}</div>

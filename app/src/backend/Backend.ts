@@ -1,5 +1,12 @@
 import type {
   AgentEvent,
+  Credentials,
+  RemoteDetails,
+  RemoteKind,
+  RemoteList,
+  RemoteRef,
+  RemoteRepo,
+  Settings,
   AgentStatus,
   GpuUsage,
   LaunchMode,
@@ -34,4 +41,19 @@ export interface Backend {
   openUrl(url: string): Promise<void>;
   /** System GPU use, sampled about every 2 s while the window is visible. */
   onGpuUsage(cb: (usage: GpuUsage) => void): Unsubscribe;
+
+  /** Repos on GitHub and GitLab, cached about 15 minutes unless `refresh`. */
+  listRemotes(refresh?: boolean): Promise<RemoteList>;
+  /** Open pull/merge requests and CI for one repo, cached about 15 minutes unless `refresh`. */
+  remoteDetails(repo: RemoteRef, refresh?: boolean): Promise<RemoteDetails>;
+  getSettings(): Promise<Settings>;
+  /** Saves settings; the next `listRemotes` uses them. */
+  setSettings(settings: Settings): Promise<void>;
+  credentials(): Promise<Credentials>;
+  /** Stores a token in Windows Credential Manager; `null` removes it. */
+  setToken(kind: RemoteKind, token: string | null): Promise<void>;
+  /** Clones into `~/projects/<name>` in WSL and resolves with the local path. */
+  cloneRepo(repo: RemoteRepo): Promise<string>;
+  /** Adds a local folder (a WSL path) to the repos the helper reports. */
+  addRepo(path: string): Promise<void>;
 }

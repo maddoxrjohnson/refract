@@ -1,7 +1,16 @@
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import type { Backend } from "./backend/Backend";
-import type { AgentStatus, LaunchMode } from "./backend/types";
+import type {
+  AgentStatus,
+  LaunchMode,
+  RemoteList,
+  RemoteRef,
+  RepoSnapshot,
+  Settings,
+} from "./backend/types";
+import { useRemoteDetails } from "./hooks/useRemoteDetails";
 import { useVisibility } from "./hooks/useVisibility";
+import { hideKey, mergeProjects } from "./projects";
 import { createQualityController } from "./quality/controller";
 import type { QualityLevel, QualitySetting } from "./quality/tiers";
 import { initialRepoState, repoReducer } from "./repoState";
@@ -14,6 +23,7 @@ import {
   initialNavState,
   matchingPaths,
   navigate,
+  newAgentMode,
   type NavContext,
   type NavEffect,
   type NavInput,
@@ -21,12 +31,25 @@ import {
 } from "./ui/navigation";
 import { Picker } from "./ui/Picker";
 import { loadQualitySetting, QualityControl } from "./ui/QualityControl";
+import { SettingsPanel } from "./ui/SettingsPanel";
 import { describeError, StatusToast, type LaunchProgress } from "./ui/StatusToast";
 
 /** How long a finished launch stays on screen. */
 const LAUNCH_TOAST_MS = 4000;
 /** How long a failed Open folder or Open on GitHub message stays. */
 const OPEN_ERROR_MS = 6000;
+
+/** Until the saved settings arrive: nothing hidden, forks and archived repos left out. */
+const DEFAULT_SETTINGS: Settings = { gitlabUrl: null, showForks: false, showArchived: false, hidden: [] };
+
+/** The host name (no port) of a GitLab address, or `null` when it does not parse. */
+function hostOf(url: string): string | null {
+  try {
+    return new URL(url).hostname.toLowerCase();
+  } catch {
+    return null;
+  }
+}
 
 /** Follows the system's reduced-motion setting. */
 function useReducedMotion(): boolean {
@@ -75,7 +98,7 @@ function useQuality(backend: Backend) {
 export function App({ backend }: { backend: Backend }) {
   const visible = useVisibility(backend);
   const [status, setStatus] = useState<AgentStatus | null>(null);
-  const [{ repos }, dispatch] = useReducer(repoReducer, initialRepoState);
+  const [{ repos: localRepos }, dispatch] = useReducer(repoReducer, initialRepoState);
   const [error, setError] = useState<string | null>(null);
   const [launch, setLaunch] = useState<LaunchProgress | null>(null);
 
@@ -135,7 +158,73 @@ export function App({ backend }: { backend: Backend }) {
 
   useEffect(() => backend.onAgentEvent((event) => dispatch({ type: "event", event })), [backend]);
 
-  const repoList = useMemo(() => [...repos.values()], [repos]);
+  // Settings and remote repos (spec §5), fetched on each show; Refresh skips the cache.
+  const [settings, setSettings] = useState<Settings | null>(null);
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const [remoteList, setRemoteList] = useState<RemoteList | null>(null);
+  const [remotesLoading, setRemotesLoading] = useState(false);
+  const remoteSeq = useRef(0);
+  // Open, hide and remote failures show briefly; they don't block anything.
+  const [openError, setOpenError] = useState<string | null>(null);
+
+  const loadRemotes = useCallback(
+    (refresh: boolean) => {
+      const id = ++remoteSeq.current;
+      setRemotesLoading(true);
+      backend
+        .listRemotes(refresh)
+        .then(
+          (list) => id === remoteSeq.current && setRemoteList(list),
+          (err: unknown) => id === remoteSeq.current && setOpenError(describeError(err)),
+        )
+        .finally(() => id === remoteSeq.current && setRemotesLoading(false));
+    },
+    [backend],
+  );
+
+  useEffect(() => {
+    if (shown === 0) return;
+    let live = true;
+    const queued = saveQueue.current;
+    backend.getSettings().then(
+      (s) => live && queued === saveQueue.current && setSettings(s),
+      (err: unknown) => live && setOpenError(describeError(err)),
+    );
+    loadRemotes(false);
+    return () => {
+      live = false;
+    };
+  }, [backend, shown, loadRemotes]);
+
+  /**
+   * Saves settings, showing them at once; puts the old ones back if saving fails.
+   * Saves run one after another, so the file ends up with the newest settings.
+   */
+  const saveQueue = useRef<Promise<unknown>>(Promise.resolve());
+  const saveSettings = useCallback(
+    (next: Settings) => {
+      const previous = settingsRef.current;
+      setSettings(next);
+      const save = saveQueue.current
+        .catch(() => {})
+        .then(() => backend.setSettings(next))
+        .catch((err: unknown) => {
+          setSettings((current) => (current === next ? previous : current));
+          throw err;
+        });
+      saveQueue.current = save;
+      return save;
+    },
+    [backend],
+  );
+
+  const projects = useMemo(
+    () => mergeProjects([...localRepos.values()], remoteList, settings ?? DEFAULT_SETTINGS),
+    [localRepos, remoteList, settings],
+  );
+  const repoList = projects.repos;
+  const repos = useMemo(() => new Map(repoList.map((r) => [r.path, r])), [repoList]);
   const positions = useMemo(() => layoutGems(repoList), [repoList]);
   const reducedMotion = useReducedMotion();
   const quality = useQuality(backend);
@@ -161,15 +250,67 @@ export function App({ backend }: { backend: Backend }) {
     [backend, repos],
   );
 
+  // Clone and launch (spec §4.4): one job with the launch, under the same guard.
+  const startClone = useCallback(
+    (key: string) => {
+      const remote = projects.remotes.get(key);
+      const gem = repos.get(key);
+      if (launching.current || !remote || !gem) return;
+      launching.current = true;
+      const repoName = remote.name;
+      setLaunch({ repoName, step: "cloning" });
+      backend
+        .cloneRepo(remote)
+        .then((path) => {
+          setLaunch({ repoName, step: "starting" });
+          return backend.launch(path, newAgentMode(gem));
+        })
+        .then(
+          () => setLaunch({ repoName, step: "done" }),
+          (err: unknown) => setLaunch({ repoName, step: "failed", message: describeError(err) }),
+        )
+        .finally(() => {
+          launching.current = false;
+        });
+    },
+    [backend, projects, repos],
+  );
+
+  const hide = (repo: RepoSnapshot) => {
+    const current = settingsRef.current;
+    if (!current) return;
+    const key = hideKey(repo);
+    if (current.hidden.includes(key)) return;
+    saveSettings({ ...current, hidden: [...current.hidden, key] }).catch((err: unknown) =>
+      setOpenError(describeError(err)),
+    );
+  };
+
+  // The settings dialog takes every key while open. Closing with the mouse returns focus
+  // to the gear; Escape hands the keyboard back to the scene, so a following Enter zooms
+  // rather than pressing the gear again.
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsOpenRef = useRef(settingsOpen);
+  settingsOpenRef.current = settingsOpen;
+  const gear = useRef<HTMLButtonElement>(null);
+  const closeSettings = useCallback((byKey: boolean) => {
+    setSettingsOpen(false);
+    if (byKey) (document.activeElement as HTMLElement | null)?.blur();
+    else gear.current?.focus();
+  }, []);
+
   // Navigation is a pure state machine; the ref lets window listeners read the latest
   // state without re-subscribing, and effects run outside the state update.
   const [nav, setNav] = useState<NavState>(initialNavState);
   const navRef = useRef(nav);
-  const ctxRef = useRef<NavContext>({ repos, positions });
-  ctxRef.current = { repos, positions };
+  const ctxRef = useRef<NavContext>({ repos, positions, remoteOnly: projects.remoteOnly });
+  ctxRef.current = { repos, positions, remoteOnly: projects.remoteOnly };
   const runEffects = useRef<(effects: NavEffect[]) => void>(() => {});
   runEffects.current = (effects) => {
-    for (const e of effects) startLaunch(e.path, e.mode);
+    for (const e of effects) {
+      if (e.kind === "clone") startClone(e.key);
+      else startLaunch(e.path, e.mode);
+    }
   };
   const send = useCallback((input: NavInput) => {
     const result = navigate(navRef.current, input, ctxRef.current);
@@ -186,6 +327,14 @@ export function App({ backend }: { backend: Backend }) {
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === "Enter" && ev.repeat) return;
+      if (settingsOpenRef.current) {
+        // Escape from outside the dialog (the dialog handles its own) still closes it.
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          closeSettings(true);
+        }
+        return;
+      }
       // Form controls (the quality radios) keep all their keys; buttons keep Enter.
       const target = ev.target as HTMLElement | null;
       if (target?.closest("input, select, textarea")) return;
@@ -198,7 +347,7 @@ export function App({ backend }: { backend: Backend }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [send]);
+  }, [send, closeSettings]);
 
   const onPointerFocus = useCallback((path: string | null) => send({ type: "pointerFocus", path }), [send]);
   const onSelect = useCallback((path: string) => send({ type: "select", path }), [send]);
@@ -206,13 +355,24 @@ export function App({ backend }: { backend: Backend }) {
 
   const matches = useMemo(() => matchingPaths(repoList, nav.filter), [repoList, nav.filter]);
   const focusedRepo = nav.focused ? repos.get(nav.focused) : undefined;
-  const focusLabel = useMemo(() => focusedRepo && <FocusLabel repo={focusedRepo} />, [focusedRepo]);
+  const focusNotCloned = !!focusedRepo && projects.remoteOnly.has(focusedRepo.path);
+  const focusLabel = useMemo(
+    () => focusedRepo && <FocusLabel repo={focusedRepo} notCloned={focusNotCloned} />,
+    [focusedRepo, focusNotCloned],
+  );
   const zoomedRepo = nav.zoomed ? repos.get(nav.zoomed) : undefined;
+  const zoomedRemote = zoomedRepo ? (projects.remotes.get(zoomedRepo.path) ?? null) : null;
+  const zoomedRemoteOnly = !!zoomedRepo && projects.remoteOnly.has(zoomedRepo.path);
+  // Details come from the listed remote, or from a local origin on a host Refract asks.
+  const gitlabHost = settings?.gitlabUrl ? hostOf(settings.gitlabUrl) : null;
+  const origin = zoomedRepo?.remote;
+  const detailsRef: RemoteRef | null =
+    zoomedRemote ??
+    (origin && (origin.host === "github.com" || origin.host === gitlabHost) ? origin : null);
+  const details = useRemoteDetails(backend, detailsRef);
   const pickerRepo = nav.picker ? repos.get(nav.picker.path) : undefined;
   const now = Date.now();
 
-  // Open failures show briefly; they don't block anything.
-  const [openError, setOpenError] = useState<string | null>(null);
   useEffect(() => {
     if (!openError) return;
     const timer = setTimeout(() => setOpenError(null), OPEN_ERROR_MS);
@@ -227,6 +387,7 @@ export function App({ backend }: { backend: Backend }) {
     <main className="app">
       <Scene
         repos={repoList}
+        remoteOnly={projects.remoteOnly}
         visible={visible}
         quality={quality.level}
         reducedMotion={reducedMotion}
@@ -254,6 +415,11 @@ export function App({ backend }: { backend: Backend }) {
           onOpenFolder={() => openFolder(zoomedRepo.path)}
           onOpenUrl={openUrl}
           onClose={() => send({ type: "key", key: { key: "Escape" } })}
+          onHide={() => hide(zoomedRepo)}
+          remote={zoomedRemote}
+          remoteOnly={zoomedRemoteOnly}
+          details={details.state}
+          onRefreshDetails={details.refresh}
         />
       )}
       {nav.picker && pickerRepo && (
@@ -267,7 +433,40 @@ export function App({ backend }: { backend: Backend }) {
           onClose={() => send({ type: "pickerClose" })}
         />
       )}
-      <QualityControl setting={quality.setting} level={quality.level} onChange={quality.setSetting} />
+      <div className="rf-corner">
+        <div className="rf-corner__row">
+          <QualityControl setting={quality.setting} level={quality.level} onChange={quality.setSetting} />
+          <button
+            ref={gear}
+            type="button"
+            className="rf-glass rf-gear"
+            aria-label="Settings"
+            aria-haspopup="dialog"
+            aria-expanded={settingsOpen}
+            onClick={() => (settingsOpen ? closeSettings(false) : setSettingsOpen(true))}
+          >
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path
+                fill="currentColor"
+                fillRule="evenodd"
+                d="M19.4 13a7.6 7.6 0 0 0 0-2l2.1-1.6-2-3.4-2.5 1a7.4 7.4 0 0 0-1.7-1L15 3.3h-4l-.4 2.7a7.4 7.4 0 0 0-1.7 1l-2.5-1-2 3.4L6.6 11a7.6 7.6 0 0 0 0 2l-2.1 1.6 2 3.4 2.5-1a7.4 7.4 0 0 0 1.7 1l.4 2.7h4l.4-2.7a7.4 7.4 0 0 0 1.7-1l2.5 1 2-3.4zM13 15.5a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7z"
+                transform="translate(-1 0)"
+              />
+            </svg>
+          </button>
+        </div>
+        {settingsOpen && (
+          <SettingsPanel
+            backend={backend}
+            settings={settings}
+            sources={remoteList?.sources ?? []}
+            remotesLoading={remotesLoading}
+            onChange={saveSettings}
+            onRefresh={() => loadRemotes(true)}
+            onClose={closeSettings}
+          />
+        )}
+      </div>
       <StatusToast
         agent={status}
         launch={launch}

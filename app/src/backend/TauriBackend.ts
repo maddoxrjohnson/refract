@@ -4,12 +4,19 @@ import type { Backend, Unsubscribe } from "./Backend";
 import type {
   AgentEvent,
   AgentStatus,
+  Credentials,
   GpuUsage,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
+  RemoteDetails,
+  RemoteKind,
+  RemoteList,
+  RemoteRef,
+  RemoteRepo,
   RepoList,
   RepoSnapshot,
+  Settings,
 } from "./types";
 
 /** Event names the Rust side emits. */
@@ -92,5 +99,39 @@ export class TauriBackend implements Backend {
 
   onGpuUsage(cb: (usage: GpuUsage) => void): Unsubscribe {
     return subscribe<GpuUsage>(EVENTS.gpu, (e) => cb(e.payload));
+  }
+
+  // Remote repos, settings and cloning reject with `CommandError` (`{kind, message}`).
+
+  listRemotes(refresh = false): Promise<RemoteList> {
+    return invoke<RemoteList>("remote_list", { refresh });
+  }
+
+  remoteDetails(repo: RemoteRef, refresh = false): Promise<RemoteDetails> {
+    return invoke<RemoteDetails>("remote_details", { repo, refresh });
+  }
+
+  getSettings(): Promise<Settings> {
+    return invoke<Settings>("settings_get");
+  }
+
+  setSettings(settings: Settings): Promise<void> {
+    return invoke<void>("settings_set", { settings });
+  }
+
+  credentials(): Promise<Credentials> {
+    return invoke<Credentials>("credentials");
+  }
+
+  setToken(kind: RemoteKind, token: string | null): Promise<void> {
+    return invoke<void>("set_token", { kind, token });
+  }
+
+  cloneRepo(repo: RemoteRepo): Promise<string> {
+    return invoke<string>("clone_repo", { repo });
+  }
+
+  addRepo(path: string): Promise<void> {
+    return invoke<void>("add_repo", { path });
   }
 }

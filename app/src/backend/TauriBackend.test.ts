@@ -2,7 +2,7 @@ import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
 import { EVENTS, TauriBackend } from "./TauriBackend";
-import type { AgentStatus, GpuUsage } from "./types";
+import type { AgentStatus, GpuUsage, RemoteRepo, Settings } from "./types";
 
 afterEach(() => clearMocks());
 
@@ -111,5 +111,76 @@ describe("TauriBackend", () => {
     await emit(EVENTS.visibility, { visible: false });
     expect(seen).toEqual([true]);
     expect(statuses).toEqual([{ state: "running" }]);
+  });
+
+  it("lists remotes, fetches details and reads and saves settings through their commands", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const settings: Settings = {
+      gitlabUrl: "https://gitlab.example.com",
+      showForks: false,
+      showArchived: true,
+      hidden: ["remote:github.com/demo-user/orbit-cli"],
+    };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "remote_list") return { repos: [], sources: [], fetchedAt: "2026-10-30T12:00:00Z" };
+      if (cmd === "settings_get") return settings;
+      if (cmd === "credentials") return { github: "ghCli", gitlab: "missing" };
+    });
+    const backend = new TauriBackend();
+    const ref = { host: "gitlab.example.com", owner: "example-group/sub", name: "app" };
+    await backend.listRemotes();
+    await backend.listRemotes(true);
+    await backend.remoteDetails(ref);
+    await backend.remoteDetails(ref, true);
+    expect(await backend.getSettings()).toEqual(settings);
+    await backend.setSettings(settings);
+    expect(await backend.credentials()).toEqual({ github: "ghCli", gitlab: "missing" });
+    expect(calls).toEqual([
+      { cmd: "remote_list", args: { refresh: false } },
+      { cmd: "remote_list", args: { refresh: true } },
+      { cmd: "remote_details", args: { repo: ref, refresh: false } },
+      { cmd: "remote_details", args: { repo: ref, refresh: true } },
+      { cmd: "settings_get", args: {} },
+      { cmd: "settings_set", args: { settings } },
+      { cmd: "credentials", args: {} },
+    ]);
+  });
+
+  it("stores tokens, clones and adds folders through their commands", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const exists = { kind: "exists", message: "~/projects/orbit-cli already exists." };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "clone_repo") return "/home/dev/projects/orbit-cli";
+      if (cmd === "add_repo") throw exists;
+    });
+    const backend = new TauriBackend();
+    const repo: RemoteRepo = {
+      kind: "github",
+      host: "github.com",
+      owner: "demo-user",
+      name: "orbit-cli",
+      webUrl: "https://github.com/demo-user/orbit-cli",
+      cloneUrl: "https://github.com/demo-user/orbit-cli.git",
+      defaultBranch: "main",
+      language: "Rust",
+      sizeKb: 120,
+      pushedAt: null,
+      fork: false,
+      archived: false,
+      private: true,
+      description: null,
+    };
+    await backend.setToken("gitlab", "glpat-example");
+    await backend.setToken("github", null);
+    expect(await backend.cloneRepo(repo)).toBe("/home/dev/projects/orbit-cli");
+    await expect(backend.addRepo("/home/dev/code/orbit-cli")).rejects.toEqual(exists);
+    expect(calls).toEqual([
+      { cmd: "set_token", args: { kind: "gitlab", token: "glpat-example" } },
+      { cmd: "set_token", args: { kind: "github", token: null } },
+      { cmd: "clone_repo", args: { repo } },
+      { cmd: "add_repo", args: { path: "/home/dev/code/orbit-cli" } },
+    ]);
   });
 });

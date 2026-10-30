@@ -43,6 +43,8 @@ export interface GemHandle {
   wait: ShaderMaterial | null;
   /** Amber edges: a session was cut off. */
   edges: LineBasicMaterial | null;
+  /** Not cloned: drawn dimmer, with no lit core. */
+  remoteOnly: boolean;
   phase: number;
   spin: number;
   /** Focus, eased from 0 to 1. */
@@ -62,6 +64,8 @@ export interface GemProps {
   interrupted: boolean;
   working: boolean;
   waiting: boolean;
+  /** Exists only on GitHub or GitLab: dimmed, with no core glow (spec §3.2). */
+  remoteOnly: boolean;
   tier: Tier;
   /** The refraction image and its size in pixels, shared by every shell. */
   back: Texture;
@@ -200,6 +204,7 @@ export const Gem = memo(function Gem(props: GemProps) {
       halo,
       wait,
       edges,
+      remoteOnly: props.remoteOnly,
       phase: motion.phase,
       spin: motion.spin,
       f: 0,
@@ -213,6 +218,7 @@ export const Gem = memo(function Gem(props: GemProps) {
     h.halo = halo;
     h.wait = wait;
     h.edges = edges;
+    h.remoteOnly = props.remoteOnly;
     handle.current = h;
     registry.set(path, h);
   });
@@ -222,7 +228,7 @@ export const Gem = memo(function Gem(props: GemProps) {
     <group ref={outer} dispose={null}>
       <group ref={spinner} rotation={motion.rotation}>
         <mesh ref={onGlass} geometry={geometry} material={shell} />
-        <mesh geometry={coreGeometry} material={core} />
+        {!props.remoteOnly && <mesh geometry={coreGeometry} material={core} />}
         {edgesGeometry && edges && (
           <lineSegments ref={onGlass} geometry={edgesGeometry} material={edges} scale={1.006} />
         )}

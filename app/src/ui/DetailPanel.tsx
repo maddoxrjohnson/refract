@@ -1,5 +1,13 @@
 import { useId } from "react";
-import type { LaunchMode, RepoSnapshot, SessionInfo } from "../backend/types";
+import type {
+  CiStatus,
+  LaunchMode,
+  RemoteKind,
+  RemoteRepo,
+  RepoSnapshot,
+  SessionInfo,
+} from "../backend/types";
+import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
 import { hostLabel, remoteUrl } from "../repoStatus";
 import { firstLine, relativeTime, sessionStateLabel } from "./format";
 import { newAgentMode, resumableSession } from "./navigation";
@@ -16,6 +24,106 @@ export interface DetailPanelProps {
   onOpenFolder(): void;
   onOpenUrl(url: string): void;
   onClose(): void;
+  /** Hides the gem; settings can bring it back. */
+  onHide(): void;
+  /** The repo on GitHub or GitLab, when it is listed there. */
+  remote?: RemoteRepo | null;
+  /** Not cloned yet: the primary action clones and launches (spec §4.4). */
+  remoteOnly?: boolean;
+  /** Pull or merge requests and CI; `null` when the repo has no remote to ask. */
+  details?: RemoteDetailsState | null;
+  /** Fetches the details again, past the cache. */
+  onRefreshDetails?(): void;
+}
+
+const CI_LABELS: Record<CiStatus, string> = {
+  success: "Passing",
+  failure: "Failing",
+  pending: "Running",
+  none: "No CI",
+};
+
+const KIND_LABELS: Record<RemoteKind, string> = { github: "GitHub", gitlab: "GitLab" };
+
+function plural(n: number, one: string, many: string): string {
+  return `${n} ${n === 1 ? one : many}`;
+}
+
+/** Open pull or merge requests and CI on the default branch (spec §3.4). */
+function RemoteSection({
+  kind,
+  state,
+  now,
+  onOpenUrl,
+  onRefresh,
+}: {
+  kind: RemoteKind;
+  state: RemoteDetailsState;
+  now: number;
+  onOpenUrl(url: string): void;
+  onRefresh?(): void;
+}) {
+  const requests =
+    kind === "github" ? ["pull request", "pull requests"] : ["merge request", "merge requests"];
+  const title = kind === "github" ? "Pull requests and CI" : "Merge requests and CI";
+  const d = state.details;
+  return (
+    <section className="rf-section" aria-label={title} aria-busy={state.status === "loading"}>
+      <h3 className="rf-section__label">{title}</h3>
+      {d ? (
+        <>
+          <dl className="rf-facts">
+            <dt>Open</dt>
+            <dd>
+              {d.openPullRequests === null
+                ? "Unknown"
+                : d.openPullRequests === 0
+                  ? `No open ${requests[1]}`
+                  : plural(d.openPullRequests, requests[0], requests[1])}
+            </dd>
+            <dt>CI</dt>
+            <dd className="rf-ci">
+              <span className={`rf-ci__status rf-ci__status--${d.ci ?? "none"}`}>
+                {d.ci ? CI_LABELS[d.ci] : "Unknown"}
+              </span>
+              {d.ciUrl && (
+                <button type="button" className="rf-link" onClick={() => onOpenUrl(d.ciUrl!)}>
+                  View run
+                </button>
+              )}
+            </dd>
+          </dl>
+          <div className="rf-updated rf-muted">
+            <span>
+              {state.status === "loading"
+                ? "Updating…"
+                : `Updated ${relativeTime(Date.parse(d.fetchedAt), now)}`}
+            </span>
+            {onRefresh && state.status !== "loading" && (
+              <button type="button" className="rf-link" onClick={onRefresh}>
+                Refresh
+              </button>
+            )}
+          </div>
+        </>
+      ) : (
+        state.status === "loading" && <div className="rf-muted">Loading…</div>
+      )}
+      {state.status === "error" && (
+        <p className="rf-error" role="alert">
+          {state.message}
+          {onRefresh && (
+            <>
+              {" "}
+              <button type="button" className="rf-link" onClick={onRefresh}>
+                Try again
+              </button>
+            </>
+          )}
+        </p>
+      )}
+    </section>
+  );
 }
 
 function upstream(repo: RepoSnapshot): string {
@@ -35,7 +143,7 @@ function lastSession(repo: RepoSnapshot): SessionInfo | null {
   return best;
 }
 
-/** The panel docked on the right while a gem is zoomed (spec §3.4, without PRs/CI and Hide). */
+/** The panel docked on the right while a gem is zoomed (spec §3.4, §4.4). */
 export function DetailPanel({
   repo,
   now,
@@ -44,33 +152,115 @@ export function DetailPanel({
   onOpenFolder,
   onOpenUrl,
   onClose,
+  onHide,
+  remote = null,
+  remoteOnly = false,
+  details = null,
+  onRefreshDetails,
 }: DetailPanelProps) {
   const hintId = useId();
   const direct = repo.preselect.kind === "noPicker";
   const resume = resumableSession(repo);
   const session = lastSession(repo);
   const sessionLine = session ? firstLine(session.lastAssistantText) : null;
-  const url = remoteUrl(repo);
-  const host = hostLabel(repo);
+  const url = remote?.webUrl ?? remoteUrl(repo);
+  const host = remote ? KIND_LABELS[remote.kind] : hostLabel(repo);
+  const kind: RemoteKind = remote?.kind ?? (repo.remote?.host === "github.com" ? "github" : "gitlab");
+  const remoteSection = details && (
+    <RemoteSection
+      kind={kind}
+      state={details}
+      now={now}
+      onOpenUrl={onOpenUrl}
+      onRefresh={onRefreshDetails}
+    />
+  );
+  const secondary = (
+    <div className="rf-row">
+      {!remoteOnly && (
+        <button type="button" className="rf-button" onClick={onOpenFolder}>
+          Open folder
+        </button>
+      )}
+      {url && (
+        <button type="button" className="rf-button" onClick={() => onOpenUrl(url)}>
+          Open on {host}
+        </button>
+      )}
+      <button type="button" className="rf-button" onClick={onHide}>
+        Hide
+      </button>
+    </div>
+  );
+
+  const header = (
+    <header className="rf-detail__header">
+      <div className="rf-detail__title">
+        <h2 className="rf-detail__name">{repo.name}</h2>
+        <div className="rf-muted">
+          {host} · {repo.language ?? "Unknown language"}
+        </div>
+      </div>
+      <button
+        type="button"
+        className="rf-button rf-button--ghost rf-icon-button"
+        aria-label="Close details (Escape)"
+        onClick={onClose}
+      >
+        ×
+      </button>
+    </header>
+  );
+
+  if (remoteOnly) {
+    return (
+      <aside className="rf-glass rf-detail" aria-label={`${repo.name} details`}>
+        {header}
+        <div className="rf-detail__body">
+          <section className="rf-section" aria-label="Remote repository">
+            <p className="rf-badges">
+              <span className="rf-badge">Not cloned</span>
+              {remote?.private && <span className="rf-badge">Private</span>}
+              {remote?.fork && <span className="rf-badge">Fork</span>}
+              {remote?.archived && <span className="rf-badge">Archived</span>}
+            </p>
+            {remote?.description && <p className="rf-description">{remote.description}</p>}
+            <dl className="rf-facts">
+              <dt>Owner</dt>
+              <dd className="rf-mono">{repo.remote?.owner}</dd>
+              <dt>Default branch</dt>
+              <dd className="rf-mono">{repo.branch ?? "None"}</dd>
+              <dt>Last push</dt>
+              <dd>{remote?.pushedAt ? relativeTime(Date.parse(remote.pushedAt), now) : "Never"}</dd>
+            </dl>
+          </section>
+          {remoteSection}
+        </div>
+        <div className="rf-detail__actions">
+          <button
+            type="button"
+            className="rf-button rf-button--primary"
+            aria-describedby={hintId}
+            onClick={onPrimary}
+          >
+            <span>Clone and launch</span>
+            <kbd className="rf-kbd" aria-hidden="true">
+              Enter
+            </kbd>
+          </button>
+          <p id={hintId} className="rf-hint">
+            Enter clones into <span className="rf-mono">~/projects/{repo.name}</span> in WSL and starts a
+            new agent.
+          </p>
+          {secondary}
+        </div>
+      </aside>
+    );
+  }
 
   return (
     <aside className="rf-glass rf-detail" aria-label={`${repo.name} details`}>
-      <header className="rf-detail__header">
-        <div className="rf-detail__title">
-          <h2 className="rf-detail__name">{repo.name}</h2>
-          <div className="rf-muted">
-            {host} · {repo.language ?? "Unknown language"}
-          </div>
-        </div>
-        <button
-          type="button"
-          className="rf-button rf-button--ghost rf-icon-button"
-          aria-label="Close details (Escape)"
-          onClick={onClose}
-        >
-          ×
-        </button>
-      </header>
+      {header}
 
       <div className="rf-detail__body">
         <section className="rf-section" aria-label="Working tree">
@@ -119,6 +309,8 @@ export function DetailPanel({
             <div className="rf-muted">No agent sessions yet</div>
           )}
         </section>
+
+        {remoteSection}
       </div>
 
       <div className="rf-detail__actions">
@@ -154,16 +346,7 @@ export function DetailPanel({
             </button>
           </div>
         )}
-        <div className="rf-row">
-          <button type="button" className="rf-button" onClick={onOpenFolder}>
-            Open folder
-          </button>
-          {url && (
-            <button type="button" className="rf-button" onClick={() => onOpenUrl(url)}>
-              Open on {host}
-            </button>
-          )}
-        </div>
+        {secondary}
       </div>
     </aside>
   );

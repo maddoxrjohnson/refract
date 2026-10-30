@@ -330,6 +330,36 @@ describe("Enter and launching", () => {
   });
 });
 
+describe("remote-only gems", () => {
+  const key = "remote:github.com/demo-user/orbit-cli";
+  const remote = { ...repo("orbit-cli"), path: key };
+  const c: NavContext = {
+    repos: new Map([[key, remote], ...ctx.repos]),
+    positions: new Map([[key, { x: 0, y: -6 }], ...ctx.positions]),
+    remoteOnly: new Set([key]),
+  };
+
+  it("Enter on a zoomed remote-only gem clones instead of launching", () => {
+    const r = run([{ type: "select", path: key }, { type: "key", key: { key: "Enter" } }], initialNavState, c);
+    expect(r.effects).toEqual([{ kind: "clone", key }]);
+    expect(r.state.picker).toBeNull();
+  });
+
+  it("the primary action clones too, and local gems still launch", () => {
+    expect(run([{ type: "select", path: key }, { type: "launch" }], initialNavState, c).effects).toEqual([
+      { kind: "clone", key },
+    ]);
+    expect(run([{ type: "launch", path: "/p/east" }], initialNavState, c).effects).toEqual([
+      { kind: "launch", path: "/p/east", mode: { kind: "new" } },
+    ]);
+  });
+
+  it("remote-only gems are focusable with the arrows", () => {
+    const r = run([{ type: "pointerFocus", path: "/p/south" }, { type: "key", key: { key: "ArrowDown" } }], initialNavState, c);
+    expect(r.state.focused).toBe(key);
+  });
+});
+
 describe("sync", () => {
   it("drops focus, zoom and picker for repos that went away", () => {
     const state: NavState = {

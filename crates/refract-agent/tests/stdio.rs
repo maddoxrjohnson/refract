@@ -640,3 +640,183 @@ fn setup_server_requests_run_one_at_a_time() {
     );
     assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
 }
+
+#[test]
+fn add_repo_reports_a_repo_outside_the_roots_and_remembers_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _root, config) = setup(tmp.path());
+    let repo = tmp.path().join("work/aurora-notes");
+    init_repo(&repo);
+    let repo_path = std::fs::canonicalize(&repo).unwrap();
+    let repo_str = repo_path.to_str().unwrap();
+    let mut agent = Agent::spawn(&home, &config);
+    agent.list_when_loaded(1);
+
+    // A folder inside the tree adds the whole tree.
+    agent.send(json!({"id": 2, "method": "addRepo", "params": {"path": repo.join("src")}}));
+    let added = agent.event(|e| e["event"] == "repoChanged");
+    assert_eq!(added["data"]["path"], repo_str);
+    assert_eq!(agent.response(), json!({"id": 2, "result": null}));
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.starts_with("roots = ["), "{text}");
+    assert!(text.contains(&format!("extra = [{repo_str:?}]")), "{text}");
+
+    // Adding it again reports it again and changes nothing.
+    agent.send(json!({"id": 3, "method": "addRepo", "params": {"path": repo_str}}));
+    let again = agent.event(|e| e["event"] == "repoChanged");
+    assert_eq!(again["data"]["path"], repo_str);
+    assert_eq!(agent.response(), json!({"id": 3, "result": null}));
+    assert_eq!(std::fs::read_to_string(&config).unwrap(), text);
+
+    let plain = tmp.path().join("work/notes");
+    std::fs::create_dir_all(&plain).unwrap();
+    agent.send(json!({"id": 4, "method": "addRepo", "params": {"path": plain}}));
+    assert_eq!(agent.response()["error"]["code"], 1);
+    agent.send(json!({"id": 5, "method": "addRepo", "params": {"path": "work/notes"}}));
+    assert_eq!(agent.response()["error"]["code"], -32602);
+    agent.send(json!({"id": 6, "method": "shutdown"}));
+    assert_eq!(agent.response()["id"], 6);
+    assert!(agent.child.wait().unwrap().success());
+
+    // The next run finds it from the config.
+    let mut agent = Agent::spawn(&home, &config);
+    let list = agent.list_when_loaded(1);
+    assert_eq!(list["result"]["repos"][0]["path"], repo_str);
+}
+
+#[test]
+fn adding_or_cloning_a_hidden_repo_unhides_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let repo = root.join("aurora-notes");
+    init_repo(&repo);
+    let repo_path = std::fs::canonicalize(&repo).unwrap();
+    let repo_str = repo_path.to_str().unwrap();
+    let (bare, _) = remote(tmp.path(), "reef-maps");
+    std::fs::create_dir_all(home.join("projects")).unwrap();
+    let dest = std::fs::canonicalize(home.join("projects"))
+        .unwrap()
+        .join("reef-maps");
+    let dest_str = dest.to_str().unwrap();
+    let text = std::fs::read_to_string(&config).unwrap();
+    write(
+        &config,
+        &format!("{text}# hidden on purpose\nhidden = [{repo_str:?}, {dest_str:?}]\n"),
+    );
+    let key = format!(
+        "url.{}/.insteadOf",
+        bare.parent().unwrap().to_str().unwrap()
+    );
+    let env: [(&str, &std::ffi::OsStr); 3] = [
+        ("GIT_CONFIG_COUNT", "1".as_ref()),
+        ("GIT_CONFIG_KEY_0", key.as_ref()),
+        ("GIT_CONFIG_VALUE_0", "https://example.com/dev/".as_ref()),
+    ];
+    let mut agent = Agent::spawn_with(&home, &config, &env);
+    let list = agent.list_when_loaded(1);
+    assert_eq!(list["result"]["repos"], json!([]));
+
+    agent.send(json!({"id": 2, "method": "addRepo", "params": {"path": repo_str}}));
+    let added = agent.event(|e| e["event"] == "repoChanged");
+    assert_eq!(added["data"]["path"], repo_str);
+    assert_eq!(agent.response(), json!({"id": 2, "result": null}));
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains("# hidden on purpose\n"), "{text}");
+    assert!(!text.contains(&format!("{repo_str:?}, ")), "{text}");
+    assert!(text.contains(&format!("{dest_str:?}")), "{text}");
+
+    agent.send(json!({"id": 3, "method": "cloneRepo", "params": {
+        "url": "https://example.com/dev/reef-maps.git", "name": "reef-maps"}}));
+    let cloned = agent.event(|e| e["event"] == "repoChanged" && e["data"]["path"] == dest_str);
+    assert_eq!(cloned["data"]["path"], dest_str);
+    assert_eq!(agent.response(), json!({"id": 3, "result": dest_str}));
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(!text.contains(&format!("hidden = [{dest_str:?}")), "{text}");
+    agent.send(json!({"id": 4, "method": "shutdown"}));
+    assert_eq!(agent.response()["id"], 4);
+    assert!(agent.child.wait().unwrap().success());
+
+    // The next run reports both.
+    let mut agent = Agent::spawn(&home, &config);
+    let list = agent.list_when_loaded(1);
+    let paths: Vec<&str> = list["result"]["repos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&repo_str) && paths.contains(&dest_str),
+        "{paths:?}"
+    );
+}
+
+#[test]
+fn clone_repo_clones_reports_and_reuses_the_clone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, _root, config) = setup(tmp.path());
+    let (bare, _) = remote(tmp.path(), "reef-maps");
+    let (other, _) = remote(tmp.path(), "kelp-cli");
+    // The helper only clones https:// URLs; point this one at the local remotes.
+    let key = format!(
+        "url.{}/.insteadOf",
+        bare.parent().unwrap().to_str().unwrap()
+    );
+    let env: [(&str, &std::ffi::OsStr); 3] = [
+        ("GIT_CONFIG_COUNT", "1".as_ref()),
+        ("GIT_CONFIG_KEY_0", key.as_ref()),
+        ("GIT_CONFIG_VALUE_0", "https://example.com/dev/".as_ref()),
+    ];
+    let mut agent = Agent::spawn_with(&home, &config, &env);
+    agent.list_when_loaded(1);
+
+    let url = "https://example.com/dev/reef-maps.git";
+    let dest = home.join("projects/reef-maps");
+    let dest_str = dest.to_str().unwrap();
+    agent
+        .send(json!({"id": 2, "method": "cloneRepo", "params": {"url": url, "name": "reef-maps"}}));
+    agent.send(json!({"id": 3, "method": "ping"}));
+    assert_eq!(agent.response()["id"], 3);
+    let added = agent.event(|e| e["event"] == "repoChanged");
+    assert_eq!(added["data"]["path"], dest_str);
+    assert_eq!(added["data"]["originUrl"], url);
+    assert_eq!(agent.response(), json!({"id": 2, "result": dest_str}));
+    assert!(dest.join("src/main.rs").is_file());
+    let text = std::fs::read_to_string(&config).unwrap();
+    assert!(text.contains(&format!("extra = [{dest_str:?}]")), "{text}");
+
+    // The same repo again is the clone that is there.
+    agent.send(json!({"id": 4, "method": "cloneRepo", "params": {
+        "url": "https://EXAMPLE.com/dev/reef-maps", "name": "reef-maps"}}));
+    agent.event(|e| e["event"] == "repoChanged" && e["data"]["path"] == dest_str);
+    assert_eq!(agent.response(), json!({"id": 4, "result": dest_str}));
+
+    // Another repo into the same folder is refused.
+    assert!(other.is_dir());
+    agent.send(json!({"id": 5, "method": "cloneRepo", "params": {
+        "url": "https://example.com/dev/kelp-cli.git", "name": "reef-maps"}}));
+    let refused = agent.response();
+    assert_eq!(refused["error"]["code"], 3);
+    assert!(refused["error"]["message"]
+        .as_str()
+        .unwrap()
+        .ends_with("already exists"));
+
+    // A failed clone is an error too.
+    agent.send(json!({"id": 6, "method": "cloneRepo", "params": {
+        "url": "https://example.com/dev/missing.git", "name": "missing"}}));
+    assert_eq!(agent.response()["error"]["code"], 3);
+    assert!(!home.join("projects/missing").exists());
+
+    for params in [
+        json!({"url": "ssh://git@example.com/dev/kelp-cli.git", "name": "kelp-cli"}),
+        json!({"url": url, "name": "../reef-maps"}),
+        json!({"url": url, "name": "--template=/tmp"}),
+    ] {
+        agent.send(json!({"id": 7, "method": "cloneRepo", "params": params}));
+        assert_eq!(agent.response()["error"]["code"], -32602, "{params}");
+    }
+    agent.send(json!({"id": 8, "method": "shutdown"}));
+    assert_eq!(agent.response()["id"], 8);
+    assert!(agent.child.wait().unwrap().success());
+}

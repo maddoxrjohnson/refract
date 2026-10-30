@@ -118,3 +118,86 @@ export interface GpuUsage {
   /** Refract's own share of that engine, 0 to 100. */
   ownPercent: number;
 }
+
+// Remote repos (M5). Fetched on the Windows side from GitHub and GitLab; see
+// app/src-tauri/src/remote.
+
+export type RemoteKind = "github" | "gitlab";
+
+/** A repo on GitHub or GitLab that the user owns, collaborates on or is a member of. */
+export interface RemoteRepo {
+  kind: RemoteKind;
+  /** "github.com" or the GitLab host, lower case. */
+  host: string;
+  /** Owner login, or the GitLab namespace path (may contain `/`). */
+  owner: string;
+  name: string;
+  webUrl: string;
+  /** HTTPS clone URL. */
+  cloneUrl: string;
+  defaultBranch: string | null;
+  language: string | null;
+  sizeKb: number;
+  /** RFC 3339. */
+  pushedAt: string | null;
+  fork: boolean;
+  archived: boolean;
+  private: boolean;
+  description: string | null;
+}
+
+export interface RemoteSource {
+  kind: RemoteKind;
+  host: string;
+  /** False when there is no URL or token for it, so it was not asked. */
+  configured: boolean;
+  /** Why listing failed, for a person; `null` when it worked or was not tried. */
+  error: string | null;
+}
+
+export interface RemoteList {
+  repos: RemoteRepo[];
+  sources: RemoteSource[];
+  /** RFC 3339. */
+  fetchedAt: string;
+}
+
+export type CiStatus = "success" | "failure" | "pending" | "none";
+
+/** Pull or merge requests and CI on the default branch; cached about 15 minutes. */
+export interface RemoteDetails {
+  openPullRequests: number | null;
+  ci: CiStatus | null;
+  ciUrl: string | null;
+  /** RFC 3339. */
+  fetchedAt: string;
+}
+
+/** Identifies a remote repo in requests. */
+export interface RemoteRef {
+  host: string;
+  owner: string;
+  name: string;
+}
+
+/** App settings, stored as JSON on the Windows side. Tokens are never in here. */
+export interface Settings {
+  /** The GitLab instance, e.g. "https://gitlab.example.com"; `null` turns GitLab off. */
+  gitlabUrl: string | null;
+  showForks: boolean;
+  showArchived: boolean;
+  /** Project keys (see `projectKey` in src/projects.ts) the user hid. */
+  hidden: string[];
+}
+
+/** Where each token comes from. Tokens themselves never reach the interface. */
+export interface Credentials {
+  github: "ghCli" | "stored" | "missing";
+  gitlab: "stored" | "missing";
+}
+
+/** Why a remote, settings or clone command failed; `message` is meant for a person. */
+export interface CommandError {
+  kind: string;
+  message: string;
+}

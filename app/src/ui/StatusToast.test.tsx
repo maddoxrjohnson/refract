@@ -26,8 +26,10 @@ describe("StatusToast", () => {
 
   it("shows launch progress with the shell's wording", () => {
     const { rerender } = render(
-      <StatusToast agent={{ state: "running" }} launch={{ repoName: "tidepool", step: "starting" }} />,
+      <StatusToast agent={{ state: "running" }} launch={{ repoName: "tidepool", step: "cloning" }} />,
     );
+    expect(screen.getByRole("status").textContent).toBe("tidepool cloning…");
+    rerender(<StatusToast agent={{ state: "running" }} launch={{ repoName: "tidepool", step: "starting" }} />);
     expect(screen.getByRole("status").textContent).toBe("tidepool starting…");
     rerender(<StatusToast agent={{ state: "running" }} launch={{ repoName: "tidepool", step: "server" }} />);
     expect(screen.getByRole("status").textContent).toBe("tidepool installing the extension in WSL…");

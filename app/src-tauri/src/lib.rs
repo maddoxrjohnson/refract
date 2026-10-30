@@ -2,11 +2,15 @@
 //! the interface.
 
 mod agent;
+mod creds;
 mod gpu;
 mod hotkey;
 mod launch;
 mod open;
 mod process;
+mod remote;
+mod repos;
+mod settings;
 mod tray;
 mod window;
 
@@ -31,6 +35,7 @@ pub fn run() {
             None,
         ))
         .plugin(hotkey::plugin())
+        .manage(remote::Remote::new())
         .setup(|app| {
             let handle = app.handle();
             window::init(handle);
@@ -63,6 +68,14 @@ pub fn run() {
             launch::launch,
             open::open_folder,
             open::open_url,
+            remote::remote_list,
+            remote::remote_details,
+            remote::credentials,
+            remote::set_token,
+            settings::settings_get,
+            settings::settings_set,
+            repos::clone_repo,
+            repos::add_repo,
         ])
         .build(tauri::generate_context!())
         .expect("building the Tauri app");
