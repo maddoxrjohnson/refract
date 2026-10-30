@@ -4,6 +4,7 @@
 
 pub mod config;
 pub mod git;
+pub mod hook;
 pub mod launch;
 pub mod procs;
 pub mod repos;
@@ -12,4 +13,5 @@ pub mod server;
 pub mod sessions;
 pub mod setup;
 pub mod state;
+pub mod usage;
 pub mod watch;

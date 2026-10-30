@@ -1,7 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState, type FormEvent } from "react";
 import type { Backend } from "../backend/Backend";
 import type { Credentials, RemoteKind, RemoteSource, Settings } from "../backend/types";
+import type { HookControls } from "../hooks/useHook";
 import { describeKey } from "../projects";
+import { HookSection } from "./HookOffer";
 import { describeError } from "./StatusToast";
 import "./ui.css";
 
@@ -19,6 +21,8 @@ export interface SettingsPanelProps {
   onRefresh(): void;
   /** `byKey` is true for Escape, false for the close button. */
   onClose(byKey: boolean): void;
+  /** The status hook, installed or removed from its own section. */
+  hook: HookControls;
 }
 
 const GITHUB_SOURCE: Record<Credentials["github"], string> = {
@@ -90,7 +94,10 @@ function TokenForm({
   );
 }
 
-/** GitLab URL, tokens, forks and archived, hidden repos and extra folders (spec §5). */
+/**
+ * GitLab URL, tokens, forks and archived, hidden repos and extra folders (spec §5), and
+ * the status hook (spec §6.2).
+ */
 export function SettingsPanel({
   backend,
   settings,
@@ -99,6 +106,7 @@ export function SettingsPanel({
   onChange,
   onRefresh,
   onClose,
+  hook,
 }: SettingsPanelProps) {
   const titleId = useId();
   const gitlabId = useId();
@@ -341,6 +349,8 @@ export function SettingsPanel({
             </form>
             <NoteLine note={notes.folder ?? null} />
           </section>
+
+          <HookSection hook={hook} labelId={`${titleId}-hook`} />
         </div>
       )}
     </div>

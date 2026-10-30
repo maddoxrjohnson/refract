@@ -53,3 +53,34 @@ export function sessionStateLabel(state: SessionState): string {
       return "Open";
   }
 }
+
+/** A count in compact form: 950, 12.3K, 1.2M, 4B. */
+export function formatCount(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return "0";
+  for (const [size, suffix] of [
+    [1e9, "B"],
+    [1e6, "M"],
+    [1e3, "K"],
+  ] as const) {
+    // Rounding can carry up a unit: 999,960 is 1M, not 1000K.
+    if (n >= size * 0.9995) {
+      const v = n / size;
+      return `${v < 100 ? v.toFixed(1).replace(/\.0$/, "") : Math.round(v)}${suffix}`;
+    }
+  }
+  return String(Math.round(n));
+}
+
+/** Memory in GB with one decimal below 100 GB, or in MB below a gigabyte. */
+export function formatBytes(bytes: number): string {
+  const mb = bytes / 1024 ** 2;
+  if (mb < 1024) return `${Math.round(mb)} MB`;
+  const gb = mb / 1024;
+  return `${gb < 100 ? gb.toFixed(1).replace(/\.0$/, "") : Math.round(gb)} GB`;
+}
+
+/** A percentage for the widgets: one decimal below 10, whole above. */
+export function formatPercent(p: number): string {
+  const v = Number.isFinite(p) ? Math.max(0, p) : 0;
+  return `${v < 10 ? v.toFixed(1).replace(/\.0$/, "") : Math.round(v)}%`;
+}

@@ -1,12 +1,12 @@
 //! The agent's picture of every repo, and the events that keep the app in step with it.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use refract_core::classify::{classify, SessionState};
+use refract_core::classify::{classify_report, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, Candidate, Preselect};
 use refract_core::protocol::{Event, RemoteId, RepoSnapshot, SessionChange, SessionInfo};
@@ -60,6 +60,8 @@ pub struct RepoState {
     pub head: HeadInfo,
     pub sessions: Vec<SessionSummary>,
     pub live: HashSet<String>,
+    /// Status hook statuses of this repo's sessions, by session id.
+    pub hooks: HashMap<String, HookReport>,
     pub snapshot: RepoSnapshot,
 }
 
@@ -70,7 +72,13 @@ impl RepoState {
     /// built earlier can be stale even when nothing on disk moved; call this before
     /// answering `listRepos` or `getRepo`.
     pub fn refresh_preselect(&mut self, now: DateTime<Utc>) -> bool {
-        let fresh = repo_preselect(&self.snapshot.dirty_paths, &self.sessions, &self.live, now);
+        let fresh = repo_preselect(
+            &self.snapshot.dirty_paths,
+            &self.sessions,
+            &self.live,
+            &self.hooks,
+            now,
+        );
         if fresh == self.snapshot.preselect {
             return false;
         }
@@ -94,6 +102,8 @@ pub struct Agent {
     reader: SessionReader,
     repos: BTreeMap<PathBuf, RepoState>,
     procs: Vec<ClaudeProcess>,
+    /// Every status the status hook reported, by session id.
+    hooks: HashMap<String, HookReport>,
 }
 
 impl Agent {
@@ -105,6 +115,7 @@ impl Agent {
             reader,
             repos: BTreeMap::new(),
             procs: Vec::new(),
+            hooks: HashMap::new(),
         }
     }
 
@@ -260,6 +271,37 @@ impl Agent {
         self.repos.values().any(|r| r.wants_live_checks(now))
     }
 
+    /// Statuses from the status hook, by session id.
+    pub fn hooks(&self) -> &HashMap<String, HookReport> {
+        &self.hooks
+    }
+
+    /// Takes in the status hook's statuses and returns events for the sessions whose
+    /// state changed with them.
+    pub fn set_hooks(&mut self, hooks: HashMap<String, HookReport>) -> Vec<Event> {
+        self.hooks = hooks;
+        let stale: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|(_, r)| hooks_for(&self.hooks, &r.sessions) != r.hooks)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut events = Vec::new();
+        for path in stale {
+            let repo = &self.repos[&path];
+            let old = repo.snapshot.clone();
+            let (status, head, sessions, live) = (
+                repo.status.clone(),
+                repo.head.clone(),
+                repo.sessions.clone(),
+                repo.live.clone(),
+            );
+            self.store(path.clone(), status, head, sessions, live);
+            events.extend(diff(&old, &self.repos[&path].snapshot));
+        }
+        events
+    }
+
     /// Re-checks running processes for repos with live or recent sessions and returns
     /// events for sessions whose state changed.
     pub fn recheck_live(&mut self, now: DateTime<Utc>) -> Vec<Event> {
@@ -304,7 +346,9 @@ impl Agent {
         live: HashSet<String>,
     ) {
         let mass = self.repos.get(&path).map_or(0.0, |r| r.snapshot.mass);
-        let mut snapshot = build_snapshot(&path, &status, &head, &sessions, &live, Utc::now());
+        let hooks = hooks_for(&self.hooks, &sessions);
+        let mut snapshot =
+            build_snapshot(&path, &status, &head, &sessions, &live, &hooks, Utc::now());
         snapshot.mass = mass;
         self.repos.insert(
             path,
@@ -313,6 +357,7 @@ impl Agent {
                 head,
                 sessions,
                 live,
+                hooks,
                 snapshot,
             },
         );
@@ -384,13 +429,29 @@ fn live_set(procs: &[ClaudeProcess], repo: &Path, sessions: &[SessionSummary]) -
     procs::live_sessions(procs, &path_str(repo), &pairs)
 }
 
-/// Builds a snapshot with mass 0; the caller fills in mass across repos.
+/// The statuses in `hooks` of `sessions`.
+fn hooks_for(
+    hooks: &HashMap<String, HookReport>,
+    sessions: &[SessionSummary],
+) -> HashMap<String, HookReport> {
+    sessions
+        .iter()
+        .filter_map(|s| {
+            let id = s.session_id.as_ref()?;
+            Some((id.clone(), *hooks.get(id)?))
+        })
+        .collect()
+}
+
+/// Builds a snapshot with mass 0; the caller fills in mass across repos. `hooks` holds
+/// status hook statuses by session id.
 pub fn build_snapshot(
     path: &Path,
     status: &Status,
     head: &HeadInfo,
     sessions: &[SessionSummary],
     live: &HashSet<String>,
+    hooks: &HashMap<String, HookReport>,
     now: DateTime<Utc>,
 ) -> RepoSnapshot {
     let root = path_str(path);
@@ -399,8 +460,8 @@ pub fn build_snapshot(
         .iter()
         .map(|p| format!("{}/{p}", root.trim_end_matches('/')))
         .collect();
-    let states = session_states(sessions, live);
-    let preselect = repo_preselect(&dirty_paths, sessions, live, now);
+    let states = session_states(sessions, live, hooks);
+    let preselect = repo_preselect(&dirty_paths, sessions, live, hooks, now);
     let sessions = sessions
         .iter()
         .zip(&states)
@@ -438,12 +499,17 @@ pub fn build_snapshot(
     }
 }
 
-fn session_states(sessions: &[SessionSummary], live: &HashSet<String>) -> Vec<SessionState> {
+fn session_states(
+    sessions: &[SessionSummary],
+    live: &HashSet<String>,
+    hooks: &HashMap<String, HookReport>,
+) -> Vec<SessionState> {
     sessions
         .iter()
         .map(|s| {
-            let is_live = s.session_id.as_ref().is_some_and(|id| live.contains(id));
-            classify(s, is_live, None)
+            let id = s.session_id.as_ref();
+            let is_live = id.is_some_and(|id| live.contains(id));
+            classify_report(s, is_live, id.and_then(|id| hooks.get(id).copied()))
         })
         .collect()
 }
@@ -452,9 +518,10 @@ fn repo_preselect(
     dirty_paths: &[String],
     sessions: &[SessionSummary],
     live: &HashSet<String>,
+    hooks: &HashMap<String, HookReport>,
     now: DateTime<Utc>,
 ) -> Preselect {
-    let states = session_states(sessions, live);
+    let states = session_states(sessions, live, hooks);
     let candidates: Vec<Candidate<'_>> = sessions
         .iter()
         .zip(&states)
@@ -536,6 +603,7 @@ mod tests {
             &HeadInfo::default(),
             &[],
             &HashSet::new(),
+            &HashMap::new(),
             Utc::now(),
         )
     }

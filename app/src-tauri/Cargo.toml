@@ -32,6 +32,8 @@ ureq = { version = "3.4", default-features = false, features = ["native-tls-no-d
 # The versions wry uses, to reach WebView2 interfaces Tauri does not wrap.
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
+# CPU and memory for the system widget.
+sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # PDH for GPU use, ToolHelp for our child processes, ShellExecuteW to open folders
 # and links, Credential Manager for tokens.
 windows = { version = "0.62", features = [

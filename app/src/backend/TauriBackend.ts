@@ -6,6 +6,7 @@ import type {
   AgentStatus,
   Credentials,
   GpuUsage,
+  HookInfo,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
@@ -17,6 +18,8 @@ import type {
   RepoList,
   RepoSnapshot,
   Settings,
+  SystemStats,
+  UsageSummary,
 } from "./types";
 
 /** Event names the Rust side emits. */
@@ -26,6 +29,7 @@ export const EVENTS = {
   agentEvent: "agent://event",
   launchProgress: "launch://progress",
   gpu: "system://gpu",
+  stats: "system://stats",
 } as const;
 
 /**
@@ -133,5 +137,27 @@ export class TauriBackend implements Backend {
 
   addRepo(path: string): Promise<void> {
     return invoke<void>("add_repo", { path });
+  }
+
+  // The hook and usage commands reject with `AgentRequestError`, as `agent_request` does.
+
+  hookInfo(): Promise<HookInfo> {
+    return invoke<HookInfo>("hook_info");
+  }
+
+  installHook(): Promise<HookInfo> {
+    return invoke<HookInfo>("install_hook");
+  }
+
+  uninstallHook(): Promise<HookInfo> {
+    return invoke<HookInfo>("uninstall_hook");
+  }
+
+  usage(): Promise<UsageSummary> {
+    return invoke<UsageSummary>("usage");
+  }
+
+  onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe {
+    return subscribe<SystemStats>(EVENTS.stats, (e) => cb(e.payload));
   }
 }

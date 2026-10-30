@@ -15,6 +15,13 @@ pub enum HookStatus {
     Ended,
 }
 
+/// A status hook report: the status and when the script wrote it, in Unix seconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HookReport {
+    pub status: HookStatus,
+    pub at: Option<i64>,
+}
+
 /// What a running session is doing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -75,12 +82,38 @@ impl SessionState {
 /// Process detection decides liveness. A hook saying `Ended` while the process still
 /// runs gives `Live(Unknown)`. When the process is gone the transcript alone decides.
 pub fn classify(summary: &SessionSummary, live: bool, hook: Option<HookStatus>) -> SessionState {
+    classify_report(
+        summary,
+        live,
+        hook.map(|status| HookReport { status, at: None }),
+    )
+}
+
+/// [`classify`] with the time of the hook status. Pressing Esc or denying a permission
+/// ends a turn without a `Stop` hook, so a live session whose transcript ends in a user
+/// interrupt written after a working or waiting status counts as idle.
+pub fn classify_report(
+    summary: &SessionSummary,
+    live: bool,
+    hook: Option<HookReport>,
+) -> SessionState {
     if live {
-        let state = match hook {
-            Some(HookStatus::Working) => LiveState::Working,
-            Some(HookStatus::WaitingOnUser) => LiveState::WaitingOnUser,
-            Some(HookStatus::Finished) => LiveState::Idle,
-            Some(HookStatus::Ended) | None => LiveState::Unknown,
+        let interrupted_since = |at: Option<i64>| {
+            summary.tail == Some(Tail::UserInterrupt)
+                && at
+                    .zip(summary.last_timestamp)
+                    .is_some_and(|(at, last)| last.timestamp_millis() > at * 1000)
+        };
+        let state = match hook.map(|h| (h.status, h.at)) {
+            Some((HookStatus::Working | HookStatus::WaitingOnUser, at))
+                if interrupted_since(at) =>
+            {
+                LiveState::Idle
+            }
+            Some((HookStatus::Working, _)) => LiveState::Working,
+            Some((HookStatus::WaitingOnUser, _)) => LiveState::WaitingOnUser,
+            Some((HookStatus::Finished, _)) => LiveState::Idle,
+            Some((HookStatus::Ended, _)) | None => LiveState::Unknown,
         };
         return SessionState::Live(state);
     }
@@ -97,5 +130,51 @@ pub fn classify(summary: &SessionSummary, live: bool, hook: Option<HookStatus>) 
         Some(Tail::AssistantReply | Tail::ToolEndedTurn) | None => {
             SessionState::Finished(FinishKind::Completed)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::*;
+
+    #[test]
+    fn a_user_interrupt_after_the_hook_status_means_idle() {
+        let at = 1_773_489_600;
+        let summary = SessionSummary {
+            tail: Some(Tail::UserInterrupt),
+            last_timestamp: Utc.timestamp_opt(at + 5, 0).single(),
+            ..SessionSummary::default()
+        };
+        let report = |status, at| Some(HookReport { status, at });
+        for status in [HookStatus::Working, HookStatus::WaitingOnUser] {
+            assert_eq!(
+                classify_report(&summary, true, report(status, Some(at))),
+                SessionState::Live(LiveState::Idle)
+            );
+            // An interrupt from before the status (an earlier turn) does not count, nor
+            // one that cannot be placed in time.
+            assert_eq!(
+                classify_report(&summary, true, report(status, Some(at + 10))),
+                classify(&summary, true, Some(status))
+            );
+            assert_eq!(
+                classify_report(&summary, true, report(status, None)),
+                classify(&summary, true, Some(status))
+            );
+        }
+        assert_eq!(
+            classify_report(&summary, true, report(HookStatus::Ended, Some(at))),
+            SessionState::Live(LiveState::Unknown)
+        );
+        let prompt = SessionSummary {
+            tail: Some(Tail::UserPrompt),
+            ..summary
+        };
+        assert_eq!(
+            classify_report(&prompt, true, report(HookStatus::Working, Some(at))),
+            SessionState::Live(LiveState::Working)
+        );
     }
 }

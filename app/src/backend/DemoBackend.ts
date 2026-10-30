@@ -5,6 +5,7 @@ import type {
   CiStatus,
   Credentials,
   GpuUsage,
+  HookInfo,
   LaunchMode,
   LaunchStep,
   LaunchTicket,
@@ -18,6 +19,9 @@ import type {
   RepoSnapshot,
   SessionInfo,
   Settings,
+  SystemStats,
+  TokenTotals,
+  UsageSummary,
 } from "./types";
 
 // Invented repos covering every state a gem can show, for running the interface in a
@@ -215,6 +219,82 @@ function demoRemote(s: RemoteSeed): RemoteRepo {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+// Status hook (spec §6.2): what installing would change in an invented settings.json.
+
+const DEMO_SETTINGS_PATH = "/home/demo/.claude/settings.json";
+const DEMO_HOOK_SCRIPT = "/home/demo/.local/share/refract/status-hook.sh";
+const HOOK_EVENTS: [event: string, status: string][] = [
+  ["SessionStart", "finished"],
+  ["UserPromptSubmit", "working"],
+  ["PostToolUse", "working"],
+  ["Notification", "waitingOnUser"],
+  ["Stop", "finished"],
+  ["SessionEnd", "ended"],
+];
+
+function demoHookDiff(): string {
+  const entries = HOOK_EVENTS.flatMap(([event, status], i) => [
+    `+    "${event}": [`,
+    `+      { "hooks": [{ "type": "command", "command": "sh '${DEMO_HOOK_SCRIPT}' ${status}" }] }`,
+    `+    ]${i < HOOK_EVENTS.length - 1 ? "," : ""}`,
+  ]);
+  return [
+    `--- ${DEMO_SETTINGS_PATH}`,
+    `+++ ${DEMO_SETTINGS_PATH}`,
+    "@@ -1,4 +1,23 @@",
+    " {",
+    '   "model": "opus",',
+    '-  "theme": "dark"',
+    '+  "theme": "dark",',
+    '+  "hooks": {',
+    ...entries,
+    "+  }",
+    " }",
+    "",
+  ].join("\n");
+}
+
+// Widgets: numbers that drift slowly, so the demo looks alive without jumping about.
+
+const GB = 1024 ** 3;
+
+/** A smooth wobble between 0 and 1 with a period of `periodS` seconds. */
+const wave = (t: number, periodS: number, phase = 0) =>
+  0.5 + 0.5 * Math.sin((2 * Math.PI * t) / periodS + phase);
+
+function demoStats(t: number): SystemStats {
+  return {
+    cpuPercent: 14 + 22 * wave(t, 47) + 6 * wave(t, 7, 1),
+    memUsedBytes: (13.2 + 1.6 * wave(t, 90, 2)) * GB,
+    memTotalBytes: 32 * GB,
+    gpuPercent: 9 + 18 * wave(t, 31, 0.5),
+    own: {
+      cpuPercent: 0.4 + 0.6 * wave(t, 11, 2),
+      memBytes: (0.21 + 0.02 * wave(t, 23)) * GB,
+      gpuPercent: 1.2 + 1.5 * wave(t, 13, 1),
+    },
+  };
+}
+
+/** Token totals that grow with `scale`, split the way Claude Code's mostly are. */
+function totals(scale: number): TokenTotals {
+  return {
+    input: Math.round(scale * 0.012),
+    output: Math.round(scale * 0.038),
+    cacheRead: Math.round(scale * 0.86),
+    cacheWrite: Math.round(scale * 0.09),
+  };
+}
+
+const USAGE_REPOS: [name: string, share: number][] = [
+  ["tidepool", 0.34],
+  ["atlas-api", 0.24],
+  ["quill", 0.16],
+  ["tessera", 0.12],
+  ["mailroom", 0.09],
+  ["ledger-sync", 0.05],
+];
+
 /** A backend with invented data. Launching only walks through the progress steps. */
 export class DemoBackend implements Backend {
   private repos = demoRepos();
@@ -227,6 +307,8 @@ export class DemoBackend implements Backend {
     hidden: [],
   };
   private creds: Credentials = { github: "ghCli", gitlab: "stored" };
+  private hookInstalled = false;
+  private started = Date.now();
 
   private emit(event: AgentEvent) {
     for (const cb of this.events) cb(event);
@@ -404,5 +486,53 @@ export class DemoBackend implements Backend {
     };
     this.repos = [...this.repos, snapshot];
     this.emit({ event: "repoChanged", data: snapshot });
+  }
+
+  hookInfo(): Promise<HookInfo> {
+    return Promise.resolve({
+      installed: this.hookInstalled,
+      settingsPath: DEMO_SETTINGS_PATH,
+      diff: this.hookInstalled ? null : demoHookDiff(),
+    });
+  }
+
+  async installHook(): Promise<HookInfo> {
+    await sleep(400);
+    this.hookInstalled = true;
+    return this.hookInfo();
+  }
+
+  async uninstallHook(): Promise<HookInfo> {
+    await sleep(400);
+    this.hookInstalled = false;
+    return this.hookInfo();
+  }
+
+  /** Totals that creep up while the demo runs, as if the live agents were working. */
+  usage(): Promise<UsageSummary> {
+    const minutes = (Date.now() - this.started) / 60_000;
+    const today = 4_200_000 + minutes * 38_000;
+    const week = 31_000_000 + minutes * 38_000;
+    const live = this.repos.flatMap((r) => r.sessions).filter((s) => s.state.kind === "live").length;
+    return Promise.resolve({
+      today: totals(today),
+      last7Days: totals(week),
+      last5Hours: totals(1_900_000 + minutes * 38_000),
+      liveAgents: live,
+      byRepo: USAGE_REPOS.map(([name, share]) => ({
+        path: `/home/demo/projects/${name}`,
+        name,
+        last7Days: totals(week * share),
+      })),
+      computedAt: new Date().toISOString(),
+      ready: true,
+    });
+  }
+
+  onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe {
+    const tick = () => cb(demoStats((Date.now() - this.started) / 1000));
+    tick();
+    const timer = setInterval(tick, 2000);
+    return () => clearInterval(timer);
   }
 }

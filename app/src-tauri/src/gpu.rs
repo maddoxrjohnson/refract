@@ -1,4 +1,5 @@
 //! GPU use from Windows' performance counters, sampled while the window is visible.
+//! The same thread samples the system widget's stats (`stats.rs`).
 //!
 //! The counter is PDH's `\GPU Engine(*)\Utilization Percentage`, whose instances are
 //! named like `pid_1234_luid_0x00000000_0x0000D1C1_phys_0_eng_3_engtype_3D`: one per
@@ -130,6 +131,12 @@ pub fn set_sampling(app: &AppHandle, visible: bool) {
     let _ = (app, visible);
 }
 
+/// The process list the sampler reads, for the ignored test in `stats.rs`.
+#[cfg(all(windows, test))]
+pub fn sampler_processes() -> Vec<crate::stats::ProcessEntry> {
+    sampler::processes()
+}
+
 #[cfg(windows)]
 mod sampler {
     #[cfg(test)]
@@ -152,6 +159,7 @@ mod sampler {
     };
 
     use super::{descendants, usage, GPU_EVENT, INTERVAL};
+    use crate::stats::{self, ProcessEntry, STATS_EVENT};
 
     /// The running sampler's stop signal. Dropping it ends the thread at once.
     static RUNNING: Mutex<Option<Sender<()>>> = Mutex::new(None);
@@ -173,26 +181,35 @@ mod sampler {
         let spawned = thread::Builder::new()
             .name("refract-gpu".into())
             .spawn(move || {
-                let query = match Query::open() {
-                    Ok(query) => query,
-                    Err(err) => {
-                        eprintln!("refract: GPU counters unavailable: {err}");
-                        return;
-                    }
-                };
-                // The first collection only primes the rate counter.
-                query.collect();
+                // Without GPU counters the stats still go out, with no GPU use.
+                let query = Query::open()
+                    .map_err(|err| eprintln!("refract: GPU counters unavailable: {err}"))
+                    .ok();
+                // The first readings only prime the rate counters.
+                if let Some(query) = &query {
+                    query.collect();
+                }
+                let mut sampler = stats::Sampler::new(&processes());
                 loop {
                     match stopped.recv_timeout(INTERVAL) {
                         Err(RecvTimeoutError::Timeout) => {}
                         _ => return,
                     }
-                    let Some(samples) = query.read() else {
-                        continue;
-                    };
-                    let own = descendants(std::process::id(), &processes());
-                    if let Err(err) = app.emit(GPU_EVENT, usage(&samples, &own)) {
-                        eprintln!("refract: emitting {GPU_EVENT}: {err}");
+                    let samples = query.as_ref().and_then(Query::read);
+                    let processes = processes();
+                    if let Some(samples) = &samples {
+                        let pairs: Vec<(u32, u32)> =
+                            processes.iter().map(|p| (p.pid, p.parent)).collect();
+                        let own = descendants(std::process::id(), &pairs);
+                        if let Err(err) = app.emit(GPU_EVENT, usage(samples, &own)) {
+                            eprintln!("refract: emitting {GPU_EVENT}: {err}");
+                        }
+                    }
+                    if let Some(sampler) = &mut sampler {
+                        let stats = sampler.sample(&processes, samples.as_deref().unwrap_or(&[]));
+                        if let Err(err) = app.emit(STATS_EVENT, stats) {
+                            eprintln!("refract: emitting {STATS_EVENT}: {err}");
+                        }
                     }
                 }
             });
@@ -302,8 +319,8 @@ mod sampler {
         }
     }
 
-    /// `(pid, parent pid)` of every process, from a ToolHelp snapshot. Empty on error.
-    pub fn processes() -> Vec<(u32, u32)> {
+    /// Every process, from a ToolHelp snapshot. Empty on error.
+    pub fn processes() -> Vec<ProcessEntry> {
         let mut found = Vec::new();
         // SAFETY: the snapshot handle is closed below; the entry carries its size.
         unsafe {
@@ -316,7 +333,13 @@ mod sampler {
             };
             let mut more = Process32FirstW(snapshot, &mut entry).is_ok();
             while more {
-                found.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                let name = &entry.szExeFile;
+                let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+                found.push(ProcessEntry {
+                    pid: entry.th32ProcessID,
+                    parent: entry.th32ParentProcessID,
+                    name: String::from_utf16_lossy(&name[..len]),
+                });
                 more = Process32NextW(snapshot, &mut entry).is_ok();
             }
             let _ = CloseHandle(snapshot);
@@ -327,7 +350,8 @@ mod sampler {
     /// For the ignored test that reads the real counters.
     #[cfg(test)]
     pub fn own_pids() -> HashSet<u32> {
-        descendants(std::process::id(), &processes())
+        let pairs: Vec<(u32, u32)> = processes().iter().map(|p| (p.pid, p.parent)).collect();
+        descendants(std::process::id(), &pairs)
     }
 }
 

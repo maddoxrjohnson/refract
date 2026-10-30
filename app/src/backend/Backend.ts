@@ -1,5 +1,8 @@
 import type {
   AgentEvent,
+  HookInfo,
+  SystemStats,
+  UsageSummary,
   Credentials,
   RemoteDetails,
   RemoteKind,
@@ -56,4 +59,14 @@ export interface Backend {
   cloneRepo(repo: RemoteRepo): Promise<string>;
   /** Adds a local folder (a WSL path) to the repos the helper reports. */
   addRepo(path: string): Promise<void>;
+
+  /** Whether the status hook is installed, and what installing would change. */
+  hookInfo(): Promise<HookInfo>;
+  installHook(): Promise<HookInfo>;
+  /** Removes the hook, restoring settings.json byte for byte when nothing else changed. */
+  uninstallHook(): Promise<HookInfo>;
+  /** Token totals; cheap, so the widget asks about every 2 s while visible. */
+  usage(): Promise<UsageSummary>;
+  /** Machine load about every 2 s while the window is visible. */
+  onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe;
 }

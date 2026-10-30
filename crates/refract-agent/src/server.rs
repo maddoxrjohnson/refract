@@ -6,7 +6,8 @@
 //! A fourth thread runs the first load, so requests are answered while it runs, a
 //! fifth runs `setupServer` requests one at a time, sending each response back through
 //! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
-//! time, sending each result back for this thread to report and answer.
+//! time, sending each result back for this thread to report and answer. A seventh keeps
+//! token usage totals up to date (see [`crate::usage`]).
 //!
 //! Backpressure: the channel is bounded and writes to stdout block. If the app stops
 //! reading stdout, this thread stops; the stdin and inotify threads then block on the
@@ -24,18 +25,21 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use refract_core::launch::wsl_path;
 use refract_core::protocol::{
-    code, parse_request, ErrorBody, Event, Hello, Id, Method, Outcome, Reply, RepoList, Response,
-    PROTOCOL_VERSION,
+    code, parse_request, ErrorBody, Event, Hello, HookInfo, Id, Method, Outcome, Reply, RepoList,
+    Response, PROTOCOL_VERSION,
 };
 use refract_core::sessions::{paths_match, project_dir_matches};
 use serde::Serialize;
 
 use crate::config::{self, Config};
+use crate::hook;
 use crate::launch;
+use crate::procs;
 use crate::repos;
 use crate::scan;
 use crate::setup;
 use crate::state::{self, path_str, Agent, Refresh};
+use crate::usage::Usage;
 use crate::watch::{self, Change, FsEvent, Watcher};
 
 /// Quiet time after the last file-system event before refreshing.
@@ -95,6 +99,8 @@ struct Pending {
     project_dirs: HashSet<String>,
     new_project_dirs: HashSet<String>,
     rewatch: HashSet<PathBuf>,
+    /// Status hook files written or removed.
+    hook_files: HashSet<String>,
     rescan: bool,
     reload: bool,
     first: Option<Instant>,
@@ -116,6 +122,9 @@ impl Pending {
             }
             Change::Rewatch(path) => {
                 self.rewatch.insert(path);
+            }
+            Change::Hook(name) => {
+                self.hook_files.insert(name);
             }
             Change::Rescan => self.rescan = true,
             Change::Overflow => self.reload = true,
@@ -159,6 +168,8 @@ struct Server<W: Write> {
     /// A rescan or reload asked for during the load, run once it is done.
     deferred_rescan: bool,
     deferred_reload: bool,
+    /// Token usage, kept up to date by its own thread.
+    usage: Usage,
 }
 
 /// Runs the helper until `shutdown` or the end of `input`.
@@ -188,6 +199,7 @@ where
             None
         }
     };
+    let usage = Usage::start(config.claude_projects.clone());
     let mut server = Server {
         out,
         agent: Agent::new(config),
@@ -205,6 +217,7 @@ where
         prewatched: Vec::new(),
         deferred_rescan: false,
         deferred_reload: false,
+        usage,
     };
 
     loop {
@@ -317,6 +330,14 @@ fn error_response(id: Option<Id>, code: i32, message: impl Into<String>) -> Resp
     }
 }
 
+/// Answers a status hook request.
+fn hook_response(id: Id, result: Result<HookInfo, String>) -> Response {
+    match result {
+        Ok(info) => Response::ok(id, Reply::Hook(info)),
+        Err(message) => Response::err(id, code::HOOK_FAILED, message),
+    }
+}
+
 impl<W: Write> Server<W> {
     /// Handles one request line. Returns false when the helper should exit.
     fn handle_line(&mut self, line: Line) -> io::Result<bool> {
@@ -419,6 +440,26 @@ impl<W: Write> Server<W> {
                     format!("path is not an absolute Linux, Windows or WSL path: {path:?}"),
                 ),
             },
+            Method::Usage => {
+                let repos: Vec<String> = self.agent.repo_paths().map(|p| path_str(p)).collect();
+                let live = procs::scan().len() as u32;
+                Response::ok(id, Reply::Usage(self.usage.summary(&repos, live)))
+            }
+            Method::HookInfo => hook_response(id, hook::info(&hook::Paths::from_env())),
+            Method::InstallHook | Method::UninstallHook => {
+                let paths = hook::Paths::from_env();
+                let result = if matches!(request.method, Method::InstallHook) {
+                    hook::install(&paths)
+                } else {
+                    hook::uninstall(&paths)
+                };
+                self.watch_hook_dir();
+                // Statuses count only while the hook is installed.
+                let events = self.agent.set_hooks(hook::statuses(&paths));
+                self.send(&hook_response(id, result))?;
+                self.send_all(&events)?;
+                return Ok(true);
+            }
             Method::Shutdown => {
                 self.send(&Response::ok(id, Reply::Done))?;
                 return Ok(false);
@@ -598,6 +639,9 @@ impl<W: Write> Server<W> {
             }
         }
         self.prewatched = walk.repos;
+        self.watch_hook_dir();
+        self.agent
+            .set_hooks(hook::statuses(&hook::Paths::from_env()));
         let phases = load_phases(&config);
         let tx = self.tx.clone();
         std::thread::Builder::new()
@@ -624,6 +668,8 @@ impl<W: Write> Server<W> {
     /// asked for since the load started, and watches the repos fully.
     fn loaded(&mut self, agent: Agent, last: bool) -> io::Result<()> {
         let old = std::mem::replace(&mut self.agent, agent);
+        // What the new statuses change is reported below, against the old snapshots.
+        self.agent.set_hooks(old.hooks().clone());
         for repo in &self.added_extra {
             self.agent.add_extra(repo.clone());
         }
@@ -701,6 +747,13 @@ impl<W: Write> Server<W> {
         }
         self.schedule_live();
         Ok(())
+    }
+
+    /// Watches the status hook's directory, when there is one.
+    fn watch_hook_dir(&mut self) {
+        if let Some(watcher) = &mut self.watcher {
+            watcher.watch_hook_dir(&hook::status_dir());
+        }
     }
 
     fn watch_repo(&mut self, repo: &Path) {
@@ -787,6 +840,21 @@ impl<W: Write> Server<W> {
             for path in self.agent.repo_paths() {
                 refresh.insert(path.clone(), Refresh::ALL);
             }
+        }
+
+        if pending.reload || !pending.hook_files.is_empty() {
+            let paths = hook::Paths::from_env();
+            let dir = &paths.status_dir;
+            let hooks = if !hook::enabled(&paths) {
+                HashMap::new()
+            } else if pending.reload {
+                hook::read_statuses(dir)
+            } else {
+                let mut hooks = self.agent.hooks().clone();
+                hook::update_statuses(dir, &mut hooks, &pending.hook_files);
+                hooks
+            };
+            events.extend(self.agent.set_hooks(hooks));
         }
 
         let repos: Vec<PathBuf> = self.agent.repo_paths().cloned().collect();

@@ -2,7 +2,7 @@ import { emit } from "@tauri-apps/api/event";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
 import { EVENTS, TauriBackend } from "./TauriBackend";
-import type { AgentStatus, GpuUsage, RemoteRepo, Settings } from "./types";
+import type { AgentStatus, GpuUsage, HookInfo, RemoteRepo, Settings, SystemStats, UsageSummary } from "./types";
 
 afterEach(() => clearMocks());
 
@@ -182,5 +182,62 @@ describe("TauriBackend", () => {
       { cmd: "clone_repo", args: { repo } },
       { cmd: "add_repo", args: { path: "/home/dev/code/orbit-cli" } },
     ]);
+  });
+
+  it("asks about the hook and usage through their commands", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const info: HookInfo = {
+      installed: false,
+      settingsPath: "/home/dev/.claude/settings.json",
+      diff: "--- a/settings.json\n+++ b/settings.json\n",
+    };
+    const totals = { input: 1, output: 2, cacheRead: 3, cacheWrite: 4 };
+    const summary: UsageSummary = {
+      today: totals,
+      last7Days: totals,
+      last5Hours: totals,
+      liveAgents: 2,
+      byRepo: [{ path: "/home/dev/projects/tidepool-api", name: "tidepool-api", last7Days: totals }],
+      computedAt: "2026-10-30T12:00:00Z",
+      ready: true,
+    };
+    const notRunning = { kind: "notRunning" };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "hook_info") return info;
+      if (cmd === "install_hook") return { ...info, installed: true, diff: null };
+      if (cmd === "uninstall_hook") throw notRunning;
+      if (cmd === "usage") return summary;
+    });
+    const backend = new TauriBackend();
+    expect(await backend.hookInfo()).toEqual(info);
+    expect(await backend.installHook()).toEqual({ ...info, installed: true, diff: null });
+    await expect(backend.uninstallHook()).rejects.toEqual(notRunning);
+    expect(await backend.usage()).toEqual(summary);
+    expect(calls).toEqual([
+      { cmd: "hook_info", args: {} },
+      { cmd: "install_hook", args: {} },
+      { cmd: "uninstall_hook", args: {} },
+      { cmd: "usage", args: {} },
+    ]);
+  });
+
+  it("delivers system stats until unsubscribed", async () => {
+    mockIPC(() => undefined, { shouldMockEvents: true });
+    const stats: SystemStats = {
+      cpuPercent: 12.5,
+      memUsedBytes: 8e9,
+      memTotalBytes: 32e9,
+      gpuPercent: 30,
+      own: { cpuPercent: 0.4, memBytes: 1.2e8, gpuPercent: 1.5 },
+    };
+    const seen: SystemStats[] = [];
+    const stop = new TauriBackend().onSystemStats((s) => seen.push(s));
+    await settle();
+    await emit(EVENTS.stats, stats);
+    stop();
+    await settle();
+    await emit(EVENTS.stats, { ...stats, cpuPercent: 90 });
+    expect(seen).toEqual([stats]);
   });
 });

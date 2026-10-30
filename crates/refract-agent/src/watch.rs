@@ -11,8 +11,9 @@
 //! Watched per repo: the git directory (HEAD, index, packed-refs, ...), `refs/heads` and
 //! `refs/remotes` with their subdirectories (in the common git directory for linked
 //! worktrees), and every working-tree directory that holds tracked files. Also watched:
-//! Claude Code's `projects` directory, the project directory of each repo, and every
-//! directory the repo search walks (for repos appearing or vanishing).
+//! Claude Code's `projects` directory, the project directory of each repo, every
+//! directory the repo search walks (for repos appearing or vanishing), and the status
+//! hook's directory of status files.
 //!
 //! Re-watching a repo only adds and removes the directories that differ, so events
 //! already queued for unchanged watches still map to their repo. When the kernel drops a
@@ -59,6 +60,8 @@ pub enum Target {
     ScanDir {
         descend: bool,
     },
+    /// The status hook's directory of `<session id>.json` files.
+    HookDir,
 }
 
 impl Target {
@@ -79,6 +82,8 @@ pub enum Change {
     Rewatch(PathBuf),
     /// Transcripts changed in this project directory.
     Sessions(String),
+    /// This status hook file was written or removed.
+    Hook(String),
     /// A project directory appeared.
     NewProjectDir(String),
     /// Repos may have appeared or vanished.
@@ -253,6 +258,16 @@ impl Watcher {
             .map(|(dir, descend)| (dir.clone(), mask, Target::ScanDir { descend: *descend }))
             .collect();
         self.sync(|t| matches!(t, Target::ScanDir { .. }), wanted);
+    }
+
+    /// Watches the status hook's directory for status files being written or removed.
+    pub fn watch_hook_dir(&mut self, dir: &Path) {
+        let mask = WatchMask::CLOSE_WRITE
+            | WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::DELETE
+            | WatchMask::ONLYDIR;
+        self.add(dir, mask, Target::HookDir);
     }
 
     /// Number of inotify watches held.
@@ -435,6 +450,11 @@ pub fn change_for(
                 *descend && mask.contains(EventMask::ISDIR) && !crate::scan::is_skipped(name);
             (new_repo || new_dir).then_some(Change::Rescan)
         }
+        // The script writes a temporary file and renames it, so only `.json` names
+        // matter; a name that is no session id is skipped when read.
+        Target::HookDir => name
+            .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
+            .map(|n| Change::Hook(n.to_owned())),
     }
 }
 
@@ -581,6 +601,27 @@ mod tests {
         assert_eq!(
             change(leaf, EventMask::CREATE, ".git"),
             Some(Change::Rescan)
+        );
+    }
+
+    #[test]
+    fn hook_dir_events() {
+        let name = "3f6c1a52-0000-4000-8000-000000000001.json";
+        assert_eq!(
+            change(Target::HookDir, EventMask::MOVED_TO, name),
+            Some(Change::Hook(name.into()))
+        );
+        assert_eq!(
+            change(
+                Target::HookDir,
+                EventMask::CLOSE_WRITE,
+                ".3f6c1a52-0000-4000-8000-000000000001.77.tmp"
+            ),
+            None
+        );
+        assert_eq!(
+            change_for(&Target::HookDir, EventMask::DELETE_SELF, None),
+            None
         );
     }
 

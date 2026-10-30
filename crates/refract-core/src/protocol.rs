@@ -14,6 +14,7 @@ use serde_json::Value;
 
 use crate::classify::SessionState;
 use crate::preselect::Preselect;
+use crate::usage::UsageSummary;
 
 /// Bumped whenever a message changes incompatibly.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -39,6 +40,9 @@ pub mod code {
     /// `cloneRepo` failed: the destination already exists and is not a clone of the
     /// same URL, or `git clone` failed or took too long.
     pub const CLONE_FAILED: i32 = 3;
+    /// `hookInfo`, `installHook` or `uninstallHook` could not read or change Claude
+    /// Code's `settings.json` or Refract's hook files.
+    pub const HOOK_FAILED: i32 = 4;
 }
 
 /// A request from the app.
@@ -81,6 +85,15 @@ pub enum Method {
     /// config's `extra` when no root covers it: answered with `null`. `path` is a
     /// Linux, Windows drive or `\\wsl.localhost\<distro>\…` path.
     AddRepo { path: String },
+    /// Token use added up from Claude Code's transcripts: answered with a
+    /// [`UsageSummary`].
+    Usage,
+    /// Whether the status hook is installed: answered with a [`HookInfo`].
+    HookInfo,
+    /// Installs the status hook (spec §6.2): answered with a [`HookInfo`].
+    InstallHook,
+    /// Removes the status hook, restoring `settings.json`: answered with a [`HookInfo`].
+    UninstallHook,
     /// Answered with `null`, then the helper exits.
     Shutdown,
 }
@@ -125,6 +138,8 @@ pub enum Reply {
     Repo(Box<RepoSnapshot>),
     Launch(LaunchTicket),
     ServerSetup(ServerSetup),
+    Hook(HookInfo),
+    Usage(UsageSummary),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -185,6 +200,17 @@ pub struct LaunchTicket {
     pub session_id: String,
     /// What to pass to `code --folder-uri`.
     pub folder_uri: String,
+}
+
+/// The result of `hookInfo`, `installHook` and `uninstallHook`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HookInfo {
+    pub installed: bool,
+    /// Claude Code's `settings.json` in WSL.
+    pub settings_path: String,
+    /// Unified diff of what installing would change; `None` when installed.
+    pub diff: Option<String>,
 }
 
 /// The result of `setupServer`: what it changed, or why it did nothing.
@@ -436,7 +462,8 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     };
     let takes_params = match method {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" => true,
-        "ping" | "listRepos" | "shutdown" => false,
+        "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
+        | "shutdown" => false,
         _ => {
             return Err(fail(
                 Some(id),
@@ -491,6 +518,7 @@ impl Response {
 mod tests {
     use super::*;
     use crate::classify::{InterruptReason, LiveState};
+    use crate::usage::{RepoUsage, TokenTotals};
     use serde_json::json;
 
     fn snapshot() -> RepoSnapshot {
@@ -842,6 +870,39 @@ mod tests {
     /// `Reply` is untagged, so each variant must read back as itself, as the app reads
     /// it: inside a [`Message`].
     #[test]
+    fn hook_messages_round_trip() {
+        for (method, name) in [
+            (Method::HookInfo, "hookInfo"),
+            (Method::InstallHook, "installHook"),
+            (Method::UninstallHook, "uninstallHook"),
+        ] {
+            let request = Request {
+                id: 1.into(),
+                method: method.clone(),
+            };
+            assert_eq!(round_trip(&request), json!({"id": 1, "method": name}));
+            let line = format!(r#"{{"id":1,"method":"{name}","params":{{}}}}"#);
+            assert_eq!(parse_request(&line).unwrap().method, method);
+        }
+        let not_installed = Reply::Hook(HookInfo {
+            installed: false,
+            settings_path: "/home/dev/.claude/settings.json".into(),
+            diff: Some("--- a\n+++ b\n".into()),
+        });
+        let installed = Reply::Hook(HookInfo {
+            installed: true,
+            settings_path: "/home/dev/.claude/settings.json".into(),
+            diff: None,
+        });
+        let wire = round_trip(&Message::Response(Response::ok(1, installed)));
+        assert_eq!(
+            wire["result"],
+            json!({"installed": true, "settingsPath": "/home/dev/.claude/settings.json", "diff": null})
+        );
+        round_trip(&Message::Response(Response::ok(2, not_installed)));
+    }
+
+    #[test]
     fn every_reply_reads_back_as_its_own_variant() {
         let replies = [
             Reply::Hello(Hello {
@@ -873,6 +934,11 @@ mod tests {
                 application_scoped: false,
                 skipped: Some("no VS Code server".into()),
             }),
+            Reply::Usage(usage()),
+            Reply::Usage(UsageSummary {
+                by_repo: vec![],
+                ..usage()
+            }),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
@@ -880,6 +946,47 @@ mod tests {
             let message = Message::Response(Response::ok(1, reply));
             round_trip(&message);
         }
+    }
+
+    fn usage() -> UsageSummary {
+        let totals = TokenTotals {
+            input: 1_200,
+            output: 3_400,
+            cache_read: 56_000,
+            cache_write: 7_800,
+        };
+        UsageSummary {
+            today: totals,
+            last_7_days: totals,
+            last_5_hours: TokenTotals::default(),
+            live_agents: 2,
+            by_repo: vec![RepoUsage {
+                path: "/home/dev/projects/tidepool-api".into(),
+                name: "tidepool-api".into(),
+                last_7_days: totals,
+            }],
+            computed_at: "2026-03-14T18:00:00Z".parse().unwrap(),
+            ready: true,
+        }
+    }
+
+    #[test]
+    fn usage_round_trips() {
+        let request = parse_request(r#"{"id":16,"method":"usage","params":{}}"#).unwrap();
+        assert_eq!(request.method, Method::Usage);
+        assert_eq!(round_trip(&request), json!({"id": 16, "method": "usage"}));
+        let totals = json!({"input": 1200, "output": 3400, "cacheRead": 56000, "cacheWrite": 7800});
+        assert_eq!(
+            round_trip(&Response::ok(16, Reply::Usage(usage()))),
+            json!({"id": 16, "result": {
+                "today": totals,
+                "last7Days": totals,
+                "last5Hours": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                "liveAgents": 2,
+                "byRepo": [{"path": "/home/dev/projects/tidepool-api", "name": "tidepool-api", "last7Days": totals}],
+                "computedAt": "2026-03-14T18:00:00Z",
+                "ready": true}})
+        );
     }
 
     #[test]

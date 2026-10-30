@@ -7,7 +7,10 @@ import type {
   RemoteRef,
   RepoSnapshot,
   Settings,
+  SystemStats,
+  UsageSummary,
 } from "./backend/types";
+import { useHook } from "./hooks/useHook";
 import { useRemoteDetails } from "./hooks/useRemoteDetails";
 import { useVisibility } from "./hooks/useVisibility";
 import { hideKey, mergeProjects } from "./projects";
@@ -19,6 +22,7 @@ import { Scene } from "./scene/Scene";
 import { DetailPanel } from "./ui/DetailPanel";
 import { FilterBar } from "./ui/FilterBar";
 import { FocusLabel } from "./ui/FocusLabel";
+import { HookOffer, loadHookOfferDismissed, saveHookOfferDismissed } from "./ui/HookOffer";
 import {
   initialNavState,
   matchingPaths,
@@ -33,11 +37,15 @@ import { Picker } from "./ui/Picker";
 import { loadQualitySetting, QualityControl } from "./ui/QualityControl";
 import { SettingsPanel } from "./ui/SettingsPanel";
 import { describeError, StatusToast, type LaunchProgress } from "./ui/StatusToast";
+import { SystemWidget } from "./ui/SystemWidget";
+import { UsageWidget } from "./ui/UsageWidget";
 
 /** How long a finished launch stays on screen. */
 const LAUNCH_TOAST_MS = 4000;
 /** How long a failed Open folder or Open on GitHub message stays. */
 const OPEN_ERROR_MS = 6000;
+/** How often the usage widget asks for totals while the window is shown. */
+const USAGE_POLL_MS = 2000;
 
 /** Until the saved settings arrive: nothing hidden, forks and archived repos left out. */
 const DEFAULT_SETTINGS: Settings = { gitlabUrl: null, showForks: false, showArchived: false, hidden: [] };
@@ -95,10 +103,49 @@ function useQuality(backend: Backend) {
   return { setting, level, setSetting, onFrameInterval };
 }
 
+/**
+ * The widgets' numbers (spec §3.5): system stats as the backend sends them and usage
+ * asked for every 2 s, both only while the window is shown.
+ */
+function useWidgets(backend: Backend, visible: boolean, running: boolean) {
+  const [stats, setStats] = useState<SystemStats | null>(null);
+  const [usage, setUsage] = useState<UsageSummary | null>(null);
+
+  useEffect(() => {
+    if (!visible) return;
+    return backend.onSystemStats(setStats);
+  }, [backend, visible]);
+
+  // The next request goes out once the last has answered, so slow answers never pile up.
+  useEffect(() => {
+    if (!visible || !running) return;
+    let live = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const poll = () => {
+      backend
+        .usage()
+        .then(
+          (u) => live && setUsage(u),
+          (err: unknown) => console.warn("usage failed", err),
+        )
+        .finally(() => {
+          if (live) timer = setTimeout(poll, USAGE_POLL_MS);
+        });
+    };
+    poll();
+    return () => {
+      live = false;
+      clearTimeout(timer);
+    };
+  }, [backend, visible, running]);
+
+  return { stats, usage };
+}
+
 export function App({ backend }: { backend: Backend }) {
   const visible = useVisibility(backend);
   const [status, setStatus] = useState<AgentStatus | null>(null);
-  const [{ repos: localRepos }, dispatch] = useReducer(repoReducer, initialRepoState);
+  const [{ repos: localRepos, loading: reposLoading }, dispatch] = useReducer(repoReducer, initialRepoState);
   const [error, setError] = useState<string | null>(null);
   const [launch, setLaunch] = useState<LaunchProgress | null>(null);
 
@@ -157,6 +204,21 @@ export function App({ backend }: { backend: Backend }) {
   }, [backend, running, shown]);
 
   useEffect(() => backend.onAgentEvent((event) => dispatch({ type: "event", event })), [backend]);
+
+  const widgets = useWidgets(backend, visible, running);
+  // The status hook (spec §6.2): offered once, after the repos are in, until installed
+  // or turned down.
+  const hook = useHook(backend, running, shown);
+  const [offerDismissed, setOfferDismissed] = useState(loadHookOfferDismissed);
+  const dismissOffer = useCallback(() => {
+    saveHookOfferDismissed();
+    setOfferDismissed(true);
+  }, []);
+  // Once installed from anywhere (settings included), the first-run offer has done its job.
+  const hookInstalled = hook.info?.installed === true;
+  useEffect(() => {
+    if (hookInstalled && !offerDismissed) dismissOffer();
+  }, [hookInstalled, offerDismissed, dismissOffer]);
 
   // Settings and remote repos (spec §5), fetched on each show; Refresh skips the cache.
   const [settings, setSettings] = useState<Settings | null>(null);
@@ -372,6 +434,15 @@ export function App({ backend }: { backend: Backend }) {
   const details = useRemoteDetails(backend, detailsRef);
   const pickerRepo = nav.picker ? repos.get(nav.picker.path) : undefined;
   const now = Date.now();
+  const showOffer =
+    !offerDismissed &&
+    hook.info?.installed === false &&
+    localRepos.size > 0 &&
+    !reposLoading &&
+    !settingsOpen &&
+    // Out of the way while a repo is zoomed or the picker is up.
+    !nav.zoomed &&
+    !nav.picker;
 
   useEffect(() => {
     if (!openError) return;
@@ -464,9 +535,13 @@ export function App({ backend }: { backend: Backend }) {
             onChange={saveSettings}
             onRefresh={() => loadRemotes(true)}
             onClose={closeSettings}
+            hook={hook}
           />
         )}
+        {showOffer && <HookOffer hook={hook} onDismiss={dismissOffer} />}
       </div>
+      <SystemWidget stats={widgets.stats} away={!!zoomedRepo} />
+      <UsageWidget usage={widgets.usage} away={!!zoomedRepo} />
       <StatusToast
         agent={status}
         launch={launch}

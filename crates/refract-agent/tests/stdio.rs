@@ -28,6 +28,9 @@ impl Agent {
 
     fn spawn_with(home: &Path, config: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
+            // Never the real state or data directories.
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_DATA_HOME")
             .envs(env.iter().copied())
             .env("HOME", home)
             .env("REFRACT_AGENT_CONFIG", config)

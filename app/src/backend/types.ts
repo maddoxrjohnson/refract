@@ -201,3 +201,56 @@ export interface CommandError {
   kind: string;
   message: string;
 }
+
+// Status hook and widgets (M6).
+
+/** The optional Claude Code status hook (spec §6.2), from the helper. */
+export interface HookInfo {
+  installed: boolean;
+  /** `~/.claude/settings.json` in WSL. */
+  settingsPath: string;
+  /** Unified diff of what installing would change; `null` when installed. */
+  diff: string | null;
+}
+
+export interface TokenTotals {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+export interface RepoUsage {
+  /** The repo's path, or the session's working directory when it matches no repo. */
+  path: string;
+  name: string;
+  last7Days: TokenTotals;
+}
+
+/** Token use summed from Claude Code's local session files (spec §3.5). */
+export interface UsageSummary {
+  /** Since local midnight in WSL. */
+  today: TokenTotals;
+  last7Days: TokenTotals;
+  /** Rolling, ending now. */
+  last5Hours: TokenTotals;
+  /** Running `claude` sessions. */
+  liveAgents: number;
+  /** Heaviest first. */
+  byRepo: RepoUsage[];
+  /** RFC 3339. */
+  computedAt: string;
+  /** False until the helper has read the transcripts once; the totals are zeros until then. */
+  ready: boolean;
+}
+
+/** Machine load, sent as `system://stats` about every 2 s while visible. */
+export interface SystemStats {
+  cpuPercent: number;
+  memUsedBytes: number;
+  memTotalBytes: number;
+  /** Busiest GPU engine, as in GpuUsage. */
+  gpuPercent: number;
+  /** Refract's own share: the app, its WebView2 processes and the helper's wsl.exe. */
+  own: { cpuPercent: number; memBytes: number; gpuPercent: number };
+}

@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { SessionInfo } from "../backend/types";
-import { firstLine, formatSize, relativeTime, sessionStateLabel } from "./format";
+import {
+  firstLine,
+  formatBytes,
+  formatCount,
+  formatPercent,
+  formatSize,
+  relativeTime,
+  sessionStateLabel,
+} from "./format";
 
 const NOW = Date.UTC(2026, 9, 30, 12);
 const ago = (seconds: number) => NOW - seconds * 1000;
@@ -48,5 +56,37 @@ describe("sessionStateLabel", () => {
     expect(s({ kind: "live", detail: "working" })).toBe("Working now");
     expect(s({ kind: "live", detail: "waitingOnUser" })).toBe("Waiting for you");
     expect(s({ kind: "live", detail: "idle" })).toBe("Open");
+  });
+});
+
+describe("formatCount", () => {
+  it("shortens to K, M and B", () => {
+    expect(formatCount(0)).toBe("0");
+    expect(formatCount(950)).toBe("950");
+    expect(formatCount(12_345)).toBe("12.3K");
+    expect(formatCount(1_000)).toBe("1K");
+    expect(formatCount(1_234_567)).toBe("1.2M");
+    expect(formatCount(31_040_000)).toBe("31M");
+    expect(formatCount(412_000_000)).toBe("412M");
+    expect(formatCount(4_000_000_000)).toBe("4B");
+  });
+
+  it("carries rounding up a unit and ignores odd values", () => {
+    expect(formatCount(999_600)).toBe("1M");
+    expect(formatCount(999_400)).toBe("999K");
+    expect(formatCount(-5)).toBe("0");
+    expect(formatCount(Number.NaN)).toBe("0");
+  });
+});
+
+describe("formatBytes and formatPercent", () => {
+  it("formats memory and percentages", () => {
+    expect(formatBytes(210 * 1024 ** 2)).toBe("210 MB");
+    expect(formatBytes(13.44 * 1024 ** 3)).toBe("13.4 GB");
+    expect(formatBytes(32 * 1024 ** 3)).toBe("32 GB");
+    expect(formatPercent(0.44)).toBe("0.4%");
+    expect(formatPercent(7)).toBe("7%");
+    expect(formatPercent(23.6)).toBe("24%");
+    expect(formatPercent(-1)).toBe("0%");
   });
 });

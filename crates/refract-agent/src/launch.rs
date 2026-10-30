@@ -26,11 +26,24 @@ pub fn launch_dir() -> PathBuf {
     )
 }
 
+/// `$XDG_STATE_HOME/refract`, defaulting to `~/.local/state/refract`: where Refract
+/// keeps launch requests, hook status files and the settings backup.
+pub fn state_dir() -> PathBuf {
+    state_dir_from(
+        std::env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+    )
+}
+
 fn launch_dir_from(state_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
+    state_dir_from(state_home, home).join("launch")
+}
+
+fn state_dir_from(state_home: Option<PathBuf>, home: Option<PathBuf>) -> PathBuf {
     state_home
         .filter(|v| v.is_absolute())
         .unwrap_or_else(|| home.unwrap_or_else(|| "/".into()).join(".local/state"))
-        .join("refract/launch")
+        .join("refract")
 }
 
 /// Checks the repo path, writes `<requestId>.json` into `dir` and returns the ticket.

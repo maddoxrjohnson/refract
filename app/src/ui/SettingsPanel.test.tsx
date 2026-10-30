@@ -31,6 +31,7 @@ async function setup(extra: Partial<SettingsPanelProps> = {}) {
     onChange: vi.fn().mockResolvedValue(undefined),
     onRefresh: vi.fn(),
     onClose: vi.fn(),
+    hook: { info: null, error: null, install: vi.fn(), remove: vi.fn() },
     ...extra,
   };
   render(<SettingsPanel {...props} />);

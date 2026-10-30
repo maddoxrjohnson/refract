@@ -11,7 +11,9 @@ mod process;
 mod remote;
 mod repos;
 mod settings;
+mod stats;
 mod tray;
+mod widgets;
 mod window;
 
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
@@ -76,6 +78,10 @@ pub fn run() {
             settings::settings_set,
             repos::clone_repo,
             repos::add_repo,
+            widgets::hook_info,
+            widgets::install_hook,
+            widgets::uninstall_hook,
+            widgets::usage,
         ])
         .build(tauri::generate_context!())
         .expect("building the Tauri app");

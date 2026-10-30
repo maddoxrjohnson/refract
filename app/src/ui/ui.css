@@ -110,6 +110,18 @@
   border-color: rgb(10 12 18 / 0.3);
 }
 
+/* The main action in a card, without the full-width launch button's layout. */
+.rf-button--accent {
+  color: #0a0c12;
+  background: var(--glass);
+  border-color: transparent;
+}
+
+.rf-button--accent:hover {
+  background: #c3e4ff;
+  border-color: transparent;
+}
+
 .rf-button--ghost {
   background: transparent;
   border-color: transparent;
@@ -770,6 +782,283 @@
   white-space: nowrap;
 }
 
+/* Status hook: the first-run offer under the corner controls, and its diff */
+
+.rf-hook-offer {
+  display: flex;
+  flex-direction: column;
+  width: min(360px, calc(100vw - 32px));
+  min-height: 0;
+  border-radius: 16px;
+  background: var(--panel-strong);
+  overflow: hidden;
+  animation: rf-rise 200ms var(--ease-out);
+}
+
+.rf-hook-offer__title {
+  margin: 0;
+  padding: 14px 18px 0;
+  font-size: 15px;
+  font-weight: 500;
+}
+
+.rf-hook-offer__body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 18px 4px;
+}
+
+.rf-hook-offer__body p {
+  margin: 0 0 8px;
+}
+
+.rf-hook-offer__actions {
+  display: flex;
+  gap: 8px;
+  padding: 10px 18px 14px;
+}
+
+.rf-hook-buttons {
+  margin-top: 10px;
+}
+
+.rf-diff {
+  margin-top: 8px;
+}
+
+.rf-diff__caption {
+  margin: 0 0 6px;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.rf-diff__body {
+  max-height: 220px;
+  margin: 0;
+  padding: 8px 10px;
+  overflow: auto;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre;
+  color: var(--muted);
+  background: rgb(0 0 0 / 0.3);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+
+.rf-diff__body:focus-visible {
+  outline: 2px solid var(--halo);
+  outline-offset: 0;
+}
+
+.rf-diff__add {
+  color: #7ee2a8;
+}
+
+.rf-diff__del {
+  color: var(--danger);
+}
+
+/* Widgets: system load top right, Claude usage bottom right. Both fade while the detail
+   panel is docked on the right, and both go on windows too small to keep them clear of
+   the filter bar, the toast and the error line. */
+
+.rf-widget {
+  position: fixed;
+  right: 16px;
+  width: 232px;
+  padding: 10px 12px;
+  border-radius: 12px;
+  transition:
+    opacity 200ms var(--ease-out),
+    visibility 0s;
+}
+
+.rf-widget--system {
+  top: 16px;
+}
+
+.rf-widget--usage {
+  bottom: 16px;
+}
+
+.rf-widget--usage:focus-visible {
+  outline: 2px solid var(--halo);
+  outline-offset: 2px;
+}
+
+.rf-widget--away {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 160ms ease-in,
+    visibility 0s linear 160ms;
+}
+
+.rf-widget__title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.rf-meter {
+  display: grid;
+  grid-template-columns: 52px 1fr 54px;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 5px;
+  font-size: 12px;
+}
+
+.rf-meter__label {
+  color: var(--muted);
+}
+
+.rf-meter__track {
+  position: relative;
+  height: 6px;
+  border-radius: 3px;
+  background: rgb(255 255 255 / 0.07);
+  overflow: hidden;
+}
+
+.rf-meter__fill,
+.rf-meter__own {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: 3px;
+  transition: width 600ms var(--ease-out);
+}
+
+.rf-meter__fill {
+  background: rgb(169 216 255 / 0.4);
+}
+
+/* Refract's share, from the start of the bar. */
+.rf-meter__own {
+  background: var(--halo);
+  box-shadow: 0 0 6px var(--halo);
+}
+
+.rf-meter__value {
+  text-align: right;
+  white-space: nowrap;
+}
+
+.rf-widget__own {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0 6px;
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rf-widget__swatch {
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  background: var(--halo);
+  box-shadow: 0 0 6px var(--halo);
+}
+
+.rf-usage__totals {
+  margin: 0;
+}
+
+.rf-usage__totals div {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 0 0 2px;
+}
+
+.rf-usage__totals dt {
+  color: var(--muted);
+}
+
+.rf-usage__totals dd {
+  margin: 0;
+}
+
+.rf-usage__agents {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rf-usage__agents::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.rf-usage__agents--live {
+  color: var(--fg);
+}
+
+.rf-usage__agents--live::before {
+  background: var(--halo);
+  box-shadow: 0 0 6px var(--halo);
+}
+
+/* The 7-day breakdown grows the widget upward, short of the system widget. */
+.rf-usage__repos {
+  margin: 0 0 10px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  animation: rf-fade 140ms linear;
+}
+
+.rf-usage__repos ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: min(220px, max(40px, calc(100vh - 360px)));
+  overflow-y: auto;
+}
+
+.rf-usage__repos li {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 12px;
+}
+
+.rf-usage__repo {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+@media (max-width: 899px), (max-height: 479px) {
+  .rf-widget {
+    display: none;
+  }
+}
+
+/* With the widgets showing, a long filter stops short of the system widget on the right
+   and, by symmetry, of the quality control and gear (about 300px) on the left. */
+@media (min-width: 900px) and (min-height: 480px) {
+  .rf-filter {
+    max-width: calc(100vw - 2 * 312px);
+  }
+}
+
 /* Status toast */
 
 .rf-toast {
@@ -833,6 +1122,7 @@
   .rf-detail,
   .rf-picker,
   .rf-settings,
+  .rf-hook-offer,
   .rf-toast {
     animation: rf-fade 120ms linear;
   }
@@ -843,7 +1133,9 @@
 
   .rf-button,
   .rf-gear,
-  .rf-quality__option span {
+  .rf-quality__option span,
+  .rf-meter__fill,
+  .rf-meter__own {
     transition: none;
   }
 
