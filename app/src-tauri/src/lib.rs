@@ -20,6 +20,15 @@ mod window;
 use tauri::{AppHandle, Manager, RunEvent, WindowEvent};
 use tauri_plugin_autostart::MacosLauncher;
 
+/// Passed by the start-with-Windows entry, so a launch at sign-in stays in the tray.
+/// Any other launch (a shortcut, the exe) opens the window.
+const HIDDEN_ARG: &str = "--hidden";
+
+/// Whether this launch starts in the tray without showing the window.
+fn starts_hidden(mut args: impl Iterator<Item = String>) -> bool {
+    args.any(|arg| arg == HIDDEN_ARG)
+}
+
 /// Stops the helper, then exits. Used by the tray's Quit item.
 pub fn quit(app: &AppHandle) {
     agent::shutdown(app);
@@ -35,7 +44,7 @@ pub fn run() {
         // Off until the user turns it on from the tray menu.
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
-            None,
+            Some(vec![HIDDEN_ARG]),
         ))
         .plugin(hotkey::plugin())
         .manage(remote::Remote::new())
@@ -44,6 +53,9 @@ pub fn run() {
             // First, so everything after it is logged.
             logfile::init(handle);
             window::init(handle);
+            if !starts_hidden(std::env::args().skip(1)) {
+                window::show(handle);
+            }
             tray::create(handle)?;
             hotkey::register(handle);
             agent::start(handle);
@@ -97,4 +109,23 @@ pub fn run() {
             logfile::flush();
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(list: &[&str]) -> impl Iterator<Item = String> {
+        list.iter()
+            .map(|arg| (*arg).to_owned())
+            .collect::<Vec<_>>()
+            .into_iter()
+    }
+
+    #[test]
+    fn only_the_sign_in_launch_starts_hidden() {
+        assert!(starts_hidden(args(&["--hidden"])));
+        assert!(!starts_hidden(args(&[])));
+        assert!(!starts_hidden(args(&["--hiddenx"])));
+    }
 }

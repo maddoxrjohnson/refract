@@ -74,6 +74,8 @@ Without that copy `app/scripts/ensure-helper.mjs` writes an empty placeholder so
 
 `scripts/dev-app.sh` runs the app in dev mode against a fresh build of the helper.
 
+To use a local build day to day, build the helper (`cargo build --release -p refract-agent`) and the exe, then run `scripts/install-local.sh`. It copies them to `%LOCALAPPDATA%\Programs\Refract`, puts the helper in WSL, adds Start menu and desktop shortcuts, turns on start at sign-in (`--no-startup` leaves that alone) and starts the app. Run it again after rebuilding. A launch at sign-in stays in the tray; any other launch opens the window.
+
 `npm run dev` serves the interface in a plain browser with invented repos, and `npm run build:demo` builds the web demo into `app/dist-demo`.
 
 ## Privacy
