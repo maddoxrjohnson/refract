@@ -119,3 +119,70 @@ test("the settings panel opens and closes", async ({ page }) => {
   await page.keyboard.press("Escape");
   await expect(settings).toBeHidden();
 });
+
+test.describe("at 1280×800", () => {
+  test.use({ viewport: { width: 1280, height: 800 } });
+
+  test("the usage widget shows the cost estimate and it fits", async ({ page }) => {
+    const widget = page.getByRole("region", { name: "Claude usage" });
+    await expect(widget).toContainText("≈ estimated at API list prices");
+    const costs = widget.locator(".rf-usage__cost");
+    await expect(costs).toHaveCount(3);
+    await expect(costs.first()).toHaveText(/^≈ \$[\d,.]+k?$/);
+    // Every row stays on one line inside the widget.
+    const fits = await widget.evaluate((el) => {
+      const box = el.getBoundingClientRect();
+      return [...el.querySelectorAll(".rf-usage__totals > div, .rf-usage__note")].every((row) => {
+        const r = row.getBoundingClientRect();
+        return r.left >= box.left && r.right <= box.right && r.height < 22 && row.scrollWidth <= row.clientWidth;
+      });
+    });
+    expect(fits).toBe(true);
+  });
+
+  test("the cost estimate settings fit the dialog", async ({ page }) => {
+    await page.getByRole("button", { name: "Settings", exact: true }).click();
+    const settings = page.getByRole("dialog", { name: "Settings", exact: true });
+    const section = settings.getByRole("region", { name: "Cost estimate" });
+    await section.scrollIntoViewIfNeeded();
+    await expect(section.getByLabel("Estimate cost at API prices")).toBeChecked();
+    const table = section.getByRole("table");
+    await expect(table).toBeVisible();
+    await expect(section.getByLabel("Row 1 model match")).toHaveValue("fable-5-1");
+    const sizes = await settings.evaluate((dialog) => {
+      const body = dialog.querySelector(".rf-settings__body")!;
+      const table = dialog.querySelector(".rf-prices__table")!;
+      // The room for text inside an input, less the width of its value in its font.
+      const ctx = document.createElement("canvas").getContext("2d")!;
+      const spare = (selector: string) =>
+        Math.min(
+          ...[...dialog.querySelectorAll<HTMLInputElement>(selector)].map((el) => {
+            const style = getComputedStyle(el);
+            ctx.font = style.font;
+            const room = el.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight);
+            return room - ctx.measureText(el.value).width;
+          }),
+        );
+      const remove = dialog.querySelector(".rf-prices__remove")!.getBoundingClientRect();
+      return {
+        bodyScroll: body.scrollWidth - body.clientWidth,
+        tableRight: table.getBoundingClientRect().right,
+        bodyRight: body.getBoundingClientRect().right,
+        // Every default value: the matches (the longest is "opus-4-2025") and the prices.
+        priceSpare: spare(".rf-prices__input[inputmode=decimal]"),
+        matchSpare: spare(".rf-prices__input:not([inputmode])"),
+        removeTarget: Math.min(remove.width, remove.height),
+      };
+    });
+    expect(sizes.bodyScroll).toBe(0);
+    expect(sizes.tableRight).toBeLessThanOrEqual(sizes.bodyRight);
+    expect(sizes.priceSpare).toBeGreaterThanOrEqual(2);
+    expect(sizes.matchSpare).toBeGreaterThanOrEqual(2);
+    expect(sizes.removeTarget).toBeGreaterThanOrEqual(24);
+    // Turning it off hides the table and the widget's estimate.
+    await section.getByLabel("Estimate cost at API prices").click();
+    await expect(table).toBeHidden();
+    await page.keyboard.press("Escape");
+    await expect(page.getByRole("region", { name: "Claude usage" })).not.toContainText("$");
+  });
+});

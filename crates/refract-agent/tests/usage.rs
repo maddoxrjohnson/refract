@@ -91,7 +91,7 @@ impl Agent {
 /// response into content blocks.
 fn response(cwd: &Path, id: &str, at: DateTime<Utc>, input: u64, copies: usize) -> String {
     let line = format!(
-        r#"{{"type":"assistant","isSidechain":false,"timestamp":"{}","cwd":"{}","sessionId":"6d4e0000-0000-4000-8000-000000000001","requestId":"req_{id}","message":{{"id":"{id}","role":"assistant","content":[{{"type":"text","text":"Done."}}],"usage":{{"input_tokens":{input},"output_tokens":{},"cache_read_input_tokens":{},"cache_creation_input_tokens":{}}}}}}}"#,
+        r#"{{"type":"assistant","isSidechain":false,"timestamp":"{}","cwd":"{}","sessionId":"6d4e0000-0000-4000-8000-000000000001","requestId":"req_{id}","message":{{"id":"{id}","model":"claude-sonnet-5-5","role":"assistant","content":[{{"type":"text","text":"Done."}}],"usage":{{"input_tokens":{input},"output_tokens":{},"cache_read_input_tokens":{},"cache_creation_input_tokens":{}}}}}}}"#,
         at.to_rfc3339(),
         cwd.display(),
         2 * input,
@@ -172,6 +172,11 @@ fn usage_is_summed_and_follows_writes() {
         json!({"input": 1120, "output": 2240, "cacheRead": 3360, "cacheWrite": 4480})
     );
     assert_eq!(input(&usage, "last5Hours"), 100);
+    assert_eq!(
+        usage["byModel"]["last7Days"],
+        json!([{"model": "claude-sonnet-5-5", "input": 1120, "output": 2240,
+            "cacheRead": 3360, "cacheWrite": 4480, "cacheWrite1h": 0}])
+    );
     let today = if recent >= today_start { 100 } else { 0 };
     assert_eq!(input(&usage, "today"), today);
     assert!(usage["liveAgents"].is_u64());

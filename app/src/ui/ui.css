@@ -660,7 +660,7 @@
 .rf-settings {
   display: flex;
   flex-direction: column;
-  width: min(360px, calc(100vw - 32px));
+  width: min(400px, calc(100vw - 32px));
   min-height: 0;
   border-radius: 16px;
   background: var(--panel-strong);
@@ -791,6 +791,82 @@
   font-size: 12px;
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Cost estimate price table: a model column and five narrow price columns, sized to
+   fit the settings dialog without scrolling sideways. */
+
+.rf-prices__help {
+  margin: 0 0 8px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.rf-prices__table {
+  width: 100%;
+  table-layout: fixed;
+  border-collapse: collapse;
+}
+
+.rf-prices__table th {
+  padding: 0 1px 3px;
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--muted);
+  text-align: left;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* Model, five prices, remove. */
+.rf-prices__table th:first-child {
+  width: 27%;
+}
+
+.rf-prices__table th:last-child {
+  width: 24px;
+}
+
+.rf-prices__table td {
+  padding: 1px;
+}
+
+.rf-input.rf-prices__input {
+  width: 100%;
+  min-height: 24px;
+  padding: 3px;
+  font-size: 11px;
+  border-radius: 6px;
+}
+
+.rf-prices__remove {
+  width: 24px;
+  min-height: 24px;
+  padding: 0;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.rf-prices__warning {
+  margin: 6px 0 0;
+  font-size: 11px;
+}
+
+.rf-prices__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 8px;
+  margin-top: 8px;
+}
+
+.rf-visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
   white-space: nowrap;
 }
 
@@ -992,11 +1068,32 @@
 }
 
 .rf-usage__totals dt {
+  flex: 1;
   color: var(--muted);
 }
 
 .rf-usage__totals dd {
   margin: 0;
+}
+
+/* The cost estimate sits between the label and the tokens, quieter than both. */
+.rf-usage__cost {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.rf-usage__tokens {
+  min-width: 40px;
+  text-align: right;
+}
+
+.rf-usage__note {
+  margin: 4px 0 0;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .rf-usage__agents {

@@ -1,6 +1,6 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import type { SystemStats, UsageSummary } from "../backend/types";
+import type { CostEstimate, ModelUsage, SystemStats, UsageSummary } from "../backend/types";
 import { SystemWidget } from "./SystemWidget";
 import { UsageWidget, totalTokens } from "./UsageWidget";
 
@@ -109,5 +109,65 @@ describe("UsageWidget", () => {
     rerender(<UsageWidget usage={USAGE} away={false} />);
     expect(widget.textContent).toContain("Today4.2M");
     expect(widget.textContent).toContain("2 agents running");
+  });
+
+  const m = (model: string, input: number, cacheWrite = 0, cacheWrite1h = 0): ModelUsage => ({
+    model,
+    ...t(input, 0, 0, cacheWrite),
+    cacheWrite1h,
+  });
+  const COST: CostEstimate = {
+    enabled: true,
+    prices: [
+      { match: "opus", input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 },
+      { match: "sonnet", input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.2 },
+    ],
+  };
+  const WITH_MODELS: UsageSummary = {
+    ...USAGE,
+    byModel: {
+      // $5 + $2
+      today: [m("claude-opus-5", 1_000_000), m("claude-sonnet-5-5", 1_000_000)],
+      // $500 + 1M 5-minute writes at $6.25 + 1M 1-hour at $10
+      last7Days: [m("claude-opus-5", 100_000_000, 2_000_000, 1_000_000), m("claude-sonnet-5-5", 1_000_000)],
+      last5Hours: [],
+    },
+  };
+
+  it("estimates each window's cost when the estimate is on", () => {
+    render(<UsageWidget usage={WITH_MODELS} away={false} costEstimate={COST} />);
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).toContain("Today≈ $7.004.2M");
+    expect(widget.textContent).toContain("7 days≈ $51831M");
+    expect(widget.textContent).toContain("5 hours≈ $0.001.9M");
+    expect(widget.textContent).toContain("≈ estimated at API list prices");
+    expect(screen.getAllByTitle(/Estimated at API list prices/).length).toBeGreaterThan(0);
+  });
+
+  it("notes tokens of models with no price", () => {
+    const usage: UsageSummary = {
+      ...WITH_MODELS,
+      byModel: { ...WITH_MODELS.byModel!, last7Days: [m("claude-opus-5", 1_000_000), m("", 12_000)] },
+    };
+    render(<UsageWidget usage={usage} away={false} costEstimate={COST} />);
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).toContain("12K tokens unpriced");
+    expect(screen.getByTitle("No price for (no model)")).toBeTruthy();
+    // The ids are read out too, not only shown on hover.
+    expect(widget.textContent).toContain("(no price for (no model))");
+  });
+
+  it("shows no cost when the estimate is off or the helper sends no split", () => {
+    const { rerender } = render(
+      <UsageWidget usage={WITH_MODELS} away={false} costEstimate={{ ...COST, enabled: false }} />,
+    );
+    const widget = screen.getByRole("region", { name: "Claude usage" });
+    expect(widget.textContent).not.toContain("$");
+    expect(widget.textContent).not.toContain("newer helper");
+    rerender(<UsageWidget usage={USAGE} away={false} costEstimate={COST} />);
+    expect(widget.textContent).not.toContain("$");
+    expect(widget.textContent).toContain("Today4.2M");
+    // On, but the helper sends no split: say so rather than show nothing.
+    expect(widget.textContent).toContain("Cost needs a newer helper");
   });
 });

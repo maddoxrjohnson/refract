@@ -3,6 +3,7 @@ import type { Backend } from "../backend/Backend";
 import type { Credentials, RemoteKind, RemoteSource, Settings } from "../backend/types";
 import type { HookControls } from "../hooks/useHook";
 import { describeKey } from "../projects";
+import { CostSection } from "./CostSection";
 import { HookSection } from "./HookOffer";
 import { describeError } from "./StatusToast";
 import "./ui.css";
@@ -95,8 +96,8 @@ function TokenForm({
 }
 
 /**
- * GitLab URL, tokens, forks and archived, hidden repos and extra folders (spec §5), and
- * the status hook (spec §6.2).
+ * GitLab URL, tokens, forks and archived, hidden repos and extra folders (spec §5), the
+ * usage cost estimate (spec §3.5) and the status hook (spec §6.2).
  */
 export function SettingsPanel({
   backend,
@@ -349,6 +350,14 @@ export function SettingsPanel({
             </form>
             <NoteLine note={notes.folder ?? null} />
           </section>
+
+          <CostSection
+            cost={settings.costEstimate}
+            labelId={`${titleId}-cost`}
+            onSave={(costEstimate) => save({ ...settings, costEstimate }, "cost")}
+          >
+            <NoteLine note={notes.cost ?? null} />
+          </CostSection>
 
           <HookSection hook={hook} labelId={`${titleId}-hook`} />
         </div>

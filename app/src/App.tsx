@@ -39,6 +39,7 @@ import { SettingsPanel } from "./ui/SettingsPanel";
 import { describeError, StatusToast, type LaunchProgress } from "./ui/StatusToast";
 import { SystemWidget } from "./ui/SystemWidget";
 import { UsageWidget } from "./ui/UsageWidget";
+import { DEFAULT_PRICES } from "./usage/cost";
 
 // The scene (three.js and its effects, most of the bundle) loads in its own chunk, so the
 // overlays and the data requests start without waiting for it. A chunk that fails to load
@@ -53,8 +54,17 @@ const OPEN_ERROR_MS = 6000;
 /** How often the usage widget asks for totals while the window is shown. */
 const USAGE_POLL_MS = 2000;
 
-/** Until the saved settings arrive: nothing hidden, forks and archived repos left out. */
-const DEFAULT_SETTINGS: Settings = { gitlabUrl: null, showForks: false, showArchived: false, hidden: [] };
+/**
+ * Until the saved settings arrive: nothing hidden, forks and archived repos left out, no
+ * cost estimate.
+ */
+const DEFAULT_SETTINGS: Settings = {
+  gitlabUrl: null,
+  showForks: false,
+  showArchived: false,
+  hidden: [],
+  costEstimate: { enabled: false, prices: [...DEFAULT_PRICES] },
+};
 
 /** The host name (no port) of a GitLab address, or `null` when it does not parse. */
 function hostOf(url: string): string | null {
@@ -556,7 +566,7 @@ export function App({ backend }: { backend: Backend }) {
         {showOffer && <HookOffer hook={hook} onDismiss={dismissOffer} />}
       </div>
       <SystemWidget stats={widgets.stats} away={!!zoomedRepo} />
-      <UsageWidget usage={widgets.usage} away={!!zoomedRepo} />
+      <UsageWidget usage={widgets.usage} away={!!zoomedRepo} costEstimate={settings?.costEstimate} />
       <StatusToast
         agent={status}
         launch={launch}

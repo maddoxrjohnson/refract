@@ -9,6 +9,7 @@ import type {
   LaunchMode,
   LaunchStep,
   LaunchTicket,
+  ModelUsage,
   Preselect,
   RemoteDetails,
   RemoteKind,
@@ -23,6 +24,7 @@ import type {
   TokenTotals,
   UsageSummary,
 } from "./types";
+import { DEFAULT_PRICES } from "../usage/cost";
 
 // Invented repos covering every state a gem can show, for running the interface in a
 // plain browser (`npm run dev`) and, later, the public demo. No real repo names.
@@ -302,6 +304,21 @@ function totals(scale: number): TokenTotals {
   };
 }
 
+/** How the demo's tokens split by model, and the 1-hour share of each one's cache writes. */
+const USAGE_MODELS: [model: string, share: number, oneHour: number][] = [
+  ["claude-opus-5-5", 0.71, 0.4],
+  ["claude-sonnet-5-5", 0.24, 0.1],
+  ["claude-haiku-5-5", 0.05, 0],
+];
+
+/** `scale` worth of tokens split across the demo's models. */
+function byModel(scale: number): ModelUsage[] {
+  return USAGE_MODELS.map(([model, share, oneHour]) => {
+    const t = totals(scale * share);
+    return { model, ...t, cacheWrite1h: Math.round(t.cacheWrite * oneHour) };
+  });
+}
+
 const USAGE_REPOS: [name: string, share: number][] = [
   ["tidepool", 0.34],
   ["atlas-api", 0.24],
@@ -325,6 +342,8 @@ export class DemoBackend implements Backend {
     showForks: false,
     showArchived: false,
     hidden: [],
+    // On in the demo, so it shows what the estimate looks like.
+    costEstimate: { enabled: true, prices: [...DEFAULT_PRICES] },
   };
   private creds: Credentials = { github: "ghCli", gitlab: "stored" };
   private hookInstalled = false;
@@ -549,17 +568,19 @@ export class DemoBackend implements Backend {
     const minutes = (Date.now() - this.started) / 60_000;
     const today = 4_200_000 + minutes * 38_000;
     const week = 31_000_000 + minutes * 38_000;
+    const five = 1_900_000 + minutes * 38_000;
     const live = this.repos.flatMap((r) => r.sessions).filter((s) => s.state.kind === "live").length;
     return Promise.resolve({
       today: totals(today),
       last7Days: totals(week),
-      last5Hours: totals(1_900_000 + minutes * 38_000),
+      last5Hours: totals(five),
       liveAgents: live,
       byRepo: USAGE_REPOS.map(([name, share]) => ({
         path: `/home/demo/projects/${name}`,
         name,
         last7Days: totals(week * share),
       })),
+      byModel: { today: byModel(today), last7Days: byModel(week), last5Hours: byModel(five) },
       computedAt: new Date().toISOString(),
       ready: true,
     });

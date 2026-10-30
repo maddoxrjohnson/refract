@@ -12,10 +12,19 @@
 //!   counts are all zero are not kept.
 //! - Entries without `message.usage` or without a readable `timestamp` are skipped.
 //!
+//! - Each record keeps its `message.model`, so totals can be split by model for the
+//!   app's optional cost estimate. Entries with no model are kept under an empty model
+//!   id rather than dropped, so the totals still add up; the app prices them as unknown.
+//!   `<synthetic>` entries carry zero usage and are dropped like any other zero record.
+//! - Cache writes are split by lifetime when `usage.cache_creation` says how
+//!   (`ephemeral_5m_input_tokens`, `ephemeral_1h_input_tokens`), because the two are
+//!   priced differently. Without that split every write counts as 5-minute, the default.
+//!
 //! Windows include their start and run to `now`: the rolling 5 hours and 7 days start
 //! exactly 5 h and 7 × 24 h before `now`, and today starts at local midnight.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use chrono::{DateTime, FixedOffset, NaiveTime, TimeDelta, TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -73,6 +82,28 @@ pub struct RepoUsage {
     pub last_7_days: TokenTotals,
 }
 
+/// One model's share of a window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelUsage {
+    /// `message.model`, such as `claude-opus-5-5`; empty for entries that name none.
+    pub model: String,
+    /// `cache_write` is every cache write, of either lifetime.
+    #[serde(flatten)]
+    pub tokens: TokenTotals,
+    /// The part of `cache_write` written with the 1-hour lifetime; the rest is 5-minute.
+    pub cache_write_1h: u64,
+}
+
+/// Each window's totals by model, heaviest first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelWindows {
+    pub today: Vec<ModelUsage>,
+    pub last_7_days: Vec<ModelUsage>,
+    pub last_5_hours: Vec<ModelUsage>,
+}
+
 /// The result of `usage`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +117,10 @@ pub struct UsageSummary {
     pub live_agents: u32,
     /// Heaviest first.
     pub by_repo: Vec<RepoUsage>,
+    /// The three windows split by model. Absent from helpers older than the cost
+    /// estimate, hence the default.
+    #[serde(default)]
+    pub by_model: ModelWindows,
     pub computed_at: DateTime<Utc>,
     /// False until the helper has read the transcripts once; the totals are zeros
     /// until then, not real ones.
@@ -101,6 +136,10 @@ pub struct UsageRecord {
     /// The entry's timestamp; for a repeated message, that of its first line.
     pub timestamp: DateTime<Utc>,
     pub tokens: TokenTotals,
+    /// `message.model`; shared between the records of one parser.
+    pub model: Option<Arc<str>>,
+    /// The part of `tokens.cache_write` written with the 1-hour lifetime.
+    pub cache_write_1h: u64,
 }
 
 /// Collects usage records from one transcript, line by line, so a growing file can be
@@ -111,6 +150,8 @@ pub struct UsageParser {
     /// Index into `records` of each key.
     seen: HashMap<String, usize>,
     cwd: Option<String>,
+    /// Model ids seen, so records share one copy of each.
+    models: Vec<Arc<str>>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +168,7 @@ struct Line {
 #[derive(Deserialize)]
 struct Message {
     id: Option<String>,
+    model: Option<String>,
     usage: Option<Usage>,
 }
 
@@ -136,6 +178,12 @@ struct Usage {
     output_tokens: Option<u64>,
     cache_creation_input_tokens: Option<u64>,
     cache_read_input_tokens: Option<u64>,
+    cache_creation: Option<CacheCreation>,
+}
+
+#[derive(Deserialize)]
+struct CacheCreation {
+    ephemeral_1h_input_tokens: Option<u64>,
 }
 
 impl UsageParser {
@@ -167,11 +215,19 @@ impl UsageParser {
             cache_read: usage.cache_read_input_tokens.unwrap_or(0),
             cache_write: usage.cache_creation_input_tokens.unwrap_or(0),
         };
+        let cache_write_1h = usage
+            .cache_creation
+            .and_then(|c| c.ephemeral_1h_input_tokens)
+            .unwrap_or(0)
+            .min(tokens.cache_write);
+        let model = message.model.map(|m| self.intern(m));
         let key = message.id.or(entry.request_id);
         if let Some(&i) = key.as_ref().and_then(|k| self.seen.get(k)) {
             // Repeats carry the same usage; taking the larger count is safe either way.
             let record = &mut self.records[i];
             record.tokens = record.tokens.max(tokens);
+            record.cache_write_1h = record.cache_write_1h.max(cache_write_1h);
+            record.model = record.model.take().or(model);
             return;
         }
         if tokens.total() == 0 {
@@ -184,7 +240,19 @@ impl UsageParser {
             key,
             timestamp,
             tokens,
+            model,
+            cache_write_1h,
         });
+    }
+
+    /// The shared copy of `model`. A transcript names few models, so a scan is enough.
+    fn intern(&mut self, model: String) -> Arc<str> {
+        if let Some(known) = self.models.iter().find(|m| m.as_ref() == model.as_str()) {
+            return Arc::clone(known);
+        }
+        let model: Arc<str> = model.into();
+        self.models.push(Arc::clone(&model));
+        model
     }
 
     /// The first `cwd` read: where the session started.
@@ -245,11 +313,15 @@ where
         last_5_hours: TokenTotals::default(),
         live_agents,
         by_repo: Vec::new(),
+        by_model: ModelWindows::default(),
         computed_at: now,
         ready: true,
     };
     let mut seen: HashSet<&str> = HashSet::new();
     let mut owners: HashMap<&str, TokenTotals> = HashMap::new();
+    let mut today_models = ModelTotals::default();
+    let mut week_models = ModelTotals::default();
+    let mut five_models = ModelTotals::default();
     for (cwd, records) in files {
         let mut file_total = TokenTotals::default();
         for record in records {
@@ -262,11 +334,14 @@ where
                 }
             }
             file_total.add(record.tokens);
+            week_models.add(record);
             if record.timestamp >= today_start {
                 summary.today.add(record.tokens);
+                today_models.add(record);
             }
             if record.timestamp >= five_start {
                 summary.last_5_hours.add(record.tokens);
+                five_models.add(record);
             }
         }
         summary.last_7_days.add(file_total);
@@ -289,7 +364,47 @@ where
             .cmp(&a.last_7_days.total())
             .then_with(|| a.path.cmp(&b.path))
     });
+    summary.by_model = ModelWindows {
+        today: today_models.into_list(),
+        last_7_days: week_models.into_list(),
+        last_5_hours: five_models.into_list(),
+    };
     summary
+}
+
+/// One window's totals by model id, as they are added up.
+#[derive(Default)]
+struct ModelTotals<'a>(HashMap<&'a str, (TokenTotals, u64)>);
+
+impl<'a> ModelTotals<'a> {
+    fn add(&mut self, record: &'a UsageRecord) {
+        let entry = self
+            .0
+            .entry(record.model.as_deref().unwrap_or(""))
+            .or_default();
+        entry.0.add(record.tokens);
+        entry.1 += record.cache_write_1h;
+    }
+
+    /// Heaviest first, then by model id.
+    fn into_list(self) -> Vec<ModelUsage> {
+        let mut list: Vec<ModelUsage> = self
+            .0
+            .into_iter()
+            .map(|(model, (tokens, cache_write_1h))| ModelUsage {
+                model: model.to_owned(),
+                tokens,
+                cache_write_1h,
+            })
+            .collect();
+        list.sort_by(|a, b| {
+            b.tokens
+                .total()
+                .cmp(&a.tokens.total())
+                .then_with(|| a.model.cmp(&b.model))
+        });
+        list
+    }
 }
 
 /// The deepest repo that holds `cwd`.
@@ -358,6 +473,229 @@ mod tests {
         assert_eq!(parser.records().len(), 1);
         parser.push_line(&line("msg_2", "2026-03-14T10:00:01Z", 7));
         assert_eq!(parser.records().len(), 1);
+    }
+
+    fn model_line(id: &str, ts: &str, model: Option<&str>, usage: &str) -> String {
+        let model = model.map_or(String::new(), |m| format!(r#""model":"{m}","#));
+        format!(
+            r#"{{"type":"assistant","timestamp":"{ts}","cwd":"/home/dev/projects/kelp-cli","message":{{"id":"{id}",{model}"usage":{usage}}}}}"#
+        )
+    }
+
+    #[test]
+    fn records_keep_their_model_and_cache_lifetimes() {
+        let mut parser = UsageParser::default();
+        let split = r#"{"input_tokens":1,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":40,"cache_creation":{"ephemeral_5m_input_tokens":10,"ephemeral_1h_input_tokens":30}}"#;
+        parser.push_line(&model_line(
+            "m1",
+            "2026-03-14T10:00:00Z",
+            Some("claude-opus-5-5"),
+            split,
+        ));
+        // A repeat without the model keeps the one already read.
+        parser.push_line(&model_line("m1", "2026-03-14T10:00:01Z", None, split));
+        // No split: every write is 5-minute. An overlarge 1-hour count is capped.
+        parser.push_line(&model_line(
+            "m2",
+            "2026-03-14T10:00:02Z",
+            Some("claude-opus-5-5"),
+            r#"{"input_tokens":1,"cache_creation_input_tokens":8}"#,
+        ));
+        parser.push_line(&model_line(
+            "m3",
+            "2026-03-14T10:00:03Z",
+            None,
+            r#"{"input_tokens":5,"cache_creation_input_tokens":2,"cache_creation":{"ephemeral_1h_input_tokens":9}}"#,
+        ));
+        // Synthetic error messages have zero usage and are not kept.
+        parser.push_line(&model_line(
+            "m4",
+            "2026-03-14T10:00:04Z",
+            Some("<synthetic>"),
+            r#"{"input_tokens":0,"output_tokens":0}"#,
+        ));
+        let records = parser.records();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(records[0].cache_write_1h, 30);
+        assert_eq!(records[0].tokens.cache_write, 40);
+        assert_eq!(records[1].cache_write_1h, 0);
+        // Both records share one copy of the id.
+        assert!(Arc::ptr_eq(
+            records[0].model.as_ref().unwrap(),
+            records[1].model.as_ref().unwrap()
+        ));
+        assert_eq!(records[2].model, None);
+        assert_eq!(records[2].cache_write_1h, 2);
+    }
+
+    #[test]
+    fn windows_split_by_model() {
+        let mut parser = UsageParser::default();
+        let usage = |input: u64, w1h: u64| {
+            format!(
+                r#"{{"input_tokens":{input},"cache_creation_input_tokens":{},"cache_creation":{{"ephemeral_1h_input_tokens":{w1h}}}}}"#,
+                2 * w1h
+            )
+        };
+        parser.push_line(&model_line(
+            "m1",
+            "2026-03-14T17:00:00Z",
+            Some("claude-sonnet-5-5"),
+            &usage(10, 1),
+        ));
+        parser.push_line(&model_line(
+            "m2",
+            "2026-03-14T08:00:00Z",
+            Some("claude-opus-5-5"),
+            &usage(500, 4),
+        ));
+        parser.push_line(&model_line(
+            "m3",
+            "2026-03-10T08:00:00Z",
+            Some("claude-sonnet-5-5"),
+            &usage(1000, 0),
+        ));
+        parser.push_line(&model_line(
+            "m4",
+            "2026-03-14T17:30:00Z",
+            None,
+            &usage(7, 0),
+        ));
+        let now: DateTime<Utc> = "2026-03-14T18:00:00Z".parse().unwrap();
+        let today: DateTime<Utc> = "2026-03-14T00:00:00Z".parse().unwrap();
+        let summary = summarize([(parser.cwd(), parser.records())], &[], now, today, 0);
+        let brief = |list: &[ModelUsage]| -> Vec<(String, u64, u64)> {
+            list.iter()
+                .map(|m| (m.model.clone(), m.tokens.input, m.cache_write_1h))
+                .collect()
+        };
+        assert_eq!(
+            brief(&summary.by_model.last_7_days),
+            [
+                ("claude-sonnet-5-5".into(), 1010, 1),
+                ("claude-opus-5-5".into(), 500, 4),
+                ("".into(), 7, 0),
+            ]
+        );
+        assert_eq!(
+            brief(&summary.by_model.today),
+            [
+                ("claude-opus-5-5".into(), 500, 4),
+                ("claude-sonnet-5-5".into(), 10, 1),
+                ("".into(), 7, 0),
+            ]
+        );
+        assert_eq!(
+            brief(&summary.by_model.last_5_hours),
+            [("claude-sonnet-5-5".into(), 10, 1), ("".into(), 7, 0)]
+        );
+        assert_split_adds_up(&summary);
+    }
+
+    /// Each window's split by model adds up to its totals, count by count.
+    fn assert_split_adds_up(summary: &UsageSummary) {
+        for (models, totals) in [
+            (&summary.by_model.today, summary.today),
+            (&summary.by_model.last_7_days, summary.last_7_days),
+            (&summary.by_model.last_5_hours, summary.last_5_hours),
+        ] {
+            let mut sum = TokenTotals::default();
+            for m in models {
+                sum.add(m.tokens);
+                assert!(m.cache_write_1h <= m.tokens.cache_write, "{}", m.model);
+            }
+            assert_eq!(sum, totals);
+        }
+    }
+
+    #[test]
+    fn a_repeat_keeps_the_first_model_and_the_larger_one_hour_count() {
+        let mut parser = UsageParser::default();
+        let usage = |w1h: u64| {
+            format!(
+                r#"{{"input_tokens":1,"cache_creation_input_tokens":50,"cache_creation":{{"ephemeral_1h_input_tokens":{w1h}}}}}"#
+            )
+        };
+        parser.push_line(&model_line(
+            "m1",
+            "2026-03-14T10:00:00Z",
+            Some("claude-opus-5-5"),
+            &usage(10),
+        ));
+        parser.push_line(&model_line(
+            "m1",
+            "2026-03-14T10:00:01Z",
+            Some("claude-sonnet-5-5"),
+            &usage(30),
+        ));
+        parser.push_line(&model_line(
+            "m1",
+            "2026-03-14T10:00:02Z",
+            Some("claude-haiku-5-5"),
+            &usage(20),
+        ));
+        let records = parser.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].model.as_deref(), Some("claude-opus-5-5"));
+        assert_eq!(records[0].cache_write_1h, 30);
+    }
+
+    #[test]
+    fn a_message_in_two_files_counts_once_under_the_first_files_model() {
+        let usage = r#"{"input_tokens":100,"output_tokens":2,"cache_read_input_tokens":3,"cache_creation_input_tokens":40,"cache_creation":{"ephemeral_1h_input_tokens":40}}"#;
+        let session = parse_str(
+            &[
+                model_line("m1", "2026-03-14T17:00:00Z", Some("claude-opus-5-5"), usage),
+                model_line(
+                    "m2",
+                    "2026-03-14T17:10:00Z",
+                    Some("claude-haiku-5-5"),
+                    usage,
+                ),
+            ]
+            .join("\n"),
+        );
+        // A fork repeats m1, here under another model id, and adds its own m3.
+        let fork = parse_str(
+            &[
+                model_line("m1", "2026-03-14T17:00:00Z", Some("claude-opus-5"), usage),
+                model_line("m3", "2026-03-10T09:00:00Z", Some("claude-opus-5-5"), usage),
+            ]
+            .join("\n"),
+        );
+        let now: DateTime<Utc> = "2026-03-14T18:00:00Z".parse().unwrap();
+        let today: DateTime<Utc> = "2026-03-14T00:00:00Z".parse().unwrap();
+        let summary = summarize(
+            [
+                (session.cwd(), session.records()),
+                (fork.cwd(), fork.records()),
+            ],
+            &[],
+            now,
+            today,
+            0,
+        );
+        let brief = |list: &[ModelUsage]| -> Vec<(String, u64, u64)> {
+            list.iter()
+                .map(|m| (m.model.clone(), m.tokens.input, m.cache_write_1h))
+                .collect()
+        };
+        assert_eq!(
+            brief(&summary.by_model.last_7_days),
+            [
+                ("claude-opus-5-5".into(), 200, 80),
+                ("claude-haiku-5-5".into(), 100, 40),
+            ]
+        );
+        assert_eq!(
+            brief(&summary.by_model.today),
+            [
+                ("claude-haiku-5-5".into(), 100, 40),
+                ("claude-opus-5-5".into(), 100, 40),
+            ]
+        );
+        assert_split_adds_up(&summary);
     }
 
     #[test]

@@ -87,7 +87,7 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `setupServer` | `{vsix, commit?}` | `{installed, applicationScoped, skipped?}` | Installs the Refract extension in the WSL VS Code server ([launch.md](launch.md)) |
 | `cloneRepo` | `{url, name}` | the clone's path | Clones an `https://` URL into `~/projects/<name>` |
 | `addRepo` | `{path}` | `null` | Reports the repo that holds `path` from now on |
-| `usage` | none | token totals | Tokens used today, in 7 days and in 5 hours, by repo |
+| `usage` | none | token totals | Tokens used today, in 7 days and in 5 hours, by repo and by model |
 | `hookInfo` | none | `{installed, settingsPath, diff}` | Whether the status hook is installed, and what installing would change |
 | `installHook` | none | the same | Installs the status hook |
 | `uninstallHook` | none | the same | Removes it and restores `settings.json` |
@@ -189,9 +189,9 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 
 - **Detail panel.** Branch, upstream, changed files, last commit, last agent session, and for repos with a GitHub or GitLab remote the open pull or merge requests and CI state. Actions: launch (or Clone and launch), Resume, New agent, Open folder, Open on the host, Hide. Remote details are fetched when a gem is zoomed, again 15 minutes after they were fetched while the same gem stays zoomed and the window is shown, and on Refresh.
 - **Picker, filter bar, focus label.** Presentation for the navigation state above.
-- **Settings.** GitLab address and token, GitHub token (the GitHub CLI login is used otherwise), show forks, show archived, refresh remotes, the hidden list with Unhide, adding a folder, the status hook's install and remove, and Open log folder. Changes are saved one after another; if saving fails the old values come back.
+- **Settings.** GitLab address and token, GitHub token (the GitHub CLI login is used otherwise), show forks, show archived, refresh remotes, the hidden list with Unhide, adding a folder, the cost estimate (on or off, and its price table with Add row, remove, Reset to defaults and Save prices), the status hook's install and remove, and Open log folder. Changes are saved one after another; if saving fails the old values come back. Price table edits stay a draft until Save prices, which checks every row first and marks the bad cells (`aria-invalid`, described by the message); the Windows side checks them again (a match of 1 to 100 characters, prices from 0 to 10,000, at most 50 rows) and refuses the save otherwise. Edits made while a save is under way are kept. A row that an earlier, shorter match always wins gets a warning under the table. A price table in `settings.json` that is the wrong shape or fails those checks is replaced by the defaults when the file is read, leaving every other setting as it was.
 - **Status hook offer.** Once the repos are in, a small card offers to install the hook, with "Show what changes" revealing the diff of `settings.json`. "Not now" is remembered.
-- **Widgets.** System load at the top right, Claude token use at the bottom right (hovering or focusing lists the last 7 days by repo). Both fade while the detail panel covers their corner.
+- **Widgets.** System load at the top right, Claude token use at the bottom right, with the optional cost estimate (hovering or focusing lists the last 7 days by repo). Both fade while the detail panel covers their corner.
 - **Launch toast.** Shows cloning, setup and opening steps, and failures until dismissed. One launch or clone runs at a time.
 
 ### Where state is kept
@@ -199,15 +199,15 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 | State | Where |
 |---|---|
 | Graphics setting (`refract.quality`), hook offer dismissed (`refract.hookOfferDismissed`) | The webview's `localStorage`; the interface works without it |
-| GitLab address, show forks, show archived, hidden gems | `settings.json` in the app's config directory on Windows |
+| GitLab address, show forks, show archived, hidden gems, cost estimate and its prices (`costEstimate`; a file without it gets the estimate off and the shipped prices) | `settings.json` in the app's config directory on Windows |
 | GitHub and GitLab tokens | Windows Credential Manager |
 | Extra folders, roots, hidden local paths | `~/.config/refract/agent.toml` in WSL (optional; `addRepo` appends to `extra`) |
 
 ### The web demo
 
-`DemoBackend` implements the whole `Backend` with invented data: 13 local repos covering every gem state, remote repos (some matching, some not cloned, a fork and an archived one), pull request and CI numbers, a pretend hook diff with the real installer's commands and matchers, and usage and system numbers that drift slowly. Settings, hook state and clones live in memory and reset on reload. A launch walks through the progress steps and then tells `DemoTerminal`, which types out the `claude` command and an invented reply in a fake terminal. GitHub links open this project's page rather than the invented owner's. The demo has no GPU counters, so its automatic quality uses frame times only.
+`DemoBackend` implements the whole `Backend` with invented data: 13 local repos covering every gem state, remote repos (some matching, some not cloned, a fork and an archived one), pull request and CI numbers, a pretend hook diff with the real installer's commands and matchers, and usage and system numbers that drift slowly, with usage split across invented shares of Opus, Sonnet and Haiku so the cost estimate, on in the demo, has something to price. Settings, hook state and clones live in memory and reset on reload. A launch walks through the progress steps and then tells `DemoTerminal`, which types out the `claude` command and an invented reply in a fake terminal. GitHub links open this project's page rather than the invented owner's. The demo has no GPU counters, so its automatic quality uses frame times only.
 
-`main.tsx` picks the demo backend when built with `--mode demo` and whenever the page is not inside Tauri, which is what `npm run dev` shows in a plain browser. `npm run build:demo` builds it into `app/dist-demo` for GitHub Pages. `app/e2e/demo.spec.ts` runs seven browser tests against that build (see [Build, CI and release](#build-ci-and-release)).
+`main.tsx` picks the demo backend when built with `--mode demo` and whenever the page is not inside Tauri, which is what `npm run dev` shows in a plain browser. `npm run build:demo` builds it into `app/dist-demo` for GitHub Pages. `app/e2e/demo.spec.ts` runs nine browser tests against that build (see [Build, CI and release](#build-ci-and-release)).
 
 ## The scene
 
@@ -371,9 +371,13 @@ A relative `XDG_*` value is ignored. The helper watches the status directory wit
 
 The usage widget adds up the tokens in Claude Code's own session files. Nothing is sent anywhere, and no model is called. `refract-core/src/usage.rs` does the counting and `refract-agent/src/usage.rs` keeps it up to date.
 
-**What counts.** Every `assistant` entry with a `message.usage` and a timestamp, in the main transcripts and in subagent transcripts, which are real cost. Input, output, cache read and cache write tokens are kept apart and the widget shows their sum. Entries whose counts are all zero (synthetic error messages) are dropped.
+**What counts.** Every `assistant` entry with a `message.usage` and a timestamp, in the main transcripts and in subagent transcripts, which are real cost. Input, output, cache read and cache write tokens are kept apart and the widget shows their sum. Entries whose counts are all zero (synthetic error messages, model `<synthetic>`) are dropped.
+
+**By model.** Each record keeps its `message.model` (such as `claude-opus-5-5`) and how much of its cache write had the 1-hour lifetime, from `usage.cache_creation.ephemeral_1h_input_tokens`; the rest counts as 5-minute, the default, including records that do not split their writes. The two are priced differently. A record with no model is kept under the model id `""`, so the split always adds up to the window's total; the app prices it as unknown. Records share one copy of each model id, so the extra memory is a pointer and a number per record.
 
 **Windows.** Today (since local midnight in WSL's time zone), the last 7 days and the last 5 hours, both rolling and ending now. The 7 day total is also split by repo: a transcript belongs to the deepest known repo that contains the directory the session started in, else to that directory itself.
+
+**The result.** `today`, `last7Days` and `last5Hours` are token totals `{input, output, cacheRead, cacheWrite}`. `byRepo` lists `{path, name, last7Days}`, heaviest first. `byModel` holds the three windows again, `{today, last7Days, last5Hours}`, each a list of `{model, input, output, cacheRead, cacheWrite, cacheWrite1h}` heaviest first, where `cacheWrite1h` is the 1-hour part of `cacheWrite`. `byModel` was added after the first release: it is a separate field rather than a list inside each window, so the window totals keep their shape, and an app reading a helper without it treats it as absent. Then come `liveAgents`, `computedAt` and `ready`.
 
 **De-duplication.** Claude Code writes one response as several lines that repeat the same `message.id`, `requestId` and usage. Records are keyed by `message.id` (else `requestId`) and counted once, within a file and across files, because a session and its fork can both hold the same message.
 
@@ -381,7 +385,9 @@ The usage widget adds up the tokens in Claude Code's own session files. Nothing 
 
 **Never waiting.** The first scan runs on that thread, and until it finishes the answer is zeros marked `ready: false`, which the widget shows as counting. While the thread is busy reading, `usage` answers the last summary it computed rather than waiting for it.
 
-The widget asks every 2 seconds, one request after the last has answered, only while the window is visible and the helper is running. It shows token counts only: there is no cost estimate, and no plan-limit percentage, which Refract will not guess.
+The widget asks every 2 seconds, one request after the last has answered, only while the window is visible and the helper is running. It never shows a plan-limit percentage, which Refract will not guess.
+
+**Cost estimate.** Off by default; settings turn it on. Each window's row then shows `≈ $X` between its label and its token count, worked out by `app/src/usage/cost.ts` from that window's `byModel` list and the price table in settings, and a line under the rows says it is an estimate at API list prices. A price row is `{match, input, output, cacheWrite5m, cacheWrite1h, cacheRead}` in US dollars per million tokens; the first row whose `match` is in the model id, ignoring case, prices it. Tokens of models no row matches are left out of the dollars, and the line then says how many there are (over the 7 days), with the model ids in its tooltip and in text a screen reader reads. With the estimate on and a helper too old to send `byModel`, the line says "Cost needs a newer helper" instead. The shipped table, `app/src/usage/defaultPrices.json`, was taken from Anthropic's pricing page on 2026-10-30 (its `takenOn`) and is read by both the interface (Reset to defaults) and the Windows side (settings saved before the estimate existed). It lists longer ids before their prefixes (`opus-5-5` before `opus-5`), which a test checks. **Known limitation:** Claude Haiku 5.5 costs 5 times as much for prompts over 100,000 tokens, and cached tokens read count toward a prompt's size, so Claude Code's Haiku subagents often cross that line. The table holds only the lower rate, which can make Haiku's share several times too low. Pricing each record by its own prompt size would fix it and is not done yet. Regional (`inference_geo`), batch and fast-mode prices are not modelled either.
 
 ### System stats
 

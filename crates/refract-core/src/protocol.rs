@@ -518,7 +518,7 @@ impl Response {
 mod tests {
     use super::*;
     use crate::classify::{InterruptReason, LiveState};
-    use crate::usage::{RepoUsage, TokenTotals};
+    use crate::usage::{ModelUsage, ModelWindows, RepoUsage, TokenTotals};
     use serde_json::json;
 
     fn snapshot() -> RepoSnapshot {
@@ -965,6 +965,15 @@ mod tests {
                 name: "tidepool-api".into(),
                 last_7_days: totals,
             }],
+            by_model: ModelWindows {
+                today: vec![ModelUsage {
+                    model: "claude-opus-5-5".into(),
+                    tokens: totals,
+                    cache_write_1h: 800,
+                }],
+                last_7_days: vec![],
+                last_5_hours: vec![],
+            },
             computed_at: "2026-03-14T18:00:00Z".parse().unwrap(),
             ready: true,
         }
@@ -984,9 +993,20 @@ mod tests {
                 "last5Hours": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                 "liveAgents": 2,
                 "byRepo": [{"path": "/home/dev/projects/tidepool-api", "name": "tidepool-api", "last7Days": totals}],
+                "byModel": {
+                    "today": [{"model": "claude-opus-5-5", "input": 1200, "output": 3400,
+                        "cacheRead": 56000, "cacheWrite": 7800, "cacheWrite1h": 800}],
+                    "last7Days": [],
+                    "last5Hours": []},
                 "computedAt": "2026-03-14T18:00:00Z",
                 "ready": true}})
         );
+        // A summary from a helper older than `byModel` still reads.
+        let old: UsageSummary = serde_json::from_value(json!({
+            "today": totals, "last7Days": totals, "last5Hours": totals, "liveAgents": 0,
+            "byRepo": [], "computedAt": "2026-03-14T18:00:00Z", "ready": true}))
+        .unwrap();
+        assert_eq!(old.by_model, ModelWindows::default());
     }
 
     #[test]

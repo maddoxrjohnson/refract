@@ -122,6 +122,10 @@ describe("TauriBackend", () => {
       showForks: false,
       showArchived: true,
       hidden: ["remote:github.com/demo-user/orbit-cli"],
+      costEstimate: {
+        enabled: true,
+        prices: [{ match: "sonnet", input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.1 }],
+      },
     };
     mockIPC((cmd, args) => {
       calls.push({ cmd, args });

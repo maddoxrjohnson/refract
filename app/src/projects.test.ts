@@ -11,7 +11,13 @@ import {
 } from "./projects";
 import { testRepo } from "./ui/testRepo";
 
-const SETTINGS: Settings = { gitlabUrl: null, showForks: false, showArchived: false, hidden: [] };
+const SETTINGS: Settings = {
+  gitlabUrl: null,
+  showForks: false,
+  showArchived: false,
+  hidden: [],
+  costEstimate: { enabled: false, prices: [] },
+};
 
 function remote(name: string, extra: Partial<RemoteRepo> = {}): RemoteRepo {
   return {

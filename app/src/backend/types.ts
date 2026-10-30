@@ -188,6 +188,25 @@ export interface Settings {
   showArchived: boolean;
   /** Project keys (see `projectKey` in src/projects.ts) the user hid. */
   hidden: string[];
+  /** The usage widget's optional cost estimate (spec §3.5). */
+  costEstimate: CostEstimate;
+}
+
+/** Whether the usage widget estimates cost, and at what prices. */
+export interface CostEstimate {
+  enabled: boolean;
+  /** Tried in order; the first row whose `match` is in the model id prices it. At most 50. */
+  prices: PriceRow[];
+}
+
+/** Prices in US dollars per million tokens for models whose id holds `match`, ignoring case. */
+export interface PriceRow {
+  match: string;
+  input: number;
+  output: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+  cacheRead: number;
 }
 
 /** Where each token comes from. Tokens themselves never reach the interface. */
@@ -220,6 +239,21 @@ export interface TokenTotals {
   cacheWrite: number;
 }
 
+/** One model's share of a window. */
+export interface ModelUsage extends TokenTotals {
+  /** `message.model`, such as "claude-opus-5-5"; empty for entries that name none. */
+  model: string;
+  /** The part of `cacheWrite` written with the 1-hour lifetime; the rest is 5-minute. */
+  cacheWrite1h: number;
+}
+
+/** Each window's totals by model, heaviest first. */
+export interface ModelWindows {
+  today: ModelUsage[];
+  last7Days: ModelUsage[];
+  last5Hours: ModelUsage[];
+}
+
 export interface RepoUsage {
   /** The repo's path, or the session's working directory when it matches no repo. */
   path: string;
@@ -238,6 +272,8 @@ export interface UsageSummary {
   liveAgents: number;
   /** Heaviest first. */
   byRepo: RepoUsage[];
+  /** The windows split by model; absent from helpers older than the cost estimate. */
+  byModel?: ModelWindows;
   /** RFC 3339. */
   computedAt: string;
   /** False until the helper has read the transcripts once; the totals are zeros until then. */
