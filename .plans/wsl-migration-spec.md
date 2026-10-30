@@ -111,7 +111,7 @@ The helper copies into `<dest parent>/.refract-migrate-<name>-<id>` on the same 
 The temporary folder is renamed to the destination only after every check passes. The rename is atomic because both are on the same filesystem. Install (§3.5) and history (§3.4) follow, then the report (§2.4).
 
 ### 4.5 Interruption
-If the app, the helper or WSL stops mid-migration, the helper deletes any leftover `.refract-migrate-*` folders at startup, and the repo is simply still on Windows. A migration that was already put in place but not yet confirmed is kept in a state file, so its report reappears on the next start.
+If the app, the helper or WSL stops mid-migration, the helper deletes any leftover `.refract-migrate-*` folders at startup, and the repo is simply still on Windows. A migration that was already put in place but not yet confirmed is kept in a state file, so its report reappears on the next start. A step after placement (install, history, re-sync) is saved as running before it starts, so one cut short is reported as such (§6.1); a cancel or a panic after placement never deletes the copy either.
 
 ## 5. Checks (all required before Delete original)
 
@@ -122,21 +122,51 @@ If the app, the helper or WSL stops mid-migration, the helper deletes any leftov
 5. **History copied** (§3.4 rules). This doesn't block deletion of the repo, but if it fails, the old transcripts are not deleted.
 
 ## 6. Delete original
-1. Run check 4 again right then, because time has passed while the report waited for you (`migrateBeginDelete`): stat every file against the final snapshot, confirm nothing has the folder open, and stat the placed copy against its state after the install. Files modified or added in the original, paths of it that can't be read, any change to the copy (or the copy gone) and running agents refuse. Files removed from the original don't: the copy still has them. If the original changed, offer **Re-sync**, which re-copies and re-checks the changes and removes from the copy only paths verifiably gone from the original. If the copy changed, it may hold your work, so it is neither re-synced over nor discarded: only **Keep both**. When the check passes, the migration is marked *deleting* in its state file before anything is deleted. From then on, re-sync, keep, discard and cancel are refused; only finishing the delete ends it, after a crash or restart too. Running the check again then passes for a partly deleted original (it shows only removals), so the rest can go. If the original folder is already gone, the Recycle Bin step is skipped, and re-sync and discard are refused, since the copy is the only one left. Check whether the folder fits in the Recycle Bin, and ask about deleting permanently, before this step, since **No** (Keep both) is refused once deleting.
+1. Run check 4 again right then, because time has passed while the report waited for you (`migrateBeginDelete`): stat every file against the final snapshot, confirm nothing has the folder open, and stat the placed copy against its state after the install. Files modified or added in the original, paths of it that can't be read, any change to the copy (or the copy gone) and running agents refuse. Files removed from the original don't: the copy still has them. If the original changed, offer **Re-sync**, which re-copies and re-checks the changes and removes from the copy only paths verifiably gone from the original. If the copy changed, it may hold your work, so it is neither re-synced over nor discarded: only **Keep both**. The app sends what Windows sees: when WSL can't see the original but Windows can, its drive is hidden from WSL, nothing of it was checked, and the deleting state is not entered (the dialog offers **Try again** and **Keep both**). When the check passes, the migration is marked *deleting* in its state file before anything is deleted. From then on, re-sync, keep and cancel are refused, and discard unless the copy is gone; only finishing the delete ends it, after a crash or restart too. Running the check again then passes for a partly deleted original (it shows only removals), so the rest can go. While deleting (and when the original is gone on both sides), a change to the copy only blocks for a path the original still has: a file added to the copy, or one whose original is already gone, loses nothing when the rest goes. For the paths that do block, **Delete the rest anyway** lists them and goes on (the copy keeps its version; the original's goes to the Recycle Bin); it never skips changes in the original, unreadable paths, running agents, a hidden drive or a copy that is gone. A copy deleted by hand while deleting stops the delete for good: the dialog says the deleted part of the original is in the Recycle Bin and the rest still on disk, and **End the move** (after asking) only forgets it. If the original folder is already gone, the Recycle Bin step is skipped, and re-sync and discard are refused, since the copy is the only one left (with the copy gone too, discard only forgets the move). Check whether the folder fits in the Recycle Bin, and ask about deleting permanently, before this step, since **No** (Keep both) is refused once deleting.
 2. Send the folder to the Recycle Bin with `IFileOperation` (`FOFX_RECYCLEONDELETE`, no UI). Beforehand, check that the drive's Recycle Bin can hold it (bin size limits from `SHQueryRecycleBin` and the drive's quota). If it can't, ask "This won't fit in the Recycle Bin. Delete permanently?" with **No** as the default. If you choose No, the result is the same as **Keep both**.
 3. Create `<name>.lnk` at the old location, pointing to `\\wsl.localhost\<distro>\<dest path>`.
 4. Delete the old transcripts that are unchanged since they were copied (§3.4); a changed one is copied again first, or kept and named in the saved report. Update the settings and `agent.toml` entries (hidden list, `extra`) that point at the old path.
 5. The gem moves to the new path, keeping its remote match by origin.
+
+### 6.1 Every state has a way forward
+What the dialog offers in each state (original as Windows and WSL see it, copy as the helper sees it). Each row has at least one action that is safe and that the helper accepts; actions the helper would refuse are not offered, and a refused answer brings the pending state back from the helper.
+
+| State | Original | Copy | Offered |
+|---|---|---|---|
+| Copying, before placement | any | temporary | **Cancel the move**: deletes the temporary copy |
+| Install, history or re-sync running (copy placed) | any | placed | **Stop and keep the copy**: the step stops, a report says so |
+| Report failed, never placed | there | none | **Discard the copy** (forgets), **Retry** |
+| Report failed, placed (install backup failed, re-sync failed or stopped) | there | as checked | **Re-sync**, **Keep both**, **Discard the copy** |
+| Report failed, placed | there | changed | **Keep both** (re-sync and discard are refused, with why) |
+| Report failed, placed | gone | there | **Keep the copy** |
+| Report passed | there, unchanged | as checked | **Delete original**, **Keep both**, **Discard the copy** |
+| Delete original refused | changed | as checked | **Re-sync**, **Keep both** |
+| Delete original refused | unreadable, or agents running | as checked | **Try again** (and **Stop** for idle agents), **Keep both** |
+| Delete original refused | any | changed | **Keep both** |
+| Delete original refused | VS Code windows open | any | **Close** each, **Try again**, **Back** |
+| Delete original refused | won't fit the Recycle Bin | any | **No** (Keep both), **Yes, delete permanently** |
+| Delete original refused | there on Windows, hidden from WSL | any | **Try again** once the drive is visible, **Keep both** |
+| Report passed | gone on both sides | there (changes ignored) | **Finish the move** |
+| Not deleting | any | gone | **End the move**: only forgets it |
+| Deleting | partly there, only removals | as checked, or only additions and changes to paths already gone | **Finish deleting** |
+| Deleting | changed, unreadable, or agents running | any | **Finish deleting** once fixed (move the files out, close programs, **Stop** agents) |
+| Deleting | partly there | changed for paths the original still has | **Delete the rest anyway** (lists them), or **Finish deleting** after undoing them |
+| Deleting | there on Windows, hidden from WSL | any | **Finish deleting** once the drive is visible, or after deleting the rest by hand |
+| Deleting | VS Code windows open, or won't fit | any | **Close** and **Finish deleting**; **Not now** or **Yes, delete permanently** |
+| Deleting | gone | there | **Finish deleting** (finishes the move) |
+| Deleting | any | gone | **End the move**, after asking; the deleted part is in the Recycle Bin |
+
+After a restart: a migration cut short during the install comes back as a report with the install stopped (its changes so far listed and backed up); during the history, with the history check failed and the copies already written found, so discarding deletes them; during a re-sync, with check 4 failed (**Re-sync**, **Keep both**, **Discard the copy**); deleting, still deleting; finished but with the config not yet written, as its report again, to answer again.
 
 ## 7. Where the code goes
 - `refract-core`: build-folder rules, manifest diffing, the `cwd` rewrite, refusal rules, report types (unit tests with fixtures).
 - Helper: preflight (Linux side), copy, normalise, hash, git checks, install, history, temp cleanup, state file. Protocol (details in `docs/architecture.md`):
   - `migrate {path, dest, snapshot}` → `{id}`, then `migrateProgress` events and `migrateReady {id, report}`
   - `migrateRecheck {id}` → `{changed, removed, unreadable, copyChanged, busyAgents, sourceMissing}` (§6 step 1 without changing anything); refused unless the report passes or the migration is deleting
-  - `migrateBeginDelete {id}` → `{ok, recheck}`: the same check; when `changed`, `unreadable`, `copyChanged` and `busyAgents` are empty, the migration is marked deleting (saved) and `ok` is true. Idempotent
+  - `migrateBeginDelete {id, sourceGone, force}` → `{ok, recheck}`: the same check; when `changed`, `unreadable`, `copyChanged` and `busyAgents` are empty, the migration is marked deleting (saved) and `ok` is true. Never `ok` when WSL can't see the original and `sourceGone` is false. While deleting, `copyChanged` lists only paths the original still has, and `force` skips them. Idempotent
   - `migrateResync {id}` → `null`, then progress and a fresh `migrateReady`; refused while deleting, when the original folder is gone, or when the copy changed
-  - `migrateFinish {id, action: delete|keep|discard}`: `delete` only while deleting; `keep` and `discard` refused while deleting, `discard` also when the original folder is gone or the copy changed. `migrateCancel {id}` only before the report
-  - `migratePending` → `[{id, report, deleting}]` (reports waiting, including after a restart)
+  - `migrateFinish {id, action: delete|keep|discard}`: `delete` only while deleting; `keep` refused while deleting or when the copy is gone; `discard` refused while deleting, when the original folder is gone or the copy changed, except that with the copy gone it only forgets the move. The state file stays until the config is written. `migrateCancel {id}` → `{ended}` while running: before placement it deletes the temporary copy (`ended`); once placed, and during a re-sync, the step stops and a report follows
+  - `migratePending` → `[{id, report, deleting, copyMissing}]` (reports waiting, including after a restart)
   - `stopAgent {path, sessionId}` → `null` (SIGTERM an idle session)
   - Errors: `6` a migration could not start, or is unknown or not at that step; `7` `stopAgent` named a working session.
 - App (Windows): S0/G0 snapshot with `git.exe`, reparse-point and lock checks, Recycle Bin, `.lnk`, closing VS Code windows, stopping idle agents, notifications, dialog, gem ring and report UI. DemoBackend simulates a migration for the demo site.

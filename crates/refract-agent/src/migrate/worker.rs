@@ -1389,6 +1389,10 @@ impl Worker {
                         {
                             continue;
                         }
+                        // Git shows a file kept byte for byte as modified: say why.
+                        if problem.path.as_ref().is_some_and(|p| self.kept.contains(p)) {
+                            problem.message = KEPT.into();
+                        }
                         problems.push(problem);
                     }
                 }
