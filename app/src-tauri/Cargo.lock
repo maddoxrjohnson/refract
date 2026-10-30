@@ -2972,6 +2972,7 @@ dependencies = [
  "refract-launch",
  "serde",
  "serde_json",
+ "sha2",
  "sysinfo",
  "tauri",
  "tauri-build",
@@ -2981,6 +2982,7 @@ dependencies = [
  "ureq",
  "webview2-com",
  "windows",
+ "windows-core",
 ]
 
 [[package]]

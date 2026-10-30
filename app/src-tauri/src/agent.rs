@@ -88,7 +88,7 @@ fn neutral_dir_from(user_profile: Option<PathBuf>) -> PathBuf {
 
 /// `wsl.exe` set up to print UTF-8 rather than UTF-16 and to run in [`neutral_dir`],
 /// with no console window.
-fn wsl_command() -> Command {
+pub(crate) fn wsl_command() -> Command {
     let mut command = Command::new("wsl.exe");
     command.env("WSL_UTF8", "1").current_dir(neutral_dir());
     no_window(&mut command);
@@ -223,7 +223,7 @@ pub fn wsl_args(helper: Option<&str>, distro: Option<&str>) -> Vec<String> {
 }
 
 /// `-d <distro>`, or nothing when the choice is left to `wsl.exe`.
-fn distro_args(distro: Option<&str>) -> Vec<String> {
+pub(crate) fn distro_args(distro: Option<&str>) -> Vec<String> {
     match distro.filter(|d| !d.is_empty()) {
         Some(distro) => vec!["-d".to_owned(), distro.to_owned()],
         None => Vec::new(),
@@ -472,7 +472,10 @@ pub fn start(app: &AppHandle) {
         move |event| {
             let result = match event {
                 ClientEvent::Status(status) => handle.emit(STATUS_EVENT, status),
-                ClientEvent::Event(event) => handle.emit(EVENT_EVENT, event),
+                ClientEvent::Event(event) => {
+                    crate::migrate::on_helper_event(&handle, &event);
+                    handle.emit(EVENT_EVENT, event)
+                }
             };
             if let Err(err) = result {
                 eprintln!("refract: forwarding a helper event: {err}");

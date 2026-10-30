@@ -1,6 +1,12 @@
 import type {
   AgentEvent,
+  DeleteOutcome,
+  FinishAction,
   HookInfo,
+  MigratePreflight,
+  MigrateSnapshotProgress,
+  PendingMigration,
+  VsCodeWindow,
   SystemStats,
   UsageSummary,
   Credentials,
@@ -71,6 +77,33 @@ export interface Backend {
   usage(): Promise<UsageSummary>;
   /** Machine load about every 2 s while the window is visible. */
   onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe;
+
+  // Move to WSL (app/src-tauri/src/migrate/mod.rs documents the flow). Paths are the
+  // source's WSL path (`/mnt/c/...`). Each rejects with a `MigrateError`.
+
+  /** Walks the source and says what the dialog shows; sends `onMigrateSnapshot` progress. */
+  migratePreflight(path: string, dest?: string): Promise<MigratePreflight>;
+  /** Takes the source snapshot, then starts the copy; resolves with the migration's id. */
+  migrateStart(path: string, dest: string): Promise<{ id: string }>;
+  /** Stops a running preflight or snapshot of `path`; false when none runs. */
+  migrateCancelSnapshot(path: string): Promise<boolean>;
+  /** Cancels a migration before its report; the partial copy is deleted. */
+  migrateCancel(id: string): Promise<void>;
+  /** VS Code windows that have the folder open. */
+  migrateWindows(path: string): Promise<VsCodeWindow[]>;
+  /** Asks one to close (its unsaved-file prompt still shows); false when it is gone. */
+  migrateCloseWindow(path: string, id: number): Promise<boolean>;
+  /** Stops an agent on the repo that is finished or waiting on the user. */
+  migrateStopAgent(path: string, sessionId: string): Promise<void>;
+  /** Re-copies what changed since the report; progress and a new `migrateReady` follow. */
+  migrateResync(id: string): Promise<void>;
+  /** Delete original; `permanent` only after the user agreed to skip the Recycle Bin. */
+  migrateDelete(id: string, permanent: boolean): Promise<DeleteOutcome>;
+  /** Keep both, or discard the copy. */
+  migrateFinish(id: string, action: FinishAction): Promise<void>;
+  /** Reports still waiting for an answer, after a restart. */
+  migratePending(): Promise<PendingMigration[]>;
+  onMigrateSnapshot(cb: (progress: MigrateSnapshotProgress) => void): Unsubscribe;
 
   /**
    * Demo only: launches that were simulated instead of started, for the pretend terminal.

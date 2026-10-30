@@ -131,6 +131,8 @@ Repos that appear later are found by watching every directory the search walks u
 
 The `migrate` methods and events are specified in `.plans/wsl-migration-spec.md`; the types and the param structs (`MigrateParams`, `MigrateFinishParams`, `MigrateCancelParams`) are in `protocol.rs`, and the helper does not handle the methods yet. Before sending `migrate`, the app writes the source snapshot (the file manifest S0 and the git snapshot G0 it took with `git.exe`) as JSON and passes the file's Linux path as `snapshot`. The rules that decide what to skip, what to compare and what to refuse are in `crates/refract-core/src/migrate` (module docs there).
 
+The app's side is in `app/src-tauri/src/migrate` (module docs there list its commands and events). It reads the source natively on NTFS: every file is hashed on up to eight threads, alternate data streams are listed, links that leave the repo and files that can't be opened refuse the move, and G0 and the clean blob ids come from `git.exe` (Linux git through `wsl.exe` when `git.exe` is missing). **Delete original** asks the helper to recheck the source, refuses while a VS Code window has the folder open, sends it to the Recycle Bin with `IFileOperation` (no UI; a folder the bin can't hold is reported, so the interface can ask before deleting it for good), leaves a `.lnk` pointing at the copy and then sends `migrateFinish delete`. Requests the protocol does not have yet (`migrateRecheck`, `migrateResync`, `migratePending`, `stopAgent`) fail as unsupported, so the original is never deleted without the recheck.
+
 Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
 
 The helper never writes anything else to standard output; logs go to standard error.
@@ -147,7 +149,7 @@ Each start writes a line with the app's version. A log over 1 MiB at startup, or
 
 If the helper exits, every request still waiting for an answer fails at once as disconnected, and the client starts the helper again after a delay. The delay starts at one second and doubles with each failure in a row, up to 30 seconds. A helper that ran for at least a minute before exiting counts as healthy, so the next delay is back to one second. Failing to start the helper at all, for example when `wsl.exe` is missing, counts as a failure too. While the helper is down, requests fail straight away instead of queueing, and the interface shows that it is restarting, when it will try again and why it stopped. A request that times out is forgotten, so an answer that arrives later is dropped. Shutting down sends `shutdown`, closes the helper's input and kills it if it has not exited after a grace period. Nothing is restarted after that.
 
-The interface does not get a free line to the helper. Its `agent_request` command accepts only `ping`, `listRepos` and `getRepo`. Everything else goes through a command that checks what it sends: `launch`, `clone_repo`, `add_repo`, `hook_info`, `install_hook`, `uninstall_hook` and `usage`.
+The interface does not get a free line to the helper. Its `agent_request` command accepts only `ping`, `listRepos` and `getRepo`. Everything else goes through a command that checks what it sends: `launch`, `clone_repo`, `add_repo`, `hook_info`, `install_hook`, `uninstall_hook`, `usage` and the `migrate_*` commands.
 
 ## Session state
 

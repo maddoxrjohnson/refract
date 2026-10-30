@@ -22,6 +22,8 @@ refract-core = { path = "../../crates/refract-core" }
 refract-launch = { path = "../../crates/refract-launch" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 of the source's files for Move to WSL.
+sha2 = "0.10"
 tauri = { version = "2.12", features = ["tray-icon", "image-png"] }
 tauri-plugin-autostart = "2.7"
 tauri-plugin-global-shortcut = "2.4"
@@ -32,19 +34,29 @@ ureq = { version = "3.4", default-features = false, features = ["native-tls-no-d
 # The versions wry uses, to reach WebView2 interfaces Tauri does not wrap.
 [target.'cfg(windows)'.dependencies]
 webview2-com = "0.39"
+# `#[implement]` for the Recycle Bin's progress sink expands to `windows_core` paths.
+windows-core = "0.62"
 # CPU and memory for the system widget.
 sysinfo = { version = "0.40", default-features = false, features = ["system"] }
 # PDH for GPU use, ToolHelp for our child processes, ShellExecuteW to open folders
 # and links, Credential Manager for tokens, a pipe for standard error's log file.
+# Move to WSL: NTFS listing and streams, the Recycle Bin (IFileOperation), .lnk files
+# (IShellLinkW), the bin's registry settings and VS Code's process names.
 windows = { version = "0.62", features = [
   "Win32_Foundation",
   "Win32_Security_Credentials",
+  "Win32_Storage_FileSystem",
   "Win32_System_Com",
   "Win32_System_Console",
   "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_Ole",
   "Win32_System_Performance",
   "Win32_System_Pipes",
+  "Win32_System_Registry",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
   "Win32_UI_Shell",
+  "Win32_UI_Shell_Common",
   "Win32_UI_WindowsAndMessaging",
 ] }
 

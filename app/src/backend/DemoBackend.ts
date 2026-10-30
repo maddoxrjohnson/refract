@@ -25,6 +25,13 @@ import type {
   TokenTotals,
   UsageSummary,
 } from "./types";
+import type {
+  DeleteOutcome,
+  MigrateError,
+  MigratePreflight,
+  PendingMigration,
+  VsCodeWindow,
+} from "./types";
 import { DEFAULT_PRICES } from "../usage/cost";
 
 // Invented repos covering every state a gem can show, for running the interface in a
@@ -623,5 +630,61 @@ export class DemoBackend implements Backend {
     tick();
     const timer = setInterval(tick, 2000);
     return () => clearInterval(timer);
+  }
+
+  // Move to WSL is not in the demo yet (spec §7 has it simulated): asking for one is
+  // refused, and the lists are empty.
+
+  private noMigration<T>(): Promise<T> {
+    const error: MigrateError = { kind: "internal", message: "Move to WSL isn't in the demo yet." };
+    return Promise.reject(error);
+  }
+
+  migratePreflight(): Promise<MigratePreflight> {
+    return this.noMigration();
+  }
+
+  migrateStart(): Promise<{ id: string }> {
+    return this.noMigration();
+  }
+
+  migrateCancelSnapshot(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+
+  migrateCancel(): Promise<void> {
+    return this.noMigration();
+  }
+
+  migrateWindows(): Promise<VsCodeWindow[]> {
+    return Promise.resolve([]);
+  }
+
+  migrateCloseWindow(): Promise<boolean> {
+    return Promise.resolve(false);
+  }
+
+  migrateStopAgent(): Promise<void> {
+    return this.noMigration();
+  }
+
+  migrateResync(): Promise<void> {
+    return this.noMigration();
+  }
+
+  migrateDelete(): Promise<DeleteOutcome> {
+    return this.noMigration();
+  }
+
+  migrateFinish(): Promise<void> {
+    return this.noMigration();
+  }
+
+  migratePending(): Promise<PendingMigration[]> {
+    return Promise.resolve([]);
+  }
+
+  onMigrateSnapshot(): Unsubscribe {
+    return () => {};
   }
 }
