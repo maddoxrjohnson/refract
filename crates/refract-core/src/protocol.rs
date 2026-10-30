@@ -47,10 +47,13 @@ pub mod code {
     /// `prepareLaunch` asked to focus a session that no process runs any more, or
     /// whose process does not run in the Refract window on that folder.
     pub const NOT_RUNNING: i32 = 5;
-    /// `migrate` could not start (the destination exists, or the snapshot file is
-    /// missing or unreadable), or `migrateFinish` or `migrateCancel` named a migration
-    /// that is unknown or past that step.
+    /// `migrate` could not start (a preflight refusal, or the snapshot file is missing
+    /// or unreadable), or `migrateFinish`, `migrateCancel`, `migrateRecheck` or
+    /// `migrateResync` named a migration that is unknown or not at that step.
     pub const MIGRATE_FAILED: i32 = 6;
+    /// `stopAgent` named a session that is working on a turn, so stopping it could lose
+    /// work.
+    pub const AGENT_BUSY: i32 = 7;
 }
 
 /// A request from the app.
@@ -112,6 +115,19 @@ pub enum Method {
     MigrateFinish(MigrateFinishParams),
     /// Stops a migration before it is ready and deletes its copy: answered with `null`.
     MigrateCancel(MigrateCancelParams),
+    /// Runs check 4 again on a ready migration, right before the app deletes the
+    /// original: answered with a [`Recheck`]. Empty lists mean it is safe to delete.
+    MigrateRecheck(MigrateIdParams),
+    /// Re-copies what changed in the original since the report into the placed copy and
+    /// checks it again: answered with `null`, then [`Event::MigrateProgress`] and a fresh
+    /// [`Event::MigrateReady`].
+    MigrateResync(MigrateIdParams),
+    /// The migrations whose reports wait for `migrateFinish`, including those from
+    /// before the helper restarted: answered with [`PendingMigrations`].
+    MigratePending,
+    /// Stops (SIGTERM) the `claude` process of a live session, unless it is working on
+    /// a turn: answered with `null`. See [`StopAgentParams`].
+    StopAgent(StopAgentParams),
 }
 
 /// A request id: any JSON number or string, echoed back unchanged.
@@ -158,6 +174,10 @@ pub enum Reply {
     Usage(UsageSummary),
     /// The result of `migrate`.
     Migration(MigrationTicket),
+    /// The result of `migrateRecheck`.
+    Recheck(Recheck),
+    /// The result of `migratePending`.
+    PendingMigrations(PendingMigrations),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -279,12 +299,8 @@ pub struct FocusTarget {
 /// Linux path that must not exist), in the background. Answered at once with a
 /// [`MigrationTicket`], followed by `migrateProgress` events and one `migrateReady`.
 /// `snapshot` is the Linux path of the [`crate::migrate::SourceSnapshot`] file the app
-/// wrote before sending it (see [`crate::migrate`]).
-///
-/// The `migrate*` methods are not [`Method`] variants yet: the helper adds
-/// `Migrate(MigrateParams)`, `MigrateFinish(MigrateFinishParams)` and
-/// `MigrateCancel(MigrateCancelParams)` together with their handling, which gives the
-/// wire format tested here.
+/// wrote before sending it (see [`crate::migrate`]). A preflight refusal is answered
+/// with [`code::MIGRATE_FAILED`] and the refusals' messages, one per line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateParams {
@@ -317,18 +333,80 @@ pub struct MigrationTicket {
     pub id: String,
 }
 
-/// What `migrateFinish` does with a migration whose report is ready.
+/// Params of `migrateRecheck` and `migrateResync`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateIdParams {
+    pub id: String,
+}
+
+/// What `migrateFinish` does with a migration whose report is ready. Each forgets the
+/// migration afterwards, so its report no longer comes back after a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum FinishAction {
-    /// The app has sent the original to the Recycle Bin: the helper deletes the old
-    /// transcripts (when the history check passed) and updates its config entries for
-    /// the old path. Refused unless the report allows deleting.
+    /// The app has already sent the original to the Recycle Bin (after a
+    /// `migrateRecheck` came back empty): the helper deletes the old transcripts (only
+    /// when the history check passed), and rewrites `extra` and `hidden` entries in
+    /// `agent.toml` that name the old path to the new one, adding the new path to
+    /// `extra` when no root covers it. Refused unless the report allows deleting.
     Delete,
-    /// Both stay; the helper only forgets the migration.
+    /// Both stay: the old path is added to `hidden` in `agent.toml`, so its gem goes,
+    /// and the new path to `extra` when no root covers it. The old transcripts stay.
+    /// Refused when the checks failed, since then there is no copy to keep.
     Keep,
-    /// The copy is deleted, and its moved transcripts with it.
+    /// The copy is deleted, and the transcripts copied for it. The original is as it
+    /// was.
     Discard,
+}
+
+/// The result of `migrateRecheck`: what changed in the original since the copy was last
+/// checked, and the agents running in it. Both empty means the original may go.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Recheck {
+    /// Paths relative to the original, changed, added or removed, sorted.
+    pub changed: Vec<String>,
+    pub busy_agents: Vec<BusyAgent>,
+}
+
+/// A `claude` process whose working directory is the original or inside it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BusyAgent {
+    pub pid: u32,
+    pub cwd: String,
+    /// When the command line names it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+}
+
+/// The result of `migratePending`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMigrations {
+    pub migrations: Vec<PendingMigration>,
+}
+
+/// A migration whose report waits for `migrateFinish`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingMigration {
+    pub id: String,
+    pub report: Box<Report>,
+}
+
+/// Params of `stopAgent`: the repo (as `getRepo` takes it) and the live session to
+/// stop. Answered with `null` once SIGTERM is sent. The session's state decides: a
+/// session that is idle or waiting on the user is stopped; one that is working is
+/// refused with [`code::AGENT_BUSY`]. Without a status hook the live state is unknown,
+/// and the transcript decides: stopped when its last turn ended, refused otherwise. A
+/// session with no process known for certain is refused with [`code::NOT_RUNNING`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StopAgentParams {
+    pub path: String,
+    pub session_id: String,
 }
 
 /// A step of a running migration, as the panel names it.
@@ -590,9 +668,11 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     };
     let takes_params = match method {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
-        | "migrateFinish" | "migrateCancel" => true,
+        | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateResync" | "stopAgent" => {
+            true
+        }
         "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
-        | "shutdown" => false,
+        | "shutdown" | "migratePending" => false,
         _ => {
             return Err(fail(
                 Some(id),
@@ -1107,6 +1187,11 @@ mod tests {
                 ..usage()
             }),
             Reply::Migration(MigrationTicket { id: "m-1".into() }),
+            Reply::Recheck(Recheck {
+                changed: vec![],
+                busy_agents: vec![],
+            }),
+            Reply::PendingMigrations(PendingMigrations { migrations: vec![] }),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
@@ -1393,6 +1478,97 @@ mod tests {
             value["data"]["report"]["dest"],
             "/home/dev/projects/aurora-notes"
         );
+    }
+
+    #[test]
+    fn migration_follow_up_messages_round_trip() {
+        for (method, value) in [
+            ("migrateRecheck", json!({"id": "m-1"})),
+            ("migrateResync", json!({"id": "m-1"})),
+        ] {
+            let line = json!({"id": 1, "method": method, "params": value}).to_string();
+            let request = parse_request(&line).unwrap();
+            let params = MigrateIdParams { id: "m-1".into() };
+            let expected = match method {
+                "migrateRecheck" => Method::MigrateRecheck(params),
+                _ => Method::MigrateResync(params),
+            };
+            assert_eq!(request.method, expected);
+            assert_eq!(round_trip(&request)["params"], value);
+        }
+        let pending = parse_request(r#"{"id":2,"method":"migratePending","params":{}}"#);
+        assert_eq!(pending.unwrap().method, Method::MigratePending);
+        let stop = parse_request(
+            r#"{"id":3,"method":"stopAgent","params":{"path":"/mnt/c/dev/aurora-notes","sessionId":"s-1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stop.method,
+            Method::StopAgent(StopAgentParams {
+                path: "/mnt/c/dev/aurora-notes".into(),
+                session_id: "s-1".into(),
+            })
+        );
+        let missing = parse_request(r#"{"id":4,"method":"stopAgent","params":{"path":"/x"}}"#);
+        assert_eq!(missing.unwrap_err().error.code, code::INVALID_PARAMS);
+
+        let recheck = Message::Response(Response::ok(
+            5,
+            Reply::Recheck(Recheck {
+                changed: vec!["notes.txt".into()],
+                busy_agents: vec![BusyAgent {
+                    pid: 4242,
+                    cwd: "/mnt/c/dev/aurora-notes".into(),
+                    session_id: Some("s-1".into()),
+                }],
+            }),
+        ));
+        assert_eq!(
+            round_trip(&recheck),
+            json!({"id": 5, "result": {"changed": ["notes.txt"], "busyAgents": [
+                {"pid": 4242, "cwd": "/mnt/c/dev/aurora-notes", "sessionId": "s-1"}]}})
+        );
+        let empty = Message::Response(Response::ok(
+            6,
+            Reply::Recheck(Recheck {
+                changed: vec![],
+                busy_agents: vec![],
+            }),
+        ));
+        round_trip(&empty);
+
+        let report = Report {
+            version: crate::migrate::report::REPORT_VERSION,
+            id: "m-1".into(),
+            source: "/mnt/c/Users/dev/Desktop/aurora-notes".into(),
+            dest: "/home/dev/projects/aurora-notes".into(),
+            started_at: "2026-10-30T10:00:00Z".parse().unwrap(),
+            finished_at: "2026-10-30T10:05:00Z".parse().unwrap(),
+            checks: vec![],
+            skipped: vec![],
+            dropped_streams: vec![],
+            new_objects: 0,
+            source_totals: Default::default(),
+            copy_totals: Default::default(),
+            install: vec![],
+            history: Default::default(),
+            linux_git: false,
+            warnings: vec![],
+        };
+        for migrations in [
+            vec![],
+            vec![PendingMigration {
+                id: "m-1".into(),
+                report: Box::new(report),
+            }],
+        ] {
+            let pending = Message::Response(Response::ok(
+                7,
+                Reply::PendingMigrations(PendingMigrations { migrations }),
+            ));
+            let value = round_trip(&pending);
+            assert!(value["result"]["migrations"].is_array());
+        }
     }
 
     #[test]

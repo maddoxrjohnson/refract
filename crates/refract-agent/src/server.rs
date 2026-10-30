@@ -9,7 +9,10 @@
 //! fifth runs `setupServer` requests one at a time, sending each response back through
 //! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
 //! time, sending each result back for this thread to report and answer. A seventh keeps
-//! token usage totals up to date (see [`crate::usage`]).
+//! token usage totals up to date (see [`crate::usage`]). Each migration runs on a
+//! thread of its own (see [`crate::migrate`]), sending its responses and events back
+//! through the channel; this thread only routes requests to it and updates the config
+//! when one finishes.
 //!
 //! Backpressure: the channel is bounded and writes to stdout block. If the app stops
 //! reading stdout, this thread stops; the stdin and inotify threads then block on the
@@ -25,10 +28,12 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use refract_core::classify::{classify_report, LiveState, SessionState};
 use refract_core::launch::wsl_path;
 use refract_core::protocol::{
-    code, parse_request, ErrorBody, Event, Hello, HookInfo, Id, LaunchMode, Method, Outcome, Reply,
-    RepoList, RepoSnapshot, Response, PROTOCOL_VERSION,
+    code, parse_request, ErrorBody, Event, FinishAction, Hello, HookInfo, Id, LaunchMode, Method,
+    Outcome, PendingMigration, PendingMigrations, Reply, RepoList, RepoSnapshot, Response,
+    StopAgentParams, PROTOCOL_VERSION,
 };
 use refract_core::sessions::{is_windows_mount, paths_match, project_dir_matches};
 use serde::Serialize;
@@ -37,6 +42,7 @@ use crate::config::{self, Config};
 use crate::hook;
 use crate::launch;
 use crate::limits::LimitsFile;
+use crate::migrate::{self, Phase};
 use crate::procs;
 use crate::repos;
 use crate::scan;
@@ -110,6 +116,8 @@ enum Msg {
         id: Id,
         result: Result<PathBuf, String>,
     },
+    /// A migration's worker has something for this thread.
+    Migration(migrate::Update),
 }
 
 /// One line of input, without its newline.
@@ -297,6 +305,8 @@ struct Server<W: Write> {
     usage: Usage,
     /// Plan limits from the status line's file, added to each `usage` answer.
     limits: LimitsFile,
+    /// Migrations running or waiting for `migrateFinish`, by id.
+    migrations: HashMap<String, migrate::Handle>,
 }
 
 /// Runs the helper until `shutdown` or the end of `input`.
@@ -327,6 +337,7 @@ where
         }
     };
     let mut server = Server::new(config, out, watcher, tx);
+    server.resume_migrations();
 
     loop {
         let deadline = [
@@ -353,6 +364,7 @@ where
             Ok(Msg::Loaded { repos, last }) => server.loaded(repos, last)?,
             Ok(Msg::Answer(response)) => server.send(&response)?,
             Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
+            Ok(Msg::Migration(update)) => server.migration(update)?,
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
@@ -461,6 +473,14 @@ impl Drop for LoadDone {
     }
 }
 
+fn unknown_migration(id: Id, migration: &str) -> Response {
+    Response::err(
+        id,
+        code::MIGRATE_FAILED,
+        format!("no migration {migration}"),
+    )
+}
+
 fn error_response(id: Option<Id>, code: i32, message: impl Into<String>) -> Response {
     Response {
         id,
@@ -502,6 +522,7 @@ impl<W: Write> Server<W> {
             unread: HashMap::new(),
             usage,
             limits,
+            migrations: HashMap::new(),
         }
     }
 
@@ -635,13 +656,93 @@ impl<W: Write> Server<W> {
                 self.send_all(&events)?;
                 return Ok(true);
             }
-            Method::Migrate(_) | Method::MigrateFinish(_) | Method::MigrateCancel(_) => {
-                Response::err(
+            Method::Migrate(params) => {
+                let busy = self.migrations.values().any(|m| {
+                    paths_match(&m.source, &params.path) || paths_match(&m.dest, &params.dest)
+                });
+                if busy {
+                    Response::err(
+                        id,
+                        code::MIGRATE_FAILED,
+                        "Another migration of this repo, or to this destination, is under way.",
+                    )
+                } else {
+                    let migration = uuid::Uuid::new_v4().to_string();
+                    let started = migrate::start(
+                        migration.clone(),
+                        id.clone(),
+                        params,
+                        self.migrate_context(),
+                        self.migrate_sink(),
+                    );
+                    match started {
+                        // The worker answers.
+                        Ok(handle) => {
+                            self.migrations.insert(migration, handle);
+                            return Ok(true);
+                        }
+                        Err(e) => Response::err(
+                            id,
+                            code::MIGRATE_FAILED,
+                            format!("cannot start the migration thread: {e}"),
+                        ),
+                    }
+                }
+            }
+            Method::MigrateCancel(params) => match self.migrations.get(&params.id) {
+                Some(m) if m.phase == Phase::Running => {
+                    if m.cancel(id.clone()) {
+                        return Ok(true);
+                    }
+                    Response::err(id, code::MIGRATE_FAILED, "the migration stopped")
+                }
+                Some(_) => Response::err(
                     id,
-                    code::METHOD_NOT_FOUND,
-                    "migration is not implemented yet",
+                    code::MIGRATE_FAILED,
+                    "the migration's report is out; end it with migrateFinish",
+                ),
+                None => unknown_migration(id, &params.id),
+            },
+            Method::MigrateFinish(params) => {
+                let command = migrate::Command::Finish(id.clone(), params.action);
+                match self.send_to_ready_migration(&params.id, command, None) {
+                    Ok(()) => return Ok(true),
+                    Err(message) => Response::err(id, code::MIGRATE_FAILED, message),
+                }
+            }
+            Method::MigrateRecheck(params) => {
+                let command = migrate::Command::Recheck(id.clone());
+                match self.send_to_ready_migration(&params.id, command, None) {
+                    Ok(()) => return Ok(true),
+                    Err(message) => Response::err(id, code::MIGRATE_FAILED, message),
+                }
+            }
+            Method::MigrateResync(params) => {
+                let command = migrate::Command::Resync(id.clone());
+                match self.send_to_ready_migration(&params.id, command, Some(Phase::Resyncing)) {
+                    Ok(()) => return Ok(true),
+                    Err(message) => Response::err(id, code::MIGRATE_FAILED, message),
+                }
+            }
+            Method::MigratePending => {
+                let mut migrations: Vec<PendingMigration> = self
+                    .migrations
+                    .values()
+                    .filter(|m| m.phase == Phase::Ready)
+                    .filter_map(|m| {
+                        Some(PendingMigration {
+                            id: m.id.clone(),
+                            report: m.report.clone()?,
+                        })
+                    })
+                    .collect();
+                migrations.sort_by_key(|m| m.report.started_at);
+                Response::ok(
+                    id,
+                    Reply::PendingMigrations(PendingMigrations { migrations }),
                 )
             }
+            Method::StopAgent(params) => self.stop_agent(id, &params)?,
             Method::Shutdown => {
                 self.send(&Response::ok(id, Reply::Done))?;
                 return Ok(false);
@@ -649,6 +750,207 @@ impl<W: Write> Server<W> {
         };
         self.send(&response)?;
         Ok(true)
+    }
+
+    fn migrate_context(&self) -> migrate::Context {
+        migrate::Context {
+            claude_projects: self.agent.config().claude_projects.clone(),
+        }
+    }
+
+    fn migrate_sink(&self) -> migrate::Sink {
+        let tx = self.tx.clone();
+        std::sync::Arc::new(move |update| tx.send(Msg::Migration(update)).is_ok())
+    }
+
+    /// Picks up the migrations placed before a restart, whose workers send their
+    /// reports again, and deletes temporary copies left by a helper that stopped.
+    fn resume_migrations(&mut self) {
+        let roots: Vec<PathBuf> = self
+            .agent
+            .config()
+            .roots
+            .iter()
+            .filter(|root| !is_slow(root))
+            .cloned()
+            .collect();
+        migrate::delete_leftovers(migrate::store::leftovers(&roots));
+        for record in migrate::store::load_records() {
+            let id = record.id.clone();
+            match migrate::resume(record, self.migrate_context(), self.migrate_sink()) {
+                Ok(handle) => {
+                    self.migrations.insert(id, handle);
+                }
+                Err(e) => eprintln!("refract-agent: cannot resume migration {id}: {e}"),
+            }
+        }
+    }
+
+    /// Hands `command` to the migration `id` if its report is out, moving it to `next`.
+    fn send_to_ready_migration(
+        &mut self,
+        id: &str,
+        command: migrate::Command,
+        next: Option<Phase>,
+    ) -> Result<(), String> {
+        let Some(migration) = self.migrations.get_mut(id) else {
+            return Err(format!("no migration {id}"));
+        };
+        if migration.phase != Phase::Ready {
+            return Err("the migration's report is not ready".into());
+        }
+        if !migration.send(command) {
+            return Err("the migration stopped".into());
+        }
+        if let Some(next) = next {
+            migration.phase = next;
+        }
+        Ok(())
+    }
+
+    /// Takes in what a migration's worker sent.
+    fn migration(&mut self, update: migrate::Update) -> io::Result<()> {
+        match update {
+            migrate::Update::Answer(response) => self.send(&response),
+            migrate::Update::Event(event) => {
+                if let Event::MigrateReady { id, report } = &event {
+                    if let Some(migration) = self.migrations.get_mut(id) {
+                        migration.phase = Phase::Ready;
+                        migration.report = Some(report.clone());
+                    }
+                }
+                self.send(&event)
+            }
+            migrate::Update::Ended { id } => {
+                self.migrations.remove(&id);
+                Ok(())
+            }
+            migrate::Update::Finished {
+                request,
+                id,
+                action,
+                source,
+                dest,
+            } => {
+                self.migrations.remove(&id);
+                let response = match self.finish_migration(action, &source, &dest)? {
+                    Ok(()) => Response::ok(request, Reply::Done),
+                    Err(message) => Response::err(request, code::MIGRATE_FAILED, message),
+                };
+                self.send(&response)
+            }
+        }
+    }
+
+    /// The config side of `migrateFinish`: with `delete`, entries naming the old path
+    /// name the new one; with `keep`, the old path is hidden. Either way the new path is
+    /// reported from now on. Then the repos are searched again.
+    fn finish_migration(
+        &mut self,
+        action: FinishAction,
+        source: &Path,
+        dest: &Path,
+    ) -> io::Result<Result<(), String>> {
+        let file = config::file_path();
+        match action {
+            FinishAction::Discard => return Ok(Ok(())),
+            FinishAction::Delete => {
+                if let Err(message) = config::replace_path(&file, source, dest) {
+                    return Ok(Err(message));
+                }
+                self.agent.repoint(source, dest);
+            }
+            FinishAction::Keep => {
+                if let Err(message) = config::add_hidden(&file, source) {
+                    return Ok(Err(message));
+                }
+                self.agent.hide(source.to_owned());
+            }
+        }
+        let config = self.agent.config();
+        if !config.extra.iter().any(|p| p == dest) && !scan::under_roots(config, dest) {
+            if let Err(message) = config::add_extra(&file, dest) {
+                return Ok(Err(message));
+            }
+            self.agent.add_extra(dest.to_owned());
+        }
+        if self.load != Load::NotStarted {
+            self.pending.rescan = true;
+            self.pending.touch(Instant::now());
+            self.flush()?;
+        }
+        Ok(Ok(()))
+    }
+
+    /// `stopAgent`: SIGTERM to a live session's process, unless it is working (see
+    /// [`StopAgentParams`]).
+    fn stop_agent(&mut self, id: Id, params: &StopAgentParams) -> io::Result<Response> {
+        let repo = self
+            .agent
+            .repo_paths()
+            .find(|p| paths_match(&path_str(p), &params.path))
+            .cloned();
+        let Some(repo) = repo else {
+            let message = format!("no repo at {}", params.path);
+            return Ok(Response::err(id, code::REPO_NOT_FOUND, message));
+        };
+        let sessions = Refresh {
+            sessions: true,
+            ..Refresh::default()
+        };
+        let events = self.agent.refresh(&repo, sessions);
+        self.send_all(&events)?;
+        let Some(state) = self.agent.repo(&repo) else {
+            return Ok(Response::err(id, code::REPO_NOT_FOUND, "the repo is gone"));
+        };
+        let session = state
+            .snapshot
+            .sessions
+            .iter()
+            .find(|s| s.id == params.session_id)
+            .map(|s| s.state);
+        let summary = state
+            .sessions
+            .iter()
+            .find(|s| s.session_id.as_deref() == Some(params.session_id.as_str()));
+        let idle = match session {
+            Some(SessionState::Live(LiveState::Idle | LiveState::WaitingOnUser)) => true,
+            Some(SessionState::Live(LiveState::Working)) => false,
+            // Without a status hook, the transcript says whether its last turn ended.
+            Some(SessionState::Live(LiveState::Unknown)) => summary.is_some_and(|s| {
+                matches!(classify_report(s, false, None), SessionState::Finished(_))
+            }),
+            _ => {
+                let message = format!("session {} is not running", params.session_id);
+                return Ok(Response::err(id, code::NOT_RUNNING, message));
+            }
+        };
+        if !idle {
+            let message = "the agent is working; stop it in its terminal, or wait";
+            return Ok(Response::err(id, code::AGENT_BUSY, message));
+        }
+        let Some(process) = self.agent.live_process(&repo, &params.session_id) else {
+            let message = "which process runs this session is not certain";
+            return Ok(Response::err(id, code::NOT_RUNNING, message));
+        };
+        if !procs::same_process(process.started, procs::process_started(process.pid)) {
+            return Ok(Response::err(
+                id,
+                code::NOT_RUNNING,
+                "the process has exited",
+            ));
+        }
+        // SAFETY: kill takes a pid and a signal number.
+        let sent = unsafe { libc::kill(process.pid as libc::pid_t, libc::SIGTERM) } == 0;
+        if !sent {
+            let message = format!(
+                "cannot stop pid {}: {}",
+                process.pid,
+                io::Error::last_os_error()
+            );
+            return Ok(Response::err(id, code::INTERNAL_ERROR, message));
+        }
+        Ok(Response::ok(id, Reply::Done))
     }
 
     /// Queues `job` for the setup thread, starting it on first use. Jobs run one at a

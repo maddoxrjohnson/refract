@@ -10,8 +10,13 @@ refract-core = { path = "../refract-core" }
 refract-launch = { path = "../refract-launch" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 inotify = { version = "0.11", default-features = false }
+# statvfs, utimensat, renameat2 and kill for moving repos into WSL; inotify already
+# depends on it.
+libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 of files, for the manifests of a repo being moved into WSL.
+sha2 = "0.10"
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 # Edits agent.toml in place for addRepo, keeping comments; toml already depends on it.
 toml_edit = { version = "0.22", default-features = false, features = ["parse", "display"] }

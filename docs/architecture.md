@@ -92,9 +92,13 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `installHook` | none | the same | Installs the status hook |
 | `uninstallHook` | none | the same | Removes it and restores `settings.json` |
 | `shutdown` | none | `null` | Answers, then the helper exits |
-| `migrate` | `{path, dest, snapshot}` | `{id}` | Moves a repo from a Windows drive into WSL in the background ([Move to WSL](#move-to-wsl)) |
-| `migrateFinish` | `{id, action}` | `null` | Ends a migration whose report is ready: `action` is `delete`, `keep` or `discard` |
+| `migrate` | `{path, dest, snapshot}` | `{id}` | Moves a repo from a Windows drive into WSL in the background ([Move to WSL](#move-to-wsl)); a preflight refusal is error `6` with one message per line |
+| `migrateRecheck` | `{id}` | `{changed, busyAgents}` | Check 4 again, right before the app deletes the original: paths changed since the last check, and `claude` processes (`{pid, cwd, sessionId?}`) running in the original; both empty means safe |
+| `migrateResync` | `{id}` | `null` | Copies what changed into the placed copy and checks again; `migrateProgress` and a fresh `migrateReady` follow |
+| `migrateFinish` | `{id, action}` | `null` | Ends a migration whose report is ready: `delete` (the app has already recycled the original), `keep` or `discard` |
 | `migrateCancel` | `{id}` | `null` | Stops a migration before its report and deletes the temporary copy |
+| `migratePending` | none | `{migrations: [{id, report}]}` | Reports waiting for `migrateFinish`, including those from before a restart |
+| `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` process, unless it is working (error `7`) |
 
 ### Events
 
@@ -111,7 +115,7 @@ Usage totals are not pushed. The app asks for them with `usage`.
 
 ### Errors
 
-Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder, `6` a migration could not start or the migration named is unknown or past that step.
+Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working.
 
 ### Rules of the line protocol
 
@@ -129,7 +133,11 @@ Repos that appear later are found by watching every directory the search walks u
 
 ### Move to WSL
 
-The `migrate` methods and events are specified in `.plans/wsl-migration-spec.md`; the types and the param structs (`MigrateParams`, `MigrateFinishParams`, `MigrateCancelParams`) are in `protocol.rs`, and the helper does not handle the methods yet. Before sending `migrate`, the app writes the source snapshot (the file manifest S0 and the git snapshot G0 it took with `git.exe`) as JSON and passes the file's Linux path as `snapshot`. The rules that decide what to skip, what to compare and what to refuse are in `crates/refract-core/src/migrate` (module docs there).
+The `migrate` methods and events are specified in `.plans/wsl-migration-spec.md`; the types are in `protocol.rs`. Before sending `migrate`, the app writes the source snapshot (the file manifest S0 and the git snapshot G0 it took with `git.exe`) as JSON and passes the file's Linux path as `snapshot`. The exact format, and a Linux-git builder of it that the tests use, are in `crates/refract-agent/src/migrate/source.rs`. The rules that decide what to skip, what to compare and what to refuse are in `crates/refract-core/src/migrate` (module docs there); the helper's steps are in `crates/refract-agent/src/migrate` (module docs there).
+
+Each migration runs on a thread of its own, so requests are answered while it copies. The helper refuses what it can check from Linux (destination, free space, worktrees, a git operation in progress, links leading out, Git LFS), copies into `.refract-migrate-<name>-<id>` next to the destination, normalises line endings and git config, and checks the copy against the snapshot. Then it stats the source again and re-copies what changed, up to three rounds. Only when checks 1 to 4 pass does it rename the copy into place, run the install and copy the session history. A failed report deletes the temporary copy at once, so only `discard` is accepted for it. A placed migration is kept in `~/.local/share/refract/migrations/state/` until `migrateFinish`: after a restart the helper sends its `migrateReady` again and lists it in `migratePending`. At startup the helper deletes temporary copies left by a helper that stopped mid-copy.
+
+Deleting the original goes: `migrateRecheck` (both lists empty, else offer `migrateResync`), the app recycles the original, then `migrateFinish` with `delete`. The helper then deletes the old transcripts (only if the history check passed) and points `extra` and `hidden` entries in `agent.toml` at the new path. `keep` adds the old path to `hidden`. Both add the new path to `extra` when no root covers it.
 
 Writes to standard output block if the app stops reading. The helper then stops reading its input. Pending file-system events are held in the kernel's queue, which overflows if it fills, and an overflow triggers a full reload once output resumes. Memory therefore stays bounded and no change is lost.
 

@@ -1,0 +1,805 @@
+//! Moving a repo "on a Windows drive" into WSL, over stdin and stdout. The drive is a
+//! temporary folder the helper treats as one ([`state::TEST_SLOW_PREFIX`]); the source
+//! snapshot the app would write is built with
+//! [`refract_agent::migrate::source::build`], Linux git standing in for `git.exe`.
+//! Faults are injected through [`TEST_HOOK`], a script the helper runs at fixed points.
+
+mod common;
+
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
+use std::time::{Duration, Instant};
+
+use chrono::{TimeDelta, Utc};
+use refract_agent::migrate::worker::TEST_HOOK;
+use refract_agent::state;
+use serde_json::{json, Value};
+
+use common::*;
+
+const SESSION_ID: &str = "5e2a7c10-0000-4000-8000-0000000000bb";
+
+struct Agent {
+    child: Child,
+    stdin: ChildStdin,
+    lines: Receiver<String>,
+    next_id: u64,
+}
+
+impl Agent {
+    fn spawn(home: &Path, config: &Path, drive: &Path, hook: Option<&Path>) -> Agent {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_refract-agent"));
+        command
+            .env_remove("XDG_STATE_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("CLAUDE_CONFIG_DIR")
+            .env("HOME", home)
+            .env("REFRACT_AGENT_CONFIG", config)
+            .env(state::TEST_SLOW_PREFIX, drive)
+            .envs(GIT_ENV.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        match hook {
+            Some(hook) => command.env(TEST_HOOK, hook),
+            None => command.env_remove(TEST_HOOK),
+        };
+        let mut child = command.spawn().expect("spawn agent");
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, lines) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if tx.send(line.unwrap()).is_err() {
+                    break;
+                }
+            }
+        });
+        Agent {
+            child,
+            stdin,
+            lines,
+            next_id: 1,
+        }
+    }
+
+    /// Sends a request and returns its id.
+    fn send(&mut self, method: &str, params: Value) -> u64 {
+        let id = self.next_id;
+        self.next_id += 1;
+        let message = json!({"id": id, "method": method, "params": params});
+        writeln!(self.stdin, "{message}").unwrap();
+        self.stdin.flush().unwrap();
+        id
+    }
+
+    #[track_caller]
+    fn next(&self, timeout: Duration) -> Value {
+        let line = self
+            .lines
+            .recv_timeout(timeout)
+            .expect("agent wrote nothing in time");
+        serde_json::from_str(&line).unwrap_or_else(|e| panic!("not JSON: {line}: {e}"))
+    }
+
+    /// The response to `id`, skipping everything else.
+    #[track_caller]
+    fn response(&self, id: u64) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let message = self.next(deadline.saturating_duration_since(Instant::now()));
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    #[track_caller]
+    fn request(&mut self, method: &str, params: Value) -> Value {
+        let id = self.send(method, params);
+        self.response(id)
+    }
+
+    /// Waits for `migrateReady` and returns the report.
+    #[track_caller]
+    fn ready(&self) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let message = self.next(deadline.saturating_duration_since(Instant::now()));
+            if message["event"] == "migrateReady" {
+                return message["data"]["report"].clone();
+            }
+        }
+    }
+
+    fn list_when_loaded(&mut self) -> Value {
+        let first = self.request("listRepos", json!(null));
+        if first["result"]["loading"] == false {
+            return first;
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let message = self.next(deadline.saturating_duration_since(Instant::now()));
+            if message["event"] == "loadComplete" {
+                break;
+            }
+        }
+        self.request("listRepos", json!(null))
+    }
+}
+
+impl Drop for Agent {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A temporary world: a home with a Linux root, a "Windows drive", and the repo on it.
+struct World {
+    _tmp: tempfile::TempDir,
+    tmp: PathBuf,
+    home: PathBuf,
+    root: PathBuf,
+    drive: PathBuf,
+    config: PathBuf,
+    src: PathBuf,
+    dest: PathBuf,
+}
+
+impl World {
+    fn new() -> World {
+        hermetic_git();
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let tmp = tmp_dir.path().to_owned();
+        let home = tmp.join("home");
+        let root = home.join("projects");
+        let drive = tmp.join("drive");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        let src = drive.join("Desktop/aurora-notes");
+        let config = tmp.join("agent.toml");
+        write(
+            &config,
+            &format!(
+                "roots = [{:?}]\nextra = [{:?}]\n",
+                root.to_str().unwrap(),
+                src.to_str().unwrap()
+            ),
+        );
+        build_repo(&tmp, &src);
+        World {
+            _tmp: tmp_dir,
+            dest: root.join("aurora-notes"),
+            tmp,
+            home,
+            root,
+            drive,
+            config,
+            src,
+        }
+    }
+
+    fn agent(&self, hook: Option<&Path>) -> Agent {
+        Agent::spawn(&self.home, &self.config, &self.drive, hook)
+    }
+
+    /// Writes the source snapshot as the app would, and returns its path.
+    fn snapshot(&self) -> PathBuf {
+        let snapshot = refract_agent::migrate::source::build(&self.src).unwrap();
+        let path = self.tmp.join("snapshot.json");
+        fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        path
+    }
+
+    fn migrate(&self, agent: &mut Agent, dest: &Path) -> Value {
+        let snapshot = self.snapshot();
+        agent.request(
+            "migrate",
+            json!({"path": self.src, "dest": dest, "snapshot": snapshot}),
+        )
+    }
+
+    /// A hook script running `body` (sh, with `$1` the point, `$2` the round, `$3` the
+    /// copy and `$4` the source).
+    fn hook(&self, body: &str) -> PathBuf {
+        let path = self.tmp.join("hook.sh");
+        write(&path, body);
+        path
+    }
+
+    fn projects(&self) -> PathBuf {
+        self.home.join(".claude/projects")
+    }
+
+    fn migrations_dir(&self) -> PathBuf {
+        self.home.join(".local/share/refract/migrations")
+    }
+
+    /// Leftover temporary copies next to the destination.
+    fn temps(&self) -> Vec<PathBuf> {
+        fs::read_dir(&self.root)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".refract-migrate-")
+            })
+            .collect()
+    }
+}
+
+fn crlf(text: &str) -> String {
+    text.replace('\n', "\r\n")
+}
+
+/// The repo as Windows git would have left it: CRLF working tree with
+/// `core.autocrlf=true`, `core.filemode=false` and friends; a commit, a branch, a
+/// stash, a submodule, an executable script, staged, unstaged, untracked and ignored
+/// files, and a `node_modules` to skip.
+fn build_repo(tmp: &Path, src: &Path) {
+    let kelp = tmp.join("seeds/kelp");
+    init_repo(&kelp);
+    commit_file(&kelp, "lib.rs", "pub fn kelp() {}\n", "Add lib");
+
+    fs::create_dir_all(src).unwrap();
+    git(src, &["init", "-q", "-b", "main"]);
+    for (key, value) in [
+        ("core.autocrlf", "true"),
+        ("core.filemode", "false"),
+        ("core.symlinks", "false"),
+        ("core.ignorecase", "true"),
+    ] {
+        git(src, &["config", key, value]);
+    }
+    write(
+        &src.join("README.md"),
+        &crlf("# aurora notes\n\nTide tables.\n"),
+    );
+    write(
+        &src.join("src/main.rs"),
+        &crlf("fn main() {\n    println!(\"hi\");\n}\n"),
+    );
+    write(&src.join("scripts/run.sh"), &crlf("#!/bin/sh\necho run\n"));
+    write(&src.join(".gitignore"), &crlf("node_modules/\n.env\n"));
+    write(&src.join("assets/logo.bin"), "\u{0}\u{1}\r\n\u{2}");
+    git(src, &["add", "."]);
+    git(src, &["update-index", "--chmod=+x", "scripts/run.sh"]);
+    git(src, &["commit", "-q", "-m", "Initial commit"]);
+    git(
+        src,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            kelp.to_str().unwrap(),
+            "libs/kelp",
+        ],
+    );
+    git(src, &["commit", "-q", "-m", "Add kelp"]);
+    git(src, &["branch", "feature"]);
+
+    write(
+        &src.join("README.md"),
+        &crlf("# aurora notes\n\nStashed.\n"),
+    );
+    git(src, &["stash", "-q"]);
+    write(
+        &src.join("src/main.rs"),
+        &crlf("fn main() {\n    println!(\"staged\");\n}\n"),
+    );
+    git(src, &["add", "src/main.rs"]);
+    write(
+        &src.join("README.md"),
+        &crlf("# aurora notes\n\nUnstaged.\n"),
+    );
+    write(&src.join("notes.txt"), &crlf("untracked\n"));
+    write(&src.join(".env"), "TOKEN=invented\n");
+    write(
+        &src.join("node_modules/left-pad/index.js"),
+        "module.exports = 1;\n",
+    );
+}
+
+fn check<'a>(report: &'a Value, name: &str) -> &'a Value {
+    report["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["check"] == name)
+        .unwrap_or_else(|| panic!("no check {name}: {report:#}"))
+}
+
+/// True when the report allows deleting the original, as `Report::can_delete` says.
+fn can_delete(report: &Value) -> bool {
+    let report: refract_core::migrate::report::Report =
+        serde_json::from_value(report.clone()).unwrap();
+    report.can_delete()
+}
+
+/// `git status`, without refreshing the index (which would change the source).
+fn status(dir: &Path, config: &[&str]) -> String {
+    let mut args = vec!["--no-optional-locks"];
+    args.extend(config);
+    args.extend([
+        "status",
+        "--porcelain=v2",
+        "--untracked-files=all",
+        "--ignored=matching",
+    ]);
+    git(dir, &args)
+}
+
+#[test]
+fn a_repo_moves_as_a_linux_checkout_and_finishing_deletes_the_old_history() {
+    let world = World::new();
+    let src = &world.src;
+    let transcript_dir = project_dir(&world.projects(), src);
+    write(
+        &transcript_dir.join(format!("{SESSION_ID}.jsonl")),
+        &transcript(
+            SESSION_ID,
+            src,
+            &src.join("src/main.rs"),
+            Utc::now() - TimeDelta::days(2),
+            true,
+        ),
+    );
+    let mut agent = world.agent(None);
+    let ticket = world.migrate(&mut agent, &world.dest);
+    let id = ticket["result"]["id"].as_str().expect("an id").to_owned();
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(report["id"], id.as_str());
+    assert_eq!(check(&report, "history")["status"], "passed", "{report:#}");
+    assert_eq!(report["skipped"][0]["path"], "node_modules");
+    assert!(report["newObjects"].as_u64().unwrap() > 0);
+
+    // A Linux checkout: LF, an executable script, no Windows-only config.
+    let dest = &world.dest;
+    assert!(world.temps().is_empty());
+    assert_eq!(
+        fs::read_to_string(dest.join("README.md")).unwrap(),
+        "# aurora notes\n\nUnstaged.\n"
+    );
+    assert!(!fs::read_to_string(dest.join("src/main.rs"))
+        .unwrap()
+        .contains('\r'));
+    assert_eq!(
+        fs::read(dest.join("assets/logo.bin")).unwrap(),
+        b"\0\x01\r\n\x02"
+    );
+    // Untracked and ignored files are copied as they are.
+    assert_eq!(
+        fs::read_to_string(dest.join("notes.txt")).unwrap(),
+        "untracked\r\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dest.join(".env")).unwrap(),
+        "TOKEN=invented\n"
+    );
+    assert!(!dest.join("node_modules").exists());
+    let mode = |p: &str| fs::metadata(dest.join(p)).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode("scripts/run.sh"), 0o755);
+    assert_eq!(mode("README.md"), 0o644);
+    assert_eq!(mode("src"), 0o755);
+    assert_eq!(
+        git(dest, &["config", "--local", "--get-regexp", "^core\\."])
+            .lines()
+            .filter(|l| l.contains("autocrlf")
+                || l.contains("symlinks")
+                || l.contains("ignorecase"))
+            .count(),
+        0
+    );
+    assert_eq!(git(dest, &["config", "core.filemode"]), "true");
+
+    // Git sees the same repo: staged, unstaged, untracked and ignored, the stash, the
+    // submodule.
+    let windows = ["-c", "core.autocrlf=true", "-c", "core.filemode=false"];
+    let expected = status(src, &windows).replace("\n! node_modules/", "");
+    assert_eq!(status(dest, &[]), expected);
+    assert!(status(dest, &[]).contains("1 M. "), "{}", status(dest, &[]));
+    assert!(status(dest, &[]).contains("1 .M "), "{}", status(dest, &[]));
+    assert_eq!(git(dest, &["stash", "list"]), git(src, &["stash", "list"]));
+    assert_eq!(
+        git(dest, &["rev-parse", "feature"]),
+        git(src, &["rev-parse", "feature"])
+    );
+    assert_eq!(
+        fs::read_to_string(dest.join("libs/kelp/lib.rs")).unwrap(),
+        "pub fn kelp() {}\n"
+    );
+    assert_eq!(git(&dest.join("libs/kelp"), &["status", "--porcelain"]), "");
+
+    // The report is saved; the history is copied with the new cwd, the old kept.
+    let saved: Vec<PathBuf> = fs::read_dir(world.migrations_dir())
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+        .collect();
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let new_transcript = project_dir(&world.projects(), dest).join(format!("{SESSION_ID}.jsonl"));
+    let moved = fs::read_to_string(&new_transcript).unwrap();
+    assert!(moved.contains(&format!("\"cwd\":\"{}\"", dest.display())));
+    assert!(!moved.contains(&format!("\"cwd\":\"{}\"", src.display())));
+    assert!(transcript_dir.exists());
+
+    // Pending until finished.
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"]["migrations"][0]["id"], id.as_str());
+
+    // Nothing changed since: safe to delete.
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(
+        recheck["result"],
+        json!({"changed": [], "busyAgents": []}),
+        "{recheck}"
+    );
+    write(&src.join("notes.txt"), "edited after the report\n");
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["changed"], json!(["notes.txt"]));
+
+    // Re-sync brings the edit over and sends a fresh report.
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(
+        fs::read_to_string(dest.join("notes.txt")).unwrap(),
+        "edited after the report\n"
+    );
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["changed"], json!([]), "{recheck}");
+
+    // The app sends the original to the Recycle Bin, then finishes.
+    fs::remove_dir_all(src).unwrap();
+    let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(finish["result"], Value::Null, "{finish}");
+    assert!(!transcript_dir.exists());
+    assert!(new_transcript.exists());
+    let config = fs::read_to_string(&world.config).unwrap();
+    assert!(config.contains(dest.to_str().unwrap()), "{config}");
+    assert!(!config.contains(src.to_str().unwrap()), "{config}");
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"]["migrations"], json!([]));
+    let again = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(again["error"]["code"], 6);
+}
+
+#[test]
+fn discard_deletes_the_copy_and_keep_hides_the_original() {
+    let world = World::new();
+    let src = &world.src;
+    write(
+        &project_dir(&world.projects(), src).join(format!("{SESSION_ID}.jsonl")),
+        &transcript(SESSION_ID, src, &src.join("README.md"), Utc::now(), true),
+    );
+    let mut agent = world.agent(None);
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    let new_history = project_dir(&world.projects(), &world.dest);
+    assert!(new_history.exists());
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(!world.dest.exists());
+    assert!(!new_history.exists());
+    assert!(project_dir(&world.projects(), src).exists());
+    assert!(src.join(".git").exists());
+
+    let dest = world.root.join("aurora-notes-2");
+    let id = world.migrate(&mut agent, &dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert_eq!(keep["result"], Value::Null, "{keep}");
+    assert!(dest.join(".git").exists() && src.join(".git").exists());
+    let config = fs::read_to_string(&world.config).unwrap();
+    assert!(config.contains("hidden"), "{config}");
+    let parsed: toml::Value = toml::from_str(&config).unwrap();
+    assert_eq!(parsed["hidden"][0].as_str(), src.to_str());
+    // Both histories stay.
+    assert!(project_dir(&world.projects(), src).exists());
+    assert!(project_dir(&world.projects(), &dest).exists());
+}
+
+#[test]
+fn a_placed_migration_comes_back_after_a_restart() {
+    let world = World::new();
+    let mut agent = world.agent(None);
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    agent.ready();
+    let bye = agent.request("shutdown", json!(null));
+    assert_eq!(bye["result"], Value::Null);
+    drop(agent);
+
+    let mut agent = world.agent(None);
+    let report = agent.ready();
+    assert_eq!(report["id"], id.as_str());
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"]["migrations"][0]["id"], id.as_str());
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["changed"], json!([]), "{recheck}");
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(!world.dest.exists());
+}
+
+#[test]
+fn leftover_temporary_copies_are_deleted_at_startup() {
+    let world = World::new();
+    let ours = world
+        .root
+        .join(".refract-migrate-aurora-notes-6f1c0000-0000-4000-8000-000000000001");
+    let not_ours = world.root.join(".refract-migrate-notes");
+    write(&ours.join("README.md"), "half a copy");
+    write(&not_ours.join("keep.txt"), "not ours");
+    let _agent = world.agent(None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while ours.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(!ours.exists());
+    assert!(not_ours.join("keep.txt").exists());
+}
+
+#[test]
+fn preflight_refusals_answer_migrate() {
+    let world = World::new();
+    let mut agent = world.agent(None);
+    fs::create_dir_all(&world.dest).unwrap();
+    let taken = world.migrate(&mut agent, &world.dest);
+    assert_eq!(taken["error"]["code"], 6, "{taken}");
+    assert!(taken["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("already exists"));
+    let on_drive = world.migrate(&mut agent, &world.drive.join("elsewhere"));
+    assert!(on_drive["error"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("isn't on the Linux filesystem"));
+    write(
+        &world.src.join(".git/MERGE_HEAD"),
+        "0000000000000000000000000000000000000000\n",
+    );
+    let merging = world.migrate(&mut agent, &world.root.join("fresh"));
+    assert!(
+        merging["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("merge is in progress"),
+        "{merging}"
+    );
+    let missing = agent.request(
+        "migrate",
+        json!({"path": world.src, "dest": world.root.join("x"), "snapshot": "/nonexistent.json"}),
+    );
+    assert_eq!(missing["error"]["code"], 6);
+    assert!(world.temps().is_empty());
+}
+
+#[test]
+fn cancel_deletes_the_temporary_copy() {
+    let world = World::new();
+    let reached = world.tmp.join("reached");
+    let hold = world.tmp.join("hold");
+    write(&hold, "");
+    let hook = world.hook(&format!(
+        "[ \"$1\" = copied ] || exit 0\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let mut agent = world.agent(Some(&hook));
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !reached.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(world.temps().len(), 1);
+    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    fs::remove_file(&hold).unwrap();
+    let answer = agent.response(cancel);
+    assert_eq!(answer["result"], Value::Null, "{answer}");
+    assert!(world.temps().is_empty());
+    assert!(!world.dest.exists());
+    let again = agent.request("migrateCancel", json!({"id": id}));
+    assert_eq!(again["error"]["code"], 6);
+}
+
+/// Runs a migration with `hook` and returns its report, which must not allow deleting.
+fn failed_migration(world: &World, hook: Option<&Path>) -> Value {
+    let mut agent = world.agent(hook);
+    let ticket = world.migrate(&mut agent, &world.dest);
+    assert!(ticket["result"]["id"].is_string(), "{ticket}");
+    let report = agent.ready();
+    assert!(!can_delete(&report), "{report:#}");
+    // A failed copy is never placed, and its temporary folder is gone.
+    assert!(!world.dest.exists());
+    assert!(world.temps().is_empty());
+    let keep = agent.request(
+        "migrateFinish",
+        json!({"id": report["id"], "action": "keep"}),
+    );
+    assert_eq!(keep["error"]["code"], 6);
+    let delete = agent.request(
+        "migrateFinish",
+        json!({"id": report["id"], "action": "delete"}),
+    );
+    assert_eq!(delete["error"]["code"], 6);
+    report
+}
+
+#[test]
+fn a_corrupted_byte_fails_every_file_matches() {
+    let world = World::new();
+    let hook = world.hook("[ \"$1\" = copied ] || exit 0\nprintf X >> \"$3/notes.txt\"\n");
+    let report = failed_migration(&world, Some(&hook));
+    let files = check(&report, "files");
+    assert_eq!(files["status"], "failed", "{report:#}");
+    assert_eq!(files["problems"][0]["path"], "notes.txt");
+}
+
+#[test]
+fn a_dropped_ref_fails_git_state() {
+    let world = World::new();
+    let hook = world.hook("[ \"$1\" = copied ] || exit 0\nrm \"$3/.git/refs/heads/feature\"\n");
+    let report = failed_migration(&world, Some(&hook));
+    let git_state = check(&report, "gitState");
+    assert_eq!(git_state["status"], "failed", "{report:#}");
+    assert!(git_state["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["path"] == "refs/heads/feature"));
+    assert_eq!(check(&report, "nothingSkipped")["status"], "failed");
+}
+
+#[test]
+fn an_unreadable_file_fails_nothing_skipped() {
+    let world = World::new();
+    let secret = world.src.join("secret.txt");
+    write(&secret, "locked\n");
+    let snapshot = world.snapshot();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).unwrap();
+    if fs::read(&secret).is_ok() {
+        // Running as root: nothing is unreadable.
+        return;
+    }
+    let mut agent = world.agent(None);
+    let ticket = agent.request(
+        "migrate",
+        json!({"path": world.src, "dest": world.dest, "snapshot": snapshot}),
+    );
+    assert!(ticket["result"]["id"].is_string(), "{ticket}");
+    let report = agent.ready();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!can_delete(&report), "{report:#}");
+    let skipped = check(&report, "nothingSkipped");
+    assert_eq!(skipped["status"], "failed", "{report:#}");
+    assert!(skipped["problems"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["path"] == "secret.txt"));
+    assert!(!world.dest.exists());
+}
+
+#[test]
+fn an_edit_during_the_copy_is_copied_again() {
+    let world = World::new();
+    let hook = world.hook(
+        "[ \"$1\" = copied ] || exit 0\nprintf 'more\\n' >> \"$4/notes.txt\"\nprintf 'new\\n' > \"$4/later.txt\"\n",
+    );
+    let mut agent = world.agent(Some(&hook));
+    world.migrate(&mut agent, &world.dest);
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(
+        fs::read_to_string(world.dest.join("notes.txt")).unwrap(),
+        "untracked\r\nmore\n"
+    );
+    assert_eq!(
+        fs::read_to_string(world.dest.join("later.txt")).unwrap(),
+        "new\n"
+    );
+    assert!(report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("changed during the copy")));
+}
+
+#[test]
+fn a_folder_that_keeps_changing_fails_check_4() {
+    let world = World::new();
+    let hook = world.hook("[ \"$1\" = verified ] || exit 0\nprintf 'x' >> \"$4/notes.txt\"\n");
+    let report = failed_migration(&world, Some(&hook));
+    let unchanged = check(&report, "unchanged");
+    assert_eq!(unchanged["status"], "failed", "{report:#}");
+    assert_eq!(unchanged["problems"][0]["path"], "notes.txt");
+    assert!(unchanged["advice"]
+        .as_str()
+        .unwrap()
+        .contains("keeps changing"));
+}
+
+/// A process that looks like `claude --session-id <id>` running in `cwd`, until its
+/// stdin closes or it is stopped.
+fn fake_claude(cwd: &Path, id: &str) -> Child {
+    Command::new("bash")
+        .arg0("claude")
+        .args(["-c", "read -r _", "claude", "--session-id", id])
+        .current_dir(cwd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn fake claude")
+}
+
+#[test]
+fn stop_agent_stops_an_idle_session_and_refuses_a_working_one() {
+    let world = World::new();
+    let repo = world.root.join("tidepool-api");
+    init_repo(&repo);
+    let idle = "5e2a7c10-0000-4000-8000-0000000000c1";
+    let working = "5e2a7c10-0000-4000-8000-0000000000c2";
+    let dir = project_dir(&world.projects(), &repo);
+    let edited = repo.join("src/main.rs");
+    let at = Utc::now() - TimeDelta::seconds(30);
+    write(
+        &dir.join(format!("{idle}.jsonl")),
+        &transcript(idle, &repo, &edited, at, true),
+    );
+    write(
+        &dir.join(format!("{working}.jsonl")),
+        &transcript(working, &repo, &edited, at, false),
+    );
+    let mut idle_proc = fake_claude(&repo, idle);
+    let mut working_proc = fake_claude(&repo, working);
+    let mut agent = world.agent(None);
+    agent.list_when_loaded();
+
+    let busy = agent.request("stopAgent", json!({"path": repo, "sessionId": working}));
+    assert_eq!(busy["error"]["code"], 7, "{busy}");
+    assert!(working_proc.try_wait().unwrap().is_none());
+
+    let stopped = agent.request("stopAgent", json!({"path": repo, "sessionId": idle}));
+    assert_eq!(stopped["result"], Value::Null, "{stopped}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while idle_proc.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(idle_proc.try_wait().unwrap().is_some());
+
+    let gone = agent.request(
+        "stopAgent",
+        json!({"path": repo, "sessionId": "5e2a7c10-0000-4000-8000-0000000000c9"}),
+    );
+    assert_eq!(gone["error"]["code"], 5, "{gone}");
+    let _ = working_proc.kill();
+    let _ = working_proc.wait();
+}

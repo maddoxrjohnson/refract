@@ -15,6 +15,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use refract_core::sessions::paths_match;
 use serde::Deserialize;
 
 /// How many directory levels below a root are searched by default.
@@ -187,6 +188,99 @@ pub fn remove_hidden(file: &Path, repo: &Path) -> Result<bool, String> {
     Ok(true)
 }
 
+/// Appends `repo` to `hidden` in the config file at `file`, creating the file if it is
+/// missing, and keeps the rest of the file as it was. Returns false when `hidden`
+/// already names it. The error is a message for the app.
+pub fn add_hidden(file: &Path, repo: &Path) -> Result<bool, String> {
+    let Some(repo_str) = repo.to_str() else {
+        return Err(format!("not a UTF-8 path: {}", repo.display()));
+    };
+    let home = home_dir();
+    edit_lists(file, &["hidden"], |list| {
+        if list
+            .iter()
+            .filter_map(|v| v.as_str())
+            .any(|p| paths_match(&expand_home(p, &home).to_string_lossy(), repo_str))
+        {
+            return false;
+        }
+        list.push(repo_str);
+        true
+    })
+}
+
+/// Rewrites the entries of `extra` and `hidden` in the config file at `file` that name
+/// `old` (by [`paths_match`]) to name `new`, keeping the rest of the file as it was.
+/// Returns false when none did. The error is a message for the app.
+pub fn replace_path(file: &Path, old: &Path, new: &Path) -> Result<bool, String> {
+    let Some(new_str) = new.to_str() else {
+        return Err(format!("not a UTF-8 path: {}", new.display()));
+    };
+    let old = old.to_string_lossy();
+    let home = home_dir();
+    edit_lists(file, &["extra", "hidden"], |list| {
+        let mut changed = false;
+        for item in list.iter_mut() {
+            let named = item
+                .as_str()
+                .is_some_and(|p| paths_match(&expand_home(p, &home).to_string_lossy(), &old));
+            if named {
+                let decor = item.decor().clone();
+                *item = new_str.into();
+                *item.decor_mut() = decor;
+                changed = true;
+            }
+        }
+        changed
+    })
+}
+
+/// Applies `edit` to each of the lists `keys` names in the config file at `file`
+/// (created empty when missing), writing the file only when some edit returns true.
+fn edit_lists(
+    file: &Path,
+    keys: &[&str],
+    mut edit: impl FnMut(&mut toml_edit::Array) -> bool,
+) -> Result<bool, String> {
+    let text = match std::fs::read_to_string(file) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+    };
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .map_err(|e| format!("cannot update {}: {e}", file.display()))?;
+    let mut changed = false;
+    for key in keys {
+        match doc.get_mut(key) {
+            Some(item) => {
+                let list = item
+                    .as_array_mut()
+                    .ok_or_else(|| format!("{key} in {} is not a list", file.display()))?;
+                changed |= edit(list);
+            }
+            // A missing list is added only when the edit puts something in it.
+            None => {
+                let mut list = toml_edit::Array::new();
+                if edit(&mut list) {
+                    doc.insert(key, toml_edit::value(list));
+                    changed = true;
+                }
+            }
+        }
+    }
+    if !changed {
+        return Ok(false);
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    }
+    std::fs::write(file, doc.to_string())
+        .map_err(|e| format!("cannot write {}: {e}", file.display()))?;
+    Ok(true)
+}
+
 fn expand_home(path: &str, home: &Path) -> PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => home.join(rest),
@@ -347,6 +441,42 @@ mod tests {
         assert_eq!(remove_hidden(&file, repo), Ok(false));
         std::fs::write(&file, "hidden = \"oops\"\n").unwrap();
         assert!(remove_hidden(&file, repo).is_err());
+    }
+
+    #[test]
+    fn hiding_and_repointing_keep_the_rest_of_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("agent.toml");
+        let old = Path::new("/mnt/c/Users/dev/Desktop/aurora-notes");
+        let new = Path::new("/home/dev/projects/aurora-notes");
+        assert_eq!(add_hidden(&file, old), Ok(true));
+        assert_eq!(add_hidden(&file, old), Ok(false));
+        // Under /mnt/ the case of the path does not matter.
+        assert_eq!(
+            add_hidden(&file, Path::new("/mnt/c/users/dev/desktop/aurora-notes")),
+            Ok(false)
+        );
+        assert_eq!(
+            parse(&std::fs::read_to_string(&file).unwrap()).hidden,
+            [old]
+        );
+
+        let text = "# mine\nroots = [\"~/src\"]\nextra = [\"/mnt/c/users/dev/Desktop/aurora-notes\", \"~/x/kelp-cli\"] # kept\n";
+        std::fs::write(&file, text).unwrap();
+        assert_eq!(replace_path(&file, old, new), Ok(true));
+        assert_eq!(replace_path(&file, old, new), Ok(false));
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            after.starts_with("# mine\nroots = [\"~/src\"]\n"),
+            "{after}"
+        );
+        assert!(after.contains("# kept"), "{after}");
+        assert!(!after.contains("hidden"), "{after}");
+        let c = parse(&after);
+        assert_eq!(
+            c.extra,
+            [new.to_owned(), PathBuf::from("/home/dev/x/kelp-cli")]
+        );
     }
 
     #[test]

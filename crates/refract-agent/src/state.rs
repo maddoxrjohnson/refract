@@ -10,6 +10,7 @@ use refract_core::classify::{classify_report, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, Candidate, Preselect};
 use refract_core::protocol::{Event, RemoteId, RepoSnapshot, SessionChange, SessionInfo};
+use refract_core::sessions::paths_match;
 use refract_core::transcript::SessionSummary;
 
 use crate::config::Config;
@@ -137,6 +138,24 @@ impl Agent {
     /// Reports `repo` from the next [`Agent::rescan`] on, though the config hides it.
     pub fn unhide(&mut self, repo: &Path) {
         self.config.hidden.retain(|p| p != repo);
+    }
+
+    /// Stops reporting `repo` from the next [`Agent::rescan`] on.
+    pub fn hide(&mut self, repo: PathBuf) {
+        if !self.config.hidden.contains(&repo) {
+            self.config.hidden.push(repo);
+        }
+    }
+
+    /// Makes `extra` and `hidden` entries naming `old` name `new`, as
+    /// [`crate::config::replace_path`] does in the file.
+    pub fn repoint(&mut self, old: &Path, new: &Path) {
+        let old = path_str(old);
+        for path in self.config.extra.iter_mut().chain(&mut self.config.hidden) {
+            if paths_match(&path_str(path), &old) {
+                *path = new.to_owned();
+            }
+        }
     }
 
     pub fn reader(&self) -> &SessionReader {
