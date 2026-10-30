@@ -40,8 +40,21 @@ export function makeBackdrop(): Mesh<PlaneGeometry, MeshBasicMaterial> {
   blob(560, 120, 180, "rgba(255,170,90,0.22)");
   blob(180, 380, 160, "rgba(60,220,210,0.18)");
   blob(880, 120, 140, "rgba(140,110,255,0.25)");
-  g.filter = "blur(4px)";
-  g.strokeStyle = "rgba(220,235,255,0.55)";
+  // A canvas filter costs a blur pass per shape, and software WebGL (SwiftShader) took
+  // seconds over 74 of them. Blending is additive, so blurring a set of shapes at once
+  // gives the same picture: each set is drawn sharp on a scratch canvas, then blurred on.
+  const layer = document.createElement("canvas");
+  layer.width = 1024;
+  layer.height = 512;
+  const l = layer.getContext("2d")!;
+  l.globalCompositeOperation = "lighter";
+  const blurOn = (px: number) => {
+    g.filter = `blur(${px}px)`;
+    g.drawImage(layer, 0, 0);
+    g.filter = "none";
+    l.clearRect(0, 0, 1024, 512);
+  };
+  l.strokeStyle = "rgba(220,235,255,0.55)";
   const streaks: [number, number, number, number, number][] = [
     [120, 470, 520, 40, 3],
     [480, 500, 980, 70, 2],
@@ -49,20 +62,22 @@ export function makeBackdrop(): Mesh<PlaneGeometry, MeshBasicMaterial> {
     [620, 512, 1010, 230, 2.5],
   ];
   for (const [x1, y1, x2, y2, w] of streaks) {
-    g.lineWidth = w;
-    g.beginPath();
-    g.moveTo(x1, y1);
-    g.lineTo(x2, y2);
-    g.stroke();
+    l.lineWidth = w;
+    l.beginPath();
+    l.moveTo(x1, y1);
+    l.lineTo(x2, y2);
+    l.stroke();
   }
-  g.filter = "blur(2px)";
+  blurOn(4);
   const r = rng(3);
   for (let i = 0; i < 70; i++) {
-    g.fillStyle = `rgba(${200 + r() * 55},${200 + r() * 55},255,${0.08 + r() * 0.25})`;
-    g.beginPath();
-    g.arc(r() * 1024, r() * 512, 2 + r() * 9, 0, 6.283);
-    g.fill();
+    l.fillStyle = `rgba(${200 + r() * 55},${200 + r() * 55},255,${0.08 + r() * 0.25})`;
+    l.beginPath();
+    l.arc(r() * 1024, r() * 512, 2 + r() * 9, 0, 6.283);
+    l.fill();
   }
+  blurOn(2);
+  layer.width = 0;
   const tex = new CanvasTexture(cv);
   tex.colorSpace = SRGBColorSpace;
   const m = new Mesh(

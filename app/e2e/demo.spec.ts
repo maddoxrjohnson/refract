@@ -44,8 +44,9 @@ async function hoverCentre(page: Page) {
 test("renders the scene without errors", async ({ page }) => {
   // The WebGL fallback is DOM content inside the canvas, shown only when WebGL fails.
   await expect(page.locator(".scene-fail")).toBeHidden();
-  const box = await page.locator(".scene canvas").boundingBox();
-  expect(box!.width).toBeGreaterThan(600);
+  // The canvas starts at the default 300 px until R3F measures its container.
+  const canvas = page.locator(".scene canvas");
+  await expect.poll(async () => (await canvas.boundingBox())!.width).toBeGreaterThan(600);
   await expect(page.getByText("Demo with invented repos")).toBeVisible();
 });
 
