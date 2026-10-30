@@ -76,6 +76,38 @@ pub struct Record {
     /// `migrateBeginDelete` passed: the app may be deleting the original.
     #[serde(default)]
     pub deleting: bool,
+    /// A step that changes the placed copy (or the history) and has begun, saved
+    /// before it touches anything, cleared once its result is saved: a helper that
+    /// finds it set after a restart knows the step was cut short.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running: Option<Running>,
+    /// While [`Running::Resyncing`]: the paths (relative to the top) the re-sync copies
+    /// over or removes in the placed copy, saved before each batch is written. Only
+    /// these, the index files and new loose objects count as the re-sync's doing; any
+    /// other change to the copy is someone else's.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resync_written: Vec<String>,
+    /// While [`Running::MovingHistory`]: the transcript copies about to be written, so
+    /// those that were can be found (and discarded) after a restart.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_planned: Vec<HistoryPlan>,
+}
+
+/// A step of a placed migration that was under way (see [`Record::running`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Running {
+    Installing,
+    MovingHistory,
+    Resyncing,
+}
+
+/// One transcript copy [`super::history::copy`] is about to write.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryPlan {
+    pub original: PathBuf,
+    pub copy: PathBuf,
 }
 
 impl Record {
@@ -100,6 +132,9 @@ impl Record {
             copy_errors: Vec::new(),
             kept: Vec::new(),
             deleting: false,
+            running: None,
+            resync_written: Vec::new(),
+            history_planned: Vec::new(),
         }
     }
 
@@ -136,6 +171,18 @@ impl Record {
             .all(|f| under_projects(&f.original) && under_projects(&f.copy))
         {
             return Err("a transcript path is outside Claude Code's projects folder".into());
+        }
+        if !self
+            .history_planned
+            .iter()
+            .all(|f| under_projects(&f.original) && under_projects(&f.copy))
+        {
+            return Err(
+                "a planned transcript path is outside Claude Code's projects folder".into(),
+            );
+        }
+        if self.resync_written.iter().any(|p| RelPath::new(p).is_err()) {
+            return Err("a re-synced path is not a plain relative path".into());
         }
         check_snapshot_paths(&self.snapshot)
     }

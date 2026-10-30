@@ -155,7 +155,8 @@ fn backup_one(
 }
 
 /// Runs `steps` in `dest`, appending their output to `log`. `progress` gets the steps
-/// done so far.
+/// done so far. Once `cancel` is set, the running step is stopped and the rest are
+/// not started, all [`InstallStatus::Cancelled`].
 pub fn run(
     dest: &Path,
     steps: Vec<InstallStep>,
@@ -166,7 +167,11 @@ pub fn run(
 ) -> Vec<InstallResult> {
     let mut results = Vec::new();
     for (n, step) in steps.into_iter().enumerate() {
-        let result = run_step(dest, &step, log, timeout, cancel);
+        let result = if cancel.cancelled() {
+            (InstallStatus::Cancelled, None)
+        } else {
+            run_step(dest, &step, log, timeout, cancel)
+        };
         results.push(InstallResult {
             step,
             status: result.0,
@@ -253,6 +258,9 @@ fn run_step(
                 }
                 let _ = child.wait();
                 let _ = writeln!(out, "stopped after {} seconds", started.elapsed().as_secs());
+                if cancel.cancelled() {
+                    return (InstallStatus::Cancelled, None);
+                }
                 return (InstallStatus::TimedOut, None);
             }
             Ok(None) => std::thread::sleep(POLL),

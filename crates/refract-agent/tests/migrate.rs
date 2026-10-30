@@ -630,11 +630,46 @@ fn cancel_deletes_the_temporary_copy() {
     let cancel = agent.send("migrateCancel", json!({"id": id}));
     fs::remove_file(&hold).unwrap();
     let answer = agent.response(cancel);
-    assert_eq!(answer["result"], Value::Null, "{answer}");
+    assert_eq!(answer["result"], json!({"ended": true}), "{answer}");
     assert!(world.temps().is_empty());
     assert!(!world.dest.exists());
     let again = agent.request("migrateCancel", json!({"id": id}));
     assert_eq!(again["error"]["code"], 6);
+}
+
+/// Review 2 #8: a request sent right after a cancel's answer is answered (the
+/// migration is forgotten before the cancel is answered).
+#[test]
+fn a_request_right_after_a_cancel_is_answered() {
+    for _ in 0..5 {
+        let world = World::new();
+        let reached = world.tmp.join("reached");
+        let hold = world.tmp.join("hold");
+        write(&hold, "");
+        let hook = world.hook(&format!(
+            "[ \"$1\" = copied ] || exit 0\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+        ));
+        let mut agent = world.agent(Some(&hook));
+        let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        wait_for(&reached);
+        let cancel = agent.send("migrateCancel", json!({"id": id}));
+        fs::remove_file(&hold).unwrap();
+        agent.response(cancel);
+        let again = agent.send("migrateCancel", json!({"id": id}));
+        let answer = agent.response(again);
+        assert_eq!(answer["error"]["code"], 6, "{answer}");
+    }
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while !path.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(path.exists(), "the hook never reached {}", path.display());
 }
 
 /// Runs a migration with `hook` and returns its report, which must not allow deleting.
@@ -1172,8 +1207,87 @@ fn history_moves_only_the_repos_sessions_and_keeps_what_changed() {
         .any(|k| k.path.as_ref().unwrap().ends_with("s4.jsonl")));
 }
 
+/// Review 2 #1: once the copy is placed, a cancel never deletes it, even with the
+/// original deleted by hand and the copy edited meanwhile: it ends in a report.
 #[test]
-fn cancelling_while_history_moves_leaves_no_transcript_copies() {
+fn a_cancel_after_the_copy_is_placed_keeps_it_and_ends_in_a_report() {
+    let world = World::new();
+    let src = &world.src;
+    write(
+        &project_dir(&world.projects(), src).join(format!("{SESSION_ID}.jsonl")),
+        &transcript(SESSION_ID, src, &src.join("README.md"), Utc::now(), true),
+    );
+    let reached = world.tmp.join("reached");
+    let hold = world.tmp.join("hold");
+    write(&hold, "");
+    let hook = world.hook(&format!(
+        "[ \"$1\" = moved ] || exit 0\necho mine > \"$3/my-work.txt\"\nrm -rf \"$4\"\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let mut agent = world.agent(Some(&hook));
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for(&reached);
+    assert!(!world.src.exists());
+    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    fs::remove_file(&hold).unwrap();
+    let report = agent.ready();
+    let answer = agent.response(cancel);
+    assert_eq!(answer["result"], json!({"ended": false}), "{answer}");
+    assert_eq!(report["placed"], true, "{report:#}");
+    assert!(world.dest.join("my-work.txt").exists());
+    // The only copy left is refused to discard; it can be kept.
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert!(
+        error_message(&discard).contains("only one left"),
+        "{discard}"
+    );
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert_eq!(keep["result"], Value::Null, "{keep}");
+    assert!(world.dest.join("my-work.txt").exists());
+}
+
+/// Cancelled before the install and the history: both are skipped and reported, the
+/// copy stays, and discarding it then leaves no transcript copies behind.
+#[test]
+fn a_cancel_before_the_install_skips_the_rest_and_discard_cleans_up() {
+    let world = World::new();
+    let src = &world.src;
+    write(
+        &project_dir(&world.projects(), src).join(format!("{SESSION_ID}.jsonl")),
+        &transcript(SESSION_ID, src, &src.join("README.md"), Utc::now(), true),
+    );
+    let reached = world.tmp.join("reached");
+    let hold = world.tmp.join("hold");
+    write(&hold, "");
+    let hook = world.hook(&format!(
+        "[ \"$1\" = placed ] || exit 0\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let mut agent = world.agent(Some(&hook));
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for(&reached);
+    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    fs::remove_file(&hold).unwrap();
+    let report = agent.ready();
+    assert_eq!(agent.response(cancel)["result"], json!({"ended": false}));
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(check(&report, "history")["status"], "failed", "{report:#}");
+    assert!(!project_dir(&world.projects(), &world.dest).exists());
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(!world.dest.exists());
+    assert!(project_dir(&world.projects(), src).exists());
+}
+
+/// Review 2 minor: the helper stopping while the history moved (after the copies
+/// were written, before they were saved) leaks no transcript copies: they are found
+/// after the restart, and a discard deletes them.
+#[test]
+fn a_restart_while_history_moves_finds_the_copies() {
     let world = World::new();
     let src = &world.src;
     write(
@@ -1191,18 +1305,63 @@ fn cancelling_while_history_moves_leaves_no_transcript_copies() {
         .as_str()
         .unwrap()
         .to_owned();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while !reached.exists() && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    wait_for(&reached);
     assert!(project_dir(&world.projects(), &world.dest).exists());
-    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    drop(agent);
     fs::remove_file(&hold).unwrap();
-    let answer = agent.response(cancel);
-    assert_eq!(answer["result"], Value::Null, "{answer}");
+    let mut agent = world.agent(None);
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(check(&report, "history")["status"], "failed", "{report:#}");
+    assert!(check(&report, "history")["problems"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("didn't finish"));
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
     assert!(!world.dest.exists());
     assert!(!project_dir(&world.projects(), &world.dest).exists());
     assert!(project_dir(&world.projects(), src).exists());
+}
+
+/// Review 2 minor: the helper stopping during the install leaves a report that says
+/// so, with Delete, Keep and Discard all possible (not only Keep both).
+#[test]
+fn a_restart_during_the_install_reports_it_cut_short() {
+    let world = World::new();
+    let reached = world.tmp.join("reached");
+    let hold = world.tmp.join("hold");
+    write(&hold, "");
+    // What an install writes outside the build folders.
+    let hook = world.hook(&format!(
+        "[ \"$1\" = placed ] || exit 0\necho lock > \"$3/package-lock.json\"\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let mut agent = world.agent(Some(&hook));
+    let id = world.migrate(&mut agent, &world.dest)["result"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    wait_for(&reached);
+    drop(agent);
+    fs::remove_file(&hold).unwrap();
+    let mut agent = world.agent(None);
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(
+        report["installChanges"]["created"],
+        json!(["package-lock.json"]),
+        "{report:#}"
+    );
+    assert!(report["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|w| w.as_str().unwrap().contains("install didn't finish")));
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["result"]["copyChanged"], json!([]), "{recheck}");
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(!world.dest.exists());
 }
 
 #[test]
@@ -1329,7 +1488,10 @@ fn a_missing_original_leaves_only_delete() {
     let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
     assert!(error_message(&discard).contains("only one left"));
     assert!(world.dest.join(".git").exists());
+    // Unless the app says Windows doesn't see it either, it may be a hidden drive.
     let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], false, "{begin}");
+    let begin = agent.request("migrateBeginDelete", json!({"id": id, "sourceGone": true}));
     assert_eq!(begin["result"]["ok"], true, "{begin}");
     let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
     assert_eq!(finish["result"], Value::Null, "{finish}");
@@ -1379,4 +1541,261 @@ fn deleting_is_saved_and_refuses_everything_but_finishing() {
         fs::read_to_string(world.dest.join("notes.txt")).unwrap(),
         "untracked\r\n"
     );
+}
+
+/// Review 2 #2: while deleting, the copy in use (a build file added, a file changed
+/// whose original is already gone) doesn't block the rest; a change to a path the
+/// original still has does, unless forced, and the copy keeps its version.
+#[test]
+fn deleting_ignores_what_the_rest_cannot_lose_and_force_deletes_the_rest() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    // A partial removal, then the user works in the copy.
+    fs::remove_dir_all(world.src.join("src")).unwrap();
+    write(&world.dest.join("tsconfig.tsbuildinfo"), "{}\n");
+    write(
+        &world.dest.join("src/main.rs"),
+        "fn main() { /* mine */ }\n",
+    );
+    let again = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(again["result"]["ok"], true, "{again}");
+    assert_eq!(
+        again["result"]["recheck"]["copyChanged"],
+        json!([]),
+        "{again}"
+    );
+    // A file the original still has, changed in the copy: blocks, and is listed.
+    write(&world.dest.join("README.md"), "my edit in the copy\n");
+    let blocked = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(blocked["result"]["ok"], false, "{blocked}");
+    assert_eq!(
+        blocked["result"]["recheck"]["copyChanged"],
+        json!(["README.md"]),
+        "{blocked}"
+    );
+    let forced = agent.request("migrateBeginDelete", json!({"id": id, "force": true}));
+    assert_eq!(forced["result"]["ok"], true, "{forced}");
+    fs::remove_dir_all(&world.src).unwrap();
+    let finish = agent.request("migrateFinish", json!({"id": id, "action": "delete"}));
+    assert_eq!(finish["result"], Value::Null, "{finish}");
+    assert_eq!(
+        fs::read_to_string(world.dest.join("README.md")).unwrap(),
+        "my edit in the copy\n"
+    );
+}
+
+/// `force` never enters the deleting state, and never skips an original that
+/// changed.
+#[test]
+fn force_only_skips_copy_changes_while_deleting() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    write(&world.dest.join("README.md"), "my edit in the copy\n");
+    let forced = agent.request("migrateBeginDelete", json!({"id": id, "force": true}));
+    assert_eq!(forced["result"]["ok"], false, "{forced}");
+    write(
+        &world.dest.join("README.md"),
+        &fs::read_to_string(world.src.join("README.md")).unwrap(),
+    );
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert_eq!(keep["result"], Value::Null, "{keep}");
+
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    std::thread::sleep(Duration::from_millis(20));
+    write(&world.src.join("notes.txt"), "edited while deleting\n");
+    let forced = agent.request("migrateBeginDelete", json!({"id": id, "force": true}));
+    assert_eq!(forced["result"]["ok"], false, "{forced}");
+    assert_eq!(
+        forced["result"]["recheck"]["changed"],
+        json!(["notes.txt"]),
+        "{forced}"
+    );
+}
+
+/// Review 2 #3: a drive WSL can't see never enters the deleting state unless the
+/// app says Windows doesn't see the original either; the move stays answerable.
+#[test]
+fn a_hidden_drive_never_enters_deleting() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let away = world.tmp.join("away");
+    fs::rename(&world.src, &away).unwrap();
+    let begin = agent.request("migrateBeginDelete", json!({"id": id, "sourceGone": false}));
+    assert_eq!(begin["result"]["ok"], false, "{begin}");
+    assert_eq!(begin["result"]["recheck"]["sourceMissing"], true, "{begin}");
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"][0]["deleting"], false, "{pending}");
+    // Back, with an edit made while WSL couldn't see it: the recheck catches it.
+    fs::rename(&away, &world.src).unwrap();
+    std::thread::sleep(Duration::from_millis(20));
+    write(
+        &world.src.join("notes.txt"),
+        "edited on Windows meanwhile\n",
+    );
+    let again = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(again["result"]["ok"], false, "{again}");
+    assert_eq!(
+        again["result"]["recheck"]["changed"],
+        json!(["notes.txt"]),
+        "{again}"
+    );
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert_eq!(keep["result"], Value::Null, "{keep}");
+}
+
+/// Review 2 #4: with the copy gone, discarding only forgets the migration, whether
+/// the original is gone too or the delete had begun; nothing else is deleted.
+#[test]
+fn a_copy_that_is_gone_can_always_be_forgotten() {
+    // Not deleting, the original gone too.
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let away = world.tmp.join("away");
+    fs::rename(&world.src, &away).unwrap();
+    fs::remove_dir_all(&world.dest).unwrap();
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"][0]["copyMissing"], true, "{pending}");
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert!(error_message(&keep).contains("nothing to keep"), "{keep}");
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(away.join(".git").exists());
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"], json!([]), "{pending}");
+
+    // Deleting, then the copy deleted by hand: the rest of the original is never
+    // deleted, even forced, and the move can be ended.
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+    fs::remove_dir_all(&world.dest).unwrap();
+    let forced = agent.request("migrateBeginDelete", json!({"id": id, "force": true}));
+    assert_eq!(forced["result"]["ok"], false, "{forced}");
+    assert_eq!(
+        forced["result"]["recheck"]["copyChanged"],
+        json!(["."]),
+        "{forced}"
+    );
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert_eq!(discard["result"], Value::Null, "{discard}");
+    assert!(world.src.join(".git").exists());
+}
+
+/// Review 2 #5: a file written to the copy while a re-sync runs is not taken for the
+/// re-sync's, so a discard doesn't delete it.
+#[test]
+fn an_edit_in_the_copy_during_a_resync_is_not_the_resyncs() {
+    let world = World::new();
+    let dest = world.dest.to_str().unwrap();
+    let hook = world.hook(&format!(
+        "[ \"$1\" = verified ] && [ \"$3\" = {dest:?} ] || exit 0\necho mine > \"$3/mine.txt\"\n"
+    ));
+    let (mut agent, id) = placed_migration(&world, Some(&hook));
+    std::thread::sleep(Duration::from_millis(20));
+    write(&world.src.join("notes.txt"), "edited after the report\n");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    agent.ready();
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(
+        recheck["result"]["copyChanged"],
+        json!(["mine.txt"]),
+        "{recheck}"
+    );
+    let discard = agent.request("migrateFinish", json!({"id": id, "action": "discard"}));
+    assert!(
+        error_message(&discard).contains("won't delete it"),
+        "{discard}"
+    );
+    assert!(world.dest.join("mine.txt").exists());
+}
+
+/// Review 2 #6 and minor: a re-sync cut short by a restart, or stopped by a cancel,
+/// is reported as such; re-syncing again finishes it.
+#[test]
+fn a_resync_cut_short_is_reported_and_can_be_run_again() {
+    let world = World::new();
+    let dest = world.dest.to_str().unwrap();
+    let reached = world.tmp.join("reached");
+    let hold = world.tmp.join("hold");
+    let hook = world.hook(&format!(
+        "[ \"$1\" = verified ] && [ \"$3\" = {dest:?} ] && [ -e {hold:?} ] || exit 0\ntouch {reached:?}\nwhile [ -e {hold:?} ]; do sleep 0.05; done\n"
+    ));
+    let (mut agent, id) = placed_migration(&world, Some(&hook));
+    std::thread::sleep(Duration::from_millis(20));
+    write(&world.src.join("notes.txt"), "edited after the report\n");
+
+    // Cancelled.
+    write(&hold, "");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    wait_for(&reached);
+    let cancel = agent.send("migrateCancel", json!({"id": id}));
+    fs::remove_file(&hold).unwrap();
+    let report = agent.ready();
+    assert_eq!(agent.response(cancel)["result"], json!({"ended": false}));
+    assert!(!can_delete(&report), "{report:#}");
+    assert!(check(&report, "unchanged")["problems"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("You stopped the re-sync"));
+
+    // Cut short by a restart.
+    fs::remove_file(&reached).unwrap();
+    write(&hold, "");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    wait_for(&reached);
+    drop(agent);
+    fs::remove_file(&hold).unwrap();
+    let mut agent = world.agent(Some(&hook));
+    let report = agent.ready();
+    assert!(!can_delete(&report), "{report:#}");
+    assert!(check(&report, "unchanged")["problems"][0]["message"]
+        .as_str()
+        .unwrap()
+        .contains("didn't finish"));
+    let recheck = agent.request("migrateRecheck", json!({"id": id}));
+    assert_eq!(recheck["error"]["code"], 6, "{recheck}");
+    let resync = agent.request("migrateResync", json!({"id": id}));
+    assert_eq!(resync["result"], Value::Null, "{resync}");
+    let report = agent.ready();
+    assert!(can_delete(&report), "{report:#}");
+    assert_eq!(
+        fs::read_to_string(world.dest.join("notes.txt")).unwrap(),
+        "edited after the report\n"
+    );
+    let begin = agent.request("migrateBeginDelete", json!({"id": id}));
+    assert_eq!(begin["result"]["ok"], true, "{begin}");
+}
+
+/// Review 2 #9: when the config can't be written, the migration stays, and the same
+/// finish again goes through once it can.
+#[test]
+fn a_finish_whose_config_fails_can_be_sent_again() {
+    let world = World::new();
+    let (mut agent, id) = placed_migration(&world, None);
+    let saved = fs::read_to_string(&world.config).unwrap();
+    fs::remove_file(&world.config).unwrap();
+    fs::create_dir(&world.config).unwrap();
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert_eq!(keep["error"]["code"], 6, "{keep}");
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"][0]["id"], id.as_str(), "{pending}");
+    fs::remove_dir(&world.config).unwrap();
+    write(&world.config, &saved);
+    let keep = agent.request("migrateFinish", json!({"id": id, "action": "keep"}));
+    assert_eq!(keep["result"], Value::Null, "{keep}");
+    assert!(fs::read_to_string(&world.config)
+        .unwrap()
+        .contains("hidden"));
+    let pending = agent.request("migratePending", json!(null));
+    assert_eq!(pending["result"], json!([]), "{pending}");
+    assert!(world.dest.exists());
 }

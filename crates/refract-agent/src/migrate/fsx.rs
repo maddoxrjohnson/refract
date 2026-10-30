@@ -244,8 +244,11 @@ pub fn remove_any(path: &Path) -> io::Result<()> {
 }
 
 /// Writes `bytes` to `path` through a temporary file in the same folder renamed over
-/// it, so a reader never sees half of it.
+/// it, so a reader never sees half of it. The file is flushed to disk before the
+/// rename and the folder after it, so once this returns the new contents survive a
+/// crash or power loss (a state file saying "deleting" must not come back older).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
     let dir = path.parent().unwrap_or(Path::new("."));
     fs::create_dir_all(dir)?;
     let tmp = PathBuf::from(format!(
@@ -253,10 +256,16 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         path.display(),
         uuid::Uuid::new_v4().simple()
     ));
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+    let written = fs::File::create(&tmp).and_then(|mut file| {
+        file.write_all(bytes)?;
+        file.sync_all()
+    });
+    written
+        .and_then(|()| fs::rename(&tmp, path))
+        .inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })?;
+    fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]

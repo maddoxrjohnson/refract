@@ -11,10 +11,18 @@
 //! Once `migrateBeginDelete` passes, the migration is *deleting* (saved in its state
 //! file): only `migrateFinish delete` ends it.
 //!
+//! Once the copy is placed it is never deleted by anything but `migrateFinish discard`
+//! and its guards: a cancel or a panic after that point stops the step at hand and
+//! ends in a report. Each step that changes the placed copy saves [`Record::running`]
+//! before it starts, so a helper that stopped mid-step reports the step as cut short
+//! after a restart ([`Worker::recover`]) instead of trusting what it left.
+//!
 //! The main thread talks to it through a [`Handle`]: commands in, [`Update`]s out
 //! through the sink. Cancelling while it runs sets a flag the long steps check between
 //! files, then sends [`Command::Cancel`], which the worker answers once it has deleted
-//! what it made.
+//! what it made (or, once placed, once the report is out). The worker reads commands
+//! until the main thread drops the handle, so none sent in the meantime goes
+//! unanswered.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -40,12 +48,12 @@ use refract_core::migrate::report::{
 };
 use refract_core::migrate::{SourceSnapshot, SOURCE_SNAPSHOT_VERSION};
 use refract_core::protocol::{
-    code, BeginDelete, Event, FinishAction, Id, MigrateParams, MigrateProgress, MigrateStep,
-    MigrationTicket, Recheck, Reply, Response,
+    code, BeginDelete, CancelOutcome, Event, FinishAction, Id, MigrateParams, MigrateProgress,
+    MigrateStep, MigrationTicket, Recheck, Reply, Response,
 };
 use refract_core::sessions::{is_windows_mount, path_within};
 
-use super::store::{self, Record};
+use super::store::{self, HistoryPlan, Record, Running};
 use super::tree::{self, Cancel, Cancelled, Stats};
 use super::{fsx, gitx, history, install, source};
 use crate::{git, procs, state};
@@ -53,7 +61,8 @@ use crate::{git, procs, state};
 /// Tests set this to a shell script the worker runs at fixed points, with the point,
 /// the round, the copy and the source as arguments: `copied` after the first copy,
 /// before normalising; `verified` after each round's checks, before the source is
-/// statted again; `moved` after the history is copied, before the report.
+/// statted again; `placed` once the copy is in place, before the install; `moved` after
+/// the history is copied, before its result is saved and the report sent.
 pub const TEST_HOOK: &str = "REFRACT_AGENT_TEST_MIGRATE_HOOK";
 
 /// Rounds of re-copying a changing source before check 4 fails (spec §5).
@@ -64,6 +73,10 @@ const PROGRESS_EVERY: Duration = Duration::from_millis(100);
 
 /// Refusal while the original is being deleted.
 pub const DELETING: &str = "The original is being deleted.";
+
+/// Check 4's message for a re-sync that was cut short.
+const RESYNC_CUT: &str = "The copy is part way between the original as it was checked and \
+    as it is now. Re-sync again to finish it, or keep both, or discard the copy.";
 
 /// Check 1's message for a file [`gitx::Normalised::kept`] whose blob then differs.
 const KEPT: &str = "Kept byte for byte: this tracked file mixes line endings (or a git \
@@ -77,7 +90,12 @@ const KEPT: &str = "Kept byte for byte: this tracked file mixes line endings (or
 pub enum Command {
     Cancel(Id),
     Recheck(Id),
-    BeginDelete(Id),
+    /// `migrateBeginDelete` (see its params for `source_gone` and `force`).
+    BeginDelete {
+        request: Id,
+        source_gone: bool,
+        force: bool,
+    },
     Resync(Id),
     Finish(Id, FinishAction),
 }
@@ -89,8 +107,10 @@ pub enum Update {
     Answer(Response),
     /// An event to write.
     Event(Event),
-    /// `migrateFinish` (or `migrateCancel` of a ready migration, as `Discard`) is done
-    /// on the worker's side; the main thread updates the config, then answers `request`.
+    /// `migrateFinish` is done on the worker's side; the main thread updates the
+    /// config, and only then removes the state file and drops the handle (which ends
+    /// the worker), and answers `request`. If the config can't be written it answers
+    /// the error and keeps both; the same `migrateFinish` again sends this again.
     Finished {
         request: Id,
         id: String,
@@ -98,7 +118,9 @@ pub enum Update {
         source: PathBuf,
         dest: PathBuf,
     },
-    /// The worker is gone; forget the migration.
+    /// The migration is over (cancelled before it was placed, or refused at the
+    /// start): forget it, dropping the handle, which lets the worker end. Sent before
+    /// the worker answers the request that ended it.
     Ended { id: String },
     /// `migrateBeginDelete` passed: the migration is deleting from now on.
     Deleting { id: String },
@@ -233,8 +255,13 @@ pub fn resume(record: Record, ctx: Context, sink: Sink) -> io::Result<Handle> {
                 .map(|p| (p.path.clone().unwrap_or_default(), p.clone()))
                 .collect();
             worker.kept = record.kept.iter().cloned().collect();
+            let running = record.running;
             let mut report = record.report.clone();
             worker.record = Some(record);
+            if running.is_some() {
+                report = worker.recover("the helper stopped while it ran");
+            }
+            report.placed = true;
             if !worker.deleting && report.can_delete() && !worker.dest.is_dir() {
                 let gone = Problem {
                     path: None,
@@ -346,6 +373,11 @@ struct Worker {
     kept: BTreeSet<String>,
     /// `migrateBeginDelete` passed.
     deleting: bool,
+    /// While a re-sync runs: the paths it copied over or removed in the placed copy.
+    written: Option<BTreeSet<String>>,
+    /// `migrateFinish` did its part with this action; the main thread may still fail
+    /// to write the config, and the same request again repeats only the answer.
+    finished: Option<FinishAction>,
 }
 
 impl Worker {
@@ -386,6 +418,8 @@ impl Worker {
             install_backup: None,
             kept: BTreeSet::new(),
             deleting: false,
+            written: None,
+            finished: None,
         }
     }
 
@@ -433,10 +467,11 @@ impl Worker {
                 ));
             }
             Err(message) => {
-                self.answer(Response::err(request, code::MIGRATE_FAILED, message));
                 self.send(Update::Ended {
                     id: self.id.clone(),
                 });
+                self.answer(Response::err(request, code::MIGRATE_FAILED, message));
+                self.drain(&rx, "the migration could not start");
                 return;
             }
         }
@@ -444,25 +479,24 @@ impl Worker {
             .unwrap_or_else(|_| Err(Stop::Fatal("internal error".into())));
         match outcome {
             Ok(()) => {}
+            Err(_) if self.placed => {
+                // Only a panic gets here once placed: the copy stays, and the report
+                // says which step was cut short.
+                let report = self.recover("an internal error stopped it");
+                self.ready(report);
+            }
             Err(Stop::Cancelled) => {
-                self.discard();
-                // The cancel request follows the flag.
-                for command in rx.iter() {
-                    match command {
-                        Command::Cancel(request) => {
-                            self.answer(Response::ok(request, Reply::Done));
-                            break;
-                        }
-                        other => self.refuse(other, "the migration was cancelled"),
-                    }
-                }
+                self.remove_temp();
+                // Forgotten before the cancel is answered, so a request sent after the
+                // answer finds no migration rather than a worker that stopped reading.
                 self.send(Update::Ended {
                     id: self.id.clone(),
                 });
+                self.drain(&rx, "the migration was cancelled");
                 return;
             }
             Err(Stop::Fatal(message)) => {
-                self.discard();
+                self.remove_temp();
                 let mut checks = not_run_checks();
                 checks[2] = CheckResult::from_problems(
                     Check::NothingSkipped,
@@ -479,6 +513,21 @@ impl Worker {
             }
         }
         self.serve(rx);
+    }
+
+    /// After [`Update::Ended`]: answers what is still sent until the main thread drops
+    /// the handle. A cancel (the one that ended it, or a repeat) is answered with
+    /// `ended: true`, anything else refused with `why`.
+    fn drain(&self, rx: &Receiver<Command>, why: &str) {
+        for command in rx.iter() {
+            match command {
+                Command::Cancel(request) => self.answer(Response::ok(
+                    request,
+                    Reply::Cancelled(CancelOutcome { ended: true }),
+                )),
+                other => self.refuse(other, why),
+            }
+        }
     }
 
     /// Reads the snapshot file and runs the Linux side of preflight (spec §4.1).
@@ -604,7 +653,7 @@ impl Worker {
             .iter()
             .all(|c| c.status == CheckStatus::Passed);
         if !passed {
-            self.discard();
+            self.remove_temp();
             let mut checks = verdict.checks.to_vec();
             checks.push(CheckResult::not_run(Check::History));
             let report = self.build_report(checks, Some(&verdict.diff), vec![], Default::default());
@@ -627,11 +676,6 @@ impl Worker {
         }
         self.placed = true;
         self.temp = None;
-        let not_moved = |checks: &[CheckResult; 4]| -> Vec<CheckResult> {
-            let mut checks = checks.to_vec();
-            checks.push(CheckResult::not_run(Check::History));
-            checks
-        };
         let report = self.build_report(
             not_moved(&verdict.checks),
             Some(&verdict.diff),
@@ -643,15 +687,32 @@ impl Worker {
             report,
             self.report_path.clone(),
             self.snapshot().clone(),
-            verdict.final_stats,
+            verdict.final_stats.clone(),
         );
         // Until the install has run, the copy as checked is the one to compare with.
         record.copy_stats = self.copy_state(&self.dest).entries;
+        record.running = Some(Running::Installing);
         self.record = Some(record);
         self.save_record();
         store::unmark_temp(&self.id);
+        self.finish_placed(verdict);
+        Ok(())
+    }
 
-        let (install, backup_problems) = self.install()?;
+    /// After the copy is placed: install, history, report. Nothing here deletes the
+    /// copy. A cancel stops the install and skips the history, and the report says so;
+    /// the user then answers it like any other.
+    fn finish_placed(&mut self, verdict: Verdict) {
+        self.test_hook("placed", 0, &self.dest.clone());
+        let (install, backup_problems) = self.install();
+        let stopped = self.cancel.cancelled();
+        if stopped {
+            self.warnings.push(
+                "You stopped the move once the copy was in place, so the copy was kept and \
+                 the rest of the install and history steps didn't run."
+                    .into(),
+            );
+        }
         let mut checks = verdict.checks.clone();
         checks[2] = with_problems(&checks[2], backup_problems);
         let report = self.build_report(
@@ -661,28 +722,197 @@ impl Worker {
             Default::default(),
         );
         let copy_stats = self.copy_state(&self.dest).entries;
+        let plan = if stopped {
+            history::Plan::default()
+        } else {
+            history::plan(
+                &self.ctx.claude_projects,
+                &self.source_str(),
+                &self.dest_str(),
+            )
+        };
         if let Some(record) = &mut self.record {
             record.copy_stats = copy_stats;
             record.report = report;
+            record.running = Some(Running::MovingHistory);
+            record.history_planned = plan
+                .files
+                .iter()
+                .map(|(original, copy)| HistoryPlan {
+                    original: original.clone(),
+                    copy: copy.clone(),
+                })
+                .collect();
         }
+        // Saved before anything is written, so that a restart finds the copies.
         self.save_record();
-        self.check_cancel()?;
-        let history = self.move_history();
+        let history = if stopped {
+            history::Copied {
+                problems: vec![Problem {
+                    path: None,
+                    message: "You stopped the move before the session history was moved, \
+                              so the old transcripts stay where they are."
+                        .into(),
+                }],
+                ..history::Copied::default()
+            }
+        } else {
+            self.move_history(plan)
+        };
         if let Some(record) = &mut self.record {
             record.history = history.files.clone();
+            record.history_planned.clear();
         }
-        // Saved before anything can stop it, so that a discard finds the copies.
-        self.save_record();
         self.test_hook("moved", 0, &self.dest.clone());
-        self.check_cancel()?;
         let history_check = CheckResult::from_problems(Check::History, history.problems.clone());
         let mut checks = checks.to_vec();
         checks.push(history_check);
         let report = self.build_report(checks, Some(&verdict.diff), install, history.moved);
+        if let Some(record) = &mut self.record {
+            record.running = None;
+        }
         self.save_record_report(&report);
         self.save_report(&report);
         self.ready(report);
-        Ok(())
+    }
+
+    /// A placed migration whose step [`Record::running`] was cut short (`why`: the
+    /// helper stopped, or a panic): makes its report from what is on disk, saves it and
+    /// returns it. The copy is never deleted here.
+    ///
+    /// - The install: what changed in the copy since it was placed counts as the
+    ///   install's (as with an install that ran to its end), the original's versions
+    ///   are backed up, and each step is marked cancelled; the history did not move.
+    /// - The history: the copies that were written, unchanged since, are taken as this
+    ///   migration's ([`history::adopt`]), so a discard deletes them; the history check
+    ///   fails, so the old transcripts are never deleted.
+    /// - A re-sync: only what it wrote counts as its doing ([`Worker::resync_stats`]);
+    ///   check 4 fails, so the original can't go before a re-sync runs to its end.
+    fn recover(&mut self, why: &str) -> Report {
+        let Some(record) = self.record.clone() else {
+            // Placed but not yet recorded: nothing is known of the copy, so nothing
+            // may happen to it (a discard finds no record and leaves it).
+            let mut checks = not_run_checks().to_vec();
+            checks[2] = CheckResult::from_problems(
+                Check::NothingSkipped,
+                vec![Problem {
+                    path: None,
+                    message: format!(
+                        "The move stopped right after the copy was put in place ({why})."
+                    ),
+                }],
+            );
+            checks.push(CheckResult::not_run(Check::History));
+            return self.build_report(checks, None, vec![], Default::default());
+        };
+        let mut report = record.report.clone();
+        report.finished_at = Utc::now();
+        report.placed = true;
+        let history_problem = |what: &str| Problem {
+            path: None,
+            message: format!(
+                "The session history {what} ({why}), so the old transcripts stay where they are."
+            ),
+        };
+        let set_check = |report: &mut Report, result: CheckResult| match report
+            .checks
+            .iter_mut()
+            .find(|c| c.check == result.check)
+        {
+            Some(check) => *check = result,
+            None => report.checks.push(result),
+        };
+        match record.running {
+            Some(Running::Installing) => {
+                let folders = self.snapshot().manifest.skipped.clone();
+                let (_, log) = store::report_paths(self.started_at, &file_name(&self.source));
+                report.install = install::plan(&self.dest, &folders)
+                    .into_iter()
+                    .map(|step| InstallResult {
+                        step,
+                        status: refract_core::migrate::report::InstallStatus::Cancelled,
+                        exit_code: None,
+                        log_path: Some(state::path_str(&log)),
+                    })
+                    .collect();
+                let now = self.copy_state(&self.dest);
+                let changes =
+                    compare_readable(&record.copy_stats, &now.entries, &now.unreadable_paths());
+                let problems = self.take_install_changes(&changes, &now.unreadable);
+                report.install_changes = self.install_changes.clone();
+                report.install_backup = self.install_backup.clone();
+                if let Some(files) = report
+                    .checks
+                    .iter()
+                    .find(|c| c.check == Check::NothingSkipped)
+                {
+                    let files = with_problems(files, problems);
+                    set_check(&mut report, files);
+                }
+                report.warnings.push(format!(
+                    "The install didn't finish ({why}). Run it again in the new folder."
+                ));
+                let history = CheckResult::from_problems(
+                    Check::History,
+                    vec![history_problem("wasn't moved")],
+                );
+                set_check(&mut report, history);
+                if let Some(r) = &mut self.record {
+                    r.copy_stats = now.entries;
+                }
+            }
+            Some(Running::MovingHistory) => {
+                let planned: Vec<(PathBuf, PathBuf)> = record
+                    .history_planned
+                    .iter()
+                    .map(|p| (p.original.clone(), p.copy.clone()))
+                    .collect();
+                let files = history::adopt(&planned, &self.source_str(), &self.dest_str());
+                report.history.sessions = files
+                    .iter()
+                    .filter(|f| f.original.extension().is_some_and(|e| e == "jsonl"))
+                    .count() as u32;
+                let history = CheckResult::from_problems(
+                    Check::History,
+                    vec![history_problem("didn't finish moving")],
+                );
+                set_check(&mut report, history);
+                if let Some(r) = &mut self.record {
+                    r.history = files;
+                }
+            }
+            Some(Running::Resyncing) => {
+                let written: BTreeSet<String> = record.resync_written.iter().cloned().collect();
+                let copy_stats = self.resync_stats(&record.copy_stats, &written);
+                let history = report
+                    .checks
+                    .iter()
+                    .find(|c| c.check == Check::History)
+                    .cloned();
+                let mut checks = not_run_checks().to_vec();
+                checks[3] = CheckResult::from_problems(
+                    Check::Unchanged,
+                    vec![Problem {
+                        path: None,
+                        message: format!("The re-sync didn't finish ({why}). {RESYNC_CUT}"),
+                    }],
+                );
+                checks.extend(history);
+                report.checks = checks;
+                if let Some(r) = &mut self.record {
+                    r.copy_stats = copy_stats;
+                }
+            }
+            None => {}
+        }
+        if let Some(r) = &mut self.record {
+            r.running = None;
+            r.resync_written.clear();
+            r.history_planned.clear();
+        }
+        self.save_record_report(&report);
+        self.save_report(&report);
+        report
     }
 
     /// Saves the record as it is, with the copy problems and kept files.
@@ -761,8 +991,13 @@ impl Worker {
         paths
     }
 
-    /// Check 4 again, and the copy against its last check (`migrateRecheck`).
-    fn recheck(&self) -> Recheck {
+    /// Check 4 again, and the copy against its last check (`migrateRecheck`). With
+    /// `relax` (deleting, or the original gone on both sides) only the copy's changes
+    /// that matter for what is left of the original are listed: paths changed or
+    /// removed in the copy whose original is still there. A path added to the copy,
+    /// or one whose original is already gone, loses nothing when the rest goes. A copy
+    /// that is gone (`"."`) is always listed.
+    fn recheck(&self, relax: bool) -> Recheck {
         let source_missing = matches!(
             fs::symlink_metadata(&self.source),
             Err(e) if e.kind() == io::ErrorKind::NotFound
@@ -800,6 +1035,21 @@ impl Worker {
             recheck.unreadable.dedup();
         }
         recheck.copy_changed = self.copy_changes();
+        if relax {
+            let known: BTreeSet<&str> = self
+                .record
+                .iter()
+                .flat_map(|r| r.copy_stats.iter().map(|e| e.path.as_str()))
+                .collect();
+            recheck.copy_changed.retain(|path| {
+                path == "."
+                    || (known.contains(path.as_str())
+                        && !matches!(
+                            fs::symlink_metadata(self.source.join(path)),
+                            Err(e) if e.kind() == io::ErrorKind::NotFound
+                        ))
+            });
+        }
         recheck.busy_agents = self.busy_agents();
         recheck
     }
@@ -884,6 +1134,13 @@ impl Worker {
             });
             self.kept
                 .extend(normalised.kept.iter().map(|file| format!("{prefix}{file}")));
+            // A re-sync's: a whole repo normalised again rewrites files no change listed.
+            let rewritten: Vec<String> = normalised
+                .rewritten
+                .iter()
+                .map(|file| format!("{prefix}{file}"))
+                .collect();
+            self.note_written(rewritten.iter().map(String::as_str));
             for (file, message) in normalised.problems {
                 let full = format!("{prefix}{file}");
                 self.copy_errors.insert(
@@ -1006,6 +1263,7 @@ impl Worker {
             gitx::tracked(&dir, &[]).unwrap_or_default()
         };
         let before: Vec<BTreeSet<String>> = repos.iter().map(|r| tracked(r)).collect();
+        self.note_written(listed.iter().copied());
         let errors = tree::recopy(&self.source, copy, changes, &*self.cancel)?;
         self.add_copy_errors(changes, errors);
         self.install_changes.forget(&changed_paths(changes));
@@ -1025,6 +1283,7 @@ impl Worker {
             );
         }
         if !untracked.is_empty() {
+            self.note_written(untracked.changed.iter().map(RelPath::as_str));
             let errors = tree::recopy(&self.source, copy, &untracked, &*self.cancel)?;
             self.add_copy_errors(&untracked, errors);
         }
@@ -1189,17 +1448,23 @@ impl Worker {
     /// build folders in `install_changes` (the copy is statted before and after). The
     /// original's version of each file it changed or removed is backed up
     /// ([`install::backup`]); a file that could not be is a copy problem, returned too.
-    fn install(&mut self) -> Result<(Vec<InstallResult>, Vec<Problem>), Stop> {
+    /// A cancel stops the step that runs and the rest; what they did is recorded all
+    /// the same. Its first progress event (sent even with nothing to install) tells the
+    /// app the copy is in place.
+    fn install(&mut self) -> (Vec<InstallResult>, Vec<Problem>) {
         let skipped = self.snapshot().manifest.skipped.clone();
         let steps = install::plan(&self.dest, &skipped);
+        let total = steps.len() as u64;
+        self.progress.report(MigrateStep::Installing, 0, total);
         if steps.is_empty() {
-            return Ok((Vec::new(), Vec::new()));
+            return (Vec::new(), Vec::new());
         }
         let folders = self.skipped();
-        let before = tree::stats(&self.dest, &folders, &*self.cancel)?;
-        let total = steps.len() as u64;
+        // Statted whatever the cancel flag says: the copy is placed, and what the
+        // install did must be known.
+        let never = AtomicBool::new(false);
+        let before = tree::stats(&self.dest, &folders, &never).unwrap_or_default();
         let (_, log) = store::report_paths(self.started_at, &file_name(&self.source));
-        self.progress.report(MigrateStep::Installing, 0, total);
         let progress = &mut self.progress;
         let results = install::run(
             &self.dest,
@@ -1209,14 +1474,23 @@ impl Worker {
             &*self.cancel,
             &mut |done| progress.report(MigrateStep::Installing, done, total),
         );
-        self.check_cancel()?;
-        let after = tree::stats(&self.dest, &folders, &*self.cancel)?;
-        self.install_changes = install::changes(
-            &self.dest,
-            &compare_readable(&before.entries, &after.entries, &after.unreadable_paths()),
-        );
-        let mut problems: Vec<Problem> = after
-            .unreadable
+        let after = tree::stats(&self.dest, &folders, &never).unwrap_or_default();
+        let changes = compare_readable(&before.entries, &after.entries, &after.unreadable_paths());
+        let problems = self.take_install_changes(&changes, &after.unreadable);
+        (results, problems)
+    }
+
+    /// Records `changes` to the placed copy as the install's (`install_changes`), backs
+    /// up the original's version of what they changed or removed, and returns the
+    /// problems (paths of the copy that could not be read, and files that could not be
+    /// backed up), which are copy problems too.
+    fn take_install_changes(
+        &mut self,
+        changes: &StatChanges,
+        unreadable: &[tree::Unreadable],
+    ) -> Vec<Problem> {
+        self.install_changes = install::changes(&self.dest, changes);
+        let mut problems: Vec<Problem> = unreadable
             .iter()
             .map(|u| Problem {
                 path: Some(dot(u.path.clone())),
@@ -1246,18 +1520,15 @@ impl Worker {
             let key = problem.path.clone().unwrap_or_default();
             self.copy_errors.insert(key, problem.clone());
         }
-        Ok((results, problems))
+        problems
     }
 
-    fn move_history(&mut self) -> history::Copied {
+    fn move_history(&mut self, plan: history::Plan) -> history::Copied {
         let (source, dest) = (self.source_str(), self.dest_str());
         let progress = &mut self.progress;
-        history::copy(
-            &self.ctx.claude_projects,
-            &source,
-            &dest,
-            &mut |done, total| progress.report(MigrateStep::MovingHistory, done, total),
-        )
+        history::copy_planned(plan, &source, &dest, &mut |done, total| {
+            progress.report(MigrateStep::MovingHistory, done, total)
+        })
     }
 
     fn build_report(
@@ -1291,6 +1562,7 @@ impl Worker {
             history,
             linux_git: snapshot.linux_git,
             warnings,
+            placed: self.placed,
         }
     }
 
@@ -1308,52 +1580,58 @@ impl Worker {
         }));
     }
 
-    /// Deletes what this migration made: the temporary copy, or the placed copy, the
-    /// transcripts copied for it that nobody wrote to since and the install backup;
-    /// and its state.
-    fn discard(&mut self) {
+    /// Deletes the temporary copy of a migration that was not placed.
+    fn remove_temp(&mut self) {
         if let Some(temp) = self.temp.take() {
             let _ = fsx::remove_any(&temp);
         }
-        if self.placed {
-            let _ = fsx::remove_any(&self.dest);
-            if let Some(record) = &self.record {
-                for kept in history::remove_copies(&self.ctx.claude_projects, &record.history) {
-                    eprintln!(
-                        "refract-agent: kept {}: {}",
-                        kept.path.unwrap_or_default(),
-                        kept.message
-                    );
-                }
-            }
-            if self.install_backup.is_some() {
-                let _ = fsx::remove_any(&store::backup_dir(&self.report_path));
-            }
-            self.placed = false;
-        }
         store::unmark_temp(&self.id);
-        store::remove_record(&self.id);
+    }
+
+    /// `migrateFinish discard` of a placed copy that passed its guards: deletes the
+    /// copy, the transcripts copied for it that nobody wrote to since and the install
+    /// backup. The state file stays until the main thread is done ([`Update::Finished`]).
+    fn discard_placed(&mut self) {
+        let _ = fsx::remove_any(&self.dest);
+        self.remove_history_copies();
+        if self.install_backup.is_some() {
+            let _ = fsx::remove_any(&store::backup_dir(&self.report_path));
+        }
+        self.placed = false;
+    }
+
+    /// The transcript copies made for this migration that nobody wrote to since go;
+    /// the originals stay.
+    fn remove_history_copies(&self) {
+        if let Some(record) = &self.record {
+            for kept in history::remove_copies(&self.ctx.claude_projects, &record.history) {
+                eprintln!(
+                    "refract-agent: kept {}: {}",
+                    kept.path.unwrap_or_default(),
+                    kept.message
+                );
+            }
+        }
     }
 
     fn refuse(&self, command: Command, why: &str) {
         let request = match command {
             Command::Cancel(id)
             | Command::Recheck(id)
-            | Command::BeginDelete(id)
+            | Command::BeginDelete { request: id, .. }
             | Command::Resync(id)
             | Command::Finish(id, _) => id,
         };
         self.answer(Response::err(request, code::MIGRATE_FAILED, why));
     }
 
-    /// Answers follow-up requests until the migration ends.
+    /// Answers follow-up requests until the main thread drops the handle (after a
+    /// finish it has written the config for).
     fn serve(mut self, rx: Receiver<Command>) {
         for command in rx.iter() {
             let done = catch_unwind(AssertUnwindSafe(|| self.follow_up(command)));
-            match done {
-                Ok(true) => return,
-                Ok(false) => {}
-                Err(_) => eprintln!("refract-agent: a migration request failed"),
+            if done.is_err() {
+                eprintln!("refract-agent: a migration request failed");
             }
         }
     }
@@ -1364,6 +1642,11 @@ impl Worker {
             fs::symlink_metadata(&self.source),
             Err(e) if e.kind() == io::ErrorKind::NotFound
         )
+    }
+
+    /// True when the placed copy's folder is gone.
+    fn copy_missing(&self) -> bool {
+        !fs::symlink_metadata(&self.dest).is_ok_and(|m| m.is_dir())
     }
 
     fn source_gone_message(&self) -> String {
@@ -1386,48 +1669,62 @@ impl Worker {
         None
     }
 
-    /// Handles one follow-up. True when the migration has ended.
-    fn follow_up(&mut self, command: Command) -> bool {
+    /// Saves `step` as running (with nothing written yet) before it touches the copy.
+    fn mark_running(&mut self, step: Running) -> Result<(), String> {
+        let Some(record) = &mut self.record else {
+            return Err("the migration has no state file".into());
+        };
+        record.running = Some(step);
+        record.resync_written.clear();
+        store::save_record(record).inspect_err(|_| {
+            record.running = None;
+        })
+    }
+
+    /// Handles one follow-up, answering it even if it panics.
+    fn follow_up(&mut self, command: Command) {
+        let request = match &command {
+            Command::Cancel(id)
+            | Command::Recheck(id)
+            | Command::BeginDelete { request: id, .. }
+            | Command::Resync(id)
+            | Command::Finish(id, _) => id.clone(),
+        };
+        if catch_unwind(AssertUnwindSafe(|| self.handle(command))).is_err() {
+            eprintln!("refract-agent: a migration request failed");
+            self.answer(Response::err(
+                request,
+                code::MIGRATE_FAILED,
+                "internal error",
+            ));
+        }
+    }
+
+    fn handle(&mut self, command: Command) {
+        if let Some(done) = self.finished {
+            if !matches!(command, Command::Finish(..)) {
+                let why = format!(
+                    "the migration is finishing ({}); send that migrateFinish again",
+                    action_name(done)
+                );
+                self.refuse(command, &why);
+                return;
+            }
+        }
         match command {
             Command::Recheck(request) => {
                 if let Some(why) = self.recheck_refusal() {
                     self.refuse(Command::Recheck(request), why);
-                    return false;
+                    return;
                 }
-                let reply = Reply::Recheck(self.recheck());
+                let reply = Reply::Recheck(self.recheck(self.deleting));
                 self.answer(Response::ok(request, reply));
-                false
             }
-            Command::BeginDelete(request) => {
-                if let Some(why) = self.recheck_refusal() {
-                    self.refuse(Command::BeginDelete(request), why);
-                    return false;
-                }
-                let recheck = self.recheck();
-                let ok = recheck.safe();
-                if ok && !self.deleting {
-                    self.deleting = true;
-                    let saved = self.record.as_mut().map(|record| {
-                        record.deleting = true;
-                        store::save_record(record)
-                    });
-                    if let Some(Err(e)) = saved {
-                        // Not saved, a restart would forget it: refuse.
-                        self.deleting = false;
-                        if let Some(record) = &mut self.record {
-                            record.deleting = false;
-                        }
-                        self.refuse(Command::BeginDelete(request), &e);
-                        return false;
-                    }
-                    self.send(Update::Deleting {
-                        id: self.id.clone(),
-                    });
-                }
-                let reply = Reply::BeginDelete(BeginDelete { ok, recheck });
-                self.answer(Response::ok(request, reply));
-                false
-            }
+            Command::BeginDelete {
+                request,
+                source_gone,
+                force,
+            } => self.begin_delete(request, source_gone, force),
             Command::Resync(request) => {
                 let refusal = if !self.placed {
                     Some("the copy was not placed, so there is nothing to re-sync".to_owned())
@@ -1448,35 +1745,96 @@ impl Worker {
                         )
                     })
                 };
+                // Saved before anything is copied, so a restart knows it was cut short.
+                let refusal = refusal.or_else(|| self.mark_running(Running::Resyncing).err());
                 if let Some(why) = refusal {
                     self.send(Update::Idle {
                         id: self.id.clone(),
                     });
                     self.refuse(Command::Resync(request), &why);
-                    return false;
+                    return;
                 }
                 self.answer(Response::ok(request, Reply::Done));
                 self.resync();
-                false
             }
             Command::Finish(request, action) => self.finish(request, action),
             Command::Cancel(request) => {
-                // The report went out before the cancel arrived: it stays.
-                self.cancel.store(false, Ordering::Relaxed);
+                if self.cancel.swap(false, Ordering::Relaxed) && !self.deleting {
+                    // Sent while the copy was placed and finishing, or while a re-sync
+                    // ran: that stopped, and its report is out.
+                    let reply = Reply::Cancelled(CancelOutcome { ended: false });
+                    self.answer(Response::ok(request, reply));
+                    return;
+                }
                 let why = if self.deleting {
                     DELETING
                 } else {
                     "the migration's report is out; end it with migrateFinish"
                 };
                 self.refuse(Command::Cancel(request), why);
-                false
             }
         }
     }
 
+    /// `migrateBeginDelete`: the recheck, and the deleting state when it passes. In the
+    /// deleting state, and when the original is gone on both sides, a change to the
+    /// copy only blocks for a path the original still has ([`Worker::recheck`]), and
+    /// `force` skips even those. A source only the helper can't see (`source_gone`
+    /// false) never passes: nothing of it was checked.
+    fn begin_delete(&mut self, request: Id, source_gone: bool, force: bool) {
+        if let Some(why) = self.recheck_refusal() {
+            let command = Command::BeginDelete {
+                request,
+                source_gone,
+                force,
+            };
+            self.refuse(command, why);
+            return;
+        }
+        let relax = self.deleting || (source_gone && self.source_missing());
+        let recheck = self.recheck(relax);
+        let hidden = recheck.source_missing && !source_gone;
+        let copy_gone = recheck.copy_changed.iter().any(|p| p == ".");
+        let copy_ok = recheck.copy_changed.is_empty() || (force && self.deleting && !copy_gone);
+        let ok = recheck.changed.is_empty()
+            && recheck.unreadable.is_empty()
+            && recheck.busy_agents.is_empty()
+            && copy_ok
+            && !hidden;
+        if ok && !self.deleting {
+            self.deleting = true;
+            let saved = self.record.as_mut().map(|record| {
+                record.deleting = true;
+                store::save_record(record)
+            });
+            if let Some(Err(e)) = saved {
+                // Not saved, a restart would forget it: refuse.
+                self.deleting = false;
+                if let Some(record) = &mut self.record {
+                    record.deleting = false;
+                }
+                let command = Command::BeginDelete {
+                    request,
+                    source_gone,
+                    force,
+                };
+                self.refuse(command, &e);
+                return;
+            }
+            self.send(Update::Deleting {
+                id: self.id.clone(),
+            });
+        }
+        let reply = Reply::BeginDelete(BeginDelete { ok, recheck });
+        self.answer(Response::ok(request, reply));
+    }
+
     /// Re-copies what changed since the last check into the placed copy and checks it
     /// again, then sends a fresh report. Only paths verifiably gone from the source
-    /// leave the copy.
+    /// leave the copy. [`Record::running`] is already saved; what it writes is saved
+    /// before each batch ([`Worker::note_written`]), and afterwards only that counts as
+    /// its doing in the copy's stat, so an edit made in the copy meanwhile still shows
+    /// as a change of the copy. A cancel stops it, with a report saying so.
     fn resync(&mut self) {
         let skipped = self.skipped();
         let Some(record) = self.record.clone() else {
@@ -1487,6 +1845,7 @@ impl Worker {
             }
             return;
         };
+        self.written = Some(BTreeSet::new());
         // A panic is reported like any other stop, so the app is never left waiting.
         let result = catch_unwind(AssertUnwindSafe(|| -> Result<Verdict, Stop> {
             let now = tree::stats(&self.source, &skipped, &*self.cancel)?;
@@ -1499,21 +1858,25 @@ impl Worker {
             self.verify_rounds(&dest, before, changes)
         }))
         .unwrap_or_else(|_| Err(Stop::Fatal("internal error".into())));
+        let written = self.written.take().unwrap_or_default();
         let old = record.report.clone();
+        let cut = |message: String| {
+            let mut checks = not_run_checks();
+            checks[3] = CheckResult::from_problems(
+                Check::Unchanged,
+                vec![Problem {
+                    path: None,
+                    message,
+                }],
+            );
+            checks.to_vec()
+        };
         let mut checks = match &result {
             Ok(verdict) => verdict.checks.to_vec(),
             Err(Stop::Fatal(message)) => {
-                let mut checks = not_run_checks();
-                checks[2] = CheckResult::from_problems(
-                    Check::NothingSkipped,
-                    vec![Problem {
-                        path: None,
-                        message: format!("The re-sync stopped: {message}"),
-                    }],
-                );
-                checks.to_vec()
+                cut(format!("The re-sync stopped: {message}. {RESYNC_CUT}"))
             }
-            Err(Stop::Cancelled) => not_run_checks().to_vec(),
+            Err(Stop::Cancelled) => cut(format!("You stopped the re-sync. {RESYNC_CUT}")),
         };
         checks.extend(
             old.checks
@@ -1524,8 +1887,7 @@ impl Worker {
         let diff = result.as_ref().ok().map(|v| &v.diff);
         let mut report = self.build_report(checks, diff, old.install.clone(), old.history.clone());
         report.started_at = old.started_at;
-        // The copy was as checked when the re-sync began, so what it is now is ours.
-        let copy_stats = self.copy_state(&self.dest).entries;
+        let copy_stats = self.resync_stats(&record.copy_stats, &written);
         let snapshot = self.snapshot.clone();
         if let Some(record) = &mut self.record {
             record.snapshot = snapshot.unwrap_or_else(|| record.snapshot.clone());
@@ -1533,28 +1895,127 @@ impl Worker {
                 record.final_stats = verdict.final_stats.clone();
             }
             record.copy_stats = copy_stats;
+            record.running = None;
+            record.resync_written.clear();
         }
         self.save_record_report(&report);
         self.save_report(&report);
         self.ready(report);
     }
 
-    /// `migrateFinish`. True when the migration has ended.
-    fn finish(&mut self, request: Id, action: FinishAction) -> bool {
-        let report = self.report.clone();
-        if self.deleting && action != FinishAction::Delete {
-            self.refuse(Command::Finish(request, action), DELETING);
-            return false;
+    /// While a re-sync runs: adds `paths` to what it wrote, and saves that before they
+    /// are written (normalising reports its rewrites after the fact, so a restart in the
+    /// middle of it leaves them counted as changes to the copy: the safe side).
+    fn note_written<'a>(&mut self, paths: impl IntoIterator<Item = &'a str>) {
+        let Some(written) = &mut self.written else {
+            return;
+        };
+        let before = written.len();
+        written.extend(paths.into_iter().map(str::to_owned));
+        if written.len() == before {
+            return;
         }
+        let all: Vec<String> = written.iter().cloned().collect();
+        if let Some(record) = &mut self.record {
+            record.resync_written = all;
+        }
+        self.save_record();
+    }
+
+    /// The copy's stat after a re-sync that wrote `written`, from its stat before
+    /// (`old`): the re-sync's own paths as they are now, everything else as before,
+    /// so that a change someone else made to the copy meanwhile still shows. The
+    /// re-sync's own are the paths in `written` and under them, what normalising
+    /// rewrites in each repo's git folder (the index, by its entries, and the config)
+    /// and new loose objects.
+    fn resync_stats(&self, old: &[StatEntry], written: &BTreeSet<String>) -> Vec<StatEntry> {
+        let indexes: BTreeSet<String> = self
+            .snapshot()
+            .git
+            .iter()
+            .filter_map(|g| gitx::index_path(&self.dest, &g.path))
+            .flat_map(|index| {
+                let config = match index.rsplit_once('/') {
+                    Some((dir, _)) => format!("{dir}/config"),
+                    None => "config".to_owned(),
+                };
+                [index, config]
+            })
+            .collect();
+        let ours = |path: &str| {
+            let mut prefix = String::new();
+            for part in path.split('/') {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(part);
+                if written.contains(&prefix) {
+                    return true;
+                }
+            }
+            let parts: Vec<&str> = path.split('/').collect();
+            indexes.contains(path)
+                || parts
+                    .iter()
+                    .position(|p| *p == ".git")
+                    .is_some_and(|i| parts[i + 1..].contains(&"objects"))
+        };
+        let now = self.copy_state(&self.dest);
+        let mut stats: BTreeMap<RelPath, StatEntry> = old
+            .iter()
+            .filter(|e| !ours(e.path.as_str()))
+            .map(|e| (e.path.clone(), e.clone()))
+            .collect();
+        for entry in now.entries {
+            if ours(entry.path.as_str()) {
+                stats.insert(entry.path.clone(), entry);
+            }
+        }
+        stats.into_values().collect()
+    }
+
+    /// `migrateFinish`. Once it has done its part it answers through
+    /// [`Update::Finished`]; the same action again (the config could not be written)
+    /// only repeats that.
+    fn finish(&mut self, request: Id, action: FinishAction) {
+        if let Some(done) = self.finished {
+            if done != action {
+                let why = format!(
+                    "the migration is finishing ({}); send that migrateFinish again",
+                    action_name(done)
+                );
+                self.refuse(Command::Finish(request, action), &why);
+                return;
+            }
+        } else if let Err(why) = self.finish_here(action) {
+            self.refuse(Command::Finish(request, action), &why);
+            return;
+        }
+        // Keep changed nothing here, so another answer may still follow it.
+        if action != FinishAction::Keep {
+            self.finished = Some(action);
+        }
+        self.send(Update::Finished {
+            request,
+            id: self.id.clone(),
+            action,
+            source: self.source.clone(),
+            dest: self.dest.clone(),
+        });
+    }
+
+    /// The worker's part of `migrateFinish`, or why it is refused.
+    fn finish_here(&mut self, action: FinishAction) -> Result<(), String> {
+        let copy_gone = self.placed && self.copy_missing();
         match action {
             FinishAction::Delete => {
                 if !self.deleting {
-                    self.refuse(
-                        Command::Finish(request, action),
-                        "send migrateBeginDelete first; the original may only go once it passes",
+                    return Err(
+                        "send migrateBeginDelete first; the original may only go once it passes"
+                            .into(),
                     );
-                    return false;
                 }
+                let report = self.report.clone();
                 if let (Some(record), Some(report)) = (&self.record, &report) {
                     if report.history_ok() {
                         let kept = history::remove_originals(
@@ -1578,47 +2039,56 @@ impl Worker {
                 }
             }
             FinishAction::Keep => {
+                if self.deleting {
+                    return Err(DELETING.into());
+                }
                 if !self.placed {
-                    self.refuse(
-                        Command::Finish(request, action),
-                        "the checks failed, so there is no copy to keep",
-                    );
-                    return false;
+                    return Err("the checks failed, so there is no copy to keep".into());
+                }
+                if copy_gone {
+                    return Err(format!(
+                        "The copy at {} is gone, so there is nothing to keep; end the move with discard.",
+                        self.dest_str()
+                    ));
                 }
             }
+            FinishAction::Discard if copy_gone => {
+                // Nothing left to delete: only forgotten. The transcript copies made for
+                // it go (their originals stay); the install backup stays unless the
+                // original is there untouched, since it may hold the only version left
+                // of what the install changed.
+                self.remove_history_copies();
+                if self.install_backup.is_some() && !self.deleting && !self.source_missing() {
+                    let _ = fsx::remove_any(&store::backup_dir(&self.report_path));
+                }
+                self.placed = false;
+            }
             FinishAction::Discard => {
+                if self.deleting {
+                    return Err(DELETING.into());
+                }
                 if self.placed {
                     if self.source_missing() {
-                        let why = format!("{} It won't be deleted.", self.source_gone_message());
-                        self.refuse(Command::Finish(request, action), &why);
-                        return false;
+                        return Err(format!(
+                            "{} It won't be deleted.",
+                            self.source_gone_message()
+                        ));
                     }
                     let changed = self.copy_changes();
-                    if !changed.is_empty() && changed != ["."] {
-                        let why = format!(
+                    if !changed.is_empty() {
+                        return Err(format!(
                             "The copy at {} changed since it was checked ({}), so it may hold work \
                              of yours; Refract won't delete it. Delete it yourself if you meant to, \
                              or keep both.",
                             self.dest_str(),
                             sample(&changed)
-                        );
-                        self.refuse(Command::Finish(request, action), &why);
-                        return false;
+                        ));
                     }
+                    self.discard_placed();
                 }
-                self.discard();
             }
         }
-        store::remove_record(&self.id);
-        store::unmark_temp(&self.id);
-        self.send(Update::Finished {
-            request,
-            id: self.id.clone(),
-            action,
-            source: self.source.clone(),
-            dest: self.dest.clone(),
-        });
-        true
+        Ok(())
     }
 
     fn test_hook(&self, point: &str, round: u64, copy: &Path) {
@@ -1633,6 +2103,21 @@ impl Worker {
             .arg(&self.source)
             .status();
     }
+}
+
+fn action_name(action: FinishAction) -> &'static str {
+    match action {
+        FinishAction::Delete => "delete",
+        FinishAction::Keep => "keep",
+        FinishAction::Discard => "discard",
+    }
+}
+
+/// With the checks and an unrun history check, the report of a copy just placed.
+fn not_moved(checks: &[CheckResult; 4]) -> Vec<CheckResult> {
+    let mut checks = checks.to_vec();
+    checks.push(CheckResult::not_run(Check::History));
+    checks
 }
 
 fn file_name(path: &Path) -> String {

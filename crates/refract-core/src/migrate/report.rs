@@ -68,7 +68,10 @@ impl Check {
                  disk."
             }
             Check::GitState => {
-                "Discard the copy and retry. If it fails again, run git fsck on the original."
+                "If a file says it was kept byte for byte, it mixes line endings or a git \
+                 filter changes it, so git in WSL shows it as modified: on Windows, give it \
+                 one kind of line ending throughout, then retry. Otherwise discard the copy \
+                 and retry; if it fails again, run git fsck on the original."
             }
             Check::NothingSkipped => {
                 "Close any program using these files, then discard the copy and retry."
@@ -169,6 +172,9 @@ pub enum InstallStatus {
     TimedOut,
     /// The tool is not installed in WSL; the step's `installHint` says how to get it.
     ToolMissing,
+    /// Stopped before it finished, or never started: the move was cancelled once the
+    /// copy was in place, or the helper stopped while it ran.
+    Cancelled,
 }
 
 /// The result of one install step. A failed install never fails the migration.
@@ -276,6 +282,10 @@ pub struct Report {
     /// Dialog warnings carried over, such as a Windows-tool project.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// The copy was put in place at the destination (a failed check before that
+    /// deletes it): `migrateFinish` `keep` is possible even when a later check failed.
+    #[serde(default)]
+    pub placed: bool,
 }
 
 impl Report {
@@ -334,6 +344,7 @@ mod tests {
             history: HistoryMoved::default(),
             linux_git: false,
             warnings: vec![],
+            placed: false,
         }
     }
 

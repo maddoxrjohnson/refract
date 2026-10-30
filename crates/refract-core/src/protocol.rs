@@ -114,7 +114,12 @@ pub enum Method {
     Migrate(MigrateParams),
     /// Ends a migration that is ready (see [`FinishAction`]): answered with `null`.
     MigrateFinish(MigrateFinishParams),
-    /// Stops a migration before it is ready and deletes its copy: answered with `null`.
+    /// Stops a running migration: answered with a [`CancelOutcome`]. Before the copy
+    /// is placed, the temporary copy is deleted and the migration ends (`ended: true`).
+    /// Once the copy is placed (from the first `installing` progress on), and during a
+    /// `migrateResync`, the copy is never deleted: the step stops, a fresh
+    /// [`Event::MigrateReady`] follows (or went out just before), and the migration
+    /// waits for `migrateFinish` (`ended: false`).
     MigrateCancel(MigrateCancelParams),
     /// Runs check 4 again on a migration whose report allows deleting the original (or
     /// that is deleting it), and checks that the placed copy is as it was checked:
@@ -123,13 +128,14 @@ pub enum Method {
     /// Sent right before the app recycles or deletes anything of the original: runs
     /// the recheck and, when it is safe ([`Recheck::safe`]), puts the migration in the
     /// *deleting* state, saved in its state file, and answers `ok: true`; see
-    /// [`BeginDelete`]. Idempotent: in the deleting state it runs the same test again
-    /// (a partly deleted original shows as removals). In the deleting state
-    /// `migrateResync`, `migrateFinish` `keep` and `discard`, and `migrateCancel` are
-    /// refused ("The original is being deleted."); only `migrateFinish` `delete`, sent
-    /// once the original is gone, ends it, and `migrateFinish` `delete` is refused
-    /// outside it. Refused unless the report allows deleting.
-    MigrateBeginDelete(MigrateIdParams),
+    /// [`BeginDelete`] and [`MigrateBeginDeleteParams`]. Idempotent: in the deleting
+    /// state it runs the same test again (a partly deleted original shows as
+    /// removals). In the deleting state `migrateResync`, `migrateFinish` `keep`, and
+    /// `migrateCancel` are refused ("The original is being deleted."), and
+    /// `migrateFinish` `discard` unless the copy is gone; `migrateFinish` `delete`,
+    /// sent once the original is gone, ends it, and is refused outside it. Refused
+    /// unless the report allows deleting.
+    MigrateBeginDelete(MigrateBeginDeleteParams),
     /// Re-copies what changed in the original since the report into the placed copy and
     /// checks it again: answered with `null`, then [`Event::MigrateProgress`] and a fresh
     /// [`Event::MigrateReady`]. Refused in the deleting state, when the original folder
@@ -193,6 +199,8 @@ pub enum Reply {
     BeginDelete(BeginDelete),
     /// The result of `migratePending`: the pending migrations, oldest first.
     PendingMigrations(Vec<PendingMigration>),
+    /// The result of `migrateCancel`.
+    Cancelled(CancelOutcome),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -348,11 +356,40 @@ pub struct MigrationTicket {
     pub id: String,
 }
 
-/// Params of `migrateRecheck`, `migrateBeginDelete` and `migrateResync`.
+/// Params of `migrateRecheck` and `migrateResync`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MigrateIdParams {
     pub id: String,
+}
+
+/// Params of `migrateBeginDelete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrateBeginDeleteParams {
+    pub id: String,
+    /// The app (Windows) no longer sees the original folder. When the helper can't see
+    /// it either, it is gone; when only the helper can't (its drive is not mounted in
+    /// WSL), nothing of it was checked, so the deleting state is not entered: `ok` is
+    /// false with `sourceMissing`. Missing means `false`.
+    #[serde(default)]
+    pub source_gone: bool,
+    /// Only in the deleting state: delete the rest even though the copy's version of
+    /// the paths in `copyChanged` differs from the original's (the copy keeps its
+    /// version). Never skips `changed`, `unreadable`, `busyAgents`, a hidden original
+    /// or a copy that is gone.
+    #[serde(default)]
+    pub force: bool,
+}
+
+/// The result of `migrateCancel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CancelOutcome {
+    /// The temporary copy was deleted and the migration is gone. False: the copy was
+    /// already in place (or a re-sync was running), so it stays, and the migration's
+    /// report comes (or came) as `migrateReady`.
+    pub ended: bool,
 }
 
 /// What `migrateFinish` does with a migration whose report is ready. Each forgets the
@@ -370,13 +407,15 @@ pub enum FinishAction {
     Delete,
     /// Both stay: the old path is added to `hidden` in `agent.toml`, so its gem goes,
     /// and the new path to `extra` when no root covers it. The old transcripts stay.
-    /// Refused when the checks failed, since then there is no copy to keep, and in the
-    /// deleting state.
+    /// Refused when the copy was never placed (its checks failed) or is gone, and in
+    /// the deleting state.
     Keep,
     /// The copy is deleted, and the transcripts copied for it that are unchanged since.
     /// The original is as it was. Refused in the deleting state, when the original
     /// folder is gone (the copy is then the only one), and when the placed copy
-    /// changed since it was checked (it may hold work of yours).
+    /// changed since it was checked (it may hold work of yours). With the copy gone
+    /// (deleted by hand) it only forgets the migration, in any state and whatever
+    /// became of the original.
     Discard,
 }
 
@@ -439,9 +478,13 @@ pub struct PendingMigration {
     pub id: String,
     pub report: Box<Report>,
     /// In the deleting state (see [`Method::MigrateBeginDelete`]): only
-    /// `migrateFinish` `delete` ends it.
+    /// `migrateFinish` `delete` ends it, or `discard` once the copy is gone.
     #[serde(default)]
     pub deleting: bool,
+    /// The placed copy is gone (deleted by hand): `migrateFinish` `discard` then only
+    /// forgets the migration, whatever became of the original.
+    #[serde(default)]
+    pub copy_missing: bool,
 }
 
 /// Params of `stopAgent`: the repo (as `getRepo` takes it) and the live session to
@@ -1250,6 +1293,8 @@ mod tests {
                 },
             }),
             Reply::PendingMigrations(vec![]),
+            Reply::Cancelled(CancelOutcome { ended: true }),
+            Reply::Cancelled(CancelOutcome { ended: false }),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
@@ -1530,6 +1575,7 @@ mod tests {
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
+            placed: true,
         };
         let ready = Event::MigrateReady {
             id: "m-1".into(),
@@ -1548,7 +1594,6 @@ mod tests {
     fn migration_follow_up_messages_round_trip() {
         for (method, value) in [
             ("migrateRecheck", json!({"id": "m-1"})),
-            ("migrateBeginDelete", json!({"id": "m-1"})),
             ("migrateResync", json!({"id": "m-1"})),
         ] {
             let line = json!({"id": 1, "method": method, "params": value}).to_string();
@@ -1556,12 +1601,36 @@ mod tests {
             let params = MigrateIdParams { id: "m-1".into() };
             let expected = match method {
                 "migrateRecheck" => Method::MigrateRecheck(params),
-                "migrateBeginDelete" => Method::MigrateBeginDelete(params),
                 _ => Method::MigrateResync(params),
             };
             assert_eq!(request.method, expected);
             assert_eq!(round_trip(&request)["params"], value);
         }
+        // An older app sends only the id: neither gone nor forced.
+        let begin =
+            parse_request(r#"{"id":1,"method":"migrateBeginDelete","params":{"id":"m-1"}}"#);
+        assert_eq!(
+            begin.unwrap().method,
+            Method::MigrateBeginDelete(MigrateBeginDeleteParams {
+                id: "m-1".into(),
+                source_gone: false,
+                force: false,
+            })
+        );
+        let begin = MigrateBeginDeleteParams {
+            id: "m-1".into(),
+            source_gone: true,
+            force: true,
+        };
+        assert_eq!(
+            round_trip(&begin),
+            json!({"id": "m-1", "sourceGone": true, "force": true})
+        );
+        let cancelled = Message::Response(Response::ok(
+            4,
+            Reply::Cancelled(CancelOutcome { ended: false }),
+        ));
+        assert_eq!(round_trip(&cancelled)["result"], json!({"ended": false}));
         let pending = parse_request(r#"{"id":2,"method":"migratePending","params":{}}"#);
         assert_eq!(pending.unwrap().method, Method::MigratePending);
         let stop = parse_request(
@@ -1660,6 +1729,7 @@ mod tests {
             history: Default::default(),
             linux_git: false,
             warnings: vec![],
+            placed: true,
         };
         for migrations in [
             vec![],
@@ -1667,6 +1737,7 @@ mod tests {
                 id: "m-1".into(),
                 report: Box::new(report),
                 deleting: true,
+                copy_missing: true,
             }],
         ] {
             let pending = Message::Response(Response::ok(7, Reply::PendingMigrations(migrations)));

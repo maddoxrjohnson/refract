@@ -694,7 +694,8 @@ impl<W: Write> Server<W> {
                 }
             }
             Method::MigrateCancel(params) => match self.migrations.get(&params.id) {
-                Some(m) if m.phase == Phase::Running => {
+                // A re-sync stops to a report, like a placed copy's install.
+                Some(m) if matches!(m.phase, Phase::Running | Phase::Resyncing) => {
                     if m.cancel(id.clone()) {
                         return Ok(true);
                     }
@@ -725,7 +726,11 @@ impl<W: Write> Server<W> {
                 }
             }
             Method::MigrateBeginDelete(params) => {
-                let command = migrate::Command::BeginDelete(id.clone());
+                let command = migrate::Command::BeginDelete {
+                    request: id.clone(),
+                    source_gone: params.source_gone,
+                    force: params.force,
+                };
                 match self.send_to_ready_migration(&params.id, command, None) {
                     Ok(()) => return Ok(true),
                     Err(message) => Response::err(id, code::MIGRATE_FAILED, message),
@@ -749,10 +754,13 @@ impl<W: Write> Server<W> {
                     .values()
                     .filter(|m| m.phase == Phase::Ready)
                     .filter_map(|m| {
+                        let report = m.report.clone()?;
+                        let copy_missing = report.placed && !Path::new(&m.dest).is_dir();
                         Some(PendingMigration {
                             id: m.id.clone(),
-                            report: m.report.clone()?,
+                            report,
                             deleting: m.deleting,
+                            copy_missing,
                         })
                     })
                     .collect();
@@ -863,9 +871,15 @@ impl<W: Write> Server<W> {
                 source,
                 dest,
             } => {
-                self.migrations.remove(&id);
+                // The state file goes only once the config is written, so a failure
+                // (or a restart before it) leaves the migration to finish again.
                 let response = match self.finish_migration(action, &source, &dest)? {
-                    Ok(()) => Response::ok(request, Reply::Done),
+                    Ok(()) => {
+                        migrate::store::remove_record(&id);
+                        migrate::store::unmark_temp(&id);
+                        self.migrations.remove(&id);
+                        Response::ok(request, Reply::Done)
+                    }
                     Err(message) => Response::err(request, code::MIGRATE_FAILED, message),
                 };
                 self.send(&response)

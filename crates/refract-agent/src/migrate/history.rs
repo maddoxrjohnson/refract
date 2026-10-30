@@ -151,11 +151,16 @@ fn plan_dir(dir: &Path, old: &str, new: &str) -> Vec<(PathBuf, String, PathBuf)>
         .collect()
 }
 
-/// Copies the history of `old` to `new` in `projects`. `progress` gets (files done,
-/// files in all). Never overwrites: a file already at the copy's place is a problem.
-pub fn copy(projects: &Path, old: &str, new: &str, progress: &mut dyn FnMut(u64, u64)) -> Copied {
-    let mut copied = Copied::default();
-    let mut files: Vec<(PathBuf, PathBuf)> = Vec::new();
+/// What [`copy`] will copy: the folder pairs, and each file with its copy's path.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Plan {
+    pub moved: HistoryMoved,
+    pub files: Vec<(PathBuf, PathBuf)>,
+}
+
+/// Plans copying the history of `old` to `new` in `projects`; nothing is written.
+pub fn plan(projects: &Path, old: &str, new: &str) -> Plan {
+    let mut planned = Plan::default();
     let mut pairs: Vec<(String, String)> = Vec::new();
     for dir in candidates(projects, old) {
         for (original, to, rel) in plan_dir(&dir, old, new) {
@@ -167,16 +172,36 @@ pub fn copy(projects: &Path, old: &str, new: &str, progress: &mut dyn FnMut(u64,
             if !pairs.contains(&pair) {
                 pairs.push(pair);
             }
-            files.push((original, to_dir.join(rel)));
+            planned.files.push((original, to_dir.join(rel)));
         }
     }
     for (from, to) in pairs {
-        copied.moved.from_dirs.push(from);
-        copied.moved.to_dirs.push(to);
+        planned.moved.from_dirs.push(from);
+        planned.moved.to_dirs.push(to);
     }
-    let total = files.len() as u64;
+    planned
+}
+
+/// Copies the history of `old` to `new` in `projects`. `progress` gets (files done,
+/// files in all). Never overwrites: a file already at the copy's place is a problem.
+pub fn copy(projects: &Path, old: &str, new: &str, progress: &mut dyn FnMut(u64, u64)) -> Copied {
+    copy_planned(plan(projects, old, new), old, new, progress)
+}
+
+/// Copies what [`plan`] planned.
+pub fn copy_planned(
+    plan: Plan,
+    old: &str,
+    new: &str,
+    progress: &mut dyn FnMut(u64, u64),
+) -> Copied {
+    let mut copied = Copied {
+        moved: plan.moved,
+        ..Copied::default()
+    };
+    let total = plan.files.len() as u64;
     progress(0, total);
-    for (n, (from, to)) in files.into_iter().enumerate() {
+    for (n, (from, to)) in plan.files.into_iter().enumerate() {
         match copy_one(&from, &to, old, new, false) {
             Ok(file) => {
                 if is_transcript(&from) {
@@ -194,6 +219,46 @@ pub fn copy(projects: &Path, old: &str, new: &str, progress: &mut dyn FnMut(u64,
     copied
 }
 
+/// The planned copies (`(original, copy)`) a copy cut short did write: each copy that
+/// holds exactly what copying its original gives now, so that nobody wrote to it
+/// since. Others are left alone, and not returned.
+pub fn adopt(planned: &[(PathBuf, PathBuf)], old: &str, new: &str) -> Vec<HistoryFile> {
+    planned
+        .iter()
+        .filter_map(|(from, to)| {
+            let copy = fs::read(to).ok()?;
+            let (file, out) = render(from, to, old, new).ok()?;
+            (copy == out).then_some(file)
+        })
+        .collect()
+}
+
+/// Reads `from` and gives what its copy at `to` holds: rewritten when it is a
+/// transcript.
+fn render(from: &Path, to: &Path, old: &str, new: &str) -> Result<(HistoryFile, Vec<u8>), String> {
+    let meta = fs::metadata(from).map_err(|e| format!("Could not read it: {e}."))?;
+    let bytes = fs::read(from).map_err(|e| format!("Could not read it: {e}."))?;
+    let sha256 = fsx::sha256_bytes(&bytes);
+    let size = bytes.len() as u64;
+    let out = if is_transcript(from) {
+        let text = String::from_utf8(bytes).map_err(|_| "It is not UTF-8.".to_string())?;
+        let rewritten = rewrite_transcript(&text, old, new)?;
+        verify_transcript(&text, &rewritten, old, new)?;
+        rewritten.into_bytes()
+    } else {
+        bytes
+    };
+    let file = HistoryFile {
+        original: from.to_owned(),
+        copy: to.to_owned(),
+        size,
+        mtime_ns: fsx::mtime_ns(&meta),
+        sha256,
+        copy_sha256: fsx::sha256_bytes(&out),
+    };
+    Ok((file, out))
+}
+
 /// Copies one file of a project folder, rewriting it when it is a transcript, and
 /// returns what it copied. With `replace`, an existing copy is replaced (atomically);
 /// without, it is a problem.
@@ -207,18 +272,7 @@ fn copy_one(
     if !replace && fs::symlink_metadata(to).is_ok() {
         return Err(format!("{} already exists.", to.display()));
     }
-    let meta = fs::metadata(from).map_err(|e| format!("Could not read it: {e}."))?;
-    let bytes = fs::read(from).map_err(|e| format!("Could not read it: {e}."))?;
-    let sha256 = fsx::sha256_bytes(&bytes);
-    let size = bytes.len() as u64;
-    let out = if is_transcript(from) {
-        let text = String::from_utf8(bytes).map_err(|_| "It is not UTF-8.".to_string())?;
-        let rewritten = rewrite_transcript(&text, old, new)?;
-        verify_transcript(&text, &rewritten, old, new)?;
-        rewritten.into_bytes()
-    } else {
-        bytes
-    };
+    let (file, out) = render(from, to, old, new)?;
     if let Some(parent) = to.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("Could not create its folder: {e}."))?;
     }
@@ -243,15 +297,8 @@ fn copy_one(
         }
         return Err(message);
     }
-    let _ = fsx::set_mtime(to, fsx::mtime_ns(&meta));
-    Ok(HistoryFile {
-        original: from.to_owned(),
-        copy: to.to_owned(),
-        size,
-        mtime_ns: fsx::mtime_ns(&meta),
-        sha256,
-        copy_sha256: fsx::sha256_bytes(&out),
-    })
+    let _ = fsx::set_mtime(to, file.mtime_ns);
+    Ok(file)
 }
 
 /// True when the file at `path` has SHA-256 `sha256`.

@@ -386,6 +386,8 @@ pub struct Normalised {
     /// part of them, mixed line endings): rewriting them would lose what the blob
     /// does not hold. Check 1 then fails on them unless Linux git stores the same blob.
     pub kept: Vec<String>,
+    /// Tracked files rewritten as Linux git checks them out.
+    pub rewritten: Vec<String>,
 }
 
 /// Normalises the copied repo whose working tree is `dir` (spec §3.3): for each tracked
@@ -457,6 +459,7 @@ pub fn normalise(
         ));
     }
     let rewritten = smudge(dir, windows, &want, &index, &mut result, progress)?;
+    result.rewritten = rewritten.clone();
     let (skip, assume) = flagged(dir)?;
     let restat: Vec<String> = if restat_all {
         index
