@@ -161,7 +161,8 @@ test.describe("at 1280×800", () => {
     // compact and clear of the system widget above it.
     await expect(widget.getByRole("meter", { name: "5-hour limit" })).toHaveAttribute(
       "aria-valuetext",
-      /^\d+% used, resets \d\d:\d\d$/,
+      // A reset after midnight is shown with its weekday.
+      /^\d+% used, resets (\w{3} )?\d\d:\d\d$/,
     );
     await expect(widget.getByRole("meter", { name: "Weekly limit" })).toHaveAttribute(
       "aria-valuetext",
