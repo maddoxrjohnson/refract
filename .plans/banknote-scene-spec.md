@@ -124,7 +124,7 @@ Move dialog, demo terminal and badge, gem marks) moves to the palette:
 - CSS tokens in `ui.css` under `:root` (light) and `:root[data-theme="dark"]` plus
   `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }` (dark):
   `--bg` = edge, `--panel` = paper at 0.86 with a 14 px backdrop blur, `--line` = ink at 0.17,
-  `--fg` = ink, `--muted` = paper mixed 62% towards ink, `--on-fg` = paper, `--accent` = accent.
+  `--fg` = ink, `--muted` = paper mixed towards ink (78% light, 62% dark, the least that passes WCAG AA), `--on-fg` = paper, `--accent` = accent.
 - **Red means "needs you"**: waiting, stopped mid-task, failures, uncommitted-changes ring, the
   "Go to the running agent" hint when waiting. Everything else is ink. The old blue glass, amber and
   halo colours go away.

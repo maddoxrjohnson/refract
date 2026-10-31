@@ -1,38 +1,38 @@
 # Refract
 
-A launcher for Claude Code agents. Every repo you work on is a glass gem in one 3D scene; pick one, press Enter, and a bare VS Code window opens on it with `claude` already running in the terminal.
+A launcher for Claude Code agents. Every repo you work on is an engraved cut stone in one 3D scene; pick one, press Enter, and a bare VS Code window opens on it with `claude` already running in the terminal.
 
 **[Try the web demo](https://maddoxrjohnson.github.io/refract/)** (invented repos; launching only shows a pretend terminal).
 
-![Hovering over gems, filtering by name, zooming into a repo and launching an agent in the web demo](docs/media/demo.gif)
+![Hovering over stones, filtering by name, zooming into a repo and launching an agent in the web demo](docs/media/demo.gif)
 
-## What the gems show
+## What the stones show
 
-Each repo is a rough-cut glass gem, frozen mid-burst. The heaviest repos sit near the centre.
+Each repo is a cut stone drawn like the engraving on a banknote, lying on a sheet of paper. The heaviest repos sit near the centre. Light mode is green ink on pale paper, dark mode gold ink on deep green; Refract follows the Windows app mode unless you fix one in settings.
 
 | You see | It means |
 |---|---|
 | Size | How big and busy the repo is: repository size blended with commits in the last 30 days |
-| Tint | Main language |
-| Blue halo | Uncommitted changes |
-| Pulsing amber edges | An agent session stopped before it finished |
-| Gentle shimmer | An agent is working in the repo right now (needs the status hook) |
-| Slow amber pulse | An agent is waiting for your input (needs the status hook) |
-| Dimmed | On GitHub or GitLab but not cloned yet |
+| Stone and colour wash | Main language (TypeScript is sapphire, Python citrine, Rust mandarin garnet, ...) |
+| Red ring on the paper | Uncommitted changes |
+| Chipped corner | An agent session stopped before it finished |
+| Rosette turning | An agent is working in the repo right now (needs the status hook) |
+| Slow red pulse | An agent is waiting for your input (needs the status hook) |
+| Stippled | On GitHub or GitLab but not cloned yet |
 
-![The scene with one gem in focus](docs/media/scene.png)
+![The scene with one stone in focus](docs/media/scene.png)
 
 ## Features
 
 - **Win+Alt+Space** shows or hides Refract from anywhere; it lives in the tray and draws nothing while hidden.
-- **Magnet focus:** the gem nearest the pointer lifts and shows its name, host, language and state.
-- **Click to zoom** into a gem and see its branch, ahead/behind, changed files, last commit, last agent session, open pull or merge requests and CI status.
+- **Magnet focus:** the stone nearest the pointer lifts and shows its name, host, language and state.
+- **Click to zoom** into a stone and see its branch, ahead/behind, changed files, last commit, last agent session, open pull or merge requests and CI status.
 - **Enter to launch.** A VS Code window opens in WSL with only a terminal, running a new agent. If the repo is already open, that window comes forward and a new terminal tab opens there with the agent. A repo with an unfinished session asks whether to resume it or start fresh, and preselects the sensible choice.
-- **Type to filter** by name; arrow keys move between gems.
-- **GitHub and GitLab** repos you haven't cloned appear dimmed; launching one clones it into `~/projects` first.
+- **Type to filter** by name; arrow keys move between stones.
+- **GitHub and GitLab** repos you haven't cloned appear stippled; launching one clones it into `~/projects` first.
 - **Status hook (optional).** One small script added to Claude Code's settings tells Refract when an agent is working or waiting on you. Removing it restores your settings byte for byte if nothing else changed them since it was installed; otherwise it removes only Refract's entries and leaves the rest alone.
 - **Widgets:** system load (with Refract's own share) and Claude Code token use today, over the last 7 days and in the last 5 hours, added up from Claude Code's local session files, with an optional cost estimate at API list prices from a price table you can edit, and the 5-hour and weekly plan-limit percentages when your Claude Code status line relays them to `~/.claude/usage-state.json` (see [plan limits](docs/architecture.md#plan-limits) for the file's format).
-- **Graphics levels** (Low, Medium, High) chosen automatically from frame times and how busy the GPU is with other programs.
+- **Graphics levels** (Low, Medium, High) chosen automatically from frame times and how busy the GPU is with other programs. They change resolution, anti-aliasing and frame rate, never the look.
 
 ## How it works
 

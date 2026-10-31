@@ -1,11 +1,11 @@
 # Refract: product and technical spec
 
 Status: approved for build, 2026-10-29.
-Interactive mockup of the chosen scene: `docs/mockups/frozen-shatter.html` (open it in a browser).
+Interactive mockup of the chosen scene: `docs/mockups/gem-studies.html` (open it in a browser; it opens on Banknote). The first scene's mockup is `docs/mockups/frozen-shatter.html`.
 
 ## 1. What Refract is
 
-Refract is a small desktop launcher for people who run coding agents across many repositories. It shows every project you work on as a cut-glass gem floating in 3D. A gem's size, colour and glow tell you about the repo at a glance. Choose a gem and press Enter, and Refract opens a Claude Code session in that repo, inside a VS Code window that contains nothing but the terminal.
+Refract is a small desktop launcher for people who run coding agents across many repositories. It shows every project you work on as an engraved cut stone on a sheet of paper, in 3D. A stone's size, colour and marks tell you about the repo at a glance. Choose a stone and press Enter, and Refract opens a Claude Code session in that repo, inside a VS Code window that contains nothing but the terminal.
 
 If a repo has uncommitted work, or an earlier agent session stopped before it finished, Refract offers to resume that conversation instead of starting a new one.
 
@@ -34,27 +34,28 @@ Non-goals for version 1
 - Win+Alt+Space shows or hides the window from anywhere. (Win+Shift+Space was the first choice, but Windows reserves it for switching input languages.) Clicking the tray icon does the same.
 - When hidden, Refract stops rendering completely.
 
-### 3.2 The scene: Frozen shatter
+### 3.2 The scene: Banknote
 
-Every project is a rough-cut glass gem, frozen mid-burst like glass a moment after it broke. The heaviest projects sit near the centre and lighter ones drift toward the edges. The camera always fits every gem in view. Moving the cursor shifts the viewpoint slightly, so gems hidden behind others come into sight.
+Every project is a cut stone drawn like the security engraving on a banknote: fine wavy line-work on each facet, a guilloche rosette printed on the sheet under it, and a pale wash of colour. The stones lie on a sheet of paper seen from about 56° above, heaviest near the centre. When Refract opens, the stones and a scatter of splinters burst from the centre and settle on the sheet; then each stone turns slowly. The camera always fits every stone in view, and moving the cursor tilts the view slightly. (The first scene, Frozen shatter, used refracting glass; see decision 0017.)
 
-How a gem encodes its repo:
+How a stone encodes its repo:
 
 | Property | Meaning |
 |---|---|
 | Size | Mass: a blend of repository size and commits in the last 30 days, log-scaled and normalised across your repos |
-| Tint | The repo's main language |
-| Blue halo | Uncommitted changes |
-| Pulsing amber edges | An agent session stopped before it finished |
-| Gentle shimmer | An agent is working in this repo right now (requires the status hook, §6) |
-| Slow amber pulse | An agent is waiting for your input (requires the status hook) |
-| Dimmed | The repo exists on GitHub or GitLab but is not cloned locally |
+| Colour wash and stone | The repo's main language (TypeScript is sapphire, Python citrine, Rust mandarin garnet, and so on) |
+| Cut | Fixed per repo, so a repo is recognisable by shape |
+| Red ring on the sheet | Uncommitted changes |
+| Chipped corner | An agent session stopped before it finished |
+| Rosette turns, stone turns faster | An agent is working in this repo right now (requires the status hook, §6) |
+| Slow red pulse | An agent is waiting for your input (requires the status hook) |
+| Stippled instead of engraved | The repo exists on GitHub or GitLab but is not cloned locally |
 
-The glass uses a custom refraction shader. Each gem bends the scene behind it, including its own lit core, splits light into a slight rainbow at its edges, and catches glints on its facets as it turns.
+Red always means that something needs you. Light mode is green ink on pale paper; dark mode is gold ink on deep green. Refract follows the Windows app mode, and settings can fix it to Light or Dark. The panels use the same paper and ink.
 
 ### 3.3 Finding and choosing a project
 
-- **Magnet focus.** The gem nearest the cursor (within about 130 px) is focused: it lifts, brightens and shows a small label with its name, host, language and state. You never need to aim exactly.
+- **Magnet focus.** The gem nearest the cursor (within about 130 px) is focused: it lifts, grows slightly and shows a small label with its name, host, language and state. You never need to aim exactly.
 - **Click to zoom.** Clicking a gem zooms the camera to it and opens the detail panel.
 - **Enter to launch.** With a gem zoomed, Enter launches (§4). Escape zooms back out.
 - **Keyboard.** Typing filters gems by name. The arrow keys move focus between gems. Enter on a focused gem zooms, and Enter again launches.
@@ -71,20 +72,20 @@ Shown next to the zoomed gem:
 
 ### 3.5 Widgets
 
-There are two small glass widgets in the corners of the scene. Both update about every 2 seconds, and only while the window is visible.
+There are two small paper widgets in the corners of the scene. Both update about every 2 seconds, and only while the window is visible.
 
 - **System:** CPU, memory and GPU use, plus Refract's own share, so you can see that Refract is cheap to run.
 - **Claude usage:** tokens used today, in the last 7 days and in a rolling 5-hour window, and how many agents are running now. Hovering shows a per-repo breakdown. The numbers are added up from Claude Code's local session files, so they cost nothing to collect. An optional cost estimate uses a pricing table you can edit. Plan-limit percentages are shown only if Claude Code exposes them through an official local source. Refract never guesses them.
 
 ### 3.6 Graphics quality
 
-There are three levels. Refract chooses one automatically, and you can override it in settings.
+There are three levels. Refract chooses one automatically, and you can override it in settings. The look is the same at every level.
 
-| Level | Refraction | Glow | Depth of field | Resolution | Frame cap |
-|---|---|---|---|---|---|
-| Low | Single sample, background at half resolution | Off | Off | 1× | 30 fps |
-| Medium | 3-sample rainbow split, soft glints | On | Off | up to 1.5× | 30 fps |
-| High | 12-sample dispersion, sharp glints | On | On | up to 2× | 60 fps |
+| Level | Resolution | Anti-aliasing | Splinters | Frame cap |
+|---|---|---|---|---|
+| Low | 1× | Off | 40 | 30 fps, and stones do not turn |
+| Medium | up to 1.5× | 4× multisampling | 90 | 30 fps |
+| High | up to 2× | 4× multisampling | 90 | 60 fps |
 
 Automatic choice:
 - Refract reads system-wide GPU use from Windows' performance counters every 2 seconds while visible. If other programs are using more than about 60% of the GPU, as a game or a render would, Refract drops to Low.
@@ -124,7 +125,7 @@ One option is preselected so that Enter accepts it:
 
 ### 4.4 Repos that aren't cloned yet
 
-A dimmed gem's detail panel shows **Clone and launch**. It clones into `~/projects/<repo-name>` in WSL, then launches a new agent.
+A stippled (not cloned) stone's detail panel shows **Clone and launch**. It clones into `~/projects/<repo-name>` in WSL, then launches a new agent.
 
 ## 5. Which projects appear
 
