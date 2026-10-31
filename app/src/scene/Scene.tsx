@@ -237,7 +237,7 @@ interface LoopState {
   /** When the last drawn frame started, and whether it asked the ticker for another. */
   lastStart: number;
   followUp: boolean;
-  /** Splinters still flying, and the layout radius and mesh they were last placed for. */
+  /** Splinters still flying, the layout radius they sit at (eased; NaN before the opening), and their mesh. */
   shardsLive: boolean;
   shardsRadius: number;
   shardsMesh: InstancedMesh | null;
@@ -251,7 +251,6 @@ interface GemFrame {
   T: number;
   clock: number;
   openAt: number;
-  ambient: boolean;
   reduced: boolean;
   focused: string | null;
   matches: ReadonlySet<string> | null;
@@ -262,6 +261,7 @@ interface GemFrame {
 }
 
 const tmp = new Vector3();
+const composerSize = new Vector2();
 const targetGoal = new Vector3();
 const look = new Vector3();
 const mPos = new Vector3();
@@ -294,8 +294,9 @@ const SHARDS = (() => {
 
 function updateGem(this: GemFrame, g: GemHandle) {
   if (Number.isNaN(g.born)) {
-    g.born = this.clock;
-    g.burst = this.clock === this.openAt;
+    // A gem first seen already leaving (it should keep its handle, but in case) only fades.
+    g.born = g.leaving ? -Infinity : this.clock;
+    g.burst = !g.leaving && this.clock === this.openAt;
   }
   const fGoal = !g.leaving && g.path === this.focused ? 1 : 0;
   const mGoal = !this.matches || this.matches.has(g.path) ? 1 : 0;
@@ -338,22 +339,31 @@ function updateGem(this: GemFrame, g: GemHandle) {
   }
   g.spot.position.set(g.home.x, 0, g.home.z);
   g.spot.scale.setScalar(g.life);
-  const T = this.ambient ? this.T : 0;
+  // Ambient time only runs while motion is on, so turning off motion freezes everything
+  // where it is rather than snapping it back.
+  const T = this.T;
   g.spinner.rotation.y = g.phase + T * (g.working ? TURN_WORKING : TURN) * g.spinDir;
 
   const fade = (FILTER_FADE + (1 - FILTER_FADE) * g.m) * g.life;
   const su = g.stone.uniforms;
   su.fade.value = fade;
+  // Without any motion yet (reduced motion or Low from the start) the wash holds its still
+  // value; once time runs it eases into the pulse over the first second.
+  const still = Math.max(0, 1 - T);
   su.accentAmt.value = g.waiting
-    ? WAIT_BASE + WAIT_SWING * (this.ambient ? 0.5 + 0.5 * Math.sin(T * 1.57 + g.phase) : WAIT_STILL)
+    ? WAIT_BASE +
+      WAIT_SWING * (still * WAIT_STILL + (1 - still) * (0.5 + 0.5 * Math.sin(T * 1.57 + g.phase)))
     : 0;
   g.rosette.uniforms.fade.value = fade;
   g.rosette.uniforms.spin.value = g.working ? T * ROSETTE_SPIN : 0;
   if (g.ring) {
     // Rings of stones in the opening draw in partway through it; later ones at once.
     if (Number.isNaN(g.ringAt)) {
-      g.ringAt =
-        g.burst && this.clock < this.openAt + RING_AT ? this.openAt + RING_AT : this.clock;
+      g.ringAt = g.leaving
+        ? -Infinity
+        : g.burst && this.clock < this.openAt + RING_AT
+          ? this.openAt + RING_AT
+          : this.clock;
     }
     const draw = this.reduced ? 1 : clamp01((this.clock - g.ringAt) / RING_S);
     if (draw < 1) this.settling = true;
@@ -550,6 +560,10 @@ function SceneContents(props: ContentsProps) {
     const output = new OutputPass();
     c.addPass(render);
     c.addPass(output);
+    // Sized now, so the first frame after a tier change does not render at 1×1.
+    gl.getSize(composerSize);
+    c.setPixelRatio(gl.getPixelRatio());
+    c.setSize(composerSize.x, composerSize.y);
     setComposer(c);
     return () => {
       setComposer(null);
@@ -587,14 +601,13 @@ function SceneContents(props: ContentsProps) {
     lastStart: 0,
     followUp: false,
     shardsLive: false,
-    shardsRadius: 0,
+    shardsRadius: Number.NaN,
     shardsMesh: null,
     gem: {
       k: 0,
       T: 0,
       clock: 0,
       openAt: Number.NaN,
-      ambient: false,
       reduced: false,
       focused: null,
       matches: null,
@@ -750,7 +763,6 @@ function SceneContents(props: ContentsProps) {
     gf.T = s.time;
     gf.clock = s.clock;
     gf.openAt = s.openAt;
-    gf.ambient = ambient;
     gf.reduced = reducedMotion;
     gf.focused = focused;
     gf.matches = matches;
@@ -768,17 +780,26 @@ function SceneContents(props: ContentsProps) {
       });
     }
 
-    // Splinters fly out with the opening, then rest; placed again only if the layout grows.
+    // Splinters fly out with the opening, then rest; when the layout grows or shrinks they
+    // ease out or in with it.
     const opened = !Number.isNaN(s.openAt);
     shards.visible = opened;
-    if (opened && (s.shardsLive || s.shardsRadius !== radius || s.shardsMesh !== shards)) {
+    if (opened && Number.isNaN(s.shardsRadius)) s.shardsRadius = radius;
+    const shardsMoving = Math.abs(radius - s.shardsRadius) > 1e-3;
+    if (shardsMoving) {
+      s.shardsRadius += (radius - s.shardsRadius) * ease(k, 4);
+      settling = true;
+    } else {
+      s.shardsRadius = radius;
+    }
+    if (opened && (s.shardsLive || shardsMoving || s.shardsMesh !== shards)) {
       const e = s.clock - s.openAt;
       let done = true;
       for (let i = 0; i < shards.count; i++) {
         const d = SHARDS[i];
         const p = reducedMotion ? 1 : easeOutExpo(clamp01((e - d.delay) / SHARD_S));
         if (p < 1) done = false;
-        const reach = 0.8 + d.reach * (radius + 0.6);
+        const reach = 0.8 + d.reach * (s.shardsRadius + 0.6);
         const y = d.s * 0.03;
         mPos.set(
           Math.cos(d.a) * reach * p,
@@ -790,7 +811,6 @@ function SceneContents(props: ContentsProps) {
       }
       shards.instanceMatrix.needsUpdate = true;
       s.shardsLive = !done;
-      s.shardsRadius = radius;
       s.shardsMesh = shards;
       if (!done) settling = true;
     }
@@ -800,6 +820,8 @@ function SceneContents(props: ContentsProps) {
       s.openingDone = openingDone;
       if (props.root.current) props.root.current.dataset.opening = openingDone ? "done" : "playing";
     }
+    // Keep drawing until it is done, even when nothing visibly moves (Low, clean repos).
+    if (opened && !openingDone) settling = true;
     scene.updateMatrixWorld();
     camera.updateMatrixWorld();
 
@@ -857,8 +879,11 @@ function SceneContents(props: ContentsProps) {
     <>
       <primitive object={sheet} />
       <primitive object={shards} />
-      {repos.map((repo) => gemFor(repo, layout.get(repo.path)!, false))}
-      {[...leaving.values()].map((l) => gemFor(l.repo, l.pos, true))}
+      {/* One keyed list, so a repo that leaves keeps its Gem and handle while it fades. */}
+      {[
+        ...repos.map((repo) => gemFor(repo, layout.get(repo.path)!, false)),
+        ...[...leaving.values()].map((l) => gemFor(l.repo, l.pos, true)),
+      ]}
     </>
   );
 }

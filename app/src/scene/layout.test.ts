@@ -92,6 +92,25 @@ describe("layoutGems", () => {
     expect(layoutGems([...big].reverse())).toEqual(layoutGems(big));
   });
 
+  it("lays out 120 repos quickly", () => {
+    // Around 10 ms on a desktop; the bound only catches a return to quadratic-per-round work.
+    // New paths, so the cache from the other tests cannot answer.
+    const crowd = many(120).map((r) => ({ ...r, path: `${r.path}-timed` }));
+    const t = performance.now();
+    layoutGems(crowd);
+    expect(performance.now() - t).toBeLessThan(250);
+  });
+
+  it("reuses the last layout for the same paths and masses, as a copy", () => {
+    const a = layoutGems(REPOS);
+    a.delete("/home/test/projects/alpha");
+    const b = layoutGems([...REPOS].reverse());
+    expect(b.size).toBe(REPOS.length);
+    expect(layoutGems([...REPOS.slice(1), repo("alpha", 0.31)]).get("/home/test/projects/alpha")).not.toEqual(
+      b.get("/home/test/projects/alpha"),
+    );
+  });
+
   it("is deterministic across calls", () => {
     expect(layoutGems(REPOS)).toEqual(layoutGems(REPOS));
   });
