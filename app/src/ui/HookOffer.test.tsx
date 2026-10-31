@@ -12,6 +12,7 @@ afterEach(() => {
 
 const INFO: HookInfo = {
   installed: false,
+  outdated: false,
   settingsPath: "/home/demo/.claude/settings.json",
   diff: '--- a\n+++ b\n {\n-  "theme": "dark"\n+  "theme": "dark",\n+  "hooks": {}\n }\n',
 };
@@ -41,6 +42,12 @@ describe("HookOffer", () => {
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Install" })));
     expect(hook.install).toHaveBeenCalled();
     expect(onDismiss).toHaveBeenCalled();
+  });
+
+  it("offers an update for an outdated install", () => {
+    render(<HookOffer hook={controls({ info: { ...INFO, outdated: true } })} onDismiss={() => {}} />);
+    expect(screen.getByRole("button", { name: "Update" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
   });
 
   it("shows a failed install inline and stays", async () => {
@@ -88,6 +95,26 @@ describe("HookSection", () => {
     expect(screen.queryByRole("button", { name: "Show what changes" })).toBeNull();
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Remove" })));
     expect(screen.getByRole("alert").textContent).toBe("notRunning");
+  });
+
+  it("updates or removes an outdated install", async () => {
+    const hook = controls({ info: { ...INFO, outdated: true } });
+    render(<HookSection hook={hook} labelId="h" />);
+    const section = screen.getByRole("region", { name: "Status hook" });
+    expect(section.textContent).toContain("State: Needs update");
+    expect(section.textContent).toContain("sessions started after the update");
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Show what changes" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Remove" })).toBeTruthy();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Update" })));
+    expect(hook.install).toHaveBeenCalled();
+    expect(hook.remove).not.toHaveBeenCalled();
+    expect(screen.getByRole("status").textContent).toBe("Updated.");
+  });
+
+  it("says only the script is missing when the settings already have the hook", () => {
+    render(<HookSection hook={controls({ info: { ...INFO, outdated: true, diff: "" } })} labelId="h" />);
+    expect(screen.getByRole("region", { name: "Status hook" }).textContent).toContain("updating restores its script");
   });
 
   it("says when the state is unknown", () => {

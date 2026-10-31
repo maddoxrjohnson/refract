@@ -206,6 +206,7 @@ fn install_run_and_uninstall_the_status_hook() {
     let info = agent.request(3, "hookInfo");
     let result = &info["result"];
     assert_eq!(result["installed"], false);
+    assert_eq!(result["outdated"], false);
     assert_eq!(result["settingsPath"], settings_path.to_str().unwrap());
     let diff = result["diff"].as_str().unwrap();
     let script = home.join(".local/share/refract/status-hook.sh");
@@ -216,7 +217,7 @@ fn install_run_and_uninstall_the_status_hook() {
     let installed = agent.request(4, "installHook");
     assert_eq!(
         installed["result"],
-        json!({"installed": true, "settingsPath": settings_path, "diff": null})
+        json!({"installed": true, "outdated": false, "settingsPath": settings_path, "diff": null})
     );
     assert!(script.is_file());
     let state = home.join(".local/state/refract");
@@ -246,6 +247,9 @@ fn install_run_and_uninstall_the_status_hook() {
         ("SessionStart", "finished", "idle"),
         ("UserPromptSubmit", "working", "working"),
         ("Notification", "waitingOnUser", "waitingOnUser"),
+        ("PostToolUse", "working", "working"),
+        // An AskUserQuestion or ExitPlanMode prompt waits on you without a Notification.
+        ("PreToolUse", "waitingOnUser", "waitingOnUser"),
         ("PostToolUse", "working", "working"),
         ("Stop", "finished", "idle"),
         ("SessionEnd", "ended", "unknown"),

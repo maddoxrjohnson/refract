@@ -273,6 +273,11 @@ pub struct LaunchTicket {
 #[serde(rename_all = "camelCase")]
 pub struct HookInfo {
     pub installed: bool,
+    /// Not installed, but `settings.json` already holds Refract entries: an install
+    /// from an older Refract (another event set, command form or status directory), or
+    /// one whose script is missing or outdated. Installing updates it in place.
+    #[serde(default)]
+    pub outdated: bool,
     /// Claude Code's `settings.json` in WSL.
     pub settings_path: String,
     /// Unified diff of what installing would change; `None` when installed.
@@ -1269,18 +1274,20 @@ mod tests {
         }
         let not_installed = Reply::Hook(HookInfo {
             installed: false,
+            outdated: true,
             settings_path: "/home/dev/.claude/settings.json".into(),
             diff: Some("--- a\n+++ b\n".into()),
         });
         let installed = Reply::Hook(HookInfo {
             installed: true,
+            outdated: false,
             settings_path: "/home/dev/.claude/settings.json".into(),
             diff: None,
         });
         let wire = round_trip(&Message::Response(Response::ok(1, installed)));
         assert_eq!(
             wire["result"],
-            json!({"installed": true, "settingsPath": "/home/dev/.claude/settings.json", "diff": null})
+            json!({"installed": true, "outdated": false, "settingsPath": "/home/dev/.claude/settings.json", "diff": null})
         );
         round_trip(&Message::Response(Response::ok(2, not_installed)));
     }

@@ -220,6 +220,7 @@ describe("TauriBackend", () => {
     const calls: Array<{ cmd: string; args: unknown }> = [];
     const info: HookInfo = {
       installed: false,
+      outdated: false,
       settingsPath: "/home/dev/.claude/settings.json",
       diff: "--- a/settings.json\n+++ b/settings.json\n",
     };

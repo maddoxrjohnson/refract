@@ -314,6 +314,7 @@ const HOOK_EVENTS: [event: string, status: string, matcher: string | null][] = [
   ["UserPromptSubmit", "working", null],
   ["PostToolUse", "working", "*"],
   ["Notification", "waitingOnUser", "permission_prompt|elicitation_dialog"],
+  ["PreToolUse", "waitingOnUser", "AskUserQuestion|ExitPlanMode"],
   ["Stop", "finished", null],
   ["SessionEnd", "ended", null],
 ];
@@ -675,6 +676,7 @@ export class DemoBackend implements Backend {
   hookInfo(): Promise<HookInfo> {
     return Promise.resolve({
       installed: this.hookInstalled,
+      outdated: false,
       settingsPath: DEMO_SETTINGS_PATH,
       diff: this.hookInstalled ? null : demoHookDiff(),
     });

@@ -29,10 +29,11 @@ pub struct HookEvent {
 }
 
 /// The events the script is registered for. `PostToolUse` marks a turn as working
-/// again after a permission prompt was answered. `Notification` only counts for
-/// permission prompts and MCP input requests; its `idle_prompt` (sent after a minute
-/// at the prompt) would wrongly say the agent is blocked. `SessionStart` leaves out
-/// `compact`, which happens mid-turn.
+/// again after a permission prompt or a question was answered. `Notification` only
+/// counts for permission prompts and MCP input requests; its `idle_prompt` (sent after
+/// a minute at the prompt) would wrongly say the agent is blocked. `AskUserQuestion`
+/// and `ExitPlanMode` wait on you without a `Notification`, so their `PreToolUse`
+/// counts too. `SessionStart` leaves out `compact`, which happens mid-turn.
 pub const EVENTS: &[HookEvent] = &[
     HookEvent {
         name: "SessionStart",
@@ -53,6 +54,11 @@ pub const EVENTS: &[HookEvent] = &[
         name: "Notification",
         status: HookStatus::WaitingOnUser,
         matcher: Some("permission_prompt|elicitation_dialog"),
+    },
+    HookEvent {
+        name: "PreToolUse",
+        status: HookStatus::WaitingOnUser,
+        matcher: Some("AskUserQuestion|ExitPlanMode"),
     },
     HookEvent {
         name: "Stop",
@@ -282,10 +288,26 @@ pub fn install(settings: &[u8], script: &str, status_dir: &str) -> Result<Vec<u8
     if has_install(&original, script, status_dir) {
         return Ok(settings.to_vec());
     }
+    // Stripping an install that was all of `hooks` removes the key and `add` appends
+    // it again, so an update would move the block to the end; put it back in place.
+    let at = original.keys().position(|key| key == "hooks");
     let mut next = original;
     strip(&mut next);
     add(&mut next, script, status_dir)?;
+    if let Some(at) = at {
+        next = with_key_at(next, "hooks", at);
+    }
     Ok(to_bytes(next))
+}
+
+/// `map` with `key` moved to position `at` (or the end, when `at` is past it).
+fn with_key_at(mut map: Map<String, Value>, key: &str, at: usize) -> Map<String, Value> {
+    let Some(value) = map.shift_remove(key) else {
+        return map;
+    };
+    let mut entries: Vec<(String, Value)> = map.into_iter().collect();
+    entries.insert(at.min(entries.len()), (key.to_owned(), value));
+    entries.into_iter().collect()
 }
 
 /// `settings` without empty event lists under `hooks`, and without `hooks` when that
@@ -456,6 +478,101 @@ mod tests {
         );
     }
 
+    /// `settings` with the six entries installs before `PreToolUse` was added.
+    fn with_old_event_set(settings: &str) -> Vec<u8> {
+        let mut v = value(settings.as_bytes());
+        let hooks = v
+            .as_object_mut()
+            .unwrap()
+            .entry("hooks")
+            .or_insert_with(|| json!({}));
+        for event in EVENTS.iter().filter(|e| e.name != "PreToolUse") {
+            let mut group = json!({"hooks": [
+                {"type": "command", "command": command(SCRIPT, event.status, DIR)}
+            ]});
+            if let Some(matcher) = event.matcher {
+                group["matcher"] = matcher.into();
+            }
+            let groups = hooks
+                .as_object_mut()
+                .unwrap()
+                .entry(event.name)
+                .or_insert_with(|| json!([]));
+            groups.as_array_mut().unwrap().push(group);
+        }
+        to_bytes(v.as_object().unwrap().clone())
+    }
+
+    #[test]
+    fn a_fresh_install_registers_every_event_in_order() {
+        let v = value(&install(b"", SCRIPT, DIR).unwrap());
+        assert_eq!(
+            keys(&v["hooks"]),
+            [
+                "SessionStart",
+                "UserPromptSubmit",
+                "PostToolUse",
+                "Notification",
+                "PreToolUse",
+                "Stop",
+                "SessionEnd"
+            ]
+        );
+        assert_eq!(
+            v["hooks"]["PreToolUse"],
+            json!([{"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [
+                {"type": "command", "command": command(SCRIPT, HookStatus::WaitingOnUser, DIR)}
+            ]}])
+        );
+    }
+
+    #[test]
+    fn the_old_event_set_is_upgraded_in_place() {
+        let old = with_old_event_set(USER);
+        assert!(has_entries(&old).unwrap());
+        assert!(!is_installed(&old, SCRIPT, DIR).unwrap());
+        let upgraded = install(&old, SCRIPT, DIR).unwrap();
+        assert!(is_installed(&upgraded, SCRIPT, DIR).unwrap());
+        assert_eq!(install(&upgraded, SCRIPT, DIR).unwrap(), upgraded);
+        // The old entries are replaced, not doubled, and the user's hooks stay.
+        let settings = parse_settings(&upgraded).unwrap();
+        assert_eq!(count_ours(&settings), EVENTS.len());
+        let v = value(&upgraded);
+        assert_eq!(v["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 2);
+        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][1]["matcher"],
+            "AskUserQuestion|ExitPlanMode"
+        );
+        // The backup taken before the first install still restores the very bytes.
+        assert_eq!(
+            uninstall(&upgraded, Some(Original::Bytes(USER.as_bytes()))).unwrap(),
+            Uninstalled::Write(USER.as_bytes().to_vec())
+        );
+        // Settings with no `PreToolUse` before the first install get none back.
+        let bare = r#"{"theme":"dark"}"#;
+        let upgraded = install(&with_old_event_set(bare), SCRIPT, DIR).unwrap();
+        assert_eq!(
+            uninstall(&upgraded, Some(Original::Bytes(bare.as_bytes()))).unwrap(),
+            Uninstalled::Write(bare.as_bytes().to_vec())
+        );
+    }
+
+    #[test]
+    fn an_update_keeps_the_hooks_block_where_it_was() {
+        // `hooks` holding only Refract entries, with a key added after it later.
+        let old = with_old_event_set(r#"{"theme":"dark"}"#);
+        let mut v = value(&old);
+        v.as_object_mut()
+            .unwrap()
+            .insert("model".into(), "opus".into());
+        let old = to_bytes(v.as_object().unwrap().clone());
+        assert_eq!(keys(&value(&old)), ["theme", "hooks", "model"]);
+        let upgraded = install(&old, SCRIPT, DIR).unwrap();
+        assert_eq!(keys(&value(&upgraded)), ["theme", "hooks", "model"]);
+        assert!(is_installed(&upgraded, SCRIPT, DIR).unwrap());
+    }
+
     #[test]
     fn an_empty_settings_file_comes_back_empty() {
         let installed = install(b"", SCRIPT, DIR).unwrap();
@@ -498,6 +615,12 @@ mod tests {
             "startup|resume|clear"
         );
         assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash");
+        assert_eq!(
+            v["hooks"]["PreToolUse"][1],
+            json!({"matcher": "AskUserQuestion|ExitPlanMode", "hooks": [
+                {"type": "command", "command": command(SCRIPT, HookStatus::WaitingOnUser, DIR)}
+            ]})
+        );
         assert!(is_installed(&out, SCRIPT, DIR).unwrap());
         assert!(!is_installed(USER.as_bytes(), SCRIPT, DIR).unwrap());
         assert!(String::from_utf8(out).unwrap().ends_with("}\n"));

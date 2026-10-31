@@ -245,6 +245,11 @@ export interface CommandError {
 /** The optional Claude Code status hook (spec §6.2), from the helper. */
 export interface HookInfo {
   installed: boolean;
+  /**
+   * Not installed, but the settings already hold Refract's entries: an install from an
+   * older Refract, or one whose script is missing or outdated. Installing updates it.
+   */
+  outdated: boolean;
   /** `~/.claude/settings.json` in WSL. */
   settingsPath: string;
   /** Unified diff of what installing would change; `null` when installed. */

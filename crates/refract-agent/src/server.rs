@@ -25,7 +25,7 @@ use std::io::{self, BufRead, Write};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
 use refract_core::classify::{classify_report, LiveState, SessionState};
@@ -281,6 +281,8 @@ struct Server<W: Write> {
     watcher: Option<Watcher>,
     pending: Pending,
     next_live: Option<Instant>,
+    /// When the status directory is next swept of files nothing needs.
+    next_sweep: Instant,
     load: Load,
     /// For the loading and setup threads.
     tx: SyncSender<Msg>,
@@ -343,6 +345,7 @@ where
         let deadline = [
             server.pending.deadline(),
             server.next_live,
+            Some(server.next_sweep),
             server.next_retry(),
         ]
         .into_iter()
@@ -378,6 +381,9 @@ where
             let events = server.agent.recheck_live(Utc::now());
             server.send_all(&events)?;
             server.next_live = None;
+        }
+        if server.next_sweep <= now {
+            server.sweep_statuses(now);
         }
         server.schedule_live();
     }
@@ -509,6 +515,7 @@ impl<W: Write> Server<W> {
             watcher,
             pending: Pending::default(),
             next_live: None,
+            next_sweep: Instant::now(),
             load: Load::NotStarted,
             tx,
             setup_jobs: None,
@@ -1352,6 +1359,18 @@ impl<W: Write> Server<W> {
         if watcher.watch_scan_dirs(&walk.dirs, &unread) {
             self.pending.rescan = true;
             self.pending.touch(now);
+        }
+    }
+
+    /// Deletes ended and temporary status files while the hook is installed, then
+    /// schedules the next sweep. The deletions reach `update_statuses` through inotify,
+    /// which changes no session's state since an ended session classifies like one
+    /// without a report. Week-old files of other statuses are left to full reads.
+    fn sweep_statuses(&mut self, now: Instant) {
+        self.next_sweep = now + hook::SWEEP_EVERY;
+        let paths = hook::Paths::from_env();
+        if hook::enabled(&paths) {
+            hook::prune_statuses(&paths.status_dir, SystemTime::now(), false);
         }
     }
 

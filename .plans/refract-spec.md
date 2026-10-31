@@ -187,10 +187,10 @@ Claude Code can run a command when something happens in a session. On first run,
 | Session starts | An agent is open in this repo |
 | You send a prompt | The agent is working |
 | Claude stops and waits | The turn finished |
-| Claude needs permission or input | The agent is blocked on you |
+| Claude needs permission or input, asks you a question, or waits for plan approval | The agent is blocked on you |
 | Session ends | Closed, and why |
 
-The script prints nothing, so Claude never sees it and it costs no tokens. It takes a few milliseconds per event. Refract can remove it at any time, restoring your settings exactly. This is what makes the *working* and *waiting on you* states possible.
+The script prints nothing, so Claude never sees it and it costs no tokens. It takes a few milliseconds per event. Refract can remove it at any time, restoring your settings exactly. When a newer Refract changes the hook, Settings shows it as needing an update and updates it only when you press Update; like any hook change, it applies to sessions started afterwards. This is what makes the *working* and *waiting on you* states possible.
 
 ## 7. Architecture
 

@@ -123,6 +123,7 @@ describe("demoHookDiff", () => {
       `"command": "[ -f '/home/demo/.local/share/refract/status-hook.sh' ] && sh '/home/demo/.local/share/refract/status-hook.sh' waitingOnUser '/home/demo/.local/state/refract/sessions' || cat >/dev/null; exit 0"`,
     );
     expect(diff).toContain(`{ "matcher": "permission_prompt|elicitation_dialog", "hooks": [`);
+    expect(diff).toContain(`"PreToolUse": [\n+      { "matcher": "AskUserQuestion|ExitPlanMode", "hooks": [`);
     expect(diff).toContain(`{ "matcher": "startup|resume|clear", "hooks": [`);
     expect(diff).toContain(`"PostToolUse": [\n+      { "matcher": "*", "hooks": [`);
     expect(diff).toContain(`"Stop": [\n+      { "hooks": [`);

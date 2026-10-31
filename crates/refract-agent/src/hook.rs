@@ -14,7 +14,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use refract_core::classify::HookReport;
+use refract_core::classify::{HookReport, HookStatus};
 use refract_core::diff::unified_diff;
 use refract_core::hook::{self, Original, Uninstalled};
 use refract_core::protocol::HookInfo;
@@ -25,8 +25,16 @@ use crate::state::path_str;
 /// The script, written to [`Paths::script`] on install.
 pub const SCRIPT: &str = include_str!("status-hook.sh");
 
-/// Status files untouched this long are deleted when the directory is read in full.
+/// Status files untouched this long are deleted. A live session can sit quiet for days
+/// with `finished`, so this is long.
 pub const MAX_STATUS_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// An `ended` status file or a script temporary file is deleted once untouched this
+/// long; the wait keeps a fast `claude --resume` from racing the delete of its own id.
+pub const ENDED_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// How often the helper sweeps the status directory while it runs.
+pub const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 
 /// Where the hook's files are.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,12 +77,15 @@ pub fn status_dir() -> PathBuf {
 }
 
 /// Whether the hook is installed, and what installing would change. A missing or
-/// outdated script counts as not installed, so installing repairs it.
+/// outdated script counts as not installed, so installing repairs it; with Refract
+/// entries already in the settings that is an outdated install, which installing
+/// updates.
 pub fn info(paths: &Paths) -> Result<HookInfo, String> {
     let current = read_settings(&paths.settings)?.unwrap_or_default();
     let (script, dir) = (path_str(&paths.script), path_str(&paths.status_dir));
     let installed = hook::is_installed(&current, &script, &dir)?
         && fs::read(&paths.script).is_ok_and(|bytes| bytes == SCRIPT.as_bytes());
+    let outdated = !installed && hook::has_entries(&current)?;
     let diff = if installed {
         None
     } else {
@@ -87,6 +98,7 @@ pub fn info(paths: &Paths) -> Result<HookInfo, String> {
     };
     Ok(HookInfo {
         installed,
+        outdated,
         settings_path: path_str(&paths.settings),
         diff,
     })
@@ -331,32 +343,85 @@ pub fn statuses(paths: &Paths) -> HashMap<String, HookReport> {
     }
 }
 
-/// Every session's report in `dir`, by session id. Files untouched for
-/// [`MAX_STATUS_AGE`] are deleted instead, since no running session is that quiet.
+/// Every session's report in `dir`, by session id, after [`prune_statuses`] has deleted
+/// the files nothing needs.
 pub fn read_statuses(dir: &Path) -> HashMap<String, HookReport> {
+    prune_statuses(dir, SystemTime::now(), true);
     let mut statuses = HashMap::new();
     let Ok(entries) = fs::read_dir(dir) else {
         return statuses;
     };
-    let now = SystemTime::now();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let Some(id) = hook::status_file_session(&name) else {
             continue;
         };
-        let old = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .is_ok_and(|t| now.duration_since(t).is_ok_and(|age| age > MAX_STATUS_AGE));
-        if old {
-            let _ = fs::remove_file(entry.path());
-            continue;
-        }
         if let Some(report) = read_status(&entry.path()) {
             statuses.insert(id.to_owned(), report);
         }
     }
     statuses
+}
+
+/// Deletes from `dir` the status files that say `ended` and are older than
+/// [`ENDED_GRACE`] (a session without a report classifies the same as an ended one)
+/// and the script's temporary files older than [`ENDED_GRACE`]. With `stale`, also
+/// any status file older than [`MAX_STATUS_AGE`]: that can change a long-quiet live
+/// session's state, so only full reads ask for it. Only regular files with those
+/// names are touched.
+pub fn prune_statuses(dir: &Path, now: SystemTime, stale: bool) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let status = hook::status_file_session(&name).is_some();
+        let temporary = name.starts_with('.') && name.ends_with(".tmp");
+        if !status && !temporary {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok());
+        let Some(age) = age else {
+            continue;
+        };
+        let delete = if temporary {
+            age > ENDED_GRACE
+        } else {
+            (stale && age > MAX_STATUS_AGE)
+                || (age > ENDED_GRACE
+                    && read_status(&path).is_some_and(|r| r.status == HookStatus::Ended))
+        };
+        // The script replaces status files by rename, so a resumed session may have
+        // written a new file since `meta` was taken; leave that one alone (this narrows
+        // the race to the gap between the check and the unlink).
+        if delete && !temporary && !same_file(&path, &meta) {
+            continue;
+        }
+        if delete {
+            let _ = fs::remove_file(&path);
+        }
+    }
+}
+
+/// True when `path` is still the file `meta` describes (same inode and mtime).
+fn same_file(path: &Path, meta: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    fs::symlink_metadata(path).is_ok_and(|now| {
+        now.dev() == meta.dev()
+            && now.ino() == meta.ino()
+            && now.mtime() == meta.mtime()
+            && now.mtime_nsec() == meta.mtime_nsec()
+    })
 }
 
 /// Re-reads the status files named `names` in `dir` into `statuses`; a file that is
@@ -398,8 +463,6 @@ fn read_status(path: &Path) -> Option<HookReport> {
 
 #[cfg(test)]
 mod tests {
-    use refract_core::classify::HookStatus;
-
     use super::*;
 
     const ID: &str = "3f6c1a52-0000-4000-8000-000000000001";
@@ -545,12 +608,48 @@ mod tests {
         let p = installed_paths(tmp.path(), "{}\n");
         let settings = fs::read(&p.settings).unwrap();
         fs::remove_file(&p.script).unwrap();
-        assert!(!info(&p).unwrap().installed);
+        let missing = info(&p).unwrap();
+        assert!(!missing.installed && missing.outdated);
         fs::write(&p.script, "echo old").unwrap();
         assert!(!info(&p).unwrap().installed);
         assert!(install(&p).unwrap().installed);
         assert_eq!(fs::read_to_string(&p.script).unwrap(), SCRIPT);
         assert_eq!(fs::read(&p.settings).unwrap(), settings);
+    }
+
+    #[test]
+    fn an_old_install_is_outdated_and_upgrades_keeping_the_first_backup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = paths(tmp.path());
+        let original = b"{\n    \"theme\": \"dark\"\n}";
+        fs::create_dir_all(p.settings.parent().unwrap()).unwrap();
+        fs::write(&p.settings, original).unwrap();
+        assert!(!info(&p).unwrap().outdated);
+        install(&p).unwrap();
+        // Take the install back to the set before `PreToolUse` was registered.
+        let mut old: serde_json::Value =
+            serde_json::from_slice(&fs::read(&p.settings).unwrap()).unwrap();
+        old["hooks"].as_object_mut().unwrap().remove("PreToolUse");
+        fs::write(&p.settings, serde_json::to_vec_pretty(&old).unwrap()).unwrap();
+
+        let before = info(&p).unwrap();
+        assert!(!before.installed && before.outdated);
+        let diff = before.diff.unwrap();
+        assert!(diff.contains("AskUserQuestion|ExitPlanMode"), "{diff}");
+        assert!(enabled(&p));
+
+        let after = install(&p).unwrap();
+        assert!(after.installed && !after.outdated);
+        assert_eq!(fs::read(&p.backup).unwrap(), original);
+        let settings = fs::read_to_string(&p.settings).unwrap();
+        assert_eq!(
+            settings.matches("status-hook.sh").count(),
+            2 * hook::EVENTS.len()
+        );
+
+        uninstall(&p).unwrap();
+        assert_eq!(fs::read(&p.settings).unwrap(), original);
+        assert!(!p.backup.exists());
     }
 
     #[test]
@@ -663,5 +762,102 @@ mod tests {
             .unwrap();
         assert!(read_statuses(tmp.path()).is_empty());
         assert!(!path.exists());
+    }
+
+    fn write_aged(dir: &Path, name: &str, body: &str, age: Duration) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, body).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(SystemTime::now() - age)
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn prune_deletes_old_ended_files_and_keeps_the_rest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let min = |n: u64| Duration::from_secs(n * 60);
+        let day = |n: u64| Duration::from_secs(n * 24 * 60 * 60);
+        let id = |n: u8| format!("3f6c1a52-0000-4000-8000-00000000000{n}.json");
+        let ended = r#"{"status":"ended","at":1}"#;
+        let old_ended = write_aged(dir, &id(1), ended, min(11));
+        let fresh_ended = write_aged(dir, &id(2), ended, min(9));
+        let finished = write_aged(dir, &id(3), r#"{"status":"finished"}"#, day(6));
+        let working = write_aged(dir, &id(4), r#"{"status":"working"}"#, day(6));
+        let fresh_working = write_aged(dir, &id(5), r#"{"status":"working"}"#, min(11));
+        let ancient = write_aged(dir, &id(6), r#"{"status":"waitingOnUser"}"#, day(8));
+        let ancient_ended = write_aged(dir, &id(7), ended, day(8));
+        let ancient_junk = write_aged(dir, &id(8), "not json", day(8));
+        let old_tmp = write_aged(dir, ".abc.123.tmp", "x", min(11));
+        let fresh_tmp = write_aged(dir, ".abc.124.tmp", "x", min(9));
+        let notes = write_aged(dir, "notes.json", ended, day(30));
+        let other_tmp = write_aged(dir, "abc.tmp", "x", day(30));
+        let target = write_aged(dir, "target", ended, day(30));
+        let link = dir.join(id(9));
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let tmp_link = dir.join(".link.1.tmp");
+        std::os::unix::fs::symlink(&target, &tmp_link).unwrap();
+        fs::create_dir(dir.join(id(0))).unwrap();
+
+        prune_statuses(dir, SystemTime::now(), true);
+
+        for gone in [
+            &old_ended,
+            &ancient,
+            &ancient_ended,
+            &ancient_junk,
+            &old_tmp,
+        ] {
+            assert!(!gone.exists(), "{} should be deleted", gone.display());
+        }
+        for kept in [
+            &fresh_ended,
+            &finished,
+            &working,
+            &fresh_working,
+            &fresh_tmp,
+            &notes,
+            &other_tmp,
+            &target,
+        ] {
+            assert!(kept.exists(), "{} should be kept", kept.display());
+        }
+        assert!(fs::symlink_metadata(&link).is_ok());
+        assert!(fs::symlink_metadata(&tmp_link).is_ok());
+        assert!(dir.join(id(0)).is_dir());
+    }
+
+    #[test]
+    fn the_hourly_sweep_leaves_week_old_live_statuses_to_full_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let week = MAX_STATUS_AGE + Duration::from_secs(3600);
+        let waiting = write_aged(
+            dir,
+            &format!("{ID}.json"),
+            r#"{"status":"waitingOnUser"}"#,
+            week,
+        );
+        let ended = write_aged(
+            dir,
+            "3f6c1a52-0000-4000-8000-000000000002.json",
+            r#"{"status":"ended"}"#,
+            week,
+        );
+        prune_statuses(dir, SystemTime::now(), false);
+        assert!(waiting.exists());
+        assert!(!ended.exists());
+        prune_statuses(dir, SystemTime::now(), true);
+        assert!(!waiting.exists());
+    }
+
+    #[test]
+    fn prune_leaves_a_missing_dir_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        prune_statuses(&tmp.path().join("nope"), SystemTime::now(), true);
     }
 }

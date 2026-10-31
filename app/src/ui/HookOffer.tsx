@@ -48,7 +48,7 @@ function DiffToggle({ diff, settingsPath }: { diff: string | null; settingsPath:
   const id = useId();
   if (diff === null) return null;
   // Settings already hold the entries; only the script itself is missing or outdated.
-  if (diff === "") return <p className="rf-hint">Your settings already have the hook; installing restores its script.</p>;
+  if (diff === "") return <p className="rf-hint">Your settings already have the hook; updating restores its script.</p>;
   return (
     <>
       <button type="button" className="rf-link" aria-expanded={shown} aria-controls={id} onClick={() => setShown(!shown)}>
@@ -77,7 +77,9 @@ function DiffToggle({ diff, settingsPath }: { diff: string | null; settingsPath:
 }
 
 const WHAT_IT_DOES =
-  "Claude Code can run a command when something happens in a session. Refract can add one small script to your Claude Code settings. It writes a one-line status file when a session starts, when you send a prompt, when Claude stops or needs your permission, and when the session ends. That is what lets the gems show when an agent is working and when it is waiting on you.";
+  "Claude Code can run a command when something happens in a session. Refract can add one small script to your Claude Code settings. It writes a one-line status file when a session starts, when you send a prompt, when Claude stops, needs your permission or asks you something, and when the session ends. That is what lets the gems show when an agent is working and when it is waiting on you.";
+const WHY_UPDATE =
+  "Refract's hook has changed since it was installed, so some states may not show. Updating replaces its entries in your settings; Remove still puts them back as they were. It applies to Claude Code sessions started after the update.";
 const WHY_ITS_SAFE =
   "The script prints nothing, so Claude never sees it and it costs no tokens. You can remove it at any time in Settings, which puts your settings back as they were. It applies to Claude Code sessions started after you install it.";
 
@@ -115,7 +117,7 @@ export function HookOffer({ hook, onDismiss }: HookOfferProps) {
           disabled={action.busy}
           onClick={() => void action.start(hook.install).then((ok) => ok && onDismiss())}
         >
-          {action.busy ? "Installing…" : "Install"}
+          {info.outdated ? (action.busy ? "Updating…" : "Update") : action.busy ? "Installing…" : "Install"}
         </button>
         <button type="button" className="rf-button rf-button--ghost" disabled={action.busy} onClick={onDismiss}>
           Not now
@@ -125,16 +127,24 @@ export function HookOffer({ hook, onDismiss }: HookOfferProps) {
   );
 }
 
-/** The settings dialog's section: the hook's state, with Install or Remove. */
+/** The settings dialog's section: the hook's state, with Install, Update or Remove. */
 export function HookSection({ hook, labelId }: { hook: HookControls; labelId: string }) {
   const action = useAction();
   const [done, setDone] = useState<string | null>(null);
   const info = hook.info;
   const error = action.error ?? hook.error;
-  const run = (fn: () => Promise<void>, message: string) => {
+  // The button under way shows its progress label.
+  const [running, setRunning] = useState<string | null>(null);
+  const run = (fn: () => Promise<void>, label: string, message: string) => {
     setDone(null);
+    setRunning(label);
     void action.start(fn).then((ok) => ok && setDone(message));
   };
+  const button = (label: string, busyLabel: string, fn: () => Promise<void>, message: string) => (
+    <button type="button" className="rf-button" disabled={action.busy} onClick={() => run(fn, label, message)}>
+      {action.busy && running === label ? busyLabel : label}
+    </button>
+  );
   return (
     <section className="rf-section" aria-labelledby={labelId}>
       <h3 id={labelId} className="rf-section__label">
@@ -142,7 +152,7 @@ export function HookSection({ hook, labelId }: { hook: HookControls; labelId: st
       </h3>
       <p className="rf-settings__line">
         <span className="rf-muted">State:</span>{" "}
-        {info ? (info.installed ? "Installed" : "Not installed") : hook.error ? "Unknown" : "…"}
+        {info ? (info.installed ? "Installed" : info.outdated ? "Needs update" : "Not installed") : hook.error ? "Unknown" : "…"}
       </p>
       <p className="rf-hint rf-settings__line">
         Lets the gems show when an agent is working or waiting on you. It prints nothing and costs no tokens.
@@ -152,18 +162,14 @@ export function HookSection({ hook, labelId }: { hook: HookControls; labelId: st
           In <span className="rf-mono">{info.settingsPath}</span>
         </p>
       )}
+      {info?.outdated && <p className="rf-hint rf-settings__line">{WHY_UPDATE}</p>}
       {info && !info.installed && <DiffToggle diff={info.diff} settingsPath={info.settingsPath} />}
       {info && (
         <div className="rf-row rf-hook-buttons">
-          {info.installed ? (
-            <button type="button" className="rf-button" disabled={action.busy} onClick={() => run(hook.remove, "Removed.")}>
-              {action.busy ? "Removing…" : "Remove"}
-            </button>
-          ) : (
-            <button type="button" className="rf-button" disabled={action.busy} onClick={() => run(hook.install, "Installed.")}>
-              {action.busy ? "Installing…" : "Install"}
-            </button>
-          )}
+          {info.outdated && button("Update", "Updating…", hook.install, "Updated.")}
+          {info.installed || info.outdated
+            ? button("Remove", "Removing…", hook.remove, "Removed.")
+            : button("Install", "Installing…", hook.install, "Installed.")}
         </div>
       )}
       {error && (

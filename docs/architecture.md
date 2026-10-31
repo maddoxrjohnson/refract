@@ -88,7 +88,7 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `cloneRepo` | `{url, name}` | the clone's path | Clones an `https://` URL into `~/projects/<name>` |
 | `addRepo` | `{path}` | `null` | Reports the repo that holds `path` from now on |
 | `usage` | none | token totals, and `limits` when there is a reading | Tokens used today, in 7 days and in 5 hours, by repo and by model; plan-limit percentages from the status line ([plan limits](#plan-limits)) |
-| `hookInfo` | none | `{installed, settingsPath, diff}` | Whether the status hook is installed, and what installing would change |
+| `hookInfo` | none | `{installed, outdated, settingsPath, diff}` | Whether the status hook is installed, whether an older install needs updating, and what installing would change |
 | `installHook` | none | the same | Installs the status hook |
 | `uninstallHook` | none | the same | Removes it and restores `settings.json` |
 | `shutdown` | none | `null` | Answers, then the helper exits |
@@ -355,12 +355,13 @@ Refract adds one small script to Claude Code's hook settings. The script writes 
 |---|---|---|---|
 | `SessionStart` | `startup`, `resume`, `clear` | finished | Nothing special (idle) |
 | `UserPromptSubmit` | | working | Rosette turns |
-| `PostToolUse` | any tool | working | Rosette turns (marks the turn working again after a permission prompt is answered) |
+| `PostToolUse` | any tool | working | Rosette turns (marks the turn working again after a permission prompt or a question is answered) |
 | `Notification` | `permission_prompt`, `elicitation_dialog` | waitingOnUser | Red line-work, knocking, red rings |
+| `PreToolUse` | `AskUserQuestion`, `ExitPlanMode` | waitingOnUser | Red line-work, knocking, red rings |
 | `Stop` | | finished | Nothing special (idle) |
 | `SessionEnd` | | ended | Nothing special |
 
-`Notification` is limited to permission prompts and input requests because its `idle_prompt`, sent after a minute at the prompt, would wrongly say the agent is blocked. `SessionStart` leaves out `compact`, which happens mid-turn.
+`Notification` is limited to permission prompts and input requests because its `idle_prompt`, sent after a minute at the prompt, would wrongly say the agent is blocked. A multiple-choice question (`AskUserQuestion`) and a plan waiting for approval (`ExitPlanMode`) send no `Notification`, so the `PreToolUse` of those two tools marks the session waiting; its `PostToolUse`, once you answer, marks it working again. `SessionStart` leaves out `compact`, which happens mid-turn.
 
 A status counts only for a session whose `claude` process is running, and the process decides liveness: a session saying `ended` that is still running is live with no detail. Pressing Esc or denying a permission ends a turn with no `Stop` event, so a live session whose transcript ends in a user interrupt written after a working or waiting status is shown as idle. Statuses are ignored altogether unless `settings.json` holds Refract's entries. Claude Code reads its hook settings when a session starts, so a session already running when the hook is installed may not report.
 
@@ -379,7 +380,8 @@ Claude Code treats exit code 2 as "block this prompt or stop", and `sh` exits 2 
 The edits are pure functions over the bytes of `settings.json` in `refract-core`, applied on disk by the helper (`crates/refract-agent/src/hook.rs`).
 
 - **Install** keeps every other key and every other hook, in order, and adds one group per event. Refract's entries are recognised by the script's path in the command. An install that is already complete changes nothing; a partial or outdated one is replaced. A `hooks` value of the wrong shape is refused rather than overwritten.
-- **Backup.** Before the first change the helper saves the file's bytes (or a marker if there was no file) in the state directory. A second install never overwrites the backup.
+- **Updating.** When a newer Refract registers a different event set (or command form, status directory or script), an existing install is no longer complete. `hookInfo` then says `installed: false, outdated: true`, and Settings shows the hook as "Needs update" with Update and Remove buttons and the diff. Nothing changes until Update is pressed; Update runs the same install, which drops the old entries and adds the current ones. Like any hook change, it reaches only Claude Code sessions started after it.
+- **Backup.** Before the first change the helper saves the file's bytes (or a marker if there was no file) in the state directory. A second install, including an update, never overwrites the backup, so uninstalling after an update still restores the bytes from before the first install.
 - **Safe writes.** The new file is written next to the old one and renamed over it, keeping its mode. A symlinked `settings.json` has its target edited. If something else (Claude Code) changes the file while Refract is working, the edit is redone once on the new bytes and a second change is an error. Nothing is written if the file is not valid JSON.
 - **Uninstall** removes Refract's entries, and any group or list left empty by that. If what is left equals the backup as JSON (empty event lists aside), the backup's bytes are written back verbatim, so install then uninstall is byte-for-byte identical, or the file is deleted if there was none before. If anything else was changed in the meantime, only Refract's entries are removed, everything else is kept, and the file is written in Claude Code's format (two-space indent, trailing newline). The backup, the script and the status files are then deleted.
 
@@ -394,7 +396,7 @@ The diff that "Show what changes" displays is computed by the helper with a smal
 | Status files | `~/.local/state/refract/sessions/<session id>.json` | `XDG_STATE_HOME` |
 | Backup | `~/.local/state/refract/settings.backup.json` (or `settings.backup.missing`) | `XDG_STATE_HOME` |
 
-A relative `XDG_*` value is ignored. The helper watches the status directory with inotify and updates the affected session when a file is written or removed. Status files untouched for seven days are deleted when the directory is read in full.
+A relative `XDG_*` value is ignored. The helper watches the status directory with inotify and updates the affected session when a file is written or removed. Status files do not pile up: at startup, then hourly, the helper deletes `ended` files and the script's leftover temporary files older than 10 minutes. An ended session classifies the same as one with no report, so that changes nothing the interface shows. Full reads of the directory (startup, reload, install) also delete any status file untouched for seven days; a live session that quiet then shows as unknown until its next event.
 
 ## Usage and system stats
 
