@@ -29,9 +29,12 @@ const args = (process.env.RECORD_CHROMIUM_ARGS ?? "--use-angle=swiftshader --ena
   .split(" ")
   .filter(Boolean);
 
+/** Seconds of the opening burst before the pointer moves; the loop starts on the burst. */
+const LEAD_S = 2.4;
+
 const ease = (t) => (t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2);
 
-/** Pointer waypoints [seconds, x, y]; the pointer glides between them. */
+/** Pointer waypoints [seconds after the lead, x, y]; the pointer glides between them. */
 const PATH = [
   [0, 960, 560],
   [0.6, 880, 470],
@@ -43,7 +46,7 @@ const PATH = [
   [6.6, 985, 590],
 ];
 
-/** What happens when, in seconds. */
+/** What happens when, in seconds after the lead. */
 const ACTIONS = [
   [3.8, "click"],
   [6.4, "Escape"],
@@ -51,9 +54,10 @@ const ACTIONS = [
   [9.3, "Enter"],
   [10.4, "Enter"],
 ];
-const END_S = 15.6;
+const END_S = LEAD_S + 15.6;
 
 function pointerAt(t) {
+  t -= LEAD_S;
   for (let i = 1; i < PATH.length; i++) {
     const [t1, x1, y1] = PATH[i];
     const [t0, x0, y0] = PATH[i - 1];
@@ -77,8 +81,11 @@ async function waitForServer() {
   throw new Error(`no server at ${URL}`);
 }
 
-/** A page on the fake clock, with the first-run hook offer already turned down. */
-async function openDemo(browser, viewport) {
+/**
+ * A page on the fake clock, with the first-run hook offer already turned down, `settleMs`
+ * after it loads (enough for the opening to finish, or just for the repos to arrive).
+ */
+async function openDemo(browser, viewport, settleMs = 2500) {
   const page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
   await page.addInitScript(() => {
     localStorage.setItem("refract.hookOfferDismissed", "1");
@@ -87,7 +94,7 @@ async function openDemo(browser, viewport) {
   await page.clock.install();
   await page.goto(URL);
   await page.locator(".scene canvas").waitFor();
-  await page.clock.runFor(2500);
+  await page.clock.runFor(settleMs);
   return page;
 }
 
@@ -98,9 +105,9 @@ try {
 
   rmSync(framesDir, { recursive: true, force: true });
   mkdirSync(framesDir, { recursive: true });
-  const page = await openDemo(browser, { width: W, height: H });
+  const page = await openDemo(browser, { width: W, height: H }, 100);
   const frames = [];
-  const pending = [...ACTIONS];
+  const pending = ACTIONS.map(([at, action]) => [at + LEAD_S, action]);
   let typing = [];
   let clickFrame = -1;
   const total = Math.round(END_S * FPS);
@@ -127,9 +134,9 @@ try {
   writeFileSync(join(framesDir, "frames.json"), JSON.stringify({ fps: FPS, frames }, null, 1));
   await page.close();
 
-  // The still: the whole scene with one gem in magnet focus.
+  // The still: the whole scene with one stone in magnet focus.
   mkdirSync(media, { recursive: true });
-  const still = await openDemo(browser, { width: 1600, height: 900 });
+  const still = await openDemo(browser, { width: 1600, height: 900 }, 4000);
   await still.mouse.move(1500, 800);
   await still.mouse.move(800, 430, { steps: 5 });
   await still.clock.runFor(1500);

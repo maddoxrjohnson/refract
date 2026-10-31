@@ -15,19 +15,21 @@ FRAMES = APP / "test-results" / "demo-frames"
 OUT = APP.parent / "docs" / "media" / "demo.gif"
 WIDTH = 800
 COLOURS = 128
+# Frames the palette is built from, spread over the loop so the panels' reds make it in.
+SAMPLES = 8
 # Pixels whose channels all changed by less than this since the last frame stay
-# transparent, so the slow shimmer of the backdrop costs almost nothing.
+# transparent, so the slow turn of the engraved stones costs little.
 STILL = 20
 
-# An arrow pointer, tip at (0, 0), in screenshot pixels.
+# An arrow pointer, tip at (0, 0), in screenshot pixels, in the light palette's ink and accent.
 ARROW = [(0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12)]
 
 
 def draw_pointer(im: Image.Image, x: int, y: int, click: bool) -> None:
     d = ImageDraw.Draw(im)
     if click:
-        d.ellipse((x - 14, y - 14, x + 14, y + 14), outline=(169, 216, 255), width=2)
-    d.polygon([(x + px, y + py) for px, py in ARROW], fill=(255, 255, 255), outline=(10, 12, 18))
+        d.ellipse((x - 14, y - 14, x + 14, y + 14), outline=(184, 50, 42), width=2)
+    d.polygon([(x + px, y + py) for px, py in ARROW], fill=(255, 255, 255), outline=(31, 74, 61))
 
 
 def main() -> int:
@@ -40,9 +42,9 @@ def main() -> int:
         frames.append(im.resize((WIDTH, h), Image.LANCZOS))
 
     # One palette from a spread of frames keeps colours steady from frame to frame.
-    sample = Image.new("RGB", (WIDTH, frames[0].height * 4))
-    for i, k in enumerate(range(0, len(frames), max(1, len(frames) // 4))):
-        if i < 4:
+    sample = Image.new("RGB", (WIDTH, frames[0].height * SAMPLES))
+    for i, k in enumerate(range(0, len(frames), max(1, len(frames) // SAMPLES))):
+        if i < SAMPLES:
             sample.paste(frames[k], (0, frames[0].height * i))
     palette = sample.quantize(colors=COLOURS - 1, method=Image.Quantize.MEDIANCUT)
     clear = COLOURS - 1  # the palette's spare last entry marks unchanged pixels
