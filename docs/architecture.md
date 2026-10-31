@@ -64,7 +64,7 @@ When VS Code is given a folder that is already open, it focuses that window. Tha
 | `vscode-extension` | The VS Code extension |
 | `.github/workflows` | CI, GitHub Pages and release builds |
 | `scripts` | `dev-app.sh` and a PowerShell helper for closing test windows |
-| `docs` | This document, [launch.md](launch.md), [decision records](decisions/README.md), the scene mockup |
+| `docs` | This document, [launch.md](launch.md), [decision records](decisions/README.md), the scene mockups (current: `mockups/gem-studies.html`) |
 
 The root Cargo workspace holds `crates/*`. `app/src-tauri` is a separate Cargo project with its own lockfile, built for Windows.
 
@@ -183,8 +183,8 @@ Only the start and the end of each file are read, and results are cached until i
 ### Where the data comes from
 
 - **Local repos** come from `listRepos` plus `repoChanged`, `repoRemoved` and `loadComplete` events, combined by a reducer (`repoState.ts`). Snapshots carry no version, so an event that arrives while a `listRepos` request is in flight is taken as newer than its answer. The list is fetched again whenever the helper enters the running state, and on every show of the window.
-- **Remote repos** come from `listRemotes` and are merged with the local ones (`projects.ts`). A remote repo whose host, owner and name match a local repo's `origin` (ignoring case) is the same gem. One with no local clone becomes a dimmed gem keyed `remote:<host>/<owner>/<name>`, with no sessions and a mass capped at 0.45 so uncloned repos sit towards the edges. Forks and archived repos that are not cloned stay out unless settings turn them on; a cloned fork always shows. Hidden keys apply to every gem.
-- **Gem appearance** comes from `repoStatus.ts`: uncommitted changes (blue halo), an interrupted session (amber edges), a live session working (shimmer) or waiting (slow amber pulse).
+- **Remote repos** come from `listRemotes` and are merged with the local ones (`projects.ts`). A remote repo whose host, owner and name match a local repo's `origin` (ignoring case) is the same gem. One with no local clone becomes a stippled stone keyed `remote:<host>/<owner>/<name>`, with no sessions and a mass capped at 0.45 so uncloned repos sit towards the edges. Forks and archived repos that are not cloned stay out unless settings turn them on; a cloned fork always shows. Hidden keys apply to every gem.
+- **Stone appearance** comes from `repoStatus.ts`: uncommitted changes (red ring on the sheet), an interrupted session (chipped corner), a live session working (rosette turns) or waiting (slow red pulse). Light or dark comes from the `theme` setting through `theme.ts`, which follows the Windows app mode for System, writes `data-theme` on `<html>` for an override, remembers the choice in local storage so it shows before the settings load, and matches the native title bar.
 
 ### Navigation
 
@@ -222,7 +222,7 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 | State | Where |
 |---|---|
 | Graphics setting (`refract.quality`), hook offer dismissed (`refract.hookOfferDismissed`) | The webview's `localStorage`; the interface works without it |
-| GitLab address, show forks, show archived, hidden gems, cost estimate and its prices (`costEstimate`; a file without it gets the estimate off and the shipped prices) | `settings.json` in the app's config directory on Windows |
+| GitLab address, show forks, show archived, hidden gems, theme (`theme`: system, light or dark; anything else reads as system), cost estimate and its prices (`costEstimate`; a file without it gets the estimate off and the shipped prices) | `settings.json` in the app's config directory on Windows |
 | GitHub and GitLab tokens | Windows Credential Manager |
 | Extra folders, roots, hidden local paths, where the plan limits file is | `~/.config/refract/agent.toml` in WSL (optional; `addRepo` appends to `extra`). Keys: `roots`, `extra`, `hidden`, `depth`, `limits_file`; an unknown key makes the helper ignore the file and say so on stderr |
 
@@ -234,20 +234,21 @@ A new agent in a repo with uncommitted changes starts with a short opening promp
 
 ## The scene
 
-The scene is React Three Fiber code in `app/src/scene`.
+The scene is React Three Fiber code in `app/src/scene`. Its look, Banknote, is described in the spec (§3.2) and [decision 0017](decisions/0017-banknote-scene.md).
 
 ### Layout and camera
 
-Gems sit on a golden-angle spiral from the centre outwards, heaviest first (`layout.ts`). Depth and every random choice are seeded from a hash of the repo's path, so a gem keeps its place whatever order repos arrive in. Gems shrink once there are more than about 14. The camera fits every gem, shifts a little with the pointer, and when a gem is zoomed flies to it, placing it left of centre so the panel fits on the right, and in windows less than about 1300 px tall raising it so the launch picker fits below it. The focus label is moved by the frame loop with a DOM transform, so React does not re-render per frame.
+Stones lie on a paper sheet (the y = 0 plane). `layout.ts` places them on a golden-angle spiral from the centre outwards, heaviest first, then relaxes the spiral: rounds of pull towards the centre and pairwise push-apart until no two stones' discs (1.22 times their size) overlap. Repos are sorted by mass and then path first, so a stone keeps its place whatever order repos arrive in. Stones shrink once there are more than about 14. The cut (one of six, in `cuts.ts`) is picked from a hash of the path, so a repo also keeps its shape.
 
-### Two-pass refraction
+The camera looks down from 56° above the sheet with a 28° field of view, at a distance that fits the layout in both directions. The pointer tilts the view a few degrees. Zooming flies in and tilts down to about 35°, placing the stone left of centre so the panel fits on the right and, in windows less than about 1300 px tall, raising it so the launch picker fits below it. The focus label and the marks are moved by the frame loop with DOM transforms, so React does not re-render per frame.
 
-Glass needs something behind it to bend. Each drawn frame therefore renders twice:
+### Drawing the engraving
 
-1. **Back pass.** Everything except the glass is drawn into a half-float texture, sized at the tier's share of the canvas. This is the painted backdrop, the dust and each gem's lit core. The glass sits on a separate layer that this pass skips, so a shell never samples itself.
-2. **Main pass.** The whole scene goes through the post-processing chain (bloom on Medium and High, depth of field on High, ACES tone mapping). Each shell's shader looks up the back texture at its own screen position, shifted by the view ray refracted through the facet, once per colour channel with slightly different indices. That is the rainbow edge. Reflections come from a procedural set of soft lights, and glints from fixed highlight directions.
+`banknote.ts` holds the palettes and the shaders, ported from `docs/mockups/gem-studies.html`. Each stone is a convex mesh with flat normals and a barycentric attribute (`prepare()` in `cuts.ts`) that masks the edges between coplanar triangles, so only real facet edges are drawn. The stone shader draws wavy lines in screen space, one direction per facet, their weight set by how much the facet faces away from the light; in dark mode the lines mark the lit facets instead, like scratchboard. Line spacing is in CSS pixels, so the engraving keeps its weight at every resolution. A remote-only stone swaps lines for stipple; a waiting stone's wash pulses towards red. A stopped session's stone has a corner cut off its geometry. The rosette and the red ring are transparent decals on the sheet, and the splinters from the opening are one instanced mesh.
 
-The number of samples per channel is compiled into the shader, so a change of level rebuilds the shell materials and the effect chain. The blue halo and the amber glow are additive shells around the gem; the amber edges are line segments.
+All materials share one set of palette uniforms, so switching between light and dark changes their values without rebuilding anything or replaying the opening. Colours are sRGB values converted to linear by three.js and back by an `OutputPass`, so the screen shows them exactly; an e2e test checks the paper and rim colours in both modes.
+
+The scene renders through three's own `EffectComposer` with only a `RenderPass` and an `OutputPass`, into a half-float target multisampled on Medium and High. There is no post-processing beyond that.
 
 ### Drawing only on change
 
@@ -261,15 +262,11 @@ The ticker (`createTicker`) invalidates the canvas `1000 / fps` ms after the pre
 |---|---|---|---|
 | Frame cap | 30 fps | 30 fps | 60 fps |
 | Largest pixel ratio | 1× | 1.5× | 2× |
-| Refraction samples | 1 | 3 | 12 |
-| Back texture size | half | three quarters | full |
-| Rainbow split, glints | none | partial | full |
-| Bloom | off | on | on |
-| Depth of field | off | off | on |
-| Gems spin, scene breathes | no | yes | yes |
-| Facets per gem | 18 | 28 | 40 |
+| Multisampling | off | 4× | 4× |
+| Splinters | 40 | 90 | 90 |
+| Stones turn, rosettes spin, waiting stones pulse | no | yes | yes |
 
-Low has no ambient motion, so it draws only when something changes. The tiers are in `quality/tiers.ts`. The graphics control in the corner offers Auto, Low, Medium and High; a fixed choice bypasses the controller.
+The look is the same at every level. Low has no ambient motion, so it draws only when something changes. The tiers are in `quality/tiers.ts`. The graphics control in the corner offers Auto, Low, Medium and High; a fixed choice bypasses the controller.
 
 ### The adaptive controller
 
@@ -289,7 +286,7 @@ The gaps between the thresholds are the hysteresis: step down at 1.25 times the 
 
 ### Loading and failure
 
-The scene, which is mostly three.js, is a separate chunk loaded with `React.lazy`, so the overlays and data requests start without waiting for it. A chunk that fails to load is asked for once more. Until it arrives the user sees an empty dark backdrop. If it still fails or throws, `SceneBoundary` shows a message and the overlays stay usable. If WebGL cannot start, the canvas shows its own message. The scene also follows the system's reduced-motion setting: no spin or breathing, and camera moves still ease but quickly.
+The scene, which is mostly three.js, is a separate chunk loaded with `React.lazy`, so the overlays and data requests start without waiting for it. A chunk that fails to load is asked for once more. Until it arrives the user sees the empty page in the paper colour. If it still fails or throws, `SceneBoundary` shows a message and the overlays stay usable. If WebGL cannot start, the canvas shows its own message. The scene also follows the system's reduced-motion setting: no opening burst, no turning or spinning, a steady wash on waiting stones, and camera moves still ease but quickly.
 
 ## Remote repos
 
@@ -343,12 +340,12 @@ The hook is optional. Without it Refract still shows interrupted sessions and wh
 
 Refract adds one small script to Claude Code's hook settings. The script writes a one-line status file for a session when one of these events fires:
 
-| Claude Code event | Only for | Status written | What the gem shows |
+| Claude Code event | Only for | Status written | What the stone shows |
 |---|---|---|---|
 | `SessionStart` | `startup`, `resume`, `clear` | finished | Nothing special (idle) |
-| `UserPromptSubmit` | | working | Shimmer |
-| `PostToolUse` | any tool | working | Shimmer (marks the turn working again after a permission prompt is answered) |
-| `Notification` | `permission_prompt`, `elicitation_dialog` | waitingOnUser | Slow amber pulse |
+| `UserPromptSubmit` | | working | Rosette turns |
+| `PostToolUse` | any tool | working | Rosette turns (marks the turn working again after a permission prompt is answered) |
+| `Notification` | `permission_prompt`, `elicitation_dialog` | waitingOnUser | Slow red pulse |
 | `Stop` | | finished | Nothing special (idle) |
 | `SessionEnd` | | ended | Nothing special |
 
@@ -437,7 +434,7 @@ Unknown keys are ignored. Anything else, such as text that is not JSON, a missin
 
 **In the answer.** `limits` is `{fiveHour?, sevenDay?, updatedAt}`, where each window is `{usedPercent, resetsAt}` and times are RFC 3339 strings like `computedAt`. It is left out when there is no reading. It was added after the first release, so an app reading an older helper finds no `limits` and shows no rows, and an older app ignores it.
 
-**In the widget.** Under the token rows (and the cost note, when the estimate is on) are two compact rows, "5-hour limit 37% · resets 15:30" and "Weekly limit 58% · resets Mon 03:00", each over a thin meter (`role="meter"`, with the percentage and reset time as its text). Times are local and in 24-hour form, with the weekday whenever the date is not today's ("Sat 00:30"), and the date when it is more than 6 days away. The bar turns amber when the rounded percentage is 90 or more, and a percentage that rounds above 999 shows as ">999%". The rows' tooltip, also read by screen readers, names the source ("Claude Code's status line, via the helper's limits file"; the app does not know the path). `app/src/usage/limits.ts` decides what to show, given the time now:
+**In the widget.** Under the token rows (and the cost note, when the estimate is on) are two compact rows, "5-hour limit 37% · resets 15:30" and "Weekly limit 58% · resets Mon 03:00", each over a thin meter (`role="meter"`, with the percentage and reset time as its text). Times are local and in 24-hour form, with the weekday whenever the date is not today's ("Sat 00:30"), and the date when it is more than 6 days away. The bar turns red when the rounded percentage is 90 or more, and a percentage that rounds above 999 shows as ">999%". The rows' tooltip, also read by screen readers, names the source ("Claude Code's status line, via the helper's limits file"; the app does not know the path). `app/src/usage/limits.ts` decides what to show, given the time now:
 - A window whose `resetsAt` has passed on Windows' clock shows "reset since last reading" and no percentage, because its real value is unknown until the next reading.
 - A reading more than 15 minutes old keeps its values and adds "Limits as of 14:02". The status line runs only while a Claude Code session is open (with `"refreshInterval": 60` in its settings, about once a minute), so readings stop when no session is. `updatedAt` was taken on WSL's clock, which can drift from Windows' (WSL 2 does after sleep), so the age is measured on the helper's clock: the answer's `computedAt` less `updatedAt`, plus the time since that answer arrived. An `updatedAt` more than a minute ahead of `computedAt` counts as stale.
 - With neither window, the rows are not shown.
