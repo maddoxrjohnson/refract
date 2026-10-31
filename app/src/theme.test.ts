@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { useThemeMode, type ThemeSetting } from "./theme";
+import { THEME_STORAGE_KEY, rememberedTheme, useThemeMode, type ThemeSetting } from "./theme";
 
 /** A `matchMedia` whose dark-mode answer the test changes. */
 function fakeMedia(dark: boolean) {
@@ -25,7 +25,10 @@ function fakeMedia(dark: boolean) {
 const original = window.matchMedia;
 const root = document.documentElement;
 
-beforeEach(() => root.removeAttribute("data-theme"));
+beforeEach(() => {
+  root.removeAttribute("data-theme");
+  localStorage.clear();
+});
 afterEach(() => {
   window.matchMedia = original;
 });
@@ -89,5 +92,18 @@ describe("useThemeMode", () => {
     window.matchMedia = undefined;
     const { result } = renderHook(() => useThemeMode("system"));
     expect(result.current).toBe("light");
+  });
+
+  it("remembers the last setting for the next start", () => {
+    fakeMedia(false);
+    expect(rememberedTheme()).toBe("system");
+    const { rerender } = renderHook(({ s }: { s: ThemeSetting }) => useThemeMode(s), {
+      initialProps: { s: "dark" },
+    });
+    expect(rememberedTheme()).toBe("dark");
+    rerender({ s: "system" });
+    expect(rememberedTheme()).toBe("system");
+    localStorage.setItem(THEME_STORAGE_KEY, "sepia");
+    expect(rememberedTheme()).toBe("system");
   });
 });

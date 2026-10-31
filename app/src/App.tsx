@@ -29,7 +29,7 @@ import { hideKey, mergeProjects } from "./projects";
 import { createQualityController } from "./quality/controller";
 import type { QualityLevel, QualitySetting } from "./quality/tiers";
 import { initialRepoState, repoReducer } from "./repoState";
-import { useThemeMode } from "./theme";
+import { rememberedTheme, useThemeMode } from "./theme";
 import { layoutGems } from "./scene/layout";
 import { SceneBoundary } from "./scene/SceneBoundary";
 import { DetailPanel } from "./ui/DetailPanel";
@@ -326,7 +326,7 @@ export function App({ backend }: { backend: Backend }) {
   const repos = useMemo(() => new Map(repoList.map((r) => [r.path, r])), [repoList]);
   const positions = useMemo(() => layoutGems(repoList), [repoList]);
   const reducedMotion = useReducedMotion();
-  const themeMode = useThemeMode(settings?.theme ?? DEFAULT_SETTINGS.theme, backend);
+  const themeMode = useThemeMode(settings?.theme ?? rememberedTheme(), backend);
   const quality = useQuality(backend);
 
   // One launch at a time: a held or repeated Enter must not start several agents.

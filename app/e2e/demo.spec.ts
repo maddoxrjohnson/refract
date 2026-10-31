@@ -157,6 +157,62 @@ test("Appearance switches the panels between paper and ink", async ({ page }) =>
   await expect.poll(background).toBe("rgb(8, 16, 13)");
 });
 
+type Screenshot = Awaited<ReturnType<Page["screenshot"]>>;
+
+/** Average colours of `size`-pixel squares centred on `points` of a PNG screenshot. */
+async function patches(page: Page, png: Screenshot, points: [number, number][], size = 12): Promise<number[][]> {
+  return page.evaluate(
+    async ({ data, points, size }) => {
+      const img = new Image();
+      img.src = `data:image/png;base64,${data}`;
+      await img.decode();
+      const ctx = document.createElement("canvas").getContext("2d")!;
+      ctx.canvas.width = img.width;
+      ctx.canvas.height = img.height;
+      ctx.drawImage(img, 0, 0);
+      return points.map(([x, y]) => {
+        const px = ctx.getImageData(x - size / 2, y - size / 2, size, size).data;
+        const sum = [0, 0, 0];
+        for (let i = 0; i < px.length; i += 4) for (let c = 0; c < 3; c++) sum[c] += px[i + c];
+        return sum.map((v) => Math.round(v / (px.length / 4)));
+      });
+    },
+    { data: png.toString("base64"), points, size },
+  );
+}
+
+test.describe("Banknote colours at 1280×760", () => {
+  test.use({ viewport: { width: 1280, height: 760 } });
+
+  // Banknote spec §1.1: bare paper and the sheet's rim show the palette's sRGB values, so
+  // no colour-space conversion was lost on the way to the screen. The rim is checked in the
+  // corners; for the paper, some patch in the middle of the sheet must be bare (rosettes,
+  // stones and the paper's fade towards the rim cover the rest).
+  for (const [mode, edge, paper] of [
+    ["light", [0xe0, 0xe3, 0xd4], [0xee, 0xf0, 0xe4]],
+    ["dark", [0x08, 0x10, 0x0d], [0x0e, 0x17, 0x13]],
+  ] as const) {
+    test(`the ${mode} sheet shows the palette's paper and edge`, async ({ page }) => {
+      await page.emulateMedia({ colorScheme: mode });
+      await expect(page.locator(".scene")).toHaveAttribute("data-opening", "done", { timeout: 30_000 });
+      // Only the canvas: overlays would cover the patches.
+      await page.addStyleTag({
+        content: "main.app > :not(.scene):not(:has(.scene)), .scene-label, .scene-mark { visibility: hidden !important; }",
+      });
+      const png = await page.screenshot();
+      const near = (got: number[], want: readonly number[]) => {
+        for (let c = 0; c < 3; c++) expect(Math.abs(got[c] - want[c]), `${got} vs ${want}`).toBeLessThanOrEqual(2);
+      };
+      for (const got of await patches(page, png, [[20, 20], [1260, 20]])) near(got, edge);
+      const middle: [number, number][] = [];
+      for (let x = 450; x <= 830; x += 10) for (let y = 150; y <= 450; y += 10) middle.push([x, y]);
+      const off = (c: number[]) => Math.max(...c.map((v, i) => Math.abs(v - paper[i])));
+      const closest = (await patches(page, png, middle, 8)).sort((a, b) => off(a) - off(b))[0];
+      near(closest, paper);
+    });
+  }
+});
+
 test.describe("at 1280×800", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 

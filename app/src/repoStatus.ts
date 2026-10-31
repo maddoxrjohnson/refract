@@ -1,14 +1,14 @@
 import type { RepoSnapshot, SessionInfo } from "./backend/types";
 
-/** What a gem shows about its repo (spec §3.2). */
+/** What a stone shows about its repo (spec §3.2, banknote spec §2). */
 export interface RepoStatus {
-  /** Uncommitted changes: the blue halo. */
+  /** Uncommitted changes: the red ring on the sheet. */
   dirty: boolean;
-  /** An agent session stopped before it finished: pulsing amber edges. */
+  /** An agent session stopped before it finished: the chipped corner. */
   interrupted: boolean;
-  /** An agent is working right now (status hook): gentle shimmer. */
+  /** An agent is working right now (status hook): the rosette turns. */
   working: boolean;
-  /** An agent is waiting for input (status hook): slow amber pulse. */
+  /** An agent is waiting for input (status hook): the slow red pulse. */
   waiting: boolean;
 }
 
