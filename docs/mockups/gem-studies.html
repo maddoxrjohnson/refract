@@ -1,0 +1,823 @@
+<title>Refract Gem Studies</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bodoni+Moda:ital,opsz,wght@1,6..96,500&family=Hanken+Grotesk:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+  /* Layout: full-bleed live scene, quiet panels pinned to the corners. The script copies each
+     look's paper and ink into these tokens; the values here are Engraved's, as a fallback. */
+  :root {
+    --bg: #dfe1db; --panel: rgba(236, 238, 233, 0.86); --line: rgba(27, 42, 58, 0.18);
+    --fg: #1b2a3a; --muted: #56616e; --on-fg: #eceee9; --accent: #c33a26; --mark: #c33a26;
+    --display: "Bodoni Moda", "Didot", "Bodoni 72", Georgia, serif;
+    --body: "Hanken Grotesk", "Segoe UI", system-ui, sans-serif;
+    --mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0b1016; --panel: rgba(18, 26, 34, 0.86); --line: rgba(228, 223, 210, 0.16);
+      --fg: #e4dfd2; --muted: #9a9a94; --on-fg: #121a22; --accent: #ff6b4f; --mark: #ff6b4f; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0b1016; --panel: rgba(18, 26, 34, 0.86); --line: rgba(228, 223, 210, 0.16);
+    --fg: #e4dfd2; --muted: #9a9a94; --on-fg: #121a22; --accent: #ff6b4f; --mark: #ff6b4f; color-scheme: dark;
+  }
+  html, body { height: 100%; }
+  body { background: var(--bg); color: var(--fg); font-family: var(--body); font-size: 14px; overflow: hidden; }
+  .stage { position: fixed; inset: 0; }
+  #c { display: block; width: 100%; height: 100%; touch-action: none; }
+
+  .ui {
+    position: fixed; inset: 0; pointer-events: none;
+    display: grid; grid-template-rows: auto 1fr auto; gap: 16px;
+    padding-block: max(18px, env(safe-area-inset-top, 0px)) max(18px, env(safe-area-inset-bottom, 0px));
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+  }
+  .ui > * { pointer-events: auto; }
+  .top { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 14px 24px; }
+  .brand { display: grid; gap: 2px; }
+  .eyebrow { font-family: var(--mono); font-size: 11px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); }
+  h1 { margin: 0; font-family: var(--display); font-style: italic; font-weight: 500; font-size: clamp(30px, 4.4vw, 50px); line-height: 1; letter-spacing: -0.01em; text-wrap: balance; }
+
+  .controls { display: grid; gap: 8px; justify-items: end; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; justify-content: flex-end; }
+  .group-label { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin-right: 2px; }
+  .tab, .ghost {
+    font: 500 13px/1 var(--body); color: var(--muted); background: var(--panel);
+    border: 1px solid var(--line); border-radius: 999px; padding: 9px 14px; cursor: pointer;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    transition: color .15s, background .15s;
+  }
+  .tab:hover, .ghost:hover { color: var(--fg); }
+  .tab[aria-selected="true"] { color: var(--on-fg); background: var(--fg); border-color: var(--fg); }
+  .tab:focus-visible, .ghost:focus-visible, .legend li:focus-visible { outline: 2px solid var(--fg); outline-offset: 2px; }
+  .ghost { font-family: var(--mono); font-size: 12px; }
+
+  .bottom { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 16px; }
+  .card, .legend { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); }
+  .card { width: min(400px, 100%); padding: 16px 18px; display: grid; gap: 12px; min-width: 0; }
+  .pitch { margin: 0; line-height: 1.55; max-width: 60ch; }
+  .facts { margin: 0; display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; font-size: 13px; }
+  .facts dt { font-family: var(--mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); padding-top: 2px; }
+  .facts dd { margin: 0; line-height: 1.45; min-width: 0; }
+  .hint { font-size: 12px; color: var(--muted); }
+
+  .legend { padding: 14px 16px; min-width: 0; }
+  .legend h2 { margin: 0 0 8px; font-family: var(--mono); font-weight: 500; font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); }
+  .legend ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+  .legend li { display: grid; grid-template-columns: 14px auto 1fr; align-items: center; gap: 10px; padding: 5px 8px; margin: 0 -8px; border-radius: 8px; font-size: 13px; }
+  .legend li:hover, .legend li:focus-visible { background: var(--line); }
+  .legend .what { white-space: nowrap; }
+  .legend .how { color: var(--muted); font-size: 12px; text-align: right; }
+  .sw { width: 10px; height: 10px; border-radius: 50%; }
+  .sw.clean { border: 1px solid var(--fg); }
+  .sw.dirty { border: 2px solid var(--mark); }
+  .sw.working { background: var(--fg); }
+  .sw.waiting { background: var(--accent); }
+  .sw.interrupted { background: var(--fg); clip-path: polygon(0 0, 100% 0, 100% 45%, 45% 100%, 0 100%); border-radius: 2px; }
+  .sw.remote { border: 1px dashed var(--fg); }
+
+  .label {
+    position: fixed; left: 0; top: 0; pointer-events: none; z-index: 2;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 11px;
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    display: grid; gap: 3px; opacity: 0; transition: opacity .12s; white-space: nowrap;
+  }
+  .label.on { opacity: 1; }
+  .label .n { font-family: var(--mono); font-weight: 500; font-size: 13px; }
+  .label .m { font-size: 12px; color: var(--muted); }
+  .label .s { font-size: 12px; display: flex; align-items: center; gap: 6px; }
+  .fail { position: fixed; inset: 0; display: grid; place-items: center; padding: 24px; color: var(--muted); text-align: center; }
+
+  @media (max-width: 760px) {
+    .controls { justify-items: start; }
+    .tabs { justify-content: flex-start; }
+    .legend .how { display: none; }
+    .legend li { grid-template-columns: 14px 1fr; }
+    .legend { width: 100%; }
+    .legend ul { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 14px; }
+    .facts { display: none; }
+    .pitch { font-size: 13px; }
+  }
+  @media (max-height: 700px) and (min-width: 761px) { .facts { display: none; } }
+</style>
+
+<div class="stage"><canvas id="c" aria-label="Live 3D preview of repos drawn as gems"></canvas></div>
+
+<div class="ui">
+  <header class="top">
+    <div class="brand">
+      <span class="eyebrow">Refract · gem studies, round 4 · engraved × blueprint</span>
+      <h1 id="lookName">Engraved</h1>
+    </div>
+    <div class="controls">
+      <nav class="tabs" role="tablist" aria-label="Originals">
+        <span class="group-label">Originals</span>
+        <button class="tab" role="tab" data-look="engraved" aria-selected="true">Engraved</button>
+        <button class="tab" role="tab" data-look="blueprint" aria-selected="false">Blueprint</button>
+        <button class="ghost" id="mode" type="button">Dark</button>
+        <button class="ghost" id="replay" type="button">Replay opening</button>
+      </nav>
+      <nav class="tabs" role="tablist" aria-label="Hybrids">
+        <span class="group-label">Hybrids</span>
+        <button class="tab" role="tab" data-look="cyanotype" aria-selected="false">Cyanotype plate</button>
+        <button class="tab" role="tab" data-look="patent" aria-selected="false">Patent drawing</button>
+        <button class="tab" role="tab" data-look="working" aria-selected="false">Working drawing</button>
+        <button class="tab" role="tab" data-look="banknote" aria-selected="false">Banknote</button>
+      </nav>
+    </div>
+  </header>
+  <div></div>
+  <footer class="bottom">
+    <section class="card" aria-live="polite">
+      <p class="pitch" id="pitch"></p>
+      <dl class="facts" id="facts"></dl>
+      <span class="hint">Move the pointer to tilt the view. Hover a stone for its repo. Keys 1–6 switch looks, D switches light and dark.</span>
+    </section>
+    <section class="legend" aria-label="How each status shows">
+      <h2>Status</h2>
+      <ul id="legend"></ul>
+    </section>
+  </footer>
+</div>
+<div class="label" id="label"><span class="n"></span><span class="m"></span><span class="s"></span></div>
+
+<script type="importmap">
+{ "imports": {
+  "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+  "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+import { ConvexGeometry } from 'three/addons/geometries/ConvexGeometry.js';
+
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)').matches;
+
+// ---------- Invented repos (demo data) ----------
+const REPOS = [
+  { name: 'atlas-api', lang: 'TypeScript', host: 'GitHub', mass: 1.0, status: 'working' },
+  { name: 'quill', lang: 'Rust', host: 'GitHub', mass: 0.86, status: 'dirty' },
+  { name: 'lumen-ml', lang: 'Python', host: 'GitHub', mass: 0.8, status: 'waiting' },
+  { name: 'harbor', lang: 'Go', host: 'GitLab', mass: 0.7, status: 'clean' },
+  { name: 'ember-ui', lang: 'TypeScript', host: 'GitHub', mass: 0.64, status: 'interrupted' },
+  { name: 'kestrel', lang: 'Rust', host: 'GitHub', mass: 0.58, status: 'clean' },
+  { name: 'tidepool', lang: 'Python', host: 'GitLab', mass: 0.52, status: 'dirty' },
+  { name: 'cinder', lang: 'C', host: 'Local', mass: 0.48, status: 'clean' },
+  { name: 'drift', lang: 'Kotlin', host: 'GitHub', mass: 0.44, status: 'clean' },
+  { name: 'orchard', lang: 'TypeScript', host: 'GitHub', mass: 0.4, status: 'remote' },
+  { name: 'wren', lang: 'Swift', host: 'GitHub', mass: 0.36, status: 'clean' },
+  { name: 'sable-cli', lang: 'Rust', host: 'GitLab', mass: 0.32, status: 'remote' },
+  { name: 'dotfiles', lang: 'Shell', host: 'GitHub', mass: 0.28, status: 'clean' },
+  { name: 'fern-notes', lang: 'Python', host: 'Local', mass: 0.24, status: 'clean' },
+];
+const STONES = {
+  TypeScript: { stone: 'sapphire', hex: 0x3d63c9 },
+  Python: { stone: 'citrine', hex: 0xe0a93a },
+  Rust: { stone: 'mandarin garnet', hex: 0xd9672e },
+  Go: { stone: 'aquamarine', hex: 0x8fd3d8 },
+  C: { stone: 'white topaz', hex: 0xe8ecf0 },
+  Kotlin: { stone: 'amethyst', hex: 0x8a62c8 },
+  Swift: { stone: 'rhodolite', hex: 0xc23a5a },
+  Shell: { stone: 'peridot', hex: 0x9cc650 },
+};
+const STATUS_TEXT = { clean: 'Clean', dirty: '3 files changed', working: 'Agent working', waiting: 'Waiting for you', interrupted: 'Stopped mid-task', remote: 'Not cloned' };
+const STATUS_NAME = { dirty: 'Uncommitted changes', working: 'Agent working', waiting: 'Waiting for you', interrupted: 'Stopped mid-task', remote: 'Not cloned', clean: 'Clean' };
+const STATUS_ORDER = ['dirty', 'working', 'waiting', 'interrupted', 'remote', 'clean'];
+
+// Each look is a set of switches over one renderer.
+//   hatch: 0 none (blueprint fill), 1 per-facet engraving, 2 fixed 45° patent shading, 3 wavy banknote, 4 pencil sketch
+//   under: 0 hatched shadow, 1 construction circle and cross, 2 nothing, 3 guilloche rosette
+//   dirty: 0 hand-drawn ring, 2 revision cloud;  working: 'drift' | 'orbit' | 'rosette'
+//   ghost: 0 stipple, 1 phantom lines (remote repos);  wait: 0 colour wash, 1 lines turn red
+const LOOKS = {
+  engraved: {
+    key: '1', name: 'Engraved',
+    pitch: 'A plate from a gemmology book. Facets are drawn in ink with hatching that follows the light, the stone’s colour is a thin wash, and anything that needs you is marked in red pencil.',
+    facts: [['Dark', 'Scratchboard: light is scratched out of black, so the lines mark the lit facets.']],
+    how: { dirty: 'circled in red', working: 'hatching drifts', waiting: 'red wash, slow pulse', interrupted: 'chipped corner', remote: 'stippled, not hatched', clean: 'plain ink' },
+    hatch: 1, spacing: 4.2, wobble: 0, graphite: 0, hidden: false, under: 0, dirty: 0, working: 'drift', ghost: 0, wait: 0, waitAmp: [0.08, 0.3],
+    floor: { fibre: 1, grid: 0, border: 0 },
+    pal: {
+      light: { paper: 0xeceee9, edge: 0xdfe1db, ink: 0x1b2a3a, accent: 0xc33a26, wash: 0.3 },
+      dark: { paper: 0x121a22, edge: 0x0b1016, ink: 0xe4dfd2, accent: 0xff6b4f, wash: 0.22 },
+    },
+  },
+  blueprint: {
+    key: '2', name: 'Blueprint',
+    pitch: 'A draughtsman’s sheet. Stones are technical drawings with hidden edges dashed, on a grid with construction marks. Uncommitted changes get a revision cloud, the mark engineers draw around anything changed since the last issue.',
+    facts: [['Dark', 'A cyanotype: white lines on Prussian blue, the original blueprint.']],
+    how: { dirty: 'revision cloud', working: 'dashed orbit turns', waiting: 'lines pulse red', interrupted: 'chipped corner', remote: 'phantom lines', clean: 'solid lines' },
+    hatch: 0, spacing: 4, wobble: 0, graphite: 0, hidden: true, under: 1, dirty: 2, working: 'orbit', ghost: 1, wait: 1, waitAmp: [0.15, 0.85],
+    floor: { fibre: 0, grid: 1, border: 0 },
+    pal: {
+      light: { paper: 0xf1f5f9, edge: 0xe1e8f0, ink: 0x1d4f91, accent: 0xd23c2a, wash: 0.06 },
+      dark: { paper: 0x0f3a63, edge: 0x0a2a49, ink: 0xe6eef7, accent: 0xff8a6b, wash: 0.07 },
+    },
+  },
+  cyanotype: {
+    key: '3', name: 'Cyanotype plate',
+    pitch: 'Engraving technique, blueprint chemistry. Facets are hatched like the engraved plate but printed in Prussian blue on a faint grid, with hidden edges dashed and construction circles underneath.',
+    facts: [['Engraved', 'Per-facet hatching, red wash for waiting, the slow drift.'], ['Blueprint', 'Prussian blue, grid, hidden edges, construction marks, revision clouds, phantom lines.'], ['Dark', 'White hatching on blue, scratched like scratchboard.']],
+    how: { dirty: 'red revision cloud', working: 'hatching drifts', waiting: 'red wash, slow pulse', interrupted: 'chipped corner', remote: 'phantom outline only', clean: 'plain print' },
+    hatch: 1, spacing: 4.2, wobble: 0, graphite: 0, hidden: true, under: 1, dirty: 2, working: 'drift', ghost: 1, wait: 0, waitAmp: [0.08, 0.3],
+    floor: { fibre: 1, grid: 0.55, border: 0 },
+    pal: {
+      light: { paper: 0xeef3f7, edge: 0xdfe7ee, ink: 0x17457f, accent: 0xc8372a, wash: 0.1 },
+      dark: { paper: 0x103c66, edge: 0x0a2a4a, ink: 0xe9f0f8, accent: 0xff8a6b, wash: 0.08 },
+    },
+  },
+  patent: {
+    key: '4', name: 'Patent drawing',
+    pitch: 'The style of a patent filing: black ink only, parallel 45° shading on the facets that face away from the light, hidden edges dashed, and a ruled border round the sheet. The starkest of the set, and very easy to read.',
+    facts: [['Engraved', 'Ink line shading and a paper sheet; the slow drift.'], ['Blueprint', 'Hidden edges, revision clouds, phantom lines, lines that pulse red.'], ['Dark', 'White ink on black, like a negative of the filing.']],
+    how: { dirty: 'revision cloud', working: 'shading drifts', waiting: 'lines pulse red', interrupted: 'chipped corner', remote: 'phantom outline only', clean: 'ink only' },
+    hatch: 2, spacing: 5.5, wobble: 0, graphite: 0, hidden: true, under: 2, dirty: 2, working: 'drift', ghost: 1, wait: 1, waitAmp: [0.15, 0.85],
+    floor: { fibre: 0.5, grid: 0, border: 1 },
+    pal: {
+      light: { paper: 0xf7f7f3, edge: 0xebebe6, ink: 0x141414, accent: 0xc8372a, wash: 0.0 },
+      dark: { paper: 0x111112, edge: 0x09090a, ink: 0xedede8, accent: 0xff6b4f, wash: 0.0 },
+    },
+  },
+  working: {
+    key: '5', name: 'Working drawing',
+    pitch: 'A draughtsman’s pencil drawing on green engineering paper, before anyone inked it. Hatching is quick and broken, edges wobble a little, construction circles sit under each stone and changes are clouded in red pencil.',
+    facts: [['Engraved', 'Hatching that follows the light, a colour wash, red pencil.'], ['Blueprint', 'Grid paper, construction marks, hidden edges, revision clouds, the dashed orbit.'], ['Dark', 'Moves to a chalkboard: chalk lines on dark green slate.']],
+    how: { dirty: 'red pencil cloud', working: 'dashed orbit turns', waiting: 'red wash, slow pulse', interrupted: 'chipped corner', remote: 'phantom outline only', clean: 'pencil only' },
+    hatch: 4, spacing: 5, wobble: 1, graphite: 1, hidden: true, under: 1, dirty: 2, working: 'orbit', ghost: 1, wait: 0, waitAmp: [0.08, 0.3],
+    floor: { fibre: 1, grid: 1, border: 0 },
+    pal: {
+      light: { paper: 0xedf2ea, edge: 0xdfe6da, ink: 0x3a3f45, grid: 0x6fae8e, accent: 0xd0402a, wash: 0.2 },
+      dark: { paper: 0x1f2b27, edge: 0x141c19, ink: 0xe8ebe4, grid: 0x5b8574, accent: 0xff9a7a, wash: 0.07 },
+    },
+  },
+  banknote: {
+    key: '6', name: 'Banknote',
+    pitch: 'Security engraving from a banknote: fine wavy line-work on every facet, a guilloche rosette under each stone and a pale wash of colour. Precise like a blueprint, crafted like an engraving.',
+    facts: [['Engraved', 'Line engraving, colour wash, hand-drawn red ring, stipple for repos not cloned.'], ['Blueprint', 'Exact geometry under each stone: the rosette is a construction mark made ornamental.'], ['Dark', 'Gold ink on deep green.']],
+    how: { dirty: 'red overprint ring', working: 'rosette turns', waiting: 'red wash, slow pulse', interrupted: 'chipped corner', remote: 'stippled', clean: 'fine line-work' },
+    hatch: 3, spacing: 3.2, wobble: 0, graphite: 0, hidden: false, under: 3, dirty: 0, working: 'rosette', ghost: 0, wait: 0, waitAmp: [0.08, 0.3],
+    floor: { fibre: 1, grid: 0, border: 0 },
+    pal: {
+      light: { paper: 0xeef0e4, edge: 0xe0e3d4, ink: 0x1f4a3d, accent: 0xb8322a, wash: 0.2 },
+      dark: { paper: 0x0e1713, edge: 0x08100d, ink: 0xd8c78f, accent: 0xff7a5c, wash: 0.14 },
+    },
+  },
+};
+const KEYS = Object.fromEntries(Object.entries(LOOKS).map(([id, l]) => [l.key, id]));
+
+// ---------- Helpers ----------
+function rng(seed) {
+  let a = seed >>> 0;
+  return () => { a = (a + 0x6d2b79f5) >>> 0; let t = a; t = Math.imul(t ^ (t >>> 15), t | 1); t ^= t + Math.imul(t ^ (t >>> 7), t | 61); return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+const clamp01 = (x) => Math.min(1, Math.max(0, x));
+const easeOutExpo = (t) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
+
+// Convex faceted solid from horizontal rings (bottom to top). r = 0 is an apex. Rings offset by
+// half a step are joined with zig-zag triangles (kite facets).
+function cutGeometry(rings, seg, sx = 1, sz = 1) {
+  const ys = rings.map((r) => r.y), yc = (Math.min(...ys) + Math.max(...ys)) / 2;
+  const ring = (R) => Array.from({ length: seg }, (_, i) => {
+    const a = ((i + (R.off || 0)) / seg) * Math.PI * 2;
+    return new THREE.Vector3(Math.cos(a) * R.r * sx, R.y, Math.sin(a) * R.r * sz);
+  });
+  const out = [], c = new THREE.Vector3(0, yc, 0), ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3(), cen = new THREE.Vector3();
+  const tri = (a, b, d) => {
+    n.crossVectors(ab.subVectors(b, a), ac.subVectors(d, a));
+    cen.copy(a).add(b).add(d).multiplyScalar(1 / 3).sub(c);
+    if (n.dot(cen) < 0) out.push(a, d, b); else out.push(a, b, d);
+  };
+  for (let k = 0; k < rings.length - 1; k++) {
+    const A = rings[k], B = rings[k + 1];
+    if (A.r === 0) { const ap = new THREE.Vector3(0, A.y, 0), P = ring(B); for (let i = 0; i < seg; i++) tri(ap, P[i], P[(i + 1) % seg]); continue; }
+    if (B.r === 0) { const ap = new THREE.Vector3(0, B.y, 0), P = ring(A); for (let i = 0; i < seg; i++) tri(P[i], P[(i + 1) % seg], ap); continue; }
+    const P = ring(A), Q = ring(B), j = (i) => (i + 1) % seg, ao = A.off || 0, bo = B.off || 0;
+    for (let i = 0; i < seg; i++) {
+      if (ao === bo) { tri(P[i], P[j(i)], Q[j(i)]); tri(P[i], Q[j(i)], Q[i]); }
+      else if (bo > ao) { tri(P[i], P[j(i)], Q[i]); tri(Q[i], P[j(i)], Q[j(i)]); }
+      else { tri(P[i], P[j(i)], Q[j(i)]); tri(Q[i], P[i], Q[j(i)]); }
+    }
+  }
+  return new THREE.BufferGeometry().setFromPoints(out);
+}
+
+// A stone stopped mid-task loses a corner: points past a plane are pushed back onto it, then re-hulled.
+function chip(geo, dir, depth) {
+  const pos = geo.attributes.position, n = dir.clone().normalize(), pts = [], v = new THREE.Vector3();
+  let max = -Infinity;
+  for (let i = 0; i < pos.count; i++) max = Math.max(max, v.fromBufferAttribute(pos, i).dot(n));
+  const d = max - depth;
+  for (let i = 0; i < pos.count; i++) {
+    v.fromBufferAttribute(pos, i);
+    const s = v.dot(n);
+    pts.push(s > d ? v.clone().addScaledVector(n, d - s) : v.clone());
+  }
+  return new ConvexGeometry(pts);
+}
+
+// Flat normals plus a barycentric attribute; edges between coplanar triangles are masked so
+// only real facet edges are drawn.
+function prepare(geo) {
+  const g = geo.index ? geo.toNonIndexed() : geo;
+  g.deleteAttribute('normal');
+  g.computeVertexNormals();
+  const pos = g.attributes.position, triCount = pos.count / 3;
+  const key = (i) => `${pos.getX(i).toFixed(3)},${pos.getY(i).toFixed(3)},${pos.getZ(i).toFixed(3)}`;
+  const normals = [], edges = new Map(), a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  for (let t = 0; t < triCount; t++) {
+    a.fromBufferAttribute(pos, t * 3); b.fromBufferAttribute(pos, t * 3 + 1); c.fromBufferAttribute(pos, t * 3 + 2);
+    normals.push(new THREE.Vector3().crossVectors(b.clone().sub(a), c.clone().sub(a)).normalize());
+    for (let e = 0; e < 3; e++) {
+      const k1 = key(t * 3 + ((e + 1) % 3)), k2 = key(t * 3 + ((e + 2) % 3)), ek = k1 < k2 ? k1 + '|' + k2 : k2 + '|' + k1;
+      if (!edges.has(ek)) edges.set(ek, []);
+      edges.get(ek).push([t, e]);
+    }
+  }
+  const bary = new Float32Array(pos.count * 3);
+  for (let t = 0; t < triCount; t++) for (let v = 0; v < 3; v++) bary[(t * 3 + v) * 3 + v] = 1;
+  for (const list of edges.values()) {
+    if (list.length !== 2) continue;
+    const [[t1, e1], [t2, e2]] = list;
+    if (normals[t1].dot(normals[t2]) > 0.999) for (const [t, e] of [[t1, e1], [t2, e2]]) for (let v = 0; v < 3; v++) bary[(t * 3 + v) * 3 + e] = 1;
+  }
+  g.setAttribute('bary', new THREE.BufferAttribute(bary, 3));
+  return g;
+}
+
+const CUTS = {
+  brilliant: () => cutGeometry([{ y: -0.86, r: 0 }, { y: -0.4, r: 0.6, off: 0.5 }, { y: -0.04, r: 1 }, { y: 0.04, r: 1 }, { y: 0.2, r: 0.8, off: 0.5 }, { y: 0.34, r: 0.56 }, { y: 0.34, r: 0 }], 8),
+  round: () => cutGeometry([{ y: -0.86, r: 0 }, { y: -0.42, r: 0.58, off: 0.5 }, { y: -0.04, r: 1 }, { y: 0.04, r: 1 }, { y: 0.19, r: 0.8, off: 0.5 }, { y: 0.32, r: 0.55 }, { y: 0.32, r: 0 }], 16),
+  emerald: () => cutGeometry([{ y: -0.6, r: 0, off: 0.5 }, { y: -0.44, r: 0.36, off: 0.5 }, { y: -0.2, r: 0.72, off: 0.5 }, { y: -0.03, r: 1, off: 0.5 }, { y: 0.03, r: 1, off: 0.5 }, { y: 0.14, r: 0.86, off: 0.5 }, { y: 0.24, r: 0.72, off: 0.5 }, { y: 0.3, r: 0.6, off: 0.5 }, { y: 0.3, r: 0, off: 0.5 }], 8, 1.3, 0.92),
+  princess: () => cutGeometry([{ y: -0.78, r: 0, off: 0.5 }, { y: -0.36, r: 0.72, off: 0.5 }, { y: -0.03, r: 1.12, off: 0.5 }, { y: 0.03, r: 1.12, off: 0.5 }, { y: 0.24, r: 0.82, off: 0.5 }, { y: 0.24, r: 0, off: 0.5 }], 4),
+  oval: () => cutGeometry([{ y: -0.82, r: 0 }, { y: -0.4, r: 0.6, off: 0.5 }, { y: -0.04, r: 1 }, { y: 0.04, r: 1 }, { y: 0.2, r: 0.8, off: 0.5 }, { y: 0.32, r: 0.55 }, { y: 0.32, r: 0 }], 12, 1.32, 0.86),
+  cushion: () => cutGeometry([{ y: -0.8, r: 0 }, { y: -0.38, r: 0.62, off: 0.5 }, { y: -0.04, r: 1 }, { y: 0.04, r: 1 }, { y: 0.22, r: 0.76, off: 0.5 }, { y: 0.34, r: 0.5 }, { y: 0.34, r: 0 }], 12, 1.08, 1),
+};
+const CUT_ORDER = ['round', 'emerald', 'brilliant', 'oval', 'princess', 'cushion', 'brilliant', 'emerald', 'oval', 'round', 'cushion', 'princess', 'brilliant', 'oval'];
+
+function shardGeometry(r, L, W, T) {
+  const outline = [[L / 2, 0], [L * (0.05 + r() * 0.15), W / 2 * (0.7 + r() * 0.3)], [-L / 2, W * (0.15 + r() * 0.2)], [-L / 2 * (0.8 + r() * 0.15), -W * (0.25 + r() * 0.15)], [L * (r() * 0.2 - 0.05), -W / 2 * (0.6 + r() * 0.4)]];
+  const pts = [];
+  for (const [x, y] of outline) { pts.push(new THREE.Vector3(x, 0, y)); pts.push(new THREE.Vector3(x * 0.86, T / 2, y * 0.7)); pts.push(new THREE.Vector3(x * 0.86, -T / 2, y * 0.7)); }
+  return new ConvexGeometry(pts);
+}
+
+// ---------- Layout (shared): heaviest in the middle, discs pushed apart ----------
+const r0 = rng(7);
+const LAYOUT = REPOS.map((repo, i) => {
+  const a = i * 2.39996, rr = 1.4 * Math.sqrt(i), size = 0.42 + repo.mass * 0.52;
+  return { x: Math.cos(a) * rr, z: Math.sin(a) * rr * 0.8, r: size * 1.22, w: 0.4 + repo.mass, size, tiltX: (r0() - 0.5) * 0.5, tiltZ: (r0() - 0.5) * 0.5, phase: r0() * 6.28, spinDir: r0() < 0.5 ? -1 : 1, delay: r0() * 0.06 };
+});
+for (let k = 0; k < 260; k++) {
+  for (const a of LAYOUT) { a.x -= a.x * 0.02 * a.w; a.z -= a.z * 0.02 * a.w; }
+  for (let i = 0; i < LAYOUT.length; i++) for (let j = i + 1; j < LAYOUT.length; j++) {
+    const a = LAYOUT[i], b = LAYOUT[j];
+    let dx = b.x - a.x, dz = b.z - a.z; const d = Math.hypot(dx, dz) || 1e-3, min = a.r + b.r;
+    if (d < min) { const p = (min - d) / 2; dx /= d; dz /= d; a.x -= dx * p; a.z -= dz * p; b.x += dx * p; b.z += dz * p; }
+  }
+}
+const LAYOUT_R = Math.max(...LAYOUT.map((d) => Math.hypot(d.x, d.z) + d.r));
+const SHADOW_DIR = new THREE.Vector2(0.45, 0.8).normalize();
+
+// ---------- Renderer ----------
+const canvas = document.getElementById('c');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: 'high-performance' });
+} catch (e) {
+  document.body.insertAdjacentHTML('beforeend', '<div class="fail">This preview needs WebGL, which this browser has turned off.</div>');
+  throw e;
+}
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.NoToneMapping;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(28, 1, 0.1, 200);
+const composer = new EffectComposer(renderer, new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, samples: 4 }));
+composer.addPass(new RenderPass(scene, camera));
+composer.addPass(new OutputPass());
+
+// ---------- Shaders ----------
+const GLSL_COMMON = `
+  vec3 hash3(vec3 p){ p = fract(p * vec3(0.1031, 0.1030, 0.0973)); p += dot(p, p.yxz + 33.33); return fract((p.xxy + p.yxx) * p.zyx); }
+  float h2(vec2 p){ return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453); }
+  float vnoise(vec2 p){ vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+    return mix(mix(h2(i), h2(i + vec2(1, 0)), f.x), mix(h2(i + vec2(0, 1)), h2(i + vec2(1, 1)), f.x), f.y); }
+  float lineAt(float s, float width){ float f = abs(fract(s) - 0.5) * 2.0, aa = fwidth(s) * 2.0; return 1.0 - smoothstep(width - aa, width + aa, f); }
+  float hatch(vec2 p, float ang, float spacing, float width){ return lineAt(dot(p, vec2(cos(ang), sin(ang))) / spacing, width); }`;
+const stoneVert = `
+  attribute vec3 bary;
+  varying vec3 vN; varying vec3 vObjN; varying vec3 vW; varying vec3 vBary; varying vec3 vLocal;
+  void main(){
+    mat4 m = modelMatrix;
+    #ifdef USE_INSTANCING
+      m = m * instanceMatrix;
+    #endif
+    vec4 wp = m * vec4(position, 1.0);
+    vW = wp.xyz; vN = normalize(mat3(m) * normal); vObjN = normal; vBary = bary; vLocal = position;
+    gl_Position = projectionMatrix * viewMatrix * wp;
+  }`;
+const stoneFrag = `
+  uniform vec3 paper; uniform vec3 ink; uniform vec3 accent; uniform vec3 tint;
+  uniform float tintAmt; uniform float invert; uniform float px; uniform float time; uniform float fade;
+  uniform float drift; uniform float accentAmt; uniform float ghost; uniform float ghostMode; uniform float waitMode;
+  uniform float spacing; uniform vec3 lightDir;
+  varying vec3 vN; varying vec3 vObjN; varying vec3 vW; varying vec3 vBary; varying vec3 vLocal;
+  ${GLSL_COMMON}
+  void main(){
+    float d = min(min(vBary.x, vBary.y), vBary.z);
+    vec2 p = gl_FragCoord.xy / px;
+  #if WOBBLE
+    d += (vnoise(p * 0.12) - 0.5) * fwidth(d) * 2.2;
+    p += (vec2(vnoise(p * 0.04), vnoise(p * 0.04 + 7.0)) - 0.5) * 5.0;
+  #endif
+    vec3 lineCol = mix(ink, accent, accentAmt * waitMode);
+    float s = fract(dot(vLocal, vec3(13.1, 9.7, 11.3)) / 2.0);
+    float phantom = step(s, 0.5) + step(0.6, s) * step(s, 0.68) + step(0.78, s) * step(s, 0.86);
+  #ifdef HIDDEN
+    float he = 1.0 - smoothstep(0.0, fwidth(d) * 1.1, d);
+    float dash = step(0.5, fract(dot(vLocal, vec3(13.1, 9.7, 11.3))));
+    float ha = he * dash * 0.4 * fade * (1.0 - ghost);
+    if (ha < 0.01) discard;
+    gl_FragColor = vec4(lineCol, ha);
+  #else
+    vec3 N = normalize(vN), L = normalize(lightDir), V = normalize(cameraPosition - vW);
+    float diff = clamp(dot(N, L), 0.0, 1.0);
+    float spec = smoothstep(0.35, 0.7, pow(clamp(dot(reflect(-L, N), V), 0.0, 1.0), 24.0));
+    float tone = clamp(1.0 - (0.12 + 0.95 * diff), 0.0, 1.0);
+    vec3 h = hash3(floor(vObjN * 9.0 + 9.0));
+    vec2 hp = p + vec2(drift * time * 6.0, 0.0);
+    float e = 1.0 - smoothstep(0.0, fwidth(d) * 1.3, d);
+    vec3 base = mix(paper, tint, tintAmt * (0.55 + 0.45 * tone));
+    base = mix(base, accent, accentAmt * (1.0 - waitMode));
+    vec3 col;
+  #if HATCH == 0
+    vec3 fill = mix(paper, ink, 0.04 + 0.08 * tone);
+    col = mix(fill, tint, tintAmt);
+  #else
+    float t = mix(tone, 1.0 - tone, invert);
+    float ang = 0.5 + h.x * 2.2;
+    float lines;
+    #if HATCH == 1
+      lines = hatch(hp, ang, spacing, 0.08 + t * 0.55);
+      lines = max(lines, step(0.55, t) * hatch(hp, ang + 1.4, spacing, (t - 0.55) * 0.9));
+    #elif HATCH == 2
+      lines = step(0.34, t) * hatch(hp, 0.785, spacing, 0.14 + (t - 0.34) * 0.5);
+    #elif HATCH == 3
+      vec2 dir = vec2(cos(ang), sin(ang)), perp = vec2(-dir.y, dir.x);
+      float sw = dot(hp, dir) / spacing + sin(dot(hp, perp) * 0.11 + h.y * 6.28) * 0.7;
+      lines = lineAt(sw, 0.06 + t * 0.5);
+      lines = max(lines, step(0.6, t) * lineAt(dot(hp, perp) / spacing + sin(dot(hp, dir) * 0.09) * 0.7, (t - 0.6) * 0.8));
+    #else
+      lines = step(0.22, t) * hatch(hp, ang, spacing, 0.1 + t * 0.45);
+      lines *= smoothstep(0.25, 0.55, vnoise(vec2(dot(hp, vec2(cos(ang), sin(ang))) * 0.35, dot(hp, vec2(-sin(ang), cos(ang))) * 0.06) + h.xy * 20.0));
+    #endif
+    #if GRAPHITE
+      lines *= 0.55 + 0.45 * h2(floor(hp));
+    #endif
+    float dots = step(h2(floor(hp / 1.6)), 0.12 + t * 0.45);
+    lines = mix(lines, mix(dots, 0.0, ghostMode), ghost);
+    lines = mix(lines * (1.0 - spec), max(lines, spec), invert);
+    col = mix(base, ink, lines * 0.82);
+  #endif
+    float edgeMask = mix(1.0, phantom, ghost * ghostMode);
+    col = mix(col, lineCol, e * edgeMask * 0.95);
+    gl_FragColor = vec4(mix(paper, col, fade), 1.0);
+  #endif
+  }`;
+const floorFrag = `
+  uniform vec3 paper; uniform vec3 edge; uniform vec3 ink; uniform vec3 gridInk; uniform float reach; uniform float px;
+  uniform float fibre; uniform float gridAmt; uniform float border; uniform vec2 borderB;
+  varying vec3 vW;
+  ${GLSL_COMMON}
+  float grid(vec2 v){ vec2 g = abs(fract(v - 0.5) - 0.5) / fwidth(v); return 1.0 - min(min(g.x, g.y), 1.0); }
+  float rule(float x){ return 1.0 - smoothstep(0.0, fwidth(x) * 1.3, abs(x)); }
+  void main(){
+    vec2 q = vW.xz - vec2(-0.6, -1.2);
+    vec3 c = mix(paper, edge, smoothstep(0.0, 1.0, length(q) / reach));
+    c *= 1.0 + (h2(floor(vW.xz * 40.0)) - 0.5) * 0.07 * fibre;
+    c = mix(c, gridInk, gridAmt * (grid(vW.xz * 4.0) * 0.07 + grid(vW.xz) * 0.16));
+    float bd = max(abs(vW.x) - borderB.x, abs(vW.z) - borderB.y);
+    c = mix(c, ink, border * max(rule(bd), rule(bd + 0.14) * 0.6));
+    gl_FragColor = vec4(c, 1.0);
+  }`;
+const decalVert = `varying vec2 vUv; void main(){ vUv = uv; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }`;
+const underFrag = `
+  uniform vec3 ink; uniform float px; uniform float fade; uniform float invert; uniform float spin;
+  varying vec2 vUv;
+  ${GLSL_COMMON}
+  void main(){
+    float r = length(vUv - 0.5) * 2.0; vec2 p = gl_FragCoord.xy / px; float a = 0.0;
+  #if UNDER == 0
+    float fall = 1.0 - smoothstep(0.25, 1.0, r);
+    a = lineAt((p.x + p.y) / 3.6, fall * 0.42) * fall * 0.75 * (1.0 - invert);
+  #elif UNDER == 1
+    float aa = fwidth(r) * 1.3;
+    float circ = 1.0 - smoothstep(aa * 0.5, aa * 1.5, abs(r - 0.94));
+    float dashC = step(0.5, fract(atan(vUv.y - 0.5, vUv.x - 0.5) / 6.28318 * 36.0));
+    vec2 dd = abs(vUv - 0.5);
+    float cross = (1.0 - smoothstep(0.0, fwidth(vUv.x) * 1.2, dd.x)) * step(dd.y, 0.1) + (1.0 - smoothstep(0.0, fwidth(vUv.y) * 1.2, dd.y)) * step(dd.x, 0.1);
+    a = max(circ * dashC * 0.35, cross * 0.5);
+  #elif UNDER == 3
+    float ang = atan(vUv.y - 0.5, vUv.x - 0.5) + spin, w = fwidth(r) * 1.1;
+    for (int k = 0; k < 6; k++) {
+      float fk = float(k);
+      float rk = 0.42 + fk * 0.1 + 0.04 * sin(ang * (10.0 + fk * 2.0) + fk * 1.7);
+      a = max(a, 1.0 - smoothstep(w * 0.4, w * 1.3, abs(r - rk)));
+    }
+    a *= 0.28;
+  #endif
+    gl_FragColor = vec4(ink, a * fade);
+  }`;
+const markFrag = `
+  uniform vec3 col; uniform float seed; uniform float draw; uniform float fade; uniform float time;
+  varying vec2 vUv;
+  void main(){
+    vec2 q = vUv - 0.5; float ang = atan(q.y, q.x), r = length(q) * 2.0;
+    float a01 = fract((ang + seed) / 6.28318), a = 0.0;
+  #if MARK == 0
+    float rr = 0.8 + 0.035 * sin(ang * 2.0 + seed) + 0.03 * a01, w = fwidth(r) * 1.4 + 0.006;
+    a = (1.0 - smoothstep(w * 0.5, w * 1.4, abs(r - rr))) * step(a01, draw);
+  #elif MARK == 2
+    float rr = 0.74 + 0.1 * abs(sin(ang * 6.0 + seed)), w = fwidth(r) * 1.3 + 0.004;
+    a = (1.0 - smoothstep(w * 0.5, w * 1.4, abs(r - rr))) * step(a01, draw);
+  #else
+    float w = fwidth(r) * 1.2 + 0.003;
+    a = (1.0 - smoothstep(w * 0.5, w * 1.4, abs(r - 0.92))) * step(0.5, fract(ang / 6.28318 * 24.0 - time * 0.6)) * 0.85;
+  #endif
+    gl_FragColor = vec4(col, a * fade);
+  }`;
+
+// ---------- Build a look ----------
+let look = null, lookId = 'banknote', mode = 'light', enterAt = 0, isolate = null;
+const clock = new THREE.Clock();
+const C = (hex) => new THREE.Color(hex);
+
+function build(id, md) {
+  const Lk = LOOKS[id], P = Lk.pal[md], dark = md === 'dark';
+  const group = new THREE.Group(), r = rng(21), pr = renderer.getPixelRatio();
+  const shared = { paper: { value: C(P.paper) }, ink: { value: C(P.ink) }, accent: { value: C(P.accent) } };
+  const light = new THREE.Vector3(-0.45, 1, -0.6);
+  const defines = { HATCH: Lk.hatch, WOBBLE: Lk.wobble, GRAPHITE: Lk.graphite };
+  const stoneMat = (tint, ghost, hidden) => new THREE.ShaderMaterial({
+    vertexShader: stoneVert, fragmentShader: stoneFrag, defines: hidden ? { ...defines, HIDDEN: 1 } : defines,
+    transparent: !!hidden, depthWrite: !hidden, depthFunc: hidden ? THREE.GreaterDepth : THREE.LessEqualDepth, side: hidden ? THREE.DoubleSide : THREE.FrontSide,
+    uniforms: { ...shared, tint: { value: tint }, tintAmt: { value: P.wash }, invert: { value: dark ? 1 : 0 }, px: { value: pr }, time: { value: 0 }, fade: { value: 1 },
+      drift: { value: 0 }, accentAmt: { value: 0 }, ghost: { value: ghost }, ghostMode: { value: Lk.ghost }, waitMode: { value: Lk.wait }, spacing: { value: Lk.spacing }, lightDir: { value: light } },
+  });
+
+  const floor = new THREE.Mesh(new THREE.PlaneGeometry(80, 80), new THREE.ShaderMaterial({
+    vertexShader: `varying vec3 vW; void main(){ vec4 w = modelMatrix * vec4(position,1.0); vW = w.xyz; gl_Position = projectionMatrix * viewMatrix * w; }`,
+    fragmentShader: floorFrag,
+    uniforms: { paper: shared.paper, edge: { value: C(P.edge) }, ink: shared.ink, gridInk: { value: C(P.grid ?? P.ink) }, reach: { value: LAYOUT_R * 1.5 }, px: { value: pr },
+      fibre: { value: Lk.floor.fibre }, gridAmt: { value: Lk.floor.grid }, border: { value: Lk.floor.border }, borderB: { value: new THREE.Vector2(LAYOUT_R + 0.6, LAYOUT_R * 0.85 + 0.6) } },
+  }));
+  floor.rotation.x = -Math.PI / 2;
+  group.add(floor);
+  scene.background = C(P.edge);
+
+  const stones = REPOS.map((repo, i) => {
+    const lay = LAYOUT[i], size = lay.size, st = STONES[repo.lang] || STONES.C, ghost = repo.status === 'remote' ? 1 : 0;
+    let geo = CUTS[CUT_ORDER[i]]();
+    if (repo.status === 'interrupted') geo = chip(geo, new THREE.Vector3(0.9, 0.5, 0.35), 0.42);
+    geo = prepare(geo);
+    const mat = stoneMat(C(st.hex), ghost, false);
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.scale.setScalar(size);
+    let hidden = null;
+    if (Lk.hidden) { hidden = new THREE.Mesh(geo, stoneMat(C(st.hex), ghost, true)); hidden.renderOrder = 2; mesh.add(hidden); }
+    const tilt = new THREE.Group(); tilt.rotation.set(lay.tiltX, 0, lay.tiltZ); tilt.add(mesh);
+    const holder = new THREE.Group(); holder.add(tilt); group.add(holder);
+
+    // What sits under the stone: a hatched shadow, construction marks or a rosette.
+    let underMat = null;
+    if (Lk.under !== 2) {
+      const sGroup = new THREE.Group();
+      underMat = new THREE.ShaderMaterial({ defines: { UNDER: Lk.under }, transparent: true, depthWrite: false, vertexShader: decalVert, fragmentShader: underFrag,
+        uniforms: { ink: shared.ink, px: { value: pr }, fade: { value: 1 }, invert: { value: dark ? 1 : 0 }, spin: { value: 0 } } });
+      const under = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), underMat);
+      under.rotation.x = -Math.PI / 2;
+      if (Lk.under === 0) { sGroup.rotation.y = Math.atan2(SHADOW_DIR.x, SHADOW_DIR.y); under.scale.set(size * 2.1, size * 3.0, 1); under.position.z = size * 0.9; }
+      else under.scale.setScalar(size * (Lk.under === 3 ? 2.5 : 2.5));
+      sGroup.add(under);
+      sGroup.position.set(lay.x, 0.004, lay.z);
+      group.add(sGroup);
+    }
+
+    const marks = [];
+    const addMark = (type, color, scale) => {
+      const m = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), new THREE.ShaderMaterial({
+        defines: { MARK: type }, transparent: true, depthWrite: false, vertexShader: decalVert, fragmentShader: markFrag,
+        uniforms: { col: { value: C(color) }, seed: { value: r() * 6.28 }, draw: { value: 0 }, fade: { value: 1 }, time: { value: 0 } },
+      }));
+      m.rotation.x = -Math.PI / 2; m.scale.setScalar(scale); m.position.set(lay.x, 0.006 + marks.length * 0.001, lay.z);
+      group.add(m); marks.push(m);
+    };
+    if (repo.status === 'dirty') addMark(Lk.dirty, P.accent, size * 3.1);
+    if (repo.status === 'working' && Lk.working === 'orbit') addMark(4, P.ink, size * 2.9);
+    return {
+      repo, lay, mesh, hidden, holder, size, mat, underMat, marks, focus: 0, dim: 1,
+      final: new THREE.Vector3(lay.x, size * 0.92, lay.z),
+      start: new THREE.Vector3((r() - 0.5) * 0.4, 1.6 + r(), (r() - 0.5) * 0.4), spinIn: (r() - 0.5) * 10, anchor: new THREE.Vector3(),
+    };
+  });
+
+  // Splinters thrown out with the stones; they settle on the table.
+  const count = 90, splinters = [];
+  const splMat = stoneMat(C(P.paper), 0, false);
+  splMat.uniforms.tintAmt.value = 0;
+  const inst = new THREE.InstancedMesh(prepare(shardGeometry(rng(5), 1, 0.32, 0.06)), splMat, count);
+  for (let i = 0; i < count; i++) {
+    const a = r() * Math.PI * 2, dist = 0.8 + Math.pow(r(), 0.6) * (LAYOUT_R + 0.6), s = 0.06 + Math.pow(r(), 2) * 0.22;
+    splinters.push({
+      to: new THREE.Vector3(Math.cos(a) * dist, s * 0.03, Math.sin(a) * dist * 0.85),
+      q: new THREE.Quaternion().setFromEuler(new THREE.Euler((r() - 0.5) * 0.2, a + (r() - 0.5) * 1.2, (r() - 0.5) * 0.2)),
+      s, delay: r() * 0.08, spin: (r() - 0.5) * 12, hop: 0.6 + r() * 1.2,
+    });
+  }
+  group.add(inst);
+  let settled = false;
+  const m4 = new THREE.Matrix4(), v = new THREE.Vector3(), q = new THREE.Quaternion(), sp = new THREE.Quaternion(), sc = new THREE.Vector3(), ax = new THREE.Vector3(1, 0, 0);
+  function splinterFrame(e) {
+    if (settled) return;
+    let done = true;
+    for (let i = 0; i < count; i++) {
+      const d = splinters[i], p = reduceMotion ? 1 : easeOutExpo(clamp01((e - d.delay) / 1.4));
+      if (p < 1) done = false;
+      v.copy(d.to).multiplyScalar(p); v.y = d.to.y + d.hop * 4 * p * (1 - p) * (1 - p) + (1 - p) * 1.4;
+      q.copy(d.q).multiply(sp.setFromAxisAngle(ax, (1 - p) * d.spin));
+      inst.setMatrixAt(i, m4.compose(v, q, sc.setScalar(d.s)));
+    }
+    inst.instanceMatrix.needsUpdate = true;
+    settled = done;
+  }
+  return { group, stones, splinterFrame, Lk, P };
+}
+
+// ---------- Status ----------
+function statusTick(s, t, e) {
+  const status = s.repo.status, Lk = look.Lk, calm = reduceMotion ? 0.6 : 0.5 + 0.5 * Math.sin(t * 1.57 + s.lay.phase);
+  s.dim += ((isolate && isolate !== status ? 0.22 : 1) - s.dim) * 0.15;
+  for (const u of [s.mat.uniforms, s.hidden?.material.uniforms]) {
+    if (!u) continue;
+    u.time.value = t;
+    u.drift.value = status === 'working' && Lk.working === 'drift' && !reduceMotion ? 1 : 0;
+    u.accentAmt.value = status === 'waiting' ? Lk.waitAmp[0] + Lk.waitAmp[1] * calm : 0;
+    u.fade.value = s.dim;
+  }
+  if (s.underMat) {
+    s.underMat.uniforms.fade.value = s.dim;
+    if (status === 'working' && Lk.working === 'rosette' && !reduceMotion) s.underMat.uniforms.spin.value = t * 0.5;
+  }
+  for (const m of s.marks) {
+    const u = m.material.uniforms;
+    u.fade.value = s.dim; u.time.value = t; u.draw.value = reduceMotion ? 1 : clamp01((e - 1.3) / 0.6);
+  }
+}
+
+// ---------- Light and dark ----------
+const mq = matchMedia('(prefers-color-scheme: dark)');
+function currentMode() {
+  const t = document.documentElement.getAttribute('data-theme');
+  return t === 'dark' || t === 'light' ? t : (mq.matches ? 'dark' : 'light');
+}
+const hex = (n) => '#' + n.toString(16).padStart(6, '0');
+function setTokens() {
+  const P = LOOKS[lookId].pal[mode], root = document.documentElement.style;
+  const fg = new THREE.Color(P.ink), paper = new THREE.Color(P.paper);
+  const rgba = (c, a) => { const s = c.clone().convertLinearToSRGB(); return `rgba(${Math.round(s.r * 255)}, ${Math.round(s.g * 255)}, ${Math.round(s.b * 255)}, ${a})`; };
+  root.setProperty('--bg', hex(P.edge));
+  root.setProperty('--panel', rgba(paper, 0.86));
+  root.setProperty('--line', rgba(fg, 0.17));
+  root.setProperty('--fg', hex(P.ink));
+  root.setProperty('--muted', paper.clone().lerp(fg, 0.62).getStyle());
+  root.setProperty('--on-fg', hex(P.paper));
+  root.setProperty('--accent', hex(P.accent));
+  root.setProperty('--mark', hex(P.accent));
+  root.setProperty('color-scheme', mode);
+  document.getElementById('mode').textContent = mode === 'dark' ? 'Light' : 'Dark';
+}
+function onModeChange() {
+  const m = currentMode();
+  if (m !== mode) { mode = m; setLook(lookId, true); }
+}
+mq.addEventListener('change', onModeChange);
+new MutationObserver(onModeChange).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+
+// ---------- Switching, camera, focus ----------
+const pointer = { x: 0, y: 0, px: -1e4, py: -1e4, inside: false };
+const aim = new THREE.Vector2();
+const labelEl = document.getElementById('label');
+
+function dispose(obj) {
+  obj.traverse((o) => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); });
+}
+function setLook(id, keepTime = false) {
+  if (look) { scene.remove(look.group); dispose(look.group); }
+  lookId = id;
+  look = build(id, mode);
+  scene.add(look.group);
+  if (!keepTime) enterAt = clock.getElapsedTime();
+  const Lk = LOOKS[id];
+  document.getElementById('lookName').textContent = Lk.name;
+  document.getElementById('pitch').textContent = Lk.pitch;
+  document.getElementById('facts').innerHTML = Lk.facts.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join('');
+  document.getElementById('legend').innerHTML = STATUS_ORDER.map((s) =>
+    `<li tabindex="0" data-status="${s}"><span class="sw ${s}"></span><span class="what">${STATUS_NAME[s]}</span><span class="how">${Lk.how[s]}</span></li>`).join('');
+  for (const li of document.querySelectorAll('#legend li')) {
+    const on = () => { isolate = li.dataset.status; }, off = () => { isolate = null; };
+    li.addEventListener('mouseenter', on); li.addEventListener('mouseleave', off); li.addEventListener('focus', on); li.addEventListener('blur', off);
+  }
+  for (const t of document.querySelectorAll('.tab')) t.setAttribute('aria-selected', String(t.dataset.look === id));
+  setTokens();
+  resize();
+}
+
+let camDist = 20;
+function resize() {
+  const w = innerWidth, h = innerHeight;
+  renderer.setSize(w, h, false);
+  composer.setSize(w, h);
+  camera.aspect = w / h;
+  const vf = THREE.MathUtils.degToRad(camera.fov), hf = 2 * Math.atan(Math.tan(vf / 2) * camera.aspect);
+  camDist = (LAYOUT_R + 0.4) / Math.sin(Math.min(vf * 1.25, hf) / 2) * 1.05;
+  camera.updateProjectionMatrix();
+  if (look) look.group.traverse((o) => { if (o.material?.uniforms?.px) o.material.uniforms.px.value = renderer.getPixelRatio(); });
+}
+
+const proj = new THREE.Vector3();
+function pickFocus() {
+  if (!pointer.inside) return null;
+  let best = null, bestD = 130;
+  for (const s of look.stones) {
+    proj.copy(s.anchor).project(camera);
+    s.sx = (proj.x * 0.5 + 0.5) * innerWidth; s.sy = (-proj.y * 0.5 + 0.5) * innerHeight;
+    const d = Math.hypot(s.sx - pointer.px, s.sy - pointer.py);
+    if (d < bestD) { bestD = d; best = s; }
+  }
+  return best;
+}
+function showLabel(s) {
+  if (!s) { labelEl.classList.remove('on'); return; }
+  const st = STONES[s.repo.lang] || STONES.C;
+  labelEl.querySelector('.n').textContent = s.repo.name;
+  labelEl.querySelector('.m').textContent = `${s.repo.host} · ${s.repo.lang} · ${st.stone}`;
+  labelEl.querySelector('.s').innerHTML = `<span class="sw ${s.repo.status}"></span>${STATUS_TEXT[s.repo.status]}`;
+  const w = labelEl.offsetWidth, h = labelEl.offsetHeight;
+  let x = s.sx + 36, y = s.sy - h - 12;
+  if (x + w > innerWidth - 12) x = s.sx - w - 36;
+  x = Math.max(12, x); y = Math.max(12, Math.min(innerHeight - h - 12, y));
+  labelEl.style.transform = `translate(${x}px, ${y}px)`;
+  labelEl.classList.add('on');
+}
+
+function frame() {
+  const t = clock.getElapsedTime(), e = t - enterAt;
+  aim.x += (pointer.x - aim.x) * 0.05; aim.y += (pointer.y - aim.y) * 0.05;
+  const el = THREE.MathUtils.degToRad(56 + aim.y * 4), az = aim.x * 0.12;
+  camera.position.set(Math.sin(az) * Math.cos(el) * camDist, Math.sin(el) * camDist, Math.cos(az) * Math.cos(el) * camDist);
+  camera.lookAt(0, 0, 0.3);
+  look.splinterFrame(e);
+  for (const s of look.stones) {
+    const p = reduceMotion ? 1 : easeOutExpo(clamp01((e - s.lay.delay) / 1.5));
+    const working = s.repo.status === 'working';
+    s.holder.position.lerpVectors(s.start, s.final, p);
+    s.holder.position.y = s.final.y + (1 - p) * s.start.y + s.focus * 0.3;
+    s.holder.rotation.set(0, (1 - p) * s.spinIn, 0);
+    s.holder.scale.setScalar((0.35 + 0.65 * p) * (1 + 0.06 * s.focus));
+    if (!reduceMotion) s.mesh.rotation.y = s.lay.phase + t * (working ? 0.45 : 0.12) * s.lay.spinDir;
+    s.anchor.copy(s.holder.position);
+    statusTick(s, t, e);
+  }
+  const focused = pickFocus();
+  for (const s of look.stones) s.focus += ((s === focused ? 1 : 0) - s.focus) * 0.15;
+  showLabel(focused);
+  composer.render();
+  requestAnimationFrame(frame);
+}
+
+// ---------- Wiring ----------
+addEventListener('resize', resize);
+canvas.addEventListener('pointermove', (ev) => {
+  pointer.px = ev.clientX; pointer.py = ev.clientY; pointer.inside = true;
+  pointer.x = (ev.clientX / innerWidth) * 2 - 1; pointer.y = -((ev.clientY / innerHeight) * 2 - 1);
+});
+canvas.addEventListener('pointerdown', (ev) => { pointer.px = ev.clientX; pointer.py = ev.clientY; pointer.inside = true; });
+canvas.addEventListener('pointerleave', () => { pointer.inside = false; pointer.x = 0; pointer.y = 0; });
+for (const t of document.querySelectorAll('.tab')) t.addEventListener('click', () => setLook(t.dataset.look));
+const toggleMode = () => document.documentElement.setAttribute('data-theme', mode === 'dark' ? 'light' : 'dark');
+document.getElementById('mode').addEventListener('click', toggleMode);
+document.getElementById('replay').addEventListener('click', () => setLook(lookId));
+addEventListener('keydown', (ev) => {
+  if (KEYS[ev.key]) setLook(KEYS[ev.key]);
+  if (ev.key === 'd' || ev.key === 'D') toggleMode();
+});
+
+mode = currentMode();
+setLook('banknote');
+requestAnimationFrame(frame);
+</script>

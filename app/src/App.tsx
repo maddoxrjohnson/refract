@@ -545,6 +545,7 @@ export function App({ backend }: { backend: Backend }) {
             remoteOnly={projects.remoteOnly}
             visible={visible}
             quality={quality.level}
+            theme="light"
             reducedMotion={reducedMotion}
             matches={matches}
             focused={nav.focused}

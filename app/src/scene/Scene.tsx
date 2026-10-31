@@ -28,6 +28,7 @@ import {
   type PerspectiveCamera,
 } from "three";
 import type { RepoSnapshot } from "../backend/types";
+import type { ThemeMode } from "../theme";
 import { TIERS, type QualityLevel } from "../quality/tiers";
 import { repoStatus } from "../repoStatus";
 import { disposeObject, makeBackdrop, makeDust } from "./backdrop";
@@ -49,6 +50,8 @@ export interface SceneProps {
   /** False stops the frame loop: nothing draws while hidden. */
   visible: boolean;
   quality: QualityLevel;
+  /** Light or dark palette (banknote spec §1.1); switching never replays the opening. */
+  theme: ThemeMode;
   /** No spin or breathing; camera moves still ease, but quickly. */
   reducedMotion: boolean;
   /** Paths of gems that are not cloned; they draw dimmed, without a lit core. */
