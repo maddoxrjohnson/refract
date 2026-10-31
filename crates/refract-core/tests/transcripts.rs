@@ -52,6 +52,7 @@ fn clean_finish_summary() {
     );
     assert!(s.last_timestamp > s.first_timestamp);
     assert_eq!(s.tail, Some(Tail::AssistantReply));
+    assert!(!s.asks_user);
     assert_eq!(
         state("clean_finish.jsonl"),
         SessionState::Finished(FinishKind::Completed)
@@ -259,6 +260,7 @@ fn malformed_lines_are_skipped_and_counted() {
 fn trailing_noise_is_ignored() {
     let s = summary("trailing_noise.jsonl");
     assert_eq!(s.tail, Some(Tail::AssistantReply));
+    assert!(!s.asks_user);
     assert_eq!(s.last_user_prompt.as_deref(), Some("Format the codebase"));
     assert_eq!(
         s.last_assistant_text.as_deref(),
@@ -283,6 +285,7 @@ fn reader_matches_str_and_tolerates_invalid_utf8() {
     let s = parse_reader(Cursor::new(bytes)).unwrap();
     assert_eq!(s.malformed_lines, 1);
     assert_eq!(s.tail, Some(Tail::AssistantReply));
+    assert!(!s.asks_user);
 }
 
 #[test]

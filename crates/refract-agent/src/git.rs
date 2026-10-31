@@ -19,6 +19,8 @@ use refract_core::sessions::is_windows_mount;
 pub struct Status {
     /// `None` when HEAD is detached.
     pub branch: Option<String>,
+    /// An upstream is set, even one that is gone from the remote.
+    pub upstream: bool,
     /// Ahead and behind the upstream; `None` without an upstream (or a gone one).
     pub ahead_behind: Option<(u32, u32)>,
     /// Changed, staged, conflicted and untracked paths, relative to the repo root. An
@@ -35,6 +37,9 @@ pub struct HeadInfo {
     pub language: Option<String>,
     pub tracked_bytes: u64,
     pub commits_30d: u32,
+    /// 1 when HEAD has a commit that no `origin/*` branch has, else 0 (also without an
+    /// origin, where it would not be used). Capped at 1: only whether there is one matters.
+    pub off_origin: u32,
     /// Directories that hold tracked files, relative to the root (`""` is the root).
     pub tracked_dirs: Vec<String>,
 }
@@ -150,8 +155,8 @@ fn untracked_arg_on(windows_drive: bool) -> &'static str {
     }
 }
 
-/// Reads the origin URL, last commit, tracked files and recent commit count. A repo with
-/// no commits gives empty values rather than an error.
+/// Reads the origin URL, last commit, tracked files, and the recent and unpushed commit
+/// counts. A repo with no commits gives empty values rather than an error.
 pub fn read_head(path: &Path) -> io::Result<HeadInfo> {
     read_head_unless(path, &AtomicBool::new(false))
 }
@@ -178,6 +183,24 @@ pub fn read_head_unless(path: &Path, cancel: &AtomicBool) -> io::Result<HeadInfo
     )?
     .and_then(|out| String::from_utf8_lossy(&out).trim().parse().ok())
     .unwrap_or(0);
+    // Without an origin the count is unused, and with nothing to exclude it would walk
+    // the whole history.
+    let off_origin = match origin_url {
+        Some(_) => git(
+            path,
+            &[
+                "rev-list",
+                "--count",
+                "--max-count=1",
+                "HEAD",
+                "--not",
+                "--remotes=origin",
+            ],
+        )?
+        .and_then(|out| String::from_utf8_lossy(&out).trim().parse().ok())
+        .unwrap_or(0),
+        None => 0,
+    };
 
     let language = main_language(files.iter().map(|(p, _)| p.as_str())).map(str::to_owned);
     let tracked_bytes = files.iter().map(|(_, size)| size).sum();
@@ -197,6 +220,7 @@ pub fn read_head_unless(path: &Path, cancel: &AtomicBool) -> io::Result<HeadInfo
         language,
         tracked_bytes,
         commits_30d,
+        off_origin,
         tracked_dirs: dirs.into_iter().collect(),
     })
 }
@@ -248,7 +272,6 @@ fn git(repo: &Path, args: &[&str]) -> io::Result<Option<Vec<u8>>> {
 /// Parses `git status --porcelain=v2 --branch -z`.
 pub fn parse_status(out: &[u8]) -> Status {
     let mut status = Status::default();
-    let mut upstream = false;
     let mut records = out
         .split(|&b| b == 0)
         .map(|r| String::from_utf8_lossy(r).into_owned());
@@ -259,7 +282,7 @@ pub fn parse_status(out: &[u8]) -> Status {
                 "branch.head" if value != "(detached)" => {
                     status.branch = Some(value.to_owned());
                 }
-                "branch.upstream" => upstream = true,
+                "branch.upstream" => status.upstream = true,
                 "branch.ab" => {
                     let mut parts = value.split(' ');
                     let ahead = parts.next().and_then(|a| a.strip_prefix('+')?.parse().ok());
@@ -287,7 +310,7 @@ pub fn parse_status(out: &[u8]) -> Status {
             status.paths.push(path.to_owned());
         }
     }
-    if !upstream {
+    if !status.upstream {
         status.ahead_behind = None;
     }
     status
@@ -338,6 +361,7 @@ mod tests {
             "# branch.ab +2 -1",
         ]));
         assert_eq!(s.branch.as_deref(), Some("main"));
+        assert!(s.upstream);
         assert_eq!(s.ahead_behind, Some((2, 1)));
         assert!(s.paths.is_empty());
     }
@@ -379,6 +403,11 @@ mod tests {
     #[test]
     fn gone_upstream_has_no_counts() {
         let s = parse_status(&z(&["# branch.head main", "# branch.upstream origin/main"]));
+        assert!(s.upstream);
+        assert_eq!(s.ahead_behind, None);
+        // Counts without an upstream header are ignored.
+        let s = parse_status(&z(&["# branch.head main", "# branch.ab +1 -0"]));
+        assert!(!s.upstream);
         assert_eq!(s.ahead_behind, None);
     }
 

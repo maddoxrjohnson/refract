@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
-import { DIRTY_REPO_PROMPT } from "../repoStatus";
+import { DIRTY_REPO_PROMPT, repoStatus } from "../repoStatus";
 import {
   initialNavState,
   matchingPaths,
@@ -24,11 +24,12 @@ function session(id: string, hoursAgo: number, kind: "interrupted" | "finished" 
     lastAssistantText: `text of ${id}`,
     byteSize: 1000,
     focusable: false,
+    resumeReason: kind === "interrupted" ? "interrupted" : null,
   };
 }
 
 function running(id: string, hoursAgo: number, detail: LiveState, focusable = true): SessionInfo {
-  return { ...session(id, hoursAgo), state: { kind: "live", detail }, focusable };
+  return { ...session(id, hoursAgo), state: { kind: "live", detail }, focusable, resumeReason: null };
 }
 
 function repo(
@@ -334,6 +335,20 @@ describe("Enter and launching", () => {
     expect(resumableSession(busy({ kind: "resume", sessionId: "old" }))).toBe(old);
     expect(resumableSession(repo("clean"))).toBeNull();
     expect(pickerOptions(repo("clean"))).toEqual([{ kind: "new" }]);
+  });
+
+  it("offers finished sessions that have a resume reason, without chipping the stone", () => {
+    const asked = { ...session("asked", 0.5, "finished"), resumeReason: "askedQuestion" as const };
+    const r = repo("asked", { sessions: [old, asked, done], preselect: { kind: "resume", sessionId: "asked" } });
+    expect(pickerOptions(r)).toEqual([
+      { kind: "resume", session: asked },
+      { kind: "resume", session: old },
+      { kind: "new" },
+    ]);
+    expect(resumableSession(r)).toBe(asked);
+    expect(run([{ type: "launch", path: r.path }], initialNavState, ctxFor(r)).state.picker?.index).toBe(0);
+    expect(repoStatus(repo("x", { sessions: [asked] })).interrupted).toBe(false);
+    expect(repoStatus(repo("x", { sessions: [old] })).interrupted).toBe(true);
   });
 });
 

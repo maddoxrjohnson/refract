@@ -43,6 +43,9 @@ use serde_json::Value;
 /// Maximum length, in characters, of the prompt and reply snippets in a summary.
 pub const SNIPPET_MAX_CHARS: usize = 120;
 
+/// How many of a reply's last non-empty lines are searched for a question.
+pub const QUESTION_LINES: usize = 8;
+
 /// Prefix of the text Claude Code writes when the user interrupts a turn.
 const INTERRUPT_MARKER: &str = "[Request interrupted by user";
 
@@ -119,6 +122,10 @@ pub struct SessionSummary {
     pub last_user_prompt: Option<String>,
     /// First line of the assistant's last text reply, truncated.
     pub last_assistant_text: Option<String>,
+    /// The transcript ends on an assistant text reply that asks the person something
+    /// (see [`asks_question`]).
+    #[serde(default)]
+    pub asks_user: bool,
     /// Paths written by Edit, Write, MultiEdit and NotebookEdit, in first-edit order.
     pub files_edited: Vec<String>,
     pub usage: TokenUsage,
@@ -176,6 +183,10 @@ struct Parser {
     summary: SessionSummary,
     seen_usage: HashSet<String>,
     pending_tools: HashSet<String>,
+    /// Full text of the assistant's last text reply, and the `message.id` it came
+    /// from, so text blocks of one response written on separate lines join up.
+    reply: String,
+    reply_id: Option<String>,
 }
 
 impl Parser {
@@ -258,9 +269,18 @@ impl Parser {
                     }
                 }
                 Some("text") => {
-                    if let Some(text) = str_field(block, "text").and_then(snippet) {
-                        self.summary.last_assistant_text = Some(text);
+                    let text = str_field(block, "text").unwrap_or("");
+                    if let Some(line) = snippet(text) {
+                        self.summary.last_assistant_text = Some(line);
                         replied = true;
+                        let id = str_field(message, "id");
+                        if id.is_some() && id == self.reply_id.as_deref() {
+                            self.reply.push('\n');
+                        } else {
+                            self.reply.clear();
+                            self.reply_id = id.map(str::to_owned);
+                        }
+                        self.reply.push_str(text);
                     }
                 }
                 _ => {}
@@ -358,7 +378,10 @@ impl Parser {
         self.summary.tail = Some(Tail::UserPrompt);
     }
 
-    fn finish(self) -> SessionSummary {
+    fn finish(mut self) -> SessionSummary {
+        // Only a reply the transcript ends on can be waiting for an answer.
+        self.summary.asks_user =
+            self.summary.tail == Some(Tail::AssistantReply) && asks_question(&self.reply);
         self.summary
     }
 }
@@ -421,6 +444,81 @@ fn snippet(text: &str) -> Option<String> {
     Some(cut)
 }
 
+/// True when a reply asks the person something (spec §4.3): with fenced code blocks
+/// and inline code removed, one of its last [`QUESTION_LINES`] non-empty lines has a
+/// `?` that ends a sentence, followed by whitespace or the end of the line once any
+/// closing markdown, brackets, quotes or punctuation are skipped, or a full-width `？`.
+/// A `?` inside a word, as in a URL query, does not count. A fence may open after a
+/// list marker (`- ```bash`).
+pub fn asks_question(text: &str) -> bool {
+    let mut fenced = false;
+    let mut lines = Vec::new();
+    for line in text.lines() {
+        if is_fence(line) {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let prose = without_inline_code(line);
+        if !prose.trim().is_empty() {
+            lines.push(prose);
+        }
+    }
+    let skip = lines.len().saturating_sub(QUESTION_LINES);
+    lines[skip..].iter().any(|line| ends_a_question(line))
+}
+
+/// True for a line that opens or closes a code fence, also after a list marker.
+fn is_fence(line: &str) -> bool {
+    let line = line.trim_start();
+    let line = match line.split_once(' ') {
+        Some((marker, rest)) if is_list_marker(marker) => rest.trim_start(),
+        _ => line,
+    };
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+/// `-`, `*`, `+`, or a number followed by `.` or `)`.
+fn is_list_marker(marker: &str) -> bool {
+    match marker {
+        "-" | "*" | "+" => true,
+        _ => marker
+            .strip_suffix(['.', ')'])
+            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit())),
+    }
+}
+
+/// The line with every `` `code` `` span removed. Text after an unmatched backtick stays.
+fn without_inline_code(line: &str) -> String {
+    let parts: Vec<&str> = line.split('`').collect();
+    let unmatched = parts.len().is_multiple_of(2);
+    parts
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 0 || (unmatched && *i == parts.len() - 1))
+        .map(|(_, part)| *part)
+        .collect()
+}
+
+fn ends_a_question(line: &str) -> bool {
+    let chars: Vec<char> = line.chars().collect();
+    chars.iter().enumerate().any(|(i, &c)| {
+        c == '？'
+            || c == '?'
+                && chars[i + 1..]
+                    .iter()
+                    .find(|c| {
+                        !matches!(
+                            c,
+                            '*' | '_' | ')' | ']' | '"' | '\'' | '”' | '’' | '.' | ',' | '!'
+                        )
+                    })
+                    .is_none_or(|c| c.is_whitespace())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +535,122 @@ mod tests {
         let cut = snippet(&long).unwrap();
         assert_eq!(cut.chars().count(), SNIPPET_MAX_CHARS);
         assert!(cut.ends_with('…'));
+    }
+
+    #[test]
+    fn a_trailing_question_asks() {
+        assert!(asks_question(
+            "I added the parser.\n\nShould I wire it into the CLI too?"
+        ));
+        assert!(asks_question("Which one do you want? I can do either."));
+        assert!(asks_question("**Want me to push it?**"));
+        assert!(asks_question("Shall I go on (or stop?)"));
+        assert!(asks_question("You said “keep it?”"));
+    }
+
+    #[test]
+    fn a_question_before_options_and_a_closing_line_asks() {
+        let text = "Two ways to fix it.\n\nWhich do you prefer?\n\na. Keep the cache\n   and expire it hourly\nb. Drop the cache\n   and read every time\n\nJust reply a or b.";
+        assert!(asks_question(text));
+    }
+
+    #[test]
+    fn a_question_far_above_the_last_lines_does_not_ask() {
+        let mut text = String::from("Why did the test fail? The fixture was stale.\n");
+        for n in 0..QUESTION_LINES {
+            text.push_str(&format!("Step {n} is done.\n"));
+        }
+        assert!(!asks_question(&text));
+        // Within the window it counts.
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(asks_question(&lines[..QUESTION_LINES].join("\n")));
+    }
+
+    #[test]
+    fn code_does_not_ask() {
+        let text =
+            "Here is the change:\n\n```rust\nlet x = y?;\nlet ok = a ? b : c;\n```\n\nIt compiles.";
+        assert!(!asks_question(text));
+        assert!(!asks_question("Use `opt?` and `a ? b : c` here."));
+        // An unclosed fence hides everything after it.
+        assert!(!asks_question("Done.\n```\nwhat?"));
+    }
+
+    #[test]
+    fn a_url_query_does_not_ask() {
+        assert!(!asks_question(
+            "Docs are at https://example.com/search?q=tide&page=2 now."
+        ));
+        assert!(!asks_question("Open http://localhost:5173/?demo=1"));
+        assert!(!asks_question("See http://localhost:5173/?q=1."));
+        assert!(!asks_question("Read it with tide?.depth when set."));
+    }
+
+    #[test]
+    fn punctuation_and_brackets_after_a_question_mark_still_ask() {
+        assert!(asks_question("Should I keep the old name?."));
+        assert!(asks_question("Keep it?, or rename it"));
+        assert!(asks_question("Really?!"));
+        assert!(asks_question("[Push it?]"));
+        assert!(asks_question("(Is that the right file?)."));
+    }
+
+    #[test]
+    fn a_full_width_question_mark_asks() {
+        assert!(asks_question("要我继续吗？"));
+        assert!(asks_question("这样可以吗？好的话我就提交。"));
+    }
+
+    #[test]
+    fn a_fence_after_a_list_marker_is_code() {
+        for opener in ["- ```bash", "* ```", "1. ```", "2) ~~~sh", "  + ```"] {
+            let text = format!("Run this:\n{opener}\nwhat?\n```\nThen it builds.");
+            assert!(!asks_question(&text), "{opener}");
+        }
+        // A list item that only mentions backticks is prose.
+        assert!(asks_question("- should it be `x`?"));
+    }
+
+    #[test]
+    fn no_question_does_not_ask() {
+        assert!(!asks_question("Done. The list now filters by title."));
+        assert!(!asks_question(""));
+    }
+
+    fn assistant(id: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "assistant",
+            "message": {"id": id, "content": [{"type": "text", "text": text}]}
+        })
+        .to_string()
+    }
+
+    fn prompt(text: &str) -> String {
+        serde_json::json!({"type": "user", "message": {"content": text}}).to_string()
+    }
+
+    #[test]
+    fn only_a_question_the_transcript_ends_on_counts() {
+        let asked = assistant("m1", "Should I also update the docs?");
+        assert!(parse_lines([&asked]).asks_user);
+        assert!(!parse_lines([&asked, &prompt("Yes please")]).asks_user);
+        let tool = serde_json::json!({
+            "type": "assistant",
+            "message": {"id": "m2", "content": [{"type": "tool_use", "id": "t1", "name": "Bash"}]}
+        })
+        .to_string();
+        assert!(!parse_lines([&asked, &tool]).asks_user);
+        let done = assistant("m3", "Docs updated.");
+        assert!(!parse_lines([&asked, &prompt("Yes"), &done]).asks_user);
+    }
+
+    #[test]
+    fn text_blocks_of_one_response_are_read_together() {
+        let first = assistant("m1", "Which name do you want?");
+        let second = assistant("m1", "a. tide\nb. reef");
+        assert!(parse_lines([&first, &second]).asks_user);
+        // A later response replaces the earlier one.
+        let other = assistant("m2", "Renamed it.");
+        assert!(!parse_lines([&first, &other]).asks_user);
     }
 }

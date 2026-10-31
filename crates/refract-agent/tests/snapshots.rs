@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 
 use chrono::{TimeDelta, Utc};
 use refract_agent::config::Config;
-use refract_agent::state::{read_git_with, Agent};
+use refract_agent::state::{read_git_with, Agent, Refresh};
 use refract_core::classify::{FinishKind, InterruptReason, SessionState};
-use refract_core::preselect::Preselect;
-use refract_core::protocol::{LastCommit, RemoteId, RepoSnapshot};
+use refract_core::preselect::{Preselect, ResumeReason};
+use refract_core::protocol::{Event, LastCommit, RemoteId, RepoSnapshot};
 
 use common::*;
 
@@ -240,6 +240,7 @@ fn dirty_repo_with_sessions_preselects_resume() {
         open.state,
         SessionState::Interrupted(InterruptReason::ToolCallWithoutResult)
     );
+    assert_eq!(open.resume_reason, Some(ResumeReason::Interrupted));
     assert!(open.byte_size > 0);
     assert!(open.last_timestamp.is_some());
     let done = &dirty.sessions[1];
@@ -248,6 +249,7 @@ fn dirty_repo_with_sessions_preselects_resume() {
         done.last_assistant_text.as_deref(),
         Some("The entry point is tidy.")
     );
+    assert_eq!(done.resume_reason, None);
 
     assert_eq!(dirty.preselect, Preselect::Resume(OPEN_ID.into()));
 }
@@ -278,25 +280,205 @@ fn agent_for(root: &Path, projects: &Path) -> Agent {
     agent
 }
 
-#[test]
-fn edit_inside_a_new_directory_preselects_resume() {
-    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
-    let edited = repo.join("src/tides/table.rs");
-    write(&edited, "pub fn table() {}\n");
+/// Writes a finished transcript for `repo` ending `minutes` after now (negative for
+/// before), with `reply` as its last text reply.
+fn finished_session(projects: &Path, repo: &Path, minutes: i64, reply: &str) {
+    let text = transcript(
+        DONE_ID,
+        repo,
+        &repo.join("src/main.rs"),
+        Utc::now() + TimeDelta::minutes(minutes),
+        true,
+    )
+    .replace("The entry point is tidy.", reply);
     write(
-        &project_dir(&projects, &repo).join(format!("{OPEN_ID}.jsonl")),
-        &transcript(
-            OPEN_ID,
-            &repo,
-            &edited,
-            Utc::now() - TimeDelta::hours(1),
-            false,
-        ),
+        &project_dir(projects, repo).join(format!("{DONE_ID}.jsonl")),
+        &text,
+    );
+}
+
+/// The one repo's resume reasons and preselect.
+fn decision(root: &Path, projects: &Path) -> (Vec<Option<ResumeReason>>, Preselect) {
+    let agent = agent_for(root, projects);
+    let snapshot = &agent.snapshots()[0];
+    let reasons = snapshot.sessions.iter().map(|s| s.resume_reason).collect();
+    (reasons, snapshot.preselect.clone())
+}
+
+#[test]
+fn a_finished_session_asking_a_question_preselects_resume() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    finished_session(&projects, &repo, -60, "Shall I add a test for it too?");
+    assert_eq!(
+        decision(&root, &projects),
+        (
+            vec![Some(ResumeReason::AskedQuestion)],
+            Preselect::Resume(DONE_ID.into())
+        )
+    );
+}
+
+#[test]
+fn uncommitted_changes_after_the_last_commit_preselect_resume() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    write(
+        &repo.join("src/main.rs"),
+        "fn main() { todo!() }
+",
+    );
+    finished_session(&projects, &repo, 1, "Done.");
+    assert_eq!(
+        decision(&root, &projects),
+        (
+            vec![Some(ResumeReason::UncommittedChanges)],
+            Preselect::Resume(DONE_ID.into())
+        )
+    );
+    // A session from before the last commit leaves New agent preselected.
+    finished_session(&projects, &repo, -60, "Done.");
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NewAgent)
+    );
+}
+
+#[test]
+fn unpushed_commits_made_in_the_session_preselect_resume() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    commit_file(&repo, "src/tides.rs", "pub fn tides() {}\n", "Add tides");
+    finished_session(&projects, &repo, 1, "Committed.");
+    assert_eq!(
+        decision(&root, &projects),
+        (
+            vec![Some(ResumeReason::UnpushedCommits)],
+            Preselect::Resume(DONE_ID.into())
+        )
+    );
+    // Commits made after the session ended are not its business.
+    finished_session(&projects, &repo, -60, "Committed.");
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NoPicker)
+    );
+}
+
+#[test]
+fn a_branch_without_upstream_counts_only_commits_origin_lacks() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    git(&repo, &["checkout", "-q", "-b", "tide-tables"]);
+    finished_session(&projects, &repo, 1, "Branch ready.");
+    // A new branch with nothing on it has nothing to push.
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NoPicker)
+    );
+
+    commit_file(&repo, "src/tides.rs", "pub fn tides() {}\n", "Add tides");
+    finished_session(&projects, &repo, 1, "Committed.");
+    assert_eq!(
+        decision(&root, &projects),
+        (
+            vec![Some(ResumeReason::UnpushedCommits)],
+            Preselect::Resume(DONE_ID.into())
+        )
+    );
+
+    // Pushed without setting an upstream: origin has the commit.
+    git(&repo, &["push", "-q", "origin", "HEAD"]);
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NoPicker)
+    );
+}
+
+#[test]
+fn a_gone_upstream_has_nothing_to_push() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    git(&repo, &["checkout", "-q", "-b", "tide-tables"]);
+    commit_file(&repo, "src/tides.rs", "pub fn tides() {}\n", "Add tides");
+    git(&repo, &["push", "-q", "-u", "origin", "tide-tables"]);
+    git(&repo, &["push", "-q", "origin", "--delete", "tide-tables"]);
+    git(&repo, &["fetch", "-q", "--prune"]);
+    finished_session(&projects, &repo, 1, "Committed.");
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NoPicker)
     );
     let agent = agent_for(&root, &projects);
-    let snapshot = &agent.snapshots()[0];
-    assert_eq!(snapshot.dirty_paths, [edited.to_str().unwrap()]);
-    assert_eq!(snapshot.preselect, Preselect::Resume(OPEN_ID.into()));
+    assert_eq!(agent.snapshots()[0].ahead, None);
+}
+
+const GIT_ONLY: Refresh = Refresh {
+    status: true,
+    head: true,
+    sessions: false,
+};
+
+#[test]
+fn pushing_clears_the_reason_in_the_change_event() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    commit_file(&repo, "src/tides.rs", "pub fn tides() {}\n", "Add tides");
+    finished_session(&projects, &repo, 1, "Committed.");
+    let mut agent = agent_for(&root, &projects);
+    assert_eq!(
+        agent.snapshots()[0].sessions[0].resume_reason,
+        Some(ResumeReason::UnpushedCommits)
+    );
+
+    git(&repo, &["push", "-q", "origin", "main"]);
+    let events = agent.refresh(&repo, GIT_ONLY);
+    let [Event::RepoChanged(snapshot)] = &events[..] else {
+        panic!("expected one repoChanged, got {events:?}");
+    };
+    assert_eq!(snapshot.ahead, Some(0));
+    assert_eq!(snapshot.sessions[0].resume_reason, None);
+    assert_eq!(snapshot.preselect, Preselect::NoPicker);
+}
+
+#[test]
+fn an_upstream_going_away_sends_the_new_preselect_with_the_session() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    git(&repo, &["checkout", "-q", "-b", "tide-tables"]);
+    commit_file(&repo, "src/tides.rs", "pub fn tides() {}\n", "Add tides");
+    finished_session(&projects, &repo, 1, "Committed.");
+    let mut agent = agent_for(&root, &projects);
+    assert_eq!(
+        agent.snapshots()[0].preselect,
+        Preselect::Resume(DONE_ID.into())
+    );
+
+    // From no upstream to a gone one: ahead and behind stay unknown, so only the
+    // session's reason changes.
+    git(&repo, &["push", "-q", "-u", "origin", "tide-tables"]);
+    git(&repo, &["push", "-q", "origin", "--delete", "tide-tables"]);
+    git(&repo, &["fetch", "-q", "--prune"]);
+    let events = agent.refresh(&repo, GIT_ONLY);
+    let [Event::SessionChanged(change)] = &events[..] else {
+        panic!("expected one sessionChanged, got {events:?}");
+    };
+    assert_eq!(change.session.id, DONE_ID);
+    assert_eq!(change.session.resume_reason, None);
+    assert_eq!(change.preselect, Preselect::NoPicker);
+}
+
+#[test]
+fn a_repo_without_origin_or_on_a_detached_head_has_nothing_to_push() {
+    let (_tmp, root, projects, repo) = single_repo("tidepool-api");
+    git(&repo, &["remote", "remove", "origin"]);
+    finished_session(&projects, &repo, 1, "Done.");
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NoPicker)
+    );
+
+    let (_tmp, root, projects, repo) = single_repo("aurora-notes");
+    commit_file(&repo, "notes.md", "- one\n", "Add notes");
+    git(&repo, &["checkout", "-q", "--detach", "HEAD"]);
+    finished_session(&projects, &repo, 1, "Done.");
+    assert_eq!(
+        decision(&root, &projects),
+        (vec![None], Preselect::NoPicker)
+    );
 }
 
 #[test]

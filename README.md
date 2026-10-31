@@ -27,7 +27,7 @@ Each repo is a cut stone drawn like the engraving on a banknote, lying on a shee
 - **Win+Alt+Space** shows or hides Refract from anywhere; it lives in the tray and draws nothing while hidden.
 - **Magnet focus:** the stone nearest the pointer lifts and shows its name, host, language and state.
 - **Click to zoom** into a stone and see its branch, ahead/behind, changed files, last commit, last agent session, open pull or merge requests and CI status.
-- **Enter to launch.** A VS Code window opens in WSL with only a terminal, running a new agent. If the repo is already open, that window comes forward and a new terminal tab opens there with the agent. A repo with an unfinished session asks whether to resume it or start fresh, and preselects the sensible choice.
+- **Enter to launch.** A VS Code window opens in WSL with only a terminal, running a new agent. If the repo is already open, that window comes forward and a new terminal tab opens there with the agent. A repo whose last conversation isn't clearly done (it stopped mid-task, asked you a question, or left changes uncommitted or unpushed) asks whether to resume it or start fresh, and preselects the sensible choice.
 - **Type to filter** by name; arrow keys move between stones.
 - **GitHub and GitLab** repos you haven't cloned appear stippled; launching one clones it into `~/projects` first.
 - **Status hook (optional).** One small script added to Claude Code's settings tells Refract when an agent is working or waiting on you. Removing it restores your settings byte for byte if nothing else changed them since it was installed; otherwise it removes only Refract's entries and leaves the rest alone.

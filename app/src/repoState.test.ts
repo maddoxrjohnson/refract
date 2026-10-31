@@ -33,6 +33,7 @@ const session = (id: string, detail: LiveState): SessionInfo => ({
   lastAssistantText: null,
   byteSize: 0,
   focusable: true,
+  resumeReason: null,
 });
 const changed = (repoPath: string, s: SessionInfo, preselect: Preselect) =>
   event({ event: "sessionChanged", data: { repoPath, session: s, preselect } });

@@ -26,10 +26,10 @@ export function repoStatus(repo: RepoSnapshot): RepoStatus {
   return { dirty: repo.changedFiles > 0, interrupted, working, waiting };
 }
 
-/** Sessions the picker offers to resume, newest first. */
+/** Sessions the picker offers to resume (those with a resume reason), newest first. */
 export function unfinishedSessions(repo: RepoSnapshot): SessionInfo[] {
   return repo.sessions
-    .filter((s) => s.state.kind === "interrupted")
+    .filter((s) => s.resumeReason != null)
     .sort((a, b) => (b.lastTimestamp ?? "").localeCompare(a.lastTimestamp ?? ""));
 }
 

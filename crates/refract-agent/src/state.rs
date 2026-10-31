@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use chrono::{DateTime, TimeDelta, Utc};
 use refract_core::classify::{classify_report, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
-use refract_core::preselect::{preselect, Candidate, Preselect};
+use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
 use refract_core::protocol::{Event, RemoteId, RepoSnapshot, SessionChange, SessionInfo};
 use refract_core::sessions::paths_match;
 use refract_core::transcript::SessionSummary;
@@ -76,14 +76,8 @@ impl RepoState {
     /// built earlier can be stale even when nothing on disk moved; call this before
     /// answering `listRepos` or `getRepo`.
     pub fn refresh_preselect(&mut self, now: DateTime<Utc>) -> bool {
-        let fresh = repo_preselect(
-            &self.snapshot.path,
-            &self.snapshot.dirty_paths,
-            &self.sessions,
-            &self.live,
-            &self.hooks,
-            now,
-        );
+        let candidates = candidates(&self.snapshot.path, &self.sessions, &self.live, &self.hooks);
+        let fresh = preselect(&candidates, &repo_facts(&self.status, &self.head), now);
         if fresh == self.snapshot.preselect {
             return false;
         }
@@ -613,18 +607,22 @@ pub fn build_snapshot(
         .iter()
         .map(|p| format!("{}/{p}", root.trim_end_matches('/')))
         .collect();
-    let states = session_states(sessions, live, hooks);
-    let preselect = repo_preselect(&root, &dirty_paths, sessions, live, hooks, now);
-    let sessions = sessions
+    // Reasons and preselect come from the same candidates and facts, so they agree.
+    let candidates = candidates(&root, sessions, live, hooks);
+    let facts = repo_facts(status, head);
+    let reasons = resume_reasons(&candidates, &facts);
+    let preselect = preselect(&candidates, &facts, now);
+    let sessions = candidates
         .iter()
-        .zip(&states)
-        .map(|(s, &state)| SessionInfo {
-            id: s.session_id.clone().unwrap_or_default(),
-            state,
-            last_timestamp: s.last_timestamp,
-            last_assistant_text: s.last_assistant_text.clone(),
-            byte_size: s.byte_size.unwrap_or(0),
-            focusable: is_focusable(&root, s, state, live),
+        .zip(reasons)
+        .map(|(c, resume_reason)| SessionInfo {
+            id: c.summary.session_id.clone().unwrap_or_default(),
+            state: c.state,
+            last_timestamp: c.summary.last_timestamp,
+            last_assistant_text: c.summary.last_assistant_text.clone(),
+            byte_size: c.summary.byte_size.unwrap_or(0),
+            focusable: c.focusable,
+            resume_reason,
         })
         .collect();
     let (ahead, behind) = match status.ahead_behind {
@@ -668,26 +666,38 @@ fn session_states(
         .collect()
 }
 
-fn repo_preselect(
+/// The repo's sessions, classified, as the preselect rule takes them.
+fn candidates<'a>(
     repo: &str,
-    dirty_paths: &[String],
-    sessions: &[SessionSummary],
+    sessions: &'a [SessionSummary],
     live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
-    now: DateTime<Utc>,
-) -> Preselect {
+) -> Vec<Candidate<'a>> {
     let states = session_states(sessions, live, hooks);
-    let candidates: Vec<Candidate<'_>> = sessions
+    sessions
         .iter()
-        .zip(&states)
-        .map(|(summary, &state)| Candidate {
+        .zip(states)
+        .map(|(summary, state)| Candidate {
             summary,
             state,
-            byte_size: summary.byte_size.unwrap_or(0),
             focusable: is_focusable(repo, summary, state, live),
         })
-        .collect();
-    preselect(&candidates, dirty_paths, now)
+        .collect()
+}
+
+/// What the preselect rule needs to know about the repo's git state.
+fn repo_facts(status: &Status, head: &HeadInfo) -> RepoFacts {
+    RepoFacts {
+        dirty: !status.paths.is_empty(),
+        head_time: head.last_commit.as_ref().map(|c| c.time),
+        has_origin: head.origin_url.is_some(),
+        on_branch: status.branch.is_some(),
+        upstream: match (status.upstream, status.ahead_behind) {
+            (false, _) => Upstream::Missing(head.off_origin),
+            (true, None) => Upstream::Gone,
+            (true, Some((ahead, _))) => Upstream::Ahead(ahead),
+        },
+    }
 }
 
 /// True when the session is live and its process is known and runs in a terminal of
@@ -757,6 +767,7 @@ pub fn path_str(path: &Path) -> String {
 mod tests {
     use super::*;
     use refract_core::classify::{FinishKind, LiveState};
+    use refract_core::preselect::Preselect;
 
     fn session(id: &str, state: SessionState) -> SessionInfo {
         SessionInfo {
@@ -766,6 +777,7 @@ mod tests {
             last_assistant_text: None,
             byte_size: 10,
             focusable: false,
+            resume_reason: None,
         }
     }
 

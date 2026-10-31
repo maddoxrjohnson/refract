@@ -103,6 +103,7 @@ test("a repo with unfinished sessions offers the picker, preselecting Resume", a
   const options = picker.getByRole("option");
   await expect(options).toHaveCount(3);
   await expect(options.first()).toHaveAttribute("aria-selected", "true");
+  await expect(options.first()).toContainText("Resume: stopped mid-task");
   await page.keyboard.press("Enter");
   const terminal = page.getByRole("dialog", { name: "Simulated terminal for tidepool" });
   await expect(terminal.getByTestId("demo-terminal")).toContainText(
@@ -110,6 +111,20 @@ test("a repo with unfinished sessions offers the picker, preselecting Resume", a
   );
   await terminal.getByRole("button", { name: "Close terminal (Escape)" }).click();
   await expect(terminal).toBeHidden();
+});
+
+test("a finished session with unpushed commits is offered for resume", async ({ page }) => {
+  await page.keyboard.type("harbor");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("complementary", { name: "harbor-android details" })).toBeVisible();
+  await page.keyboard.press("Enter");
+  const picker = page.getByRole("dialog", { name: "Start an agent in harbor-android" });
+  const options = picker.getByRole("option");
+  await expect(options).toHaveCount(2);
+  await expect(options.first()).toHaveAttribute("aria-selected", "true");
+  await expect(options.first()).toContainText("Resume: unpushed commits");
+  await page.keyboard.press("Escape");
+  await expect(picker).toBeHidden();
 });
 
 test("a repo with an agent waiting on you preselects going to it", async ({ page }) => {

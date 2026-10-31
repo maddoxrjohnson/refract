@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef } from "react";
 import { firstLine, formatSize, relativeTime } from "./format";
-import type { SessionInfo } from "../backend/types";
+import type { ResumeReason, SessionInfo } from "../backend/types";
 import { optionKey, type PickerOption } from "./navigation";
 import "./ui.css";
 
@@ -31,6 +31,18 @@ export function liveStatus(session: SessionInfo): string {
     default:
       return "running";
   }
+}
+
+const RESUME_LABELS: Record<ResumeReason, string> = {
+  interrupted: "Resume: stopped mid-task",
+  askedQuestion: "Resume: asked you a question",
+  uncommittedChanges: "Resume: uncommitted changes",
+  unpushedCommits: "Resume: unpushed commits",
+};
+
+/** The label of a session's Resume row, naming why it is worth resuming. */
+export function resumeLabel(session: SessionInfo): string {
+  return session.resumeReason ? RESUME_LABELS[session.resumeReason] : "Resume";
 }
 
 /**
@@ -90,7 +102,7 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
             ) : option.kind === "resume" ? (
               <>
                 <div className="rf-option__head">
-                  <span>Resume</span>
+                  <span>{resumeLabel(option.session)}</span>
                   <span className="rf-option__meta rf-mono">
                     {option.session.lastTimestamp
                       ? `${relativeTime(Date.parse(option.session.lastTimestamp), now)} · `

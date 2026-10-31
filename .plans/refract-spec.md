@@ -111,17 +111,49 @@ If a VS Code window already has that folder open, Refract brings it to the front
 
 ### 4.3 Choosing between resuming and starting fresh
 
-A launch goes straight to a new agent when the repo is clean, has no unfinished sessions and has no agent running in its Refract VS Code window. Otherwise a small picker lists:
+A finished reply doesn't mean the conversation is done: it may have asked you something, or left work uncommitted or unpushed. Starting a new agent then loses its context, so Enter resumes the repo's last conversation unless it is clearly done.
+
+**Unfinished sessions.** A session that isn't running is unfinished, with a reason, when:
+
+| Reason | Which sessions | When |
+|---|---|---|
+| Stopped mid-task | any | It was interrupted (spec §6): an unanswered prompt, a tool call without a result, tool results without a reply, or an API error. |
+| Asked you a question | the repo's last conversation | Its last turn ended in a reply that asks the person something (below). |
+| Uncommitted changes | the repo's last conversation | The repo has uncommitted changes and the session was active after the last commit (or the repo has no commits). |
+| Unpushed commits | the repo's last conversation | The branch is ahead of its upstream, or has no upstream but an origin and commits that no `origin/*` branch has, and the session was active after the last commit. A gone upstream (branch deleted on the remote) and a detached HEAD don't count. |
+
+The repo's last conversation is the session with the newest transcript timestamp, ignoring transcripts with no conversation in them. If it is still running, no session gets the last three reasons: the running agent's own edits aren't another session's unfinished work. When more than one reason applies, the first in the table wins. "Active after the last commit" compares the session's last transcript timestamp with the committer time of HEAD.
+
+A reply asks the person something when, with fenced code blocks and inline code removed, one of its last 8 non-empty lines has a `?` (or a full-width `？`) at the end of a sentence: followed by whitespace, the end of the line, or closing markdown, brackets, quotes or punctuation such as `*`, `_`, `)`, `]`, `"`, `.`, `,` or `!`. A fence may open after a list marker (`- ```bash`). Only the assistant's last text reply counts, and only when the transcript ends on it. It is a heuristic: a false positive costs one arrow key, a false negative a lost context.
+
+**The picker.** A launch goes straight to a new agent when the repo is clean, has no unfinished sessions and has no agent running in its Refract VS Code window. Otherwise a small picker lists:
 
 - "Go to the running agent" for each agent still running in a terminal of the Refract window on this repo (what it is doing: waiting on you, working, idle or just running; when it last wrote; the first line of its last reply),
-- each unfinished session (when it ran, the first line of its last message, how large it is), and
+- each unfinished session, newest first, labelled with its reason ("Resume: stopped mid-task", "Resume: asked you a question", "Resume: uncommitted changes", "Resume: unpushed commits"), when it ran, how large it is and the first line of its last message, and
 - New agent.
 
 One option is preselected so that Enter accepts it:
 
 - **Go to the running agent** when the most recent such agent is waiting on you. Nothing new starts; the existing window comes to the front with that agent's terminal shown.
-- Otherwise **Resume** the most recent session when it ended less than about 2 days ago, edited the files that are currently uncommitted, and its transcript is below a size limit. Resuming a very long conversation reloads all of it, which costs more than starting fresh.
-- Otherwise **New agent**, started with a short opening prompt: "This repo has uncommitted changes. Review `git diff` and help me finish or commit them."
+- Otherwise **Resume** the newest session that isn't running when it is unfinished and ended less than about 2 days ago. Its size doesn't matter: Claude Code compacts a long conversation when it resumes, and losing the context costs more than reloading it.
+- Otherwise **New agent**, started with a short opening prompt when the repo has uncommitted changes: "This repo has uncommitted changes. Review `git diff` and help me finish or commit them."
+
+Cases, for a repo with no agent running, where S is its last conversation and ended under 2 days ago:
+
+| Repo | S | Picker | Preselected |
+|---|---|---|---|
+| clean, pushed | finished, no question | none | (new agent starts) |
+| clean, pushed | reply ends asking a question | shown | Resume S: asked you a question |
+| clean, pushed | interrupted | shown | Resume S: stopped mid-task |
+| dirty | active after the last commit | shown | Resume S: uncommitted changes |
+| dirty | ended before the last commit | shown | New agent (review prompt) |
+| clean, 2 ahead | active after the last commit | shown | Resume S: unpushed commits |
+| clean, branch without upstream, has origin | active after the last commit | shown | Resume S: unpushed commits |
+| clean, new branch without upstream, no commits of its own | active after the last commit | none | (new agent starts) |
+| clean, 2 ahead | ended before the last commit | none | (new agent starts) |
+| any | unfinished but 3 days old | shown | New agent |
+
+The chipped corner on a stone still means only "stopped mid-task" (interrupted); the other reasons don't change the stone.
 
 ### 4.4 Repos that aren't cloned yet
 

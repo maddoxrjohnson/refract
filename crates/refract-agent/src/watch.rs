@@ -50,7 +50,7 @@ pub struct FsEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Target {
     GitDir(PathBuf),
-    /// The common git directory of a linked worktree, for `packed-refs`.
+    /// The common git directory of a linked worktree, for `packed-refs` and `config`.
     CommonDir(PathBuf),
     Refs(PathBuf),
     Tree(PathBuf),
@@ -465,7 +465,8 @@ pub fn change_for(
             }
             git_dir_refresh(name?).map(|r| Change::Repo(repo.clone(), r))
         }
-        Target::CommonDir(repo) => (name? == "packed-refs").then(|| {
+        // `config` holds the remotes and each branch's upstream for every worktree.
+        Target::CommonDir(repo) => matches!(name?, "packed-refs" | "config").then(|| {
             Change::Repo(
                 repo.clone(),
                 Refresh {
@@ -620,6 +621,8 @@ mod tests {
             "packed-refs",
         );
         assert!(matches!(packed, Some(Change::Repo(_, r)) if r.head && r.status));
+        let config = change(Target::CommonDir(repo()), EventMask::MOVED_TO, "config");
+        assert!(matches!(config, Some(Change::Repo(_, r)) if r.head && r.status));
         assert_eq!(
             change(Target::CommonDir(repo()), EventMask::MOVED_TO, "HEAD"),
             None

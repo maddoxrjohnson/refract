@@ -14,7 +14,7 @@ use serde_json::Value;
 
 use crate::classify::SessionState;
 use crate::migrate::report::Report;
-use crate::preselect::Preselect;
+use crate::preselect::{Preselect, ResumeReason};
 use crate::usage::UsageSummary;
 
 /// Bumped whenever a message changes incompatibly.
@@ -673,6 +673,9 @@ pub struct SessionInfo {
     /// window on exactly this repo, so the picker can go to it.
     #[serde(default)]
     pub focusable: bool,
+    /// Why the session is worth resuming; `null` when it is running or done.
+    #[serde(default)]
+    pub resume_reason: Option<ResumeReason>,
 }
 
 /// A hosted repo named by its remote URL, such as `github.com` / `dev` / `tidepool-api`.
@@ -893,6 +896,7 @@ mod tests {
                 last_assistant_text: Some("Tide tables are wired up.".into()),
                 byte_size: 20_480,
                 focusable: false,
+                resume_reason: Some(ResumeReason::Interrupted),
             }],
             preselect: Preselect::Resume("3f6c1a52-0000-4000-8000-000000000001".into()),
         }
@@ -1479,6 +1483,7 @@ mod tests {
             json!({"kind": "interrupted", "detail": "apiError"})
         );
         assert_eq!(session["lastTimestamp"], json!("2026-03-14T12:00:00Z"));
+        assert_eq!(session["resumeReason"], json!("interrupted"));
         assert_eq!(
             value["preselect"],
             json!({"kind": "resume", "sessionId": "3f6c1a52-0000-4000-8000-000000000001"})
@@ -1511,6 +1516,7 @@ mod tests {
                 last_assistant_text: None,
                 byte_size: 0,
                 focusable: true,
+                resume_reason: None,
             },
             preselect: Preselect::Focus("3f6c1a52-0000-4000-8000-000000000002".into()),
         });
@@ -1521,6 +1527,7 @@ mod tests {
             json!({"kind": "live", "detail": "unknown"})
         );
         assert_eq!(value["data"]["session"]["focusable"], true);
+        assert_eq!(value["data"]["session"]["resumeReason"], Value::Null);
         assert_eq!(
             value["data"]["preselect"],
             json!({"kind": "focus", "sessionId": "3f6c1a52-0000-4000-8000-000000000002"})

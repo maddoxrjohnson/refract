@@ -1,4 +1,4 @@
-import type { MigrationReport, RepoSnapshot, SessionInfo } from "../backend/types";
+import type { MigrationReport, RepoSnapshot, ResumeReason, SessionInfo } from "../backend/types";
 
 // Fixtures for the overlay tests. Invented names only.
 
@@ -14,8 +14,17 @@ export function testSession(
   hours: number,
   text: string | null = null,
   byteSize = 100_000,
+  reason: ResumeReason | null = state.kind === "interrupted" ? "interrupted" : null,
 ): SessionInfo {
-  return { id, state, lastTimestamp: hoursAgo(hours), lastAssistantText: text, byteSize, focusable: false };
+  return {
+    id,
+    state,
+    lastTimestamp: hoursAgo(hours),
+    lastAssistantText: text,
+    byteSize,
+    focusable: false,
+    resumeReason: reason,
+  };
 }
 
 export function testRepo(extra: Partial<RepoSnapshot> = {}): RepoSnapshot {

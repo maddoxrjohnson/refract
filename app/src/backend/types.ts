@@ -37,6 +37,9 @@ export type Preselect =
   /** Preselect "Go to the running agent" for this live session. */
   | { kind: "focus"; sessionId: string };
 
+/** Why a session that isn't running is worth resuming (spec §4.3). */
+export type ResumeReason = "interrupted" | "askedQuestion" | "uncommittedChanges" | "unpushedCommits";
+
 export interface SessionInfo {
   id: string;
   state: SessionState;
@@ -46,6 +49,8 @@ export interface SessionInfo {
   byteSize: number;
   /** Live, in a terminal of the Refract window on this repo: the picker can go to it. */
   focusable: boolean;
+  /** Why it is worth resuming; null when it is running or done. */
+  resumeReason: ResumeReason | null;
 }
 
 export interface RemoteId {

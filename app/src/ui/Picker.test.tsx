@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
 import type { PickerOption } from "./navigation";
-import { liveStatus, Picker } from "./Picker";
+import { liveStatus, Picker, resumeLabel } from "./Picker";
 import { NOW, testSession } from "./testRepo";
 
 afterEach(cleanup);
@@ -91,6 +91,19 @@ describe("Picker", () => {
     expect(focus.textContent).toContain("Shall I run the tide import?");
     expect(focus.textContent).not.toContain("More");
     expect(resume.textContent).toContain("Resume");
+  });
+
+  it("names why each session is worth resuming", () => {
+    setup();
+    expect(screen.getAllByRole("option")[0].textContent).toContain("Resume: stopped mid-task");
+    const finished = { kind: "finished", detail: "completed" } as const;
+    const at = (reason: "askedQuestion" | "uncommittedChanges" | "unpushedCommits") =>
+      resumeLabel(testSession("s", finished, 1, null, 1000, reason));
+    expect([at("askedQuestion"), at("uncommittedChanges"), at("unpushedCommits")]).toEqual([
+      "Resume: asked you a question",
+      "Resume: uncommitted changes",
+      "Resume: unpushed commits",
+    ]);
   });
 
   it("names each live status", () => {

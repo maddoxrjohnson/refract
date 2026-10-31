@@ -19,6 +19,7 @@ import type {
   RemoteRepo,
   RepoList,
   RepoSnapshot,
+  ResumeReason,
   SessionInfo,
   Settings,
   SystemStats,
@@ -68,6 +69,7 @@ interface Seed {
 /** The demo's repo on a Windows drive. */
 export const DEMO_WINDOWS_REPO = "/mnt/c/Users/demo/Desktop/marigold-site";
 
+/** An interrupted session's resume reason is always "interrupted"; others pass theirs. */
 const session = (
   id: string,
   state: SessionInfo["state"],
@@ -75,7 +77,16 @@ const session = (
   text: string | null,
   byteSize: number,
   focusable = false,
-): SessionInfo => ({ id, state, lastTimestamp: iso(secondsAgo), lastAssistantText: text, byteSize, focusable });
+  reason: ResumeReason | null = null,
+): SessionInfo => ({
+  id,
+  state,
+  lastTimestamp: iso(secondsAgo),
+  lastAssistantText: text,
+  byteSize,
+  focusable,
+  resumeReason: state.kind === "interrupted" ? "interrupted" : reason,
+});
 
 const SEEDS: Seed[] = [
   {
@@ -112,7 +123,17 @@ const SEEDS: Seed[] = [
     commit: ["Handle duplicate ledger rows", 4 * 24 * HOUR],
     preselect: { kind: "newAgent" },
   },
-  { name: "trailhead-ios", host: "github.com", language: "Swift", mass: 0.46, commit: ["Bump the deployment target", 9 * 24 * HOUR] },
+  {
+    name: "trailhead-ios",
+    host: "github.com",
+    language: "Swift",
+    mass: 0.46,
+    commit: ["Bump the deployment target", 9 * 24 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-000000000008", { kind: "finished", detail: "completed" }, 3 * HOUR, "The trail widget is in. Should it show on the lock screen too?", 210_000, false, "askedQuestion"),
+    ],
+    preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-000000000008" },
+  },
   {
     name: "quill",
     host: "github.com",
@@ -138,7 +159,18 @@ const SEEDS: Seed[] = [
     preselect: { kind: "focus", sessionId: "5f0c2a1e-0000-4000-8000-000000000005" },
   },
   { name: "sweep", host: "github.com", language: "C#", mass: 0.18, commit: ["Initial commit", 60 * 24 * HOUR] },
-  { name: "harbor-android", host: "github.com", language: "Kotlin", mass: 0.52, commit: ["Offline mode for the map", 6 * 24 * HOUR] },
+  {
+    name: "harbor-android",
+    host: "github.com",
+    language: "Kotlin",
+    mass: 0.52,
+    ahead: 3,
+    commit: ["Offline mode for the map", 4 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-000000000009", { kind: "finished", detail: "completed" }, 3 * HOUR, "Offline mode is committed on main.", 150_000, false, "unpushedCommits"),
+    ],
+    preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-000000000009" },
+  },
   {
     name: "mailroom",
     host: "github.com",
@@ -148,7 +180,7 @@ const SEEDS: Seed[] = [
     sessions: [
       session("5f0c2a1e-0000-4000-8000-000000000006", { kind: "interrupted", detail: "unansweredPrompt" }, 7 * HOUR, "The queue tests are green.", 2_600_000),
     ],
-    preselect: { kind: "newAgent" },
+    preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-000000000006" },
   },
   {
     name: "shell-kit",
@@ -157,7 +189,10 @@ const SEEDS: Seed[] = [
     mass: 0.62,
     changedFiles: 7,
     commit: ["Pipes between built-ins", 8 * HOUR],
-    preselect: { kind: "newAgent" },
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-00000000000a", { kind: "finished", detail: "completed" }, 1 * HOUR, "Redirection works for built-ins too.", 120_000, false, "uncommittedChanges"),
+    ],
+    preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-00000000000a" },
   },
   { name: "notebook-lab", host: "gitlab.example.com", language: "Python", mass: 0.24, commit: ["Problem set 4", 3 * 24 * HOUR] },
   { name: "scratch", host: null, language: null, mass: 0.12, commit: ["wip", 40 * 24 * HOUR] },

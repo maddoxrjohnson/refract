@@ -27,7 +27,7 @@ Contents: [why the split](#why-the-work-is-split-this-way) · [layout](#reposito
 
 **Logic lives in a library with no I/O.** `refract-core` holds the decisions that are easy to get wrong:
 - Is this session interrupted?
-- Which option should the picker preselect?
+- Which sessions are worth resuming, and which option should the picker preselect?
 - How heavy is this repo?
 - How many tokens were used in the last five hours?
 - What does the status hook add to `settings.json`, and how is it taken out again?
@@ -176,6 +176,17 @@ Claude Code writes one JSON-lines file per conversation under `~/.claude/project
 
 Only the start and the end of each file are read, and results are cached until inotify reports a change.
 
+A session that isn't running can be worth resuming even when it finished. Each session is sent with a `resumeReason`, and the first that applies wins:
+
+| Reason | Which sessions | When |
+|---|---|---|
+| `interrupted` | any | It is interrupted |
+| `askedQuestion` | the last conversation | The transcript ends on a reply that asks something: with code removed, one of its last 8 non-empty lines has a `?` (or `？`) that ends a sentence |
+| `uncommittedChanges` | the last conversation | The repo has uncommitted changes and the session was active after HEAD's committer time, or there are no commits |
+| `unpushedCommits` | the last conversation | The branch is ahead of its upstream, or has no upstream but an origin and commits no `origin/*` branch has, and the session was active after HEAD's committer time. A gone upstream or a detached HEAD has nothing to push |
+
+The last conversation is the session with the newest transcript timestamp, skipping transcripts with no conversation in them. When it is still running, no session gets the last three reasons: the running agent's own edits aren't another session's unfinished work. Running and finished sessions get `null`. The chipped corner still means only `interrupted`.
+
 ## The interface
 
 `app/src/App.tsx` holds the state; the pieces are small and take plain props.
@@ -203,10 +214,10 @@ Finding and choosing a project is a pure state machine in `ui/navigation.ts`. In
 
 Launching a gem depends on what it is:
 - Not cloned: the `clone` effect, which clones and then launches.
-- The helper's preselect is `noPicker` (clean repo, nothing unfinished, no focusable session): launch a new agent at once.
+- The helper's preselect is `noPicker` (clean repo, no session with a resume reason, no focusable session): launch a new agent at once.
 - Otherwise open the picker.
 
-A new agent in a repo with uncommitted changes starts with a short opening prompt asking Claude to review `git diff`. The picker lists "Go to the running agent" for each focusable live session, then unfinished sessions to resume, each newest first, then New agent. It highlights the option the helper preselected (`focus` or `resume`, each with a `sessionId`), or else New agent. Going to a running agent launches with mode `{"kind": "focus", "sessionId": …}`, which starts nothing and shows that agent's terminal ([launch.md](launch.md)). Keys with Ctrl, Meta or Alt are ignored, a held Enter does not repeat, and the settings dialog takes all keys while it is open.
+A new agent in a repo with uncommitted changes starts with a short opening prompt asking Claude to review `git diff`. The picker lists "Go to the running agent" for each focusable live session, then the sessions with a resume reason, each newest first, then New agent. A resume option names its reason: "Resume: stopped mid-task", "Resume: asked you a question", "Resume: uncommitted changes" or "Resume: unpushed commits". It highlights the option the helper preselected (`focus` or `resume`, each with a `sessionId`), or else New agent. The helper preselects resume when the newest session that isn't running has a reason and ended less than 2 days ago; its size doesn't matter. Going to a running agent launches with mode `{"kind": "focus", "sessionId": …}`, which starts nothing and shows that agent's terminal ([launch.md](launch.md)). Keys with Ctrl, Meta or Alt are ignored, a held Enter does not repeat, and the settings dialog takes all keys while it is open.
 
 ### Panels and widgets
 

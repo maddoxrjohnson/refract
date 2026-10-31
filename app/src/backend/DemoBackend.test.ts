@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canDelete } from "../migrations";
-import { DEMO_WINDOWS_REPO, DemoBackend, demoHookDiff } from "./DemoBackend";
+import { DEMO_WINDOWS_REPO, DemoBackend, demoHookDiff, demoRepos } from "./DemoBackend";
 import type { AgentEvent, MigrateError, MigrateSnapshotProgress } from "./types";
 
 afterEach(() => vi.useRealTimers());
@@ -17,6 +17,19 @@ async function settle<T>(promise: Promise<T>): Promise<T> {
   if (r.ok) return r.value;
   throw r.error;
 }
+
+describe("demo repos", () => {
+  it("show every resume reason, and preselect only sessions that have one", () => {
+    const repos = demoRepos();
+    const reasons = new Set(repos.flatMap((r) => r.sessions.map((s) => s.resumeReason)));
+    expect(reasons).toEqual(new Set([null, "interrupted", "askedQuestion", "uncommittedChanges", "unpushedCommits"]));
+    for (const r of repos) {
+      const pre = r.preselect;
+      if (pre.kind !== "resume") continue;
+      expect(r.sessions.find((s) => s.id === pre.sessionId)?.resumeReason, r.name).toBeTruthy();
+    }
+  });
+});
 
 describe("DemoBackend's Move to WSL", () => {
   it("runs a migration through every step to a passing report and the Recycle Bin", async () => {

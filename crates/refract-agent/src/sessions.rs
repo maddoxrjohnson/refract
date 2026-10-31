@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use refract_core::classify::classify;
-use refract_core::preselect::MAX_RESUME_BYTES;
 use refract_core::sessions::{path_within, paths_match, project_dir_matches};
 use refract_core::transcript::{parse_lines, SessionSummary};
 
@@ -43,15 +41,6 @@ struct Cached {
     size: u64,
     head: Head,
     summary: SessionSummary,
-    /// Edits found by scanning the whole file, for sessions that may be resumed.
-    edits: Option<EditScan>,
-}
-
-/// Edited paths from the start of a transcript up to `offset`, a line boundary.
-#[derive(Debug, Clone, Default)]
-struct EditScan {
-    offset: u64,
-    files: Vec<String>,
 }
 
 /// Reads and caches transcript summaries.
@@ -144,8 +133,8 @@ impl SessionReader {
         self.cache.retain(|path, _| !path.starts_with(dir));
     }
 
-    /// Reads a transcript into the cache. A transcript only grows, so the head and the
-    /// edits already scanned are kept unless the file shrank (was rewritten).
+    /// Reads a transcript into the cache. A transcript only grows, so the head is kept
+    /// unless the file shrank (was rewritten).
     fn load(&mut self, path: &Path, mtime: SystemTime, size: u64) -> io::Result<()> {
         let old = self.cache.remove(path).filter(|c| c.size <= size);
         let head = match old.as_ref().map(|c| c.head.clone()) {
@@ -164,27 +153,9 @@ impl SessionReader {
         summary.modified = Some(modified);
         if summary.entry_count == 0 && tail.start > 0 {
             // The last line is longer than MAX_TAIL_BYTES, so how the session stands is
-            // unknown. Its tail stays `None` (shown as finished, never preselected) and
+            // unknown. Its tail stays `None` (finished, asking nothing) and
             // the file's mtime stands in for its last activity, so it keeps its place.
             summary.last_timestamp = Some(modified);
-        }
-
-        // Resuming needs to know every file a session edited, not only those in the
-        // tail. For a session that would count as interrupted and is small enough to
-        // resume, scan the whole file, continuing from where the last scan stopped.
-        let mut edits = old.and_then(|c| c.edits);
-        let resumable =
-            tail.size < MAX_RESUME_BYTES && classify(&summary, false, None).is_unfinished();
-        if tail.start > 0 && resumable {
-            let scan = scan_edits(path, tail.size, edits.take().unwrap_or_default())?;
-            let mut files = scan.files.clone();
-            for file in &summary.files_edited {
-                if !files.contains(file) {
-                    files.push(file.clone());
-                }
-            }
-            summary.files_edited = files;
-            edits = Some(scan);
         }
 
         self.cache.insert(
@@ -194,7 +165,6 @@ impl SessionReader {
                 size,
                 head,
                 summary,
-                edits,
             },
         );
         Ok(())
@@ -237,8 +207,6 @@ struct Window {
     summary: SessionSummary,
     /// Where the window starts; 0 when the whole file was read.
     start: u64,
-    /// The file size the window ends at.
-    size: u64,
 }
 
 fn read_window(path: &Path, size: u64) -> io::Result<Window> {
@@ -267,32 +235,10 @@ fn read_window(path: &Path, size: u64) -> io::Result<Window> {
             return Ok(Window {
                 summary: summary.with_byte_size(size),
                 start,
-                size,
             });
         }
         window *= 2;
     }
-}
-
-/// Collects edited paths from `scan.offset` to the last complete line before `size`.
-/// Starts over when the file is shorter than the scan's offset.
-fn scan_edits(path: &Path, size: u64, mut scan: EditScan) -> io::Result<EditScan> {
-    if scan.offset > size {
-        scan = EditScan::default();
-    }
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(scan.offset))?;
-    let mut buf = Vec::new();
-    file.take(size - scan.offset).read_to_end(&mut buf)?;
-    let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    let found = parse_lines(String::from_utf8_lossy(&buf[..end]).lines()).files_edited;
-    for file in found {
-        if !scan.files.contains(&file) {
-            scan.files.push(file);
-        }
-    }
-    scan.offset += end as u64;
-    Ok(scan)
 }
 
 #[cfg(test)]
@@ -369,12 +315,6 @@ mod tests {
 
     fn write_lines(path: &Path, lines: &[String]) {
         fs::write(path, lines.join("\n") + "\n").unwrap();
-    }
-
-    fn edit(cwd: &str, file: &str) -> String {
-        format!(
-            r#"{{"type":"assistant","sessionId":"{ID}","cwd":"{cwd}","timestamp":"2026-03-14T11:00:00Z","message":{{"id":"m-edit-{file}","role":"assistant","content":[{{"type":"tool_use","id":"t-{file}","name":"Edit","input":{{"file_path":"{file}"}}}}]}}}}"#
-        )
     }
 
     fn pending_tool(cwd: &str) -> String {
@@ -463,6 +403,7 @@ mod tests {
         let size = fs::metadata(&path).unwrap().len();
         let summary = read_tail(&path, size).unwrap();
         assert_eq!(summary.tail, None);
+        assert!(!summary.asks_user);
         assert_eq!(summary.byte_size, Some(size));
     }
 
@@ -493,47 +434,5 @@ mod tests {
         assert_eq!(summary.malformed_lines, 0);
         assert_eq!(summary.last_assistant_text.as_deref(), Some("rewritten"));
         assert_eq!(summary.byte_size, Some(fs::metadata(&path).unwrap().len()));
-    }
-
-    #[test]
-    fn interrupted_session_reports_edits_from_before_the_tail() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = repo_dir(tmp.path());
-        let path = dir.join(format!("{ID}.jsonl"));
-        let early = format!("{REPO}/src/early.rs");
-        let mut lines = vec![line(REPO, "start"), edit(REPO, &early)];
-        let filler = line(REPO, &"z".repeat(1000));
-        while lines.len() * filler.len() < (TAIL_BYTES * 2) as usize {
-            lines.push(filler.clone());
-        }
-        lines.push(pending_tool(REPO));
-        write_lines(&path, &lines);
-        let mut reader = SessionReader::new(tmp.path().to_owned());
-        let sessions = reader.read_repo(REPO);
-        assert_eq!(sessions[0].files_edited, std::slice::from_ref(&early));
-
-        // Growth is scanned from where the last scan stopped.
-        let late = format!("{REPO}/src/late.rs");
-        let mut f = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(f, "{}", edit(REPO, &late)).unwrap();
-        writeln!(f, "{}", pending_tool(REPO)).unwrap();
-        drop(f);
-        let sessions = reader.read_repo(REPO);
-        assert_eq!(sessions[0].files_edited, [early, late]);
-    }
-
-    #[test]
-    fn finished_session_keeps_tail_edits_only() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dir = repo_dir(tmp.path());
-        let early = format!("{REPO}/src/early.rs");
-        let mut lines = vec![line(REPO, "start"), edit(REPO, &early)];
-        let filler = line(REPO, &"z".repeat(1000));
-        while lines.len() * filler.len() < (TAIL_BYTES * 2) as usize {
-            lines.push(filler.clone());
-        }
-        write_lines(&dir.join(format!("{ID}.jsonl")), &lines);
-        let mut reader = SessionReader::new(tmp.path().to_owned());
-        assert!(reader.read_repo(REPO)[0].files_edited.is_empty());
     }
 }
