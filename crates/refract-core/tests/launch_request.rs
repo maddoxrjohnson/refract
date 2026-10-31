@@ -34,6 +34,7 @@ fn golden_request_parses() {
 
     let mode = LaunchMode::New {
         prompt: Some(PROMPT.into()),
+        plan_mode: false,
     };
     assert_eq!(request.argv, launch_argv(&mode, SESSION_ID));
     assert_eq!(request.title, launch_title(&mode));

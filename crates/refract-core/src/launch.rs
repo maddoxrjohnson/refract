@@ -5,24 +5,30 @@
 use crate::protocol::LaunchMode;
 
 /// The command to run in the new terminal. `session_id` is the ticket's session id,
-/// which for a resume is the one being resumed. A prompt follows `--`, which ends
-/// `claude`'s options, so a prompt starting with `-` is not read as a flag. A focus
-/// starts nothing, so its command is empty.
+/// which for a resume is the one being resumed. A new agent in plan mode gets
+/// `--permission-mode plan`. A prompt follows `--`, which ends `claude`'s options, so a
+/// prompt starting with `-` is not read as a flag. A focus starts nothing, so its
+/// command is empty.
 pub fn launch_argv(mode: &LaunchMode, session_id: &str) -> Vec<String> {
-    match mode {
-        LaunchMode::New { prompt } => {
+    let (mut argv, prompt) = match mode {
+        LaunchMode::New { prompt, plan_mode } => {
             let mut argv = vec!["claude".into(), "--session-id".into(), session_id.into()];
-            if let Some(prompt) = prompt.as_deref().filter(|p| !p.is_empty()) {
-                argv.push("--".into());
-                argv.push(prompt.into());
+            if *plan_mode {
+                argv.extend(["--permission-mode".into(), "plan".into()]);
             }
-            argv
+            (argv, prompt)
         }
-        LaunchMode::Resume { .. } => {
-            vec!["claude".into(), "--resume".into(), session_id.into()]
-        }
-        LaunchMode::Focus { .. } => Vec::new(),
+        LaunchMode::Resume { prompt, .. } => (
+            vec!["claude".into(), "--resume".into(), session_id.into()],
+            prompt,
+        ),
+        LaunchMode::Focus { .. } => return Vec::new(),
+    };
+    if let Some(prompt) = prompt.as_deref().filter(|p| !p.is_empty()) {
+        argv.push("--".into());
+        argv.push(prompt.into());
     }
+    argv
 }
 
 /// The terminal tab's name.
@@ -140,13 +146,20 @@ mod tests {
     #[test]
     fn argv_for_each_mode() {
         assert_eq!(
-            launch_argv(&LaunchMode::New { prompt: None }, ID),
+            launch_argv(
+                &LaunchMode::New {
+                    prompt: None,
+                    plan_mode: false
+                },
+                ID
+            ),
             ["claude", "--session-id", ID]
         );
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
-                    prompt: Some("Add tide tables".into())
+                    prompt: Some("Add tide tables".into()),
+                    plan_mode: false
                 },
                 ID
             ),
@@ -155,7 +168,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
-                    prompt: Some("--help me".into())
+                    prompt: Some("--help me".into()),
+                    plan_mode: false
                 },
                 ID
             ),
@@ -164,16 +178,54 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
-                    prompt: Some(String::new())
+                    prompt: Some(String::new()),
+                    plan_mode: false
                 },
                 ID
             ),
             ["claude", "--session-id", ID]
         );
+        assert_eq!(
+            launch_argv(
+                &LaunchMode::New {
+                    prompt: Some("Refactor it".into()),
+                    plan_mode: true
+                },
+                ID
+            ),
+            [
+                "claude",
+                "--session-id",
+                ID,
+                "--permission-mode",
+                "plan",
+                "--",
+                "Refactor it"
+            ]
+        );
+        assert_eq!(
+            launch_argv(
+                &LaunchMode::New {
+                    prompt: None,
+                    plan_mode: true
+                },
+                ID
+            ),
+            ["claude", "--session-id", ID, "--permission-mode", "plan"]
+        );
         let resume = LaunchMode::Resume {
             session_id: ID.into(),
+            prompt: None,
         };
         assert_eq!(launch_argv(&resume, ID), ["claude", "--resume", ID]);
+        let resume = LaunchMode::Resume {
+            session_id: ID.into(),
+            prompt: Some("-Continue".into()),
+        };
+        assert_eq!(
+            launch_argv(&resume, ID),
+            ["claude", "--resume", ID, "--", "-Continue"]
+        );
         let focus = LaunchMode::Focus {
             session_id: ID.into(),
         };
@@ -182,9 +234,14 @@ mod tests {
 
     #[test]
     fn titles() {
-        assert_eq!(launch_title(&LaunchMode::New { prompt: None }), "New agent");
+        let new = LaunchMode::New {
+            prompt: None,
+            plan_mode: false,
+        };
+        assert_eq!(launch_title(&new), "New agent");
         let resume = LaunchMode::Resume {
             session_id: ID.into(),
+            prompt: None,
         };
         assert_eq!(launch_title(&resume), "Resume");
         let focus = LaunchMode::Focus {

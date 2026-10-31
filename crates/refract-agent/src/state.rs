@@ -9,7 +9,9 @@ use chrono::{DateTime, TimeDelta, Utc};
 use refract_core::classify::{classify_report, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
-use refract_core::protocol::{Event, RemoteId, RepoSnapshot, SessionChange, SessionInfo};
+use refract_core::protocol::{
+    Event, RefactorInfo, RemoteId, RepoSnapshot, SessionChange, SessionInfo,
+};
 use refract_core::sessions::paths_match;
 use refract_core::transcript::SessionSummary;
 
@@ -103,6 +105,8 @@ pub struct Agent {
     procs: Vec<ClaudeProcess>,
     /// Every status the status hook reported, by session id.
     hooks: HashMap<String, HookReport>,
+    /// Each repo's refactor, by repo path, as [`crate::refactor`] last worked it out.
+    refactors: HashMap<PathBuf, RefactorInfo>,
 }
 
 impl Agent {
@@ -115,6 +119,7 @@ impl Agent {
             repos: BTreeMap::new(),
             procs: Vec::new(),
             hooks: HashMap::new(),
+            refactors: HashMap::new(),
         }
     }
 
@@ -366,6 +371,22 @@ impl Agent {
         events
     }
 
+    /// Sets the refactor of the repo at `path` (`None`: it has none) and returns a
+    /// `repoChanged` when that changes its snapshot.
+    pub fn set_refactor(&mut self, path: &Path, info: Option<RefactorInfo>) -> Vec<Event> {
+        match &info {
+            Some(info) => self.refactors.insert(path.to_owned(), info.clone()),
+            None => self.refactors.remove(path),
+        };
+        match self.repos.get_mut(path) {
+            Some(repo) if repo.snapshot.refactor != info => {
+                repo.snapshot.refactor = info;
+                vec![Event::RepoChanged(Box::new(repo.snapshot.clone()))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Re-checks running processes for repos with live or recent sessions and returns
     /// events for sessions whose state changed.
     pub fn recheck_live(&mut self, now: DateTime<Utc>) -> Vec<Event> {
@@ -416,6 +437,7 @@ impl Agent {
         let mut snapshot =
             build_snapshot(&path, &status, &head, &sessions, &live, &hooks, Utc::now());
         snapshot.mass = mass;
+        snapshot.refactor = self.refactors.get(&path).cloned();
         self.repos.insert(
             path,
             RepoState {
@@ -648,6 +670,7 @@ pub fn build_snapshot(
         mass: 0.0,
         sessions,
         preselect,
+        refactor: None,
     }
 }
 
@@ -866,6 +889,34 @@ mod tests {
         assert!(matches!(diff(&old, &new)[..], [Event::RepoChanged(_)]));
         let mut new = old.clone();
         new.changed_files = 3;
+        assert!(matches!(diff(&old, &new)[..], [Event::RepoChanged(_)]));
+    }
+
+    #[test]
+    fn a_refactor_change_gives_a_repo_event_even_with_a_session_change() {
+        let mut old = snapshot();
+        old.sessions = vec![session("a", SessionState::Live(LiveState::Unknown))];
+        let mut new = old.clone();
+        new.sessions[0].state = SessionState::Finished(FinishKind::Completed);
+        new.refactor = Some(refract_core::protocol::RefactorInfo {
+            state: refract_core::protocol::RefactorState::Starting,
+            worktree: "/home/dev/projects/.refract-worktrees/tidepool-api-20261031-1405".into(),
+            folder_uri: String::new(),
+            branch: "refactor/20261031-1405".into(),
+            target_branch: "main".into(),
+            base_commit: "a1b2c3d".into(),
+            session_id: String::new(),
+            created_at: Utc::now(),
+            live: false,
+            interrupted: false,
+            commits: vec![],
+            files_changed: 0,
+            insertions: 0,
+            deletions: 0,
+            checks: None,
+            summary: None,
+            blocked: None,
+        });
         assert!(matches!(diff(&old, &new)[..], [Event::RepoChanged(_)]));
     }
 }

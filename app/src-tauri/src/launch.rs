@@ -606,7 +606,8 @@ mod tests {
         assert_eq!(
             new,
             LaunchMode::New {
-                prompt: Some("hi".into())
+                prompt: Some("hi".into()),
+                plan_mode: false,
             }
         );
         let resume: LaunchMode =
@@ -614,7 +615,8 @@ mod tests {
         assert_eq!(
             resume,
             LaunchMode::Resume {
-                session_id: "abc".into()
+                session_id: "abc".into(),
+                prompt: None,
             }
         );
         let focus: LaunchMode =

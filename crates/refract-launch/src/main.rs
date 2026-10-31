@@ -69,8 +69,14 @@ fn run() -> Result<(), String> {
     let args = parse_args(std::env::args().skip(1))?;
     let repo = args.repo.ok_or(USAGE)?;
     let mode = match (args.resume, args.focus, args.prompt) {
-        (None, None, prompt) => LaunchMode::New { prompt },
-        (Some(session_id), None, None) => LaunchMode::Resume { session_id },
+        (None, None, prompt) => LaunchMode::New {
+            prompt,
+            plan_mode: false,
+        },
+        (Some(session_id), None, None) => LaunchMode::Resume {
+            session_id,
+            prompt: None,
+        },
         (None, Some(session_id), None) => LaunchMode::Focus { session_id },
         _ => return Err("--resume, --focus and --prompt cannot be combined".into()),
     };

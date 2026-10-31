@@ -9,6 +9,7 @@ pub mod launch;
 pub mod limits;
 pub mod migrate;
 pub mod procs;
+pub mod refactor;
 pub mod repos;
 pub mod scan;
 pub mod server;

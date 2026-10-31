@@ -62,6 +62,18 @@ pub fn prepare(
     prepare_with(path, mode, running, procs_chain, dir, distro, now)
 }
 
+/// [`prepare`] for a new agent or a resume whose terminal tab is named `title`.
+pub fn prepare_titled(
+    path: &str,
+    mode: &LaunchMode,
+    title: &str,
+    dir: &Path,
+    distro: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<LaunchTicket, ErrorBody> {
+    prepare_full(path, mode, None, procs_chain, title, dir, distro, now)
+}
+
 /// A running `claude` process and its ancestors, or nothing once it has exited or its
 /// pid has been given to a process that started later.
 fn procs_chain(process: &LiveProcess) -> Vec<u32> {
@@ -84,6 +96,22 @@ fn prepare_with(
     distro: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<LaunchTicket, ErrorBody> {
+    let title = launch_title(mode);
+    prepare_full(path, mode, running, chain, title, dir, distro, now)
+}
+
+/// [`prepare_with`], naming the terminal tab `title`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_full(
+    path: &str,
+    mode: &LaunchMode,
+    running: Option<LiveProcess>,
+    chain: impl Fn(&LiveProcess) -> Vec<u32>,
+    title: &str,
+    dir: &Path,
+    distro: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<LaunchTicket, ErrorBody> {
     let fail = |code, message: String| ErrorBody { code, message };
     let trimmed = path.trim_end_matches('/');
     let folder = if trimmed.is_empty() { "/" } else { trimmed };
@@ -101,7 +129,7 @@ fn prepare_with(
     };
     let session_id = match mode {
         LaunchMode::New { .. } => uuid::Uuid::new_v4().to_string(),
-        LaunchMode::Resume { session_id } | LaunchMode::Focus { session_id } => {
+        LaunchMode::Resume { session_id, .. } | LaunchMode::Focus { session_id } => {
             // Only the hyphenated form, which is the only one 36 characters long.
             if session_id.len() != 36 || uuid::Uuid::try_parse(session_id).is_err() {
                 return Err(fail(
@@ -139,7 +167,7 @@ fn prepare_with(
         request_id: request_id.clone(),
         folder: folder.to_owned(),
         argv: launch_argv(mode, &session_id),
-        title: launch_title(mode).to_owned(),
+        title: title.to_owned(),
         created_at: now.trunc_subsecs(0),
         focus,
     };
@@ -225,6 +253,7 @@ mod tests {
         let path = format!("{}/", repo.to_str().unwrap());
         let mode = LaunchMode::New {
             prompt: Some("Add tide tables".into()),
+            plan_mode: false,
         };
         let ticket = prepare(&path, &mode, None, &dir, Some("Ubuntu"), now()).unwrap();
         assert_ne!(ticket.request_id, ticket.session_id);
@@ -267,7 +296,10 @@ mod tests {
     fn rejects_missing_dirs_and_missing_distro() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("launch");
-        let mode = LaunchMode::New { prompt: None };
+        let mode = LaunchMode::New {
+            prompt: None,
+            plan_mode: false,
+        };
         let missing = tmp.path().join("nope");
         let err = prepare(
             missing.to_str().unwrap(),
@@ -351,7 +383,10 @@ mod tests {
         let repo = tmp.path().join("repo");
         fs::create_dir(&repo).unwrap();
         let dir = tmp.path().join("state/refract/launch");
-        let mode = LaunchMode::New { prompt: None };
+        let mode = LaunchMode::New {
+            prompt: None,
+            plan_mode: false,
+        };
         prepare(
             repo.to_str().unwrap(),
             &mode,
@@ -380,6 +415,7 @@ mod tests {
         ] {
             let mode = LaunchMode::Resume {
                 session_id: bad.into(),
+                prompt: None,
             };
             let err = prepare(repo, &mode, None, &dir, Some("Ubuntu"), now()).unwrap_err();
             assert_eq!(err.code, code::INVALID_PARAMS, "{bad:?}");
@@ -388,6 +424,7 @@ mod tests {
         let id = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e";
         let mode = LaunchMode::Resume {
             session_id: id.into(),
+            prompt: None,
         };
         let ticket = prepare(repo, &mode, None, &dir, Some("Ubuntu"), now()).unwrap();
         assert_eq!(ticket.session_id, id);

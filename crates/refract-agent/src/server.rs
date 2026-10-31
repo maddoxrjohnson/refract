@@ -44,6 +44,7 @@ use crate::launch;
 use crate::limits::LimitsFile;
 use crate::migrate::{self, Phase};
 use crate::procs;
+use crate::refactor::Refactors;
 use crate::repos;
 use crate::scan;
 use crate::setup;
@@ -309,6 +310,10 @@ struct Server<W: Write> {
     limits: LimitsFile,
     /// Migrations running or waiting for `migrateFinish`, by id.
     migrations: HashMap<String, migrate::Handle>,
+    /// Every repo's refactor (see [`crate::refactor`]).
+    refactors: Refactors,
+    /// When the refactors are next looked at, while there are any.
+    next_refactor: Option<Instant>,
 }
 
 /// Runs the helper until `shutdown` or the end of `input`.
@@ -345,6 +350,7 @@ where
         let deadline = [
             server.pending.deadline(),
             server.next_live,
+            server.next_refactor,
             Some(server.next_sweep),
             server.next_retry(),
         ]
@@ -385,7 +391,15 @@ where
         if server.next_sweep <= now {
             server.sweep_statuses(now);
         }
+        if server.next_refactor.is_some_and(|d| d <= now) {
+            server.next_refactor = None;
+            let events = server
+                .refactors
+                .refresh(&mut server.agent, None, Utc::now());
+            server.send_all(&events)?;
+        }
         server.schedule_live();
+        server.schedule_refactors();
     }
 }
 
@@ -530,6 +544,8 @@ impl<W: Write> Server<W> {
             usage,
             limits,
             migrations: HashMap::new(),
+            refactors: Refactors::from_env(),
+            next_refactor: None,
         }
     }
 
@@ -658,10 +674,43 @@ impl<W: Write> Server<W> {
                 };
                 self.watch_hook_dir();
                 // Statuses count only while the hook is installed.
-                let events = self.agent.set_hooks(hook::statuses(&paths));
+                let mut events = self.agent.set_hooks(hook::statuses(&paths));
+                if self.load == Load::Done {
+                    events.extend(self.refactors.refresh(&mut self.agent, None, Utc::now()));
+                }
                 self.send(&hook_response(id, result))?;
                 self.send_all(&events)?;
                 return Ok(true);
+            }
+            Method::StartRefactor { path, focus } => {
+                self.ensure_loaded()?;
+                let dir = launch::launch_dir();
+                let started = self.refactors.start(
+                    &mut self.agent,
+                    &path,
+                    focus.as_deref(),
+                    &dir,
+                    Utc::now(),
+                );
+                return self.answer_refactor(id, started.map(|(t, e)| (Reply::Launch(t), e)));
+            }
+            Method::ResumeRefactor { path, fix } => {
+                self.ensure_loaded()?;
+                let dir = launch::launch_dir();
+                let resumed = self
+                    .refactors
+                    .resume(&mut self.agent, &path, fix, &dir, Utc::now());
+                return self.answer_refactor(id, resumed.map(|(t, e)| (Reply::Launch(t), e)));
+            }
+            Method::MergeRefactor { path } => {
+                self.ensure_loaded()?;
+                let merged = self.refactors.merge(&mut self.agent, &path, Utc::now());
+                return self.answer_refactor(id, merged.map(|(o, e)| (Reply::RefactorMerge(o), e)));
+            }
+            Method::DiscardRefactor { path } => {
+                self.ensure_loaded()?;
+                let discarded = self.refactors.discard(&mut self.agent, &path);
+                return self.answer_refactor(id, discarded.map(|e| (Reply::Done, e)));
             }
             Method::Migrate(params) => {
                 // Any of the two folders within, or holding, one of another migration's.
@@ -1296,6 +1345,7 @@ impl<W: Write> Server<W> {
         }
         if last {
             self.load = Load::Done;
+            events.extend(self.refactors.reconcile(&mut self.agent, Utc::now()));
             self.touched.clear();
             self.load_dirs.clear();
             let unloaded: Vec<PathBuf> = std::mem::take(&mut self.prewatched)
@@ -1541,6 +1591,7 @@ impl<W: Write> Server<W> {
 
         let mut order: Vec<_> = refresh.into_iter().collect();
         order.sort_by(|a, b| a.0.cmp(&b.0));
+        let refreshed: Vec<PathBuf> = order.iter().map(|(p, _)| p.clone()).collect();
         let mut rewatch = pending.rewatch;
         for (path, what) in order {
             events.extend(self.agent.refresh(&path, what));
@@ -1551,7 +1602,44 @@ impl<W: Write> Server<W> {
         for path in rewatch {
             self.watch_repo(&path);
         }
+        // A refactor's commits show as changes in its repo's git directory; its agent's
+        // hook status as a status file.
+        if self.load == Load::Done && !self.refactors.is_empty() {
+            let hooks_moved = pending.reload || !pending.hook_files.is_empty();
+            let which = (!hooks_moved).then_some(refreshed.as_slice());
+            events.extend(self.refactors.refresh(&mut self.agent, which, Utc::now()));
+        }
         self.send_all(&events)
+    }
+
+    /// Answers a refactor request, then sends the events it caused. The refactors are
+    /// looked at again on the timer from now on, which may now run faster.
+    fn answer_refactor(
+        &mut self,
+        id: Id,
+        result: Result<(Reply, Vec<Event>), ErrorBody>,
+    ) -> io::Result<bool> {
+        self.next_refactor = None;
+        match result {
+            Ok((reply, events)) => {
+                self.send(&Response::ok(id, reply))?;
+                self.send_all(&events)?;
+            }
+            Err(e) => self.send(&Response::err(id, e.code, e.message))?,
+        }
+        Ok(true)
+    }
+
+    /// Arms the refactor timer once the repos are loaded and some refactor exists.
+    fn schedule_refactors(&mut self) {
+        match self.refactors.poll_interval() {
+            Some(every) if self.load == Load::Done => {
+                if self.next_refactor.is_none() {
+                    self.next_refactor = Some(Instant::now() + every);
+                }
+            }
+            _ => self.next_refactor = None,
+        }
     }
 
     /// Arms the liveness timer when a session is live or recent, and disarms it

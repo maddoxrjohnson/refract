@@ -173,8 +173,8 @@ pub fn read_head_unless(path: &Path, cancel: &AtomicBool) -> io::Result<HeadInfo
     let origin_url = git(path, &["config", "--get", "remote.origin.url"])?
         .map(|out| redact_userinfo(String::from_utf8_lossy(&out).trim()))
         .filter(|url| !url.is_empty());
-    let last_commit =
-        git(path, &["log", "-1", "--format=%ct%x00%s"])?.and_then(|out| parse_last_commit(&out));
+    let last_commit = git(path, &["log", "-1", "--format=%ct%x00%h%x00%s"])?
+        .and_then(|out| parse_last_commit(&out));
     let tree = git(path, &["ls-tree", "-r", "-l", "-z", "HEAD"])?.unwrap_or_default();
     let files = parse_ls_tree(&tree);
     let commits_30d = git(
@@ -316,13 +316,15 @@ pub fn parse_status(out: &[u8]) -> Status {
     status
 }
 
-/// Parses `git log -1 --format=%ct%x00%s`.
+/// Parses `git log -1 --format=%ct%x00%h%x00%s`.
 fn parse_last_commit(out: &[u8]) -> Option<LastCommit> {
     let text = String::from_utf8_lossy(out);
-    let (time, summary) = text.trim_end_matches('\n').split_once('\0')?;
+    let (time, rest) = text.trim_end_matches('\n').split_once('\0')?;
+    let (sha, summary) = rest.split_once('\0')?;
     Some(LastCommit {
         summary: summary.to_owned(),
         time: time.trim().parse().ok()?,
+        sha: Some(sha.to_owned()).filter(|s| !s.is_empty()),
     })
 }
 
@@ -492,10 +494,11 @@ none /mnt/wsl tmpfs rw,relatime 0 0
     #[test]
     fn last_commit_parses() {
         assert_eq!(
-            parse_last_commit(b"1773489600\0Add tide tables\n"),
+            parse_last_commit(b"1773489600\0a1b2c3d\0Add tide tables\n"),
             Some(LastCommit {
                 summary: "Add tide tables".into(),
-                time: 1_773_489_600
+                time: 1_773_489_600,
+                sha: Some("a1b2c3d".into()),
             })
         );
         assert_eq!(parse_last_commit(b""), None);

@@ -55,6 +55,11 @@ pub mod code {
     /// `stopAgent` named a session that is working on a turn, so stopping it could lose
     /// work.
     pub const AGENT_BUSY: i32 = 7;
+    /// `startRefactor` was refused (detached HEAD, no commits, a refactor already under
+    /// way) or failed, or `resumeRefactor`, `mergeRefactor` or `discardRefactor` named a
+    /// repo with no refactor, was refused (its agent is running, its worktree is not one
+    /// Refract made) or failed.
+    pub const REFACTOR_FAILED: i32 = 8;
 }
 
 /// A request from the app.
@@ -150,6 +155,32 @@ pub enum Method {
     /// Stops (SIGTERM) the `claude` process of a live session, unless it is working on
     /// a turn: answered with `null`. See [`StopAgentParams`].
     StopAgent(StopAgentParams),
+    /// Starts a refactor of the repo at `path` (as `getRepo` takes it): a worktree on a
+    /// new `refactor/…` branch from the repo's last commit, and a launch request for a
+    /// plan-mode agent there with the built-in prompt (see [`crate::refactor`]) and the
+    /// optional `focus` line. Answered with a [`LaunchTicket`] for the worktree. Refused
+    /// with [`code::REFACTOR_FAILED`] on a detached HEAD, in a repo with no commits, and
+    /// while the repo already has a refactor.
+    StartRefactor {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        focus: Option<String>,
+    },
+    /// Resumes the repo's refactor agent: answered with a [`LaunchTicket`]. Without
+    /// `fix` it continues where it stopped; with `fix` it rebases the branch onto the
+    /// target branch after a merge hit conflicts. Refused while the agent runs.
+    ResumeRefactor {
+        path: String,
+        #[serde(default)]
+        fix: bool,
+    },
+    /// Fast-forwards the refactor's target branch to the refactor branch (rebasing it
+    /// first when the target moved on), then removes the worktree and the branch:
+    /// answered with a [`MergeOutcome`]. Nothing is pushed.
+    MergeRefactor { path: String },
+    /// Deletes the refactor's worktree and branch: answered with `null`. Refused while
+    /// the agent runs.
+    DiscardRefactor { path: String },
 }
 
 /// A request id: any JSON number or string, echoed back unchanged.
@@ -204,6 +235,8 @@ pub enum Reply {
     PendingMigrations(Vec<PendingMigration>),
     /// The result of `migrateCancel`.
     Cancelled(CancelOutcome),
+    /// The result of `mergeRefactor`.
+    RefactorMerge(MergeOutcome),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -246,15 +279,25 @@ pub const LAUNCH_REQUEST_VERSION: u32 = 1;
     rename_all_fields = "camelCase"
 )]
 pub enum LaunchMode {
-    /// A new agent, with an optional opening prompt.
+    /// A new agent, with an optional opening prompt, in plan mode when `plan_mode`.
     New {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        plan_mode: bool,
     },
-    /// Resume an existing session.
-    Resume { session_id: String },
+    /// Resume an existing session, with an optional prompt to send it.
+    Resume {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt: Option<String>,
+    },
     /// Bring the VS Code terminal running a live session to the front, starting nothing.
     Focus { session_id: String },
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// The result of `prepareLaunch`.
@@ -651,6 +694,9 @@ pub struct RepoSnapshot {
     /// Sessions whose working directory is this repo, most recent first.
     pub sessions: Vec<SessionInfo>,
     pub preselect: Preselect,
+    /// The repo's refactor, while it has one (see [`Method::StartRefactor`]).
+    #[serde(default)]
+    pub refactor: Option<RefactorInfo>,
 }
 
 /// The newest commit on HEAD.
@@ -661,6 +707,145 @@ pub struct LastCommit {
     pub summary: String,
     /// Committer time, Unix seconds.
     pub time: i64,
+    /// Abbreviated commit id.
+    #[serde(default)]
+    pub sha: Option<String>,
+}
+
+/// A repo's refactor: its worktree and branch, how its agent stands, and what it did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefactorInfo {
+    pub state: RefactorState,
+    /// Absolute Linux path of the worktree.
+    pub worktree: String,
+    /// What to pass to `code --folder-uri` to review the worktree.
+    pub folder_uri: String,
+    /// Such as `refactor/20261031-1405`.
+    pub branch: String,
+    /// The branch the repo was on when the refactor started, which a merge moves.
+    pub target_branch: String,
+    /// The full id of the commit the worktree started from.
+    pub base_commit: String,
+    /// The refactor agent's session; empty when none is known.
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    /// The refactor agent's `claude` process is running.
+    pub live: bool,
+    /// The agent is not running and its transcript ends mid-turn, so it is worth
+    /// resuming, whatever the state.
+    #[serde(default)]
+    pub interrupted: bool,
+    /// Commits on the branch and not on the target, oldest first.
+    pub commits: Vec<RefactorCommit>,
+    /// `git diff --shortstat` of the target and the branch from where they part.
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+    /// The checks the agent reported; `None` when its result file is missing or not
+    /// valid.
+    pub checks: Option<Vec<CheckResult>>,
+    /// The agent's summary from its result file.
+    pub summary: Option<String>,
+    /// Why the last merge stopped, until the next merge or resume, or a new commit on
+    /// the branch.
+    pub blocked: Option<MergeBlock>,
+}
+
+/// Where a refactor stands (spec §4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RefactorState {
+    /// The launch is pending: no agent and no transcript yet.
+    Starting,
+    /// The agent is running a turn (or runs without a hook status that says more).
+    Working,
+    /// The agent waits on the user: plan approval or a question, or, its turn over,
+    /// with nothing committed.
+    NeedsYou,
+    /// The agent stopped before finishing, with nothing committed.
+    Interrupted,
+    /// The agent stopped, or is idle with its turn over, with at least one commit to
+    /// merge.
+    Ready,
+    /// The agent finished and found nothing worth refactoring.
+    NothingToDo,
+    /// The last merge stopped; see [`RefactorInfo::blocked`].
+    MergeBlocked,
+}
+
+/// One commit of a refactor branch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RefactorCommit {
+    /// Abbreviated commit id.
+    pub sha: String,
+    /// First line of the message.
+    pub summary: String,
+}
+
+/// One check the refactor agent ran, before its refactors and after them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckResult {
+    pub command: String,
+    pub before: CheckOutcome,
+    pub after: CheckOutcome,
+}
+
+/// How a check ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CheckOutcome {
+    Pass,
+    Fail,
+    NotRun,
+}
+
+/// Why a merge stopped, and the files concerned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MergeBlock {
+    pub reason: MergeBlockReason,
+    /// Paths relative to the repo: the uncommitted files the refactor also changed, or
+    /// the files the rebase could not merge.
+    pub files: Vec<String>,
+}
+
+/// Why a merge stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MergeBlockReason {
+    /// Uncommitted files in the repo are ones the refactor changed.
+    DirtyOverlap,
+    /// Rebasing the branch onto the target hit conflicts; the rebase was undone.
+    Conflict,
+    /// The target branch no longer exists.
+    TargetMissing,
+    /// The refactor agent is still working on a turn or waiting on the user.
+    Live,
+}
+
+/// The result of `mergeRefactor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "outcome",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MergeOutcome {
+    /// The target branch now holds the refactor's `commits`, and the refactor is gone.
+    /// `kept` says why the worktree or branch could not be removed, one line each.
+    Merged {
+        commits: u32,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        kept: Vec<String>,
+    },
+    /// Nothing changed in the repo; the refactor stays.
+    Blocked {
+        reason: MergeBlockReason,
+        files: Vec<String>,
+    },
 }
 
 /// One Claude Code session in a repo.
@@ -810,7 +995,8 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
     let takes_params = match method {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
         | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateBeginDelete"
-        | "migrateResync" | "stopAgent" => true,
+        | "migrateResync" | "stopAgent" | "startRefactor" | "resumeRefactor" | "mergeRefactor"
+        | "discardRefactor" => true,
         "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
         | "shutdown" | "migratePending" => false,
         _ => {
@@ -889,6 +1075,7 @@ mod tests {
             last_commit: Some(LastCommit {
                 summary: "Add tide tables".into(),
                 time: 1_773_489_600,
+                sha: Some("a1b2c3d".into()),
             }),
             language: Some("Rust".into()),
             tracked_bytes: 48_213,
@@ -904,6 +1091,41 @@ mod tests {
                 resume_reason: Some(ResumeReason::Interrupted),
             }],
             preselect: Preselect::Resume("3f6c1a52-0000-4000-8000-000000000001".into()),
+            refactor: Some(refactor_info()),
+        }
+    }
+
+    fn refactor_info() -> RefactorInfo {
+        RefactorInfo {
+            state: RefactorState::Ready,
+            worktree: "/home/dev/projects/.refract-worktrees/tidepool-api-20261031-1405".into(),
+            folder_uri:
+                "vscode-remote://wsl+Ubuntu/home/dev/projects/.refract-worktrees/tidepool-api-20261031-1405"
+                    .into(),
+            branch: "refactor/20261031-1405".into(),
+            target_branch: "main".into(),
+            base_commit: "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678".into(),
+            session_id: "0b7e0000-0000-4000-8000-000000000002".into(),
+            created_at: "2026-10-31T14:05:00Z".parse().unwrap(),
+            live: false,
+            interrupted: false,
+            commits: vec![RefactorCommit {
+                sha: "b2c3d4e".into(),
+                summary: "Split the tide parser".into(),
+            }],
+            files_changed: 3,
+            insertions: 40,
+            deletions: 12,
+            checks: Some(vec![CheckResult {
+                command: "cargo test".into(),
+                before: CheckOutcome::Pass,
+                after: CheckOutcome::NotRun,
+            }]),
+            summary: Some("Split the parser.".into()),
+            blocked: Some(MergeBlock {
+                reason: MergeBlockReason::DirtyOverlap,
+                files: vec!["src/lib.rs".into()],
+            }),
         }
     }
 
@@ -925,6 +1147,7 @@ mod tests {
             mass: 0.0,
             sessions: vec![],
             preselect: Preselect::NoPicker,
+            refactor: None,
         }
     }
 
@@ -977,7 +1200,10 @@ mod tests {
             id: 5.into(),
             method: Method::PrepareLaunch {
                 path: "/home/dev/projects/tidepool-api".into(),
-                mode: LaunchMode::New { prompt: None },
+                mode: LaunchMode::New {
+                    prompt: None,
+                    plan_mode: false,
+                },
             },
         };
         assert_eq!(
@@ -994,7 +1220,8 @@ mod tests {
             Method::PrepareLaunch {
                 path: "/x".into(),
                 mode: LaunchMode::New {
-                    prompt: Some("Fix it".into())
+                    prompt: Some("Fix it".into()),
+                    plan_mode: false,
                 }
             }
         );
@@ -1007,7 +1234,8 @@ mod tests {
             Method::PrepareLaunch {
                 path: "/x".into(),
                 mode: LaunchMode::Resume {
-                    session_id: "abc".into()
+                    session_id: "abc".into(),
+                    prompt: None,
                 }
             }
         );
@@ -1088,6 +1316,95 @@ mod tests {
                 "focus": {"sessionId": "abc", "pids": [812, 640]}
             })
         );
+    }
+
+    #[test]
+    fn refactor_messages_round_trip() {
+        let plan = LaunchMode::New {
+            prompt: Some("Refactor".into()),
+            plan_mode: true,
+        };
+        assert_eq!(
+            round_trip(&plan),
+            json!({"kind": "new", "prompt": "Refactor", "planMode": true})
+        );
+        let resume = LaunchMode::Resume {
+            session_id: "abc".into(),
+            prompt: Some("Continue".into()),
+        };
+        assert_eq!(
+            round_trip(&resume),
+            json!({"kind": "resume", "sessionId": "abc", "prompt": "Continue"})
+        );
+        for (line, method) in [
+            (
+                r#"{"id":1,"method":"startRefactor","params":{"path":"/x"}}"#,
+                Method::StartRefactor {
+                    path: "/x".into(),
+                    focus: None,
+                },
+            ),
+            (
+                r#"{"id":1,"method":"startRefactor","params":{"path":"/x","focus":"the parser"}}"#,
+                Method::StartRefactor {
+                    path: "/x".into(),
+                    focus: Some("the parser".into()),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"resumeRefactor","params":{"path":"/x"}}"#,
+                Method::ResumeRefactor {
+                    path: "/x".into(),
+                    fix: false,
+                },
+            ),
+            (
+                r#"{"id":1,"method":"resumeRefactor","params":{"path":"/x","fix":true}}"#,
+                Method::ResumeRefactor {
+                    path: "/x".into(),
+                    fix: true,
+                },
+            ),
+            (
+                r#"{"id":1,"method":"mergeRefactor","params":{"path":"/x"}}"#,
+                Method::MergeRefactor { path: "/x".into() },
+            ),
+            (
+                r#"{"id":1,"method":"discardRefactor","params":{"path":"/x"}}"#,
+                Method::DiscardRefactor { path: "/x".into() },
+            ),
+        ] {
+            assert_eq!(parse_request(line).unwrap().method, method, "{line}");
+        }
+        let err = parse_request(r#"{"id":2,"method":"mergeRefactor","params":{}}"#).unwrap_err();
+        assert_eq!(err.error.code, code::INVALID_PARAMS);
+
+        assert_eq!(
+            round_trip(&MergeOutcome::Merged {
+                commits: 2,
+                kept: vec![]
+            }),
+            json!({"outcome": "merged", "commits": 2})
+        );
+        assert_eq!(
+            round_trip(&MergeOutcome::Blocked {
+                reason: MergeBlockReason::DirtyOverlap,
+                files: vec!["src/lib.rs".into()],
+            }),
+            json!({"outcome": "blocked", "reason": "dirtyOverlap", "files": ["src/lib.rs"]})
+        );
+        let info = round_trip(&refactor_info());
+        assert_eq!(info["state"], "ready");
+        assert_eq!(info["targetBranch"], "main");
+        assert_eq!(info["checks"][0]["after"], "notRun");
+        assert_eq!(info["blocked"]["reason"], "dirtyOverlap");
+        // Snapshots and commits from before refactors read as having none.
+        let mut old = serde_json::to_value(snapshot()).unwrap();
+        old.as_object_mut().unwrap().remove("refactor");
+        old["lastCommit"].as_object_mut().unwrap().remove("sha");
+        let read: RepoSnapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(read.refactor, None);
+        assert_eq!(read.last_commit.unwrap().sha, None);
     }
 
     #[test]
@@ -1342,6 +1659,22 @@ mod tests {
             Reply::PendingMigrations(vec![]),
             Reply::Cancelled(CancelOutcome { ended: true }),
             Reply::Cancelled(CancelOutcome { ended: false }),
+            Reply::RefactorMerge(MergeOutcome::Merged {
+                commits: 3,
+                kept: vec![],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Merged {
+                commits: 1,
+                kept: vec!["Kept the branch refactor/x: not fully merged".into()],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Blocked {
+                reason: MergeBlockReason::Conflict,
+                files: vec!["src/lib.rs".into()],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Blocked {
+                reason: MergeBlockReason::Live,
+                files: vec![],
+            }),
             Reply::Path("/home/dev/projects/kelp-cli".into()),
             Reply::Done,
         ];
