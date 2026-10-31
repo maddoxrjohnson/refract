@@ -237,7 +237,7 @@ interface LoopState {
   /** When the last drawn frame started, and whether it asked the ticker for another. */
   lastStart: number;
   followUp: boolean;
-  /** Splinters still flying, the layout radius they sit at (eased; NaN before the opening), and their mesh. */
+  /** Splinters still flying, the layout radius they sit at (eased once the opening starts; the layout's own before it), and their mesh. */
   shardsLive: boolean;
   shardsRadius: number;
   shardsMesh: InstancedMesh | null;
@@ -784,7 +784,9 @@ function SceneContents(props: ContentsProps) {
     // ease out or in with it.
     const opened = !Number.isNaN(s.openAt);
     shards.visible = opened;
-    if (opened && Number.isNaN(s.shardsRadius)) s.shardsRadius = radius;
+    // Until the opening starts there is nothing to ease from: the splinters fly straight to
+    // wherever the layout is when it does.
+    if (!opened || Number.isNaN(s.shardsRadius)) s.shardsRadius = radius;
     const shardsMoving = Math.abs(radius - s.shardsRadius) > 1e-3;
     if (shardsMoving) {
       s.shardsRadius += (radius - s.shardsRadius) * ease(k, 4);
