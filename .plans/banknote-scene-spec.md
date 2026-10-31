@@ -46,15 +46,15 @@ paper reads `#eef0e4` (light) / `#0e1713` (dark) within 2/255. A test checks thi
 |---|---|
 | Uncommitted changes (`dirty`) | Hand-drawn red ring on the sheet around the stone (mockup `markFrag` `MARK 0`, accent, 3.1 × size). It draws itself in over 0.6 s when it first appears (at 1.3 s into the opening; at once when a repo becomes dirty later). |
 | Agent working (`working`) | The rosette turns (0.5 rad/s) and the stone turns faster (0.45 rad/s instead of 0.12). |
-| Waiting for you (`waiting`) | Red wash, slow pulse: `accentAmt = 0.08 + 0.30 × (0.5 + 0.5 sin(1.57 t + phase))`, `waitMode 0` (the wash turns red, not the lines). |
+| Waiting for you (`waiting`) | Line-work and facet edges in the accent (`alarm = 1`), edges about three times as thick, and a band of extra weight running up the stone (`(0.5 + 0.5 sin(7 y − 3 t))³`). Every 1.6 s the stone knocks (a 0.45 s hop of 0.18 stone sizes with a wobble of 0.16 rad) and a red double ring spreads over the sheet from under it, one at each knock and one half a period later. Changed 2026-10-31 from a pale red wash, which read as a language colour (Rust). |
 | Stopped mid-task (`interrupted`) | Chipped corner: the geometry loses a corner (mockup `chip(geo, (0.9, 0.5, 0.35), 0.42)`, then re-hulled). Static. |
 | Not cloned (remote-only) | Stippled: dots instead of lines (`ghost 1`, `ghostMode 0`). Edges stay solid. |
 | Clean | Plain line-work. |
 
-States combine: a dirty, waiting, chipped stone shows the ring, the pulse and the chip together.
+States combine: a dirty, waiting, chipped stone shows the ring, the red line-work and the chip together.
 
 **Reduced motion** (system setting): no opening burst (everything starts settled), no turning, no
-rosette spin, the waiting wash holds at its middle value (0.08 + 0.30 × 0.6), rings appear fully drawn.
+rosette spin, no knock and no waiting rings (a waiting stone keeps its red line-work, still), rings appear fully drawn.
 
 ## 3. Stones
 

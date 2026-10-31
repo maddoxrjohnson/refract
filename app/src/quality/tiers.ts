@@ -19,7 +19,7 @@ export interface Tier {
   msaa: number;
   /** Paper splinters thrown out by the opening that stay on the sheet. */
   splinters: number;
-  /** Stones turn, rosettes spin and the waiting wash pulses. Off on Low, which only draws on change. */
+  /** Stones turn, rosettes spin and waiting stones knock. Off on Low, which only draws on change. */
   ambientMotion: boolean;
 }
 

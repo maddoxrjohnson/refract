@@ -49,7 +49,7 @@ export interface SceneProps {
   quality: QualityLevel;
   /** Light or dark palette (banknote spec §1.1); switching never replays the opening. */
   theme: ThemeMode;
-  /** No opening, turning or pulsing; camera moves still ease, but quickly. */
+  /** No opening, turning or knocking; camera moves still ease, but quickly. */
   reducedMotion: boolean;
   /** Paths of gems that are not cloned; they draw stippled. */
   remoteOnly: ReadonlySet<string>;
@@ -105,6 +105,7 @@ const ZOOM_X = -0.4;
 /**
  * How far below its centre a zoomed gem reaches, rosette and ring included, as a share of
  * half the view height: seen from 35°, the near side of the ring lies about 1.5 sizes down.
+ * A waiting stone's rings spread further and may pass under the picker as they fade.
  */
 export const ZOOM_REACH = 0.5;
 /**
@@ -147,10 +148,15 @@ const RING_S = 0.6;
 const TURN = 0.12;
 const TURN_WORKING = 0.45;
 const ROSETTE_SPIN = 0.5;
-/** The waiting wash: base, swing, and the share it holds at without motion. */
-const WAIT_BASE = 0.08;
-const WAIT_SWING = 0.3;
-const WAIT_STILL = 0.6;
+/**
+ * A stone whose agent waits on you knocks once a period: a hop of `KNOCK_LIFT` stone
+ * sizes with a wobble of `KNOCK_TILT` radians, over `KNOCK_S` seconds. A ping ring
+ * leaves the sheet under it at each knock and half a period later.
+ */
+const KNOCK_PERIOD = 1.6;
+const KNOCK_S = 0.45;
+const KNOCK_LIFT = 0.18;
+const KNOCK_TILT = 0.16;
 /** The smallest layout radius the camera and sheet are fitted to. */
 const MIN_RADIUS = 2;
 
@@ -209,7 +215,7 @@ interface ContentsProps extends SceneProps {
 /** Mutable state the frame loop and pointer handlers share; never drives a React render. */
 interface LoopState {
   first: boolean;
-  /** Seconds of ambient motion (turning, pulsing). */
+  /** Seconds of ambient motion (turning, knocking). */
   time: number;
   /** Seconds of drawn frames, motion or not: drives the opening and drop-ins. */
   clock: number;
@@ -252,6 +258,8 @@ interface GemFrame {
   clock: number;
   openAt: number;
   reduced: boolean;
+  /** Ambient motion is on (not Low, not reduced motion): waiting stones knock and ping. */
+  ambient: boolean;
   focused: string | null;
   matches: ReadonlySet<string> | null;
   /** Set when any gem is still easing towards its goal. */
@@ -343,17 +351,29 @@ function updateGem(this: GemFrame, g: GemHandle) {
   // where it is rather than snapping it back.
   const T = this.T;
   g.spinner.rotation.y = g.phase + T * (g.working ? TURN_WORKING : TURN) * g.spinDir;
+  // The knock moves the stone inside its holder, so the label and marks, placed from the
+  // holder, stay still. Without ambient motion there is no knock (it would freeze mid-hop).
+  const knock = g.waiting && this.ambient ? ((T + g.phase) % KNOCK_PERIOD) / KNOCK_S : 1;
+  if (knock < 1) {
+    g.spinner.position.y = Math.sin(Math.PI * knock) * KNOCK_LIFT * g.size;
+    g.spinner.rotation.x = Math.sin(knock * Math.PI * 5) * (1 - knock) * KNOCK_TILT;
+  } else {
+    g.spinner.position.y = 0;
+    g.spinner.rotation.x = 0;
+  }
 
   const fade = (FILTER_FADE + (1 - FILTER_FADE) * g.m) * g.life;
   const su = g.stone.uniforms;
   su.fade.value = fade;
-  // Without any motion yet (reduced motion or Low from the start) the wash holds its still
-  // value; once time runs it eases into the pulse over the first second.
-  const still = Math.max(0, 1 - T);
-  su.accentAmt.value = g.waiting
-    ? WAIT_BASE +
-      WAIT_SWING * (still * WAIT_STILL + (1 - still) * (0.5 + 0.5 * Math.sin(T * 1.57 + g.phase)))
-    : 0;
+  // Waiting draws the stone in red at once; the band of weight only runs while ambient
+  // time does, so reduced motion and Low show it still, and the rings not at all. Both
+  // phases wrap here, as float32 in the shader would step visibly after a day or so.
+  su.alarm.value = g.waiting ? 1 : 0;
+  su.alarmT.value = (T + g.phase) % ((2 * Math.PI) / 3);
+  if (g.ping) {
+    g.ping.uniforms.t.value = ((T + g.phase) / KNOCK_PERIOD) % 1;
+    g.ping.uniforms.fade.value = this.ambient ? fade : 0;
+  }
   g.rosette.uniforms.fade.value = fade;
   g.rosette.uniforms.spin.value = g.working ? T * ROSETTE_SPIN : 0;
   if (g.ring) {
@@ -609,6 +629,7 @@ function SceneContents(props: ContentsProps) {
       clock: 0,
       openAt: Number.NaN,
       reduced: false,
+      ambient: false,
       focused: null,
       matches: null,
       settling: false,
@@ -764,6 +785,7 @@ function SceneContents(props: ContentsProps) {
     gf.clock = s.clock;
     gf.openAt = s.openAt;
     gf.reduced = reducedMotion;
+    gf.ambient = ambient;
     gf.focused = focused;
     gf.matches = matches;
     gf.settling = false;

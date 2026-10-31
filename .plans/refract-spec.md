@@ -48,7 +48,7 @@ How a stone encodes its repo:
 | Red ring on the sheet | Uncommitted changes |
 | Chipped corner | An agent session stopped before it finished |
 | Rosette turns, stone turns faster | An agent is working in this repo right now (requires the status hook, §6) |
-| Slow red pulse | An agent is waiting for your input (requires the status hook) |
+| Red line-work, knocking, red rings | An agent is waiting for your input (requires the status hook) |
 | Stippled instead of engraved | The repo exists on GitHub or GitLab but is not cloned locally |
 
 Red always means that something needs you. Light mode is green ink on pale paper; dark mode is gold ink on deep green. Refract follows the Windows app mode, and settings can fix it to Light or Dark. The panels use the same paper and ink.

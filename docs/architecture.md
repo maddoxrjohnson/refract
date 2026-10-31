@@ -184,7 +184,7 @@ Only the start and the end of each file are read, and results are cached until i
 
 - **Local repos** come from `listRepos` plus `repoChanged`, `repoRemoved` and `loadComplete` events, combined by a reducer (`repoState.ts`). Snapshots carry no version, so an event that arrives while a `listRepos` request is in flight is taken as newer than its answer. The list is fetched again whenever the helper enters the running state, and on every show of the window.
 - **Remote repos** come from `listRemotes` and are merged with the local ones (`projects.ts`). A remote repo whose host, owner and name match a local repo's `origin` (ignoring case) is the same gem. One with no local clone becomes a stippled stone keyed `remote:<host>/<owner>/<name>`, with no sessions and a mass capped at 0.45 so uncloned repos sit towards the edges. Forks and archived repos that are not cloned stay out unless settings turn them on; a cloned fork always shows. Hidden keys apply to every gem.
-- **Stone appearance** comes from `repoStatus.ts`: uncommitted changes (red ring on the sheet), an interrupted session (chipped corner), a live session working (rosette turns) or waiting (slow red pulse). Light or dark comes from the `theme` setting through `theme.ts`, which follows the Windows app mode for System, writes `data-theme` on `<html>` for an override, remembers the choice in local storage so it shows before the settings load, and matches the native title bar.
+- **Stone appearance** comes from `repoStatus.ts`: uncommitted changes (red ring on the sheet), an interrupted session (chipped corner), a live session working (rosette turns) or waiting (red line-work, a knock and red rings). Light or dark comes from the `theme` setting through `theme.ts`, which follows the Windows app mode for System, writes `data-theme` on `<html>` for an override, remembers the choice in local storage so it shows before the settings load, and matches the native title bar.
 
 ### Navigation
 
@@ -244,7 +244,7 @@ The camera looks down from 56° above the sheet with a 28° field of view, at a 
 
 ### Drawing the engraving
 
-`banknote.ts` holds the palettes and the shaders, ported from `docs/mockups/gem-studies.html`. Each stone is a convex mesh with flat normals and a barycentric attribute (`prepare()` in `cuts.ts`) that masks the edges between coplanar triangles, so only real facet edges are drawn. The stone shader draws wavy lines in screen space, one direction per facet, their weight set by how much the facet faces away from the light; in dark mode the lines mark the lit facets instead, like scratchboard. Line spacing is in CSS pixels, so the engraving keeps its weight at every resolution. A remote-only stone swaps lines for stipple; a waiting stone's wash pulses towards red. A stopped session's stone has a corner cut off its geometry. The rosette and the red ring are transparent decals on the sheet, and the splinters from the opening are one instanced mesh.
+`banknote.ts` holds the palettes and the shaders, ported from `docs/mockups/gem-studies.html`. Each stone is a convex mesh with flat normals and a barycentric attribute (`prepare()` in `cuts.ts`) that masks the edges between coplanar triangles, so only real facet edges are drawn. The stone shader draws wavy lines in screen space, one direction per facet, their weight set by how much the facet faces away from the light; in dark mode the lines mark the lit facets instead, like scratchboard. Line spacing is in CSS pixels, so the engraving keeps its weight at every resolution. A remote-only stone swaps lines for stipple; a waiting stone draws its lines and facet edges in red, with bold edges and a band of extra weight running up it, knocks (a hop and a wobble every 1.6 s) and sends red rings across the sheet. A stopped session's stone has a corner cut off its geometry. The rosette, the red ring and the waiting rings are transparent decals on the sheet, and the splinters from the opening are one instanced mesh.
 
 All materials share one set of palette uniforms, so switching between light and dark changes their values without rebuilding anything or replaying the opening. Colours are sRGB values converted to linear by three.js and back by an `OutputPass`, so the screen shows them exactly; an e2e test checks the paper and rim colours in both modes.
 
@@ -264,7 +264,7 @@ The ticker (`createTicker`) invalidates the canvas `1000 / fps` ms after the pre
 | Largest pixel ratio | 1× | 1.5× | 2× |
 | Multisampling | off | 4× | 4× |
 | Splinters | 40 | 90 | 90 |
-| Stones turn, rosettes spin, waiting stones pulse | no | yes | yes |
+| Stones turn, rosettes spin, waiting stones knock and send out rings | no | yes | yes |
 
 The look is the same at every level. Low has no ambient motion, so it draws only when something changes. The tiers are in `quality/tiers.ts`. The graphics control in the corner offers Auto, Low, Medium and High; a fixed choice bypasses the controller.
 
@@ -286,7 +286,7 @@ The gaps between the thresholds are the hysteresis: step down at 1.25 times the 
 
 ### Loading and failure
 
-The scene, which is mostly three.js, is a separate chunk loaded with `React.lazy`, so the overlays and data requests start without waiting for it. A chunk that fails to load is asked for once more. Until it arrives the user sees the empty page in the paper colour. If it still fails or throws, `SceneBoundary` shows a message and the overlays stay usable. If WebGL cannot start, the canvas shows its own message. The scene also follows the system's reduced-motion setting: no opening burst, no turning or spinning, a steady wash on waiting stones, and camera moves still ease but quickly.
+The scene, which is mostly three.js, is a separate chunk loaded with `React.lazy`, so the overlays and data requests start without waiting for it. A chunk that fails to load is asked for once more. Until it arrives the user sees the empty page in the paper colour. If it still fails or throws, `SceneBoundary` shows a message and the overlays stay usable. If WebGL cannot start, the canvas shows its own message. The scene also follows the system's reduced-motion setting: no opening burst, no turning or spinning, waiting stones keep their red line-work but neither knock nor send out rings, and camera moves still ease but quickly.
 
 ## Remote repos
 
@@ -345,7 +345,7 @@ Refract adds one small script to Claude Code's hook settings. The script writes 
 | `SessionStart` | `startup`, `resume`, `clear` | finished | Nothing special (idle) |
 | `UserPromptSubmit` | | working | Rosette turns |
 | `PostToolUse` | any tool | working | Rosette turns (marks the turn working again after a permission prompt is answered) |
-| `Notification` | `permission_prompt`, `elicitation_dialog` | waitingOnUser | Slow red pulse |
+| `Notification` | `permission_prompt`, `elicitation_dialog` | waitingOnUser | Red line-work, knocking, red rings |
 | `Stop` | | finished | Nothing special (idle) |
 | `SessionEnd` | | ended | Nothing special |
 

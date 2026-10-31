@@ -17,7 +17,7 @@ Each repo is a cut stone drawn like the engraving on a banknote, lying on a shee
 | Red ring on the paper | Uncommitted changes |
 | Chipped corner | An agent session stopped before it finished |
 | Rosette turning | An agent is working in the repo right now (needs the status hook) |
-| Slow red pulse | An agent is waiting for your input (needs the status hook) |
+| Red line-work, knocking, red rings | An agent is waiting for your input (needs the status hook) |
 | Stippled | On GitHub or GitLab but not cloned yet |
 
 ![The scene with one stone in focus](docs/media/scene.png)

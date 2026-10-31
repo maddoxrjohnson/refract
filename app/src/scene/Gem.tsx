@@ -3,9 +3,11 @@ import { Color, Group, Vector3, type Mesh, type ShaderMaterial } from "three";
 import { stoneFor } from "../stones";
 import {
   makeDecalGeometry,
+  makePingMaterial,
   makeRingMaterial,
   makeRosetteMaterial,
   makeStoneMaterial,
+  type PingUniforms,
   type RingUniforms,
   type RosetteUniforms,
   type SheetUniforms,
@@ -27,11 +29,13 @@ export interface GemHandle {
   /** Lifts, scales and flies in; holds the tilted, turning stone. */
   holder: Group;
   spinner: Mesh;
-  /** On the sheet under the stone: the rosette and the ring. */
+  /** On the sheet under the stone: the rosette, the ring and the waiting rings. */
   spot: Group;
   stone: ShaderMaterial & { uniforms: StoneUniforms };
   rosette: ShaderMaterial & { uniforms: RosetteUniforms };
   ring: (ShaderMaterial & { uniforms: RingUniforms }) | null;
+  /** The red rings spreading from a waiting stone; null while no agent waits. */
+  ping: (ShaderMaterial & { uniforms: PingUniforms }) | null;
   working: boolean;
   waiting: boolean;
   /** Gone from the repos; fades out, then the scene drops it. */
@@ -102,11 +106,16 @@ export const Gem = memo(function Gem(props: GemProps) {
     () => (props.dirty ? makeRingMaterial(sheet, motion.ringSeed) : null),
     [props.dirty, sheet, motion.ringSeed],
   );
+  const ping = useMemo(
+    () => (props.waiting ? makePingMaterial(sheet) : null),
+    [props.waiting, sheet],
+  );
   useDispose(geometry);
   useDispose(decal);
   useDispose(stone);
   useDispose(rosette);
   useDispose(ring);
+  useDispose(ping);
 
   const holder = useRef<Group>(null);
   const spinner = useRef<Mesh>(null);
@@ -128,6 +137,7 @@ export const Gem = memo(function Gem(props: GemProps) {
       stone,
       rosette,
       ring,
+      ping,
       working: false,
       waiting: false,
       leaving: false,
@@ -150,6 +160,7 @@ export const Gem = memo(function Gem(props: GemProps) {
     h.stone = stone;
     h.rosette = rosette;
     h.ring = ring;
+    h.ping = ping;
     h.working = props.working;
     h.waiting = props.waiting;
     h.leaving = props.leaving;
@@ -168,6 +179,7 @@ export const Gem = memo(function Gem(props: GemProps) {
       <group ref={spot} dispose={null}>
         <mesh geometry={decal} material={rosette} position-y={0.004} scale={size * 2.5} />
         {ring && <mesh geometry={decal} material={ring} position-y={0.006} scale={size * 3.1} />}
+        {ping && <mesh geometry={decal} material={ping} position-y={0.008} scale={size * 4.2} />}
       </group>
     </>
   );

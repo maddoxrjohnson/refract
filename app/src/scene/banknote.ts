@@ -3,7 +3,8 @@ import type { ThemeMode } from "../theme";
 
 // The Banknote look (banknote spec §1): stones drawn as a banknote engraving on a paper
 // sheet. Shaders are ported from docs/mockups/gem-studies.html with only the switches the
-// Banknote look sets (HATCH 3, UNDER 3, MARK 0, stipple for remote, red wash for waiting).
+// Banknote look sets (HATCH 3, UNDER 3, MARK 0, stipple for remote). A waiting stone is
+// drawn in red line-work and knocks, with red rings spreading from it.
 //
 // Colours are sRGB hex. THREE.Color converts them to linear, the shaders work in linear
 // into a half-float target, and the OutputPass converts back, so bare paper shows on
@@ -16,7 +17,7 @@ export interface Palette {
   edge: number;
   /** Lines. */
   ink: number;
-  /** Needs you: the waiting wash and the uncommitted-changes ring. */
+  /** Needs you: the waiting stone's line-work and the uncommitted-changes ring. */
   accent: number;
   /** How strongly the stone's colour tints its facets. */
   wash: number;
@@ -82,10 +83,12 @@ const stoneVert = /* glsl */ `
 
 // Wavy banknote lines per facet, thicker where the facet is darker (lit, when inverted),
 // facet edges from the barycentric attribute, dots instead of lines for remote repos.
+// `alarm` (an agent waiting on you) draws the line-work in the accent with bold facet
+// edges, and a band of extra weight runs up through the stone as `alarmT` advances.
 const stoneFrag = /* glsl */ `
   uniform vec3 paper; uniform vec3 ink; uniform vec3 accent; uniform vec3 tint;
   uniform float tintAmt; uniform float invert; uniform float px; uniform float fade;
-  uniform float accentAmt; uniform float ghost; uniform float spacing; uniform vec3 lightDir;
+  uniform float alarm; uniform float alarmT; uniform float ghost; uniform float spacing; uniform vec3 lightDir;
   varying vec3 vN; varying vec3 vObjN; varying vec3 vW; varying vec3 vBary;
   ${GLSL_COMMON}
   void main(){
@@ -96,20 +99,21 @@ const stoneFrag = /* glsl */ `
     float spec = smoothstep(0.35, 0.7, pow(clamp(dot(reflect(-L, N), V), 0.0, 1.0), 24.0));
     float tone = clamp(1.0 - (0.12 + 0.95 * diff), 0.0, 1.0);
     vec3 h = hash3(floor(vObjN * 9.0 + 9.0));
-    float e = 1.0 - smoothstep(0.0, fwidth(d) * 1.3, d);
+    float run = pow(0.5 + 0.5 * sin(vW.y * 7.0 - alarmT * 3.0), 3.0);
+    float e = 1.0 - smoothstep(0.0, fwidth(d) * (1.3 + alarm * (2.6 + 3.0 * run)), d);
     vec3 base = mix(paper, tint, tintAmt * (0.55 + 0.45 * tone));
-    base = mix(base, accent, accentAmt);
+    vec3 line = mix(ink, accent, alarm);
     float t = mix(tone, 1.0 - tone, invert);
     float ang = 0.5 + h.x * 2.2;
     vec2 dir = vec2(cos(ang), sin(ang)), perp = vec2(-dir.y, dir.x);
     float sw = dot(p, dir) / spacing + sin(dot(p, perp) * 0.11 + h.y * 6.28) * 0.7;
-    float lines = lineAt(sw, 0.06 + t * 0.5);
+    float lines = lineAt(sw, 0.06 + t * 0.5 + alarm * (0.08 + 0.12 * run));
     lines = max(lines, step(0.6, t) * lineAt(dot(p, perp) / spacing + sin(dot(p, dir) * 0.09) * 0.7, (t - 0.6) * 0.8));
     float dots = step(h2(floor(p / 1.6)), 0.12 + t * 0.45);
     lines = mix(lines, dots, ghost);
     lines = mix(lines * (1.0 - spec), max(lines, spec), invert);
-    vec3 col = mix(base, ink, lines * 0.82);
-    col = mix(col, ink, e * 0.95);
+    vec3 col = mix(base, line, lines * 0.82);
+    col = mix(col, line, e * 0.95);
     gl_FragColor = vec4(mix(paper, col, fade), 1.0);
   }`;
 
@@ -168,7 +172,10 @@ const SPACING = 3.2;
 export type StoneUniforms = {
   tint: { value: Color };
   fade: { value: number };
-  accentAmt: { value: number };
+  /** 1 while an agent waits on you: red line-work and bold edges. */
+  alarm: { value: number };
+  /** Advances while ambient motion runs, moving the band of weight up the stone. */
+  alarmT: { value: number };
   ghost: { value: number };
 };
 
@@ -193,7 +200,8 @@ export function makeStoneMaterial(
       tintAmt,
       tint: { value: tint },
       fade: { value: 1 },
-      accentAmt: { value: 0 },
+      alarm: { value: 0 },
+      alarmT: { value: 0 },
       ghost: { value: 0 },
       spacing: { value: SPACING },
       lightDir: { value: LIGHT_DIR },
@@ -213,6 +221,35 @@ export function makeRosetteMaterial(u: SheetUniforms): ShaderMaterial & { unifor
   }) as ShaderMaterial & { uniforms: RosetteUniforms };
 }
 
+// Red rings spreading over the sheet from a stone whose agent waits on you, two per
+// period (`t` counts periods), engraved as a double line and fading as they widen.
+const pingFrag = /* glsl */ `
+  uniform vec3 col; uniform float t; uniform float fade;
+  varying vec2 vUv;
+  void main(){
+    float r = length(vUv - 0.5) * 2.0, w = fwidth(r), a = 0.0;
+    for (int k = 0; k < 2; k++) {
+      float p = fract(t + float(k) * 0.5);
+      float rk = 0.3 + 0.7 * p;
+      float band = max(1.0 - smoothstep(w * 0.5, w * 1.6, abs(r - rk)),
+                       0.7 * (1.0 - smoothstep(w * 0.4, w * 1.3, abs(r - rk + 0.035))));
+      a = max(a, band * pow(1.0 - p, 1.4));
+    }
+    gl_FragColor = vec4(col, a * 0.9 * fade);
+  }`;
+
+export type PingUniforms = { fade: { value: number }; t: { value: number } };
+
+export function makePingMaterial(u: SheetUniforms): ShaderMaterial & { uniforms: PingUniforms } {
+  return new ShaderMaterial({
+    vertexShader: decalVert,
+    fragmentShader: pingFrag,
+    transparent: true,
+    depthWrite: false,
+    uniforms: { col: u.accent, t: { value: 0 }, fade: { value: 1 } },
+  }) as ShaderMaterial & { uniforms: PingUniforms };
+}
+
 export type RingUniforms = { fade: { value: number }; draw: { value: number } };
 
 export function makeRingMaterial(u: SheetUniforms, seed: number): ShaderMaterial & { uniforms: RingUniforms } {
@@ -225,7 +262,7 @@ export function makeRingMaterial(u: SheetUniforms, seed: number): ShaderMaterial
   }) as ShaderMaterial & { uniforms: RingUniforms };
 }
 
-/** A unit square lying flat on the sheet, for the rosette and the ring. */
+/** A unit square lying flat on the sheet, for the rosette and the rings. */
 export function makeDecalGeometry(): PlaneGeometry {
   return new PlaneGeometry(1, 1).rotateX(-Math.PI / 2);
 }

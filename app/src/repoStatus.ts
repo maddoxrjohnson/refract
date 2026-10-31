@@ -8,7 +8,7 @@ export interface RepoStatus {
   interrupted: boolean;
   /** An agent is working right now (status hook): the rosette turns. */
   working: boolean;
-  /** An agent is waiting for input (status hook): the slow red pulse. */
+  /** An agent is waiting for input (status hook): red line-work, a knock and red rings. */
   waiting: boolean;
 }
 
