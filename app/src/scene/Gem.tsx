@@ -1,240 +1,174 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { Color, Group, Vector3, type Mesh, type ShaderMaterial } from "three";
+import { stoneFor } from "../stones";
 import {
-  AdditiveBlending,
-  Color,
-  EdgesGeometry,
-  Group,
-  IcosahedronGeometry,
-  LineBasicMaterial,
-  MeshBasicMaterial,
-  ShaderMaterial,
-  Vector3,
-  type Object3D,
-  type Texture,
-  type Vector2,
-} from "three";
-import { ConvexGeometry } from "three/examples/jsm/geometries/ConvexGeometry.js";
-import type { Tier } from "../quality/tiers";
-import { languageColor } from "./languages";
+  makeDecalGeometry,
+  makeRingMaterial,
+  makeRosetteMaterial,
+  makeStoneMaterial,
+  type RingUniforms,
+  type RosetteUniforms,
+  type SheetUniforms,
+  type StoneUniforms,
+} from "./banknote";
+import { cutFor, stoneGeometry } from "./cuts";
 import { hashString, rng } from "./layout";
-import { glowFrag, glowVert, gemFrag, gemVert } from "./shaders";
 
-/**
- * Layer for everything drawn on top of the refraction image: shells, halos and edges.
- * The first pass renders layer 0 only, so the glass never samples itself.
- */
-export const GLASS_LAYER = 1;
+/** How high a resting stone's centre sits above the sheet, as a share of its size. */
+export const REST_HEIGHT = 0.92;
 
-/** What the scene's frame loop animates on each gem. */
+/** What the scene's frame loop animates on each stone. */
 export interface GemHandle {
   path: string;
-  /** Resting position from the layout, before the scene breathes. */
+  /** Resting centre from the layout; `home` eases towards it when the layout changes. */
   base: Vector3;
-  radius: number;
-  outer: Group;
-  spinner: Group;
-  shell: ShaderMaterial;
-  core: MeshBasicMaterial;
-  /** The core's undimmed colour. */
-  coreColor: Color;
-  /** Blue halo: uncommitted changes. */
-  halo: ShaderMaterial | null;
-  /** Amber glow: an agent is waiting for input. */
-  wait: ShaderMaterial | null;
-  /** Amber edges: a session was cut off. */
-  edges: LineBasicMaterial | null;
-  /** Not cloned: drawn dimmer, with no lit core. */
-  remoteOnly: boolean;
+  home: Vector3;
+  size: number;
+  /** Lifts, scales and flies in; holds the tilted, turning stone. */
+  holder: Group;
+  spinner: Mesh;
+  /** On the sheet under the stone: the rosette and the ring. */
+  spot: Group;
+  stone: ShaderMaterial & { uniforms: StoneUniforms };
+  rosette: ShaderMaterial & { uniforms: RosetteUniforms };
+  ring: (ShaderMaterial & { uniforms: RingUniforms }) | null;
+  working: boolean;
+  waiting: boolean;
+  /** Gone from the repos; fades out, then the scene drops it. */
+  leaving: boolean;
+  /** Seeded motion: turn phase and direction, opening delay, where the burst starts. */
   phase: number;
-  spin: number;
+  spinDir: number;
+  delay: number;
+  start: Vector3;
+  spinIn: number;
+  /** Scene clock when the loop first saw it (NaN before), and whether it came in with the opening. */
+  born: number;
+  burst: boolean;
+  /** Scene clock when the ring starts drawing in; NaN while there is no ring. */
+  ringAt: number;
   /** Focus, eased from 0 to 1. */
   f: number;
   /** Filter match, eased: 1 matches, 0 is filtered out. */
   m: number;
+  /** Presence, eased: 1 shown, 0 gone. */
+  life: number;
 }
 
 export interface GemProps {
   path: string;
+  /** Resting place on the sheet: x to the right, z towards the viewer. */
   x: number;
-  y: number;
   z: number;
-  radius: number;
+  size: number;
   language: string | null;
   dirty: boolean;
   interrupted: boolean;
   working: boolean;
   waiting: boolean;
-  /** Exists only on GitHub or GitLab: dimmed, with no core glow (spec §3.2). */
+  /** Exists only on GitHub or GitLab: stippled instead of lined. */
   remoteOnly: boolean;
-  tier: Tier;
-  /** The refraction image and its size in pixels, shared by every shell. */
-  back: Texture;
-  res: Vector2;
+  leaving: boolean;
+  sheet: SheetUniforms;
   registry: Map<string, GemHandle>;
 }
 
-/** A rough-cut hull: `facets` points on a jittered Fibonacci sphere. */
-function roughGeometry(r: number, facets: number, rand: () => number): ConvexGeometry {
-  const sy = 0.86 + rand() * 0.2;
-  const pts: Vector3[] = [];
-  for (let i = 0; i < facets; i++) {
-    const y = 1 - (2 * (i + 0.5)) / facets;
-    const rad = Math.sqrt(1 - y * y);
-    const th = i * 2.39996 + (rand() - 0.5) * 0.7;
-    const k = r * (0.9 + rand() * 0.12);
-    pts.push(new Vector3(Math.cos(th) * rad * k, y * k * sy, Math.sin(th) * rad * k));
-  }
-  return new ConvexGeometry(pts);
-}
-
-const glowMaterial = (color: Color) =>
-  new ShaderMaterial({
-    vertexShader: glowVert,
-    fragmentShader: glowFrag,
-    uniforms: { color: { value: color }, k: { value: 0.7 } },
-    transparent: true,
-    blending: AdditiveBlending,
-    depthWrite: false,
-  });
-
-const onGlass = (o: Object3D | null) => {
-  o?.layers.set(GLASS_LAYER);
-};
-
-/** Frees GPU resources when they are replaced or the gem goes away. */
+/** Frees GPU resources when they are replaced or the stone goes away. */
 function useDispose(resource: { dispose(): void } | null) {
   useEffect(() => () => resource?.dispose(), [resource]);
 }
 
 export const Gem = memo(function Gem(props: GemProps) {
-  const { path, radius, tier, back, res, registry } = props;
+  const { path, size, sheet, registry } = props;
   const seed = hashString(path);
 
-  // Shape depends on the tier's facet count; turn and phase do not.
-  const geometry = useMemo(
-    () => roughGeometry(radius, tier.facets, rng(seed ^ 0x5bd1e995)),
-    [radius, tier.facets, seed],
-  );
-  const edgesGeometry = useMemo(
-    () => (props.interrupted ? new EdgesGeometry(geometry, 1) : null),
-    [geometry, props.interrupted],
-  );
-  const coreGeometry = useMemo(() => new IcosahedronGeometry(radius * 0.3, 0), [radius]);
-  const haloGeometry = useMemo(() => new IcosahedronGeometry(radius * 1.32, 3), [radius]);
-  const waitGeometry = useMemo(() => new IcosahedronGeometry(radius * 1.2, 3), [radius]);
+  const geometry = useMemo(() => stoneGeometry(cutFor(path), props.interrupted), [path, props.interrupted]);
+  const decal = useMemo(makeDecalGeometry, []);
   const motion = useMemo(() => {
-    const rand = rng(seed);
+    const r = rng(seed);
     return {
-      rotation: [-0.5 + rand() * 1.0, rand() * 6.28, rand() * 0.6] as [number, number, number],
-      phase: rand() * 6.28,
-      spin: 0.1 + rand() * 0.16,
+      tilt: [(r() - 0.5) * 0.5, 0, (r() - 0.5) * 0.5] as [number, number, number],
+      phase: r() * 6.28,
+      spinDir: r() < 0.5 ? -1 : 1,
+      delay: r() * 0.06,
+      start: new Vector3((r() - 0.5) * 0.4, 1.6 + r(), (r() - 0.5) * 0.4),
+      spinIn: (r() - 0.5) * 10,
+      ringSeed: r() * 6.28,
     };
   }, [seed]);
-
-  const shell = useMemo(
-    () =>
-      new ShaderMaterial({
-        vertexShader: gemVert,
-        fragmentShader: gemFrag,
-        defines: { SAMPLES: tier.samples },
-        uniforms: {
-          uBack: { value: back },
-          uRes: { value: res },
-          uTint: { value: new Color() },
-          uChroma: { value: 0 },
-          uRefract: { value: 0.32 },
-          uFocus: { value: 0 },
-          uSparkle: { value: 0 },
-          uIrid: { value: 0 },
-          uShimmer: { value: 0 },
-          uTime: { value: 0 },
-          uDim: { value: 1 },
-        },
-      }),
-    [tier.samples, back, res],
-  );
-  const core = useMemo(() => new MeshBasicMaterial(), []);
-  const halo = useMemo(
-    () => (props.dirty ? glowMaterial(new Color(0.35, 0.8, 1.6)) : null),
-    [props.dirty],
-  );
-  const wait = useMemo(
-    () => (props.waiting ? glowMaterial(new Color(1.6, 0.85, 0.25)) : null),
-    [props.waiting],
-  );
-  const edges = useMemo(
-    () =>
-      props.interrupted
-        ? new LineBasicMaterial({ color: new Color(2.2, 1.25, 0.35), transparent: true })
-        : null,
-    [props.interrupted],
+  const stone = useMemo(() => makeStoneMaterial(sheet, new Color()), [sheet]);
+  const rosette = useMemo(() => makeRosetteMaterial(sheet), [sheet]);
+  const ring = useMemo(
+    () => (props.dirty ? makeRingMaterial(sheet, motion.ringSeed) : null),
+    [props.dirty, sheet, motion.ringSeed],
   );
   useDispose(geometry);
-  useDispose(edgesGeometry);
-  useDispose(coreGeometry);
-  useDispose(haloGeometry);
-  useDispose(waitGeometry);
-  useDispose(shell);
-  useDispose(core);
-  useDispose(halo);
-  useDispose(wait);
-  useDispose(edges);
+  useDispose(decal);
+  useDispose(stone);
+  useDispose(rosette);
+  useDispose(ring);
 
-  const outer = useRef<Group>(null);
-  const spinner = useRef<Group>(null);
+  const holder = useRef<Group>(null);
+  const spinner = useRef<Mesh>(null);
+  const spot = useRef<Group>(null);
   const handle = useRef<GemHandle | null>(null);
 
   // Keep the handle the frame loop reads in step with the latest props.
   useLayoutEffect(() => {
-    const tint = languageColor(props.language);
-    shell.uniforms.uTint.value.copy(tint).lerp(new Color(1, 1, 1), 0.25);
-    shell.uniforms.uChroma.value = tier.chroma;
-    shell.uniforms.uSparkle.value = tier.sparkle;
-    shell.uniforms.uIrid.value = tier.irid;
-    shell.uniforms.uShimmer.value = props.working ? 1 : 0;
+    stone.uniforms.tint.value.setHex(stoneFor(props.language).hex);
+    stone.uniforms.ghost.value = props.remoteOnly ? 1 : 0;
     const h: GemHandle = handle.current ?? {
       path,
       base: new Vector3(),
-      radius,
-      outer: outer.current!,
+      home: new Vector3(),
+      size,
+      holder: holder.current!,
       spinner: spinner.current!,
-      shell,
-      core,
-      coreColor: new Color(),
-      halo,
-      wait,
-      edges,
-      remoteOnly: props.remoteOnly,
+      spot: spot.current!,
+      stone,
+      rosette,
+      ring,
+      working: false,
+      waiting: false,
+      leaving: false,
       phase: motion.phase,
-      spin: motion.spin,
+      spinDir: motion.spinDir,
+      delay: motion.delay,
+      start: motion.start,
+      spinIn: motion.spinIn,
+      born: Number.NaN,
+      burst: false,
+      ringAt: Number.NaN,
       f: 0,
       m: 1,
+      life: 1,
     };
-    h.base.set(props.x, props.y, props.z);
-    h.radius = radius;
-    h.shell = shell;
-    h.core = core;
-    h.coreColor.copy(tint).multiplyScalar(2.6);
-    h.halo = halo;
-    h.wait = wait;
-    h.edges = edges;
-    h.remoteOnly = props.remoteOnly;
+    h.base.set(props.x, size * REST_HEIGHT, props.z);
+    if (!handle.current) h.home.copy(h.base);
+    h.size = size;
+    h.spinner = spinner.current!;
+    h.stone = stone;
+    h.rosette = rosette;
+    h.ring = ring;
+    h.working = props.working;
+    h.waiting = props.waiting;
+    h.leaving = props.leaving;
     handle.current = h;
     registry.set(path, h);
   });
   useLayoutEffect(() => () => void registry.delete(path), [registry, path]);
 
   return (
-    <group ref={outer} dispose={null}>
-      <group ref={spinner} rotation={motion.rotation}>
-        <mesh ref={onGlass} geometry={geometry} material={shell} />
-        {!props.remoteOnly && <mesh geometry={coreGeometry} material={core} />}
-        {edgesGeometry && edges && (
-          <lineSegments ref={onGlass} geometry={edgesGeometry} material={edges} scale={1.006} />
-        )}
+    <>
+      <group ref={holder} dispose={null}>
+        <group rotation={motion.tilt}>
+          <mesh ref={spinner} geometry={geometry} material={stone} scale={size} />
+        </group>
       </group>
-      {halo && <mesh ref={onGlass} geometry={haloGeometry} material={halo} />}
-      {wait && <mesh ref={onGlass} geometry={waitGeometry} material={wait} />}
-    </group>
+      <group ref={spot} dispose={null}>
+        <mesh geometry={decal} material={rosette} position-y={0.004} scale={size * 2.5} />
+        {ring && <mesh geometry={decal} material={ring} position-y={0.006} scale={size * 3.1} />}
+      </group>
+    </>
   );
 });

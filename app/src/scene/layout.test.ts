@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { RepoSnapshot } from "../backend/types";
-import { hashString, layoutGems, rng } from "./layout";
+import { DISC, hashString, layoutGems, layoutRadius, rng } from "./layout";
 
 function repo(name: string, mass: number): RepoSnapshot {
   return {
@@ -34,9 +34,24 @@ const REPOS = [
 
 const centreDistance = (p: { x: number; y: number }) => Math.hypot(p.x, p.y);
 
+/** Invented repos with a spread of masses. */
+const many = (count: number) =>
+  Array.from({ length: count }, (_, i) => repo(`r${i}`, rng(hashString(`m${i}`))()));
+
+function expectNoOverlaps(layout: ReturnType<typeof layoutGems>) {
+  const ps = [...layout.values()];
+  for (let i = 0; i < ps.length; i++) {
+    for (let j = i + 1; j < ps.length; j++) {
+      const d = Math.hypot(ps[i].x - ps[j].x, ps[i].y - ps[j].y);
+      expect(d).toBeGreaterThanOrEqual((ps[i].size + ps[j].size) * DISC - 1e-9);
+    }
+  }
+}
+
 describe("layoutGems", () => {
   it("returns an empty map for no repos", () => {
     expect(layoutGems([]).size).toBe(0);
+    expect(layoutRadius(layoutGems([]))).toBe(0);
   });
 
   it("places every repo, keyed by path", () => {
@@ -54,41 +69,56 @@ describe("layoutGems", () => {
     }
   });
 
+  it("never lets two stones' discs overlap", () => {
+    for (const count of [2, 6, 14, 40, 120]) expectNoOverlaps(layoutGems(many(count)));
+    expectNoOverlaps(layoutGems(REPOS));
+  });
+
+  it("stays within a bounded radius however many repos there are", () => {
+    for (const count of [1, 14, 40, 120]) {
+      const layout = layoutGems(many(count));
+      expect(layoutRadius(layout)).toBeLessThan(6);
+      for (const p of layout.values()) expect(Number.isFinite(p.x + p.y + p.size)).toBe(true);
+    }
+  });
+
   it("does not depend on the order repos arrive in", () => {
     const a = layoutGems(REPOS);
     const b = layoutGems([...REPOS].reverse());
     const c = layoutGems([REPOS[3], REPOS[0], REPOS[5], REPOS[1], REPOS[4], REPOS[2]]);
     expect(b).toEqual(a);
     expect(c).toEqual(a);
+    const big = many(40);
+    expect(layoutGems([...big].reverse())).toEqual(layoutGems(big));
   });
 
   it("is deterministic across calls", () => {
     expect(layoutGems(REPOS)).toEqual(layoutGems(REPOS));
   });
 
-  it("makes heavier gems bigger", () => {
+  it("makes heavier stones bigger", () => {
     const layout = layoutGems(REPOS);
-    const r = (name: string) => layout.get(`/home/test/projects/${name}`)!.radius;
-    expect(r("bravo")).toBeGreaterThan(r("echo"));
-    expect(r("echo")).toBeGreaterThan(r("delta"));
-    expect(r("alpha")).toBe(r("foxtrot"));
+    const s = (name: string) => layout.get(`/home/test/projects/${name}`)!.size;
+    expect(s("bravo")).toBeGreaterThan(s("echo"));
+    expect(s("echo")).toBeGreaterThan(s("delta"));
+    expect(s("alpha")).toBe(s("foxtrot"));
   });
 
-  it("shrinks gems when there are many", () => {
-    const few = layoutGems([repo("solo", 0.5)]).get("/home/test/projects/solo")!.radius;
-    const many = Array.from({ length: 40 }, (_, i) => repo(`r${i}`, 0.2));
-    many.push(repo("solo", 0.5));
-    const crowded = layoutGems(many).get("/home/test/projects/solo")!.radius;
+  it("shrinks stones when there are many", () => {
+    const few = layoutGems([repo("solo", 0.5)]).get("/home/test/projects/solo")!.size;
+    const crowd = Array.from({ length: 40 }, (_, i) => repo(`r${i}`, 0.2));
+    crowd.push(repo("solo", 0.5));
+    const crowded = layoutGems(crowd).get("/home/test/projects/solo")!.size;
     expect(crowded).toBeLessThan(few);
   });
 
   it("treats out-of-range masses as the nearest valid one", () => {
     const layout = layoutGems([repo("big", 4), repo("nan", Number.NaN), repo("neg", -1)]);
-    const r = (name: string) => layout.get(`/home/test/projects/${name}`)!.radius;
-    expect(r("nan")).toBe(r("neg"));
-    expect(r("big")).toBeGreaterThan(r("nan"));
+    const s = (name: string) => layout.get(`/home/test/projects/${name}`)!.size;
+    expect(s("nan")).toBe(s("neg"));
+    expect(s("big")).toBeGreaterThan(s("nan"));
     for (const p of layout.values()) {
-      expect(Number.isFinite(p.x + p.y + p.z + p.radius)).toBe(true);
+      expect(Number.isFinite(p.x + p.y + p.size)).toBe(true);
     }
   });
 });

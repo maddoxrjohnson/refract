@@ -1,15 +1,5 @@
 import { Canvas, useFrame, useThree } from "@react-three/fiber";
 import {
-  BloomEffect,
-  DepthOfFieldEffect,
-  EffectComposer,
-  EffectPass,
-  RenderPass,
-  ToneMappingEffect,
-  ToneMappingMode,
-  type Effect,
-} from "postprocessing";
-import {
   useEffect,
   useLayoutEffect,
   useMemo,
@@ -20,27 +10,34 @@ import {
 } from "react";
 import {
   HalfFloatType,
+  InstancedMesh,
   MathUtils,
+  Matrix4,
+  Quaternion,
   Vector2,
   Vector3,
   WebGLRenderTarget,
   type Camera,
   type PerspectiveCamera,
 } from "three";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import type { RepoSnapshot } from "../backend/types";
 import type { ThemeMode } from "../theme";
 import { TIERS, type QualityLevel } from "../quality/tiers";
 import { repoStatus } from "../repoStatus";
-import { disposeObject, makeBackdrop, makeDust } from "./backdrop";
-import { GLASS_LAYER, Gem, type GemHandle } from "./Gem";
-import { linearHex } from "./languages";
-import { layoutGems } from "./layout";
+import { applyPalette, makeSheet, makeSheetUniforms, makeStoneMaterial } from "./banknote";
+import { shardGeometry, prepare } from "./cuts";
+import { Gem, type GemHandle } from "./Gem";
+import { layoutGems, layoutRadius, rng, type GemPosition } from "./layout";
 import { createTicker } from "./ticker";
 
-// The Frozen shatter scene (spec §3.2), ported from docs/mockups/frozen-shatter.html.
+// The Banknote scene (banknote spec), ported from docs/mockups/gem-studies.html: engraved
+// stones on a paper sheet seen from above, a rosette under each, splinters from the opening.
 //
-// Each drawn frame renders twice: everything but the glass into `back`, then the whole
-// scene through the post-processing chain, with the shells sampling `back` to refract.
+// Frames render through three's EffectComposer: the scene into a half-float target
+// (multisampled above Low), then an OutputPass to sRGB, so palette colours show exactly.
 // Frames are drawn on demand only: on a prop change, pointer movement or resize, and
 // while something animates, paced to the tier's frame cap by ./ticker.ts. The loop body
 // allocates nothing per frame beyond the style strings of the label and the marks.
@@ -52,13 +49,13 @@ export interface SceneProps {
   quality: QualityLevel;
   /** Light or dark palette (banknote spec §1.1); switching never replays the opening. */
   theme: ThemeMode;
-  /** No spin or breathing; camera moves still ease, but quickly. */
+  /** No opening, turning or pulsing; camera moves still ease, but quickly. */
   reducedMotion: boolean;
-  /** Paths of gems that are not cloned; they draw dimmed, without a lit core. */
+  /** Paths of gems that are not cloned; they draw stippled. */
   remoteOnly: ReadonlySet<string>;
-  /** Filter result; `null` is no filter. Gems outside it dim and shrink a little. */
+  /** Filter result; `null` is no filter. Gems outside it fade towards the paper. */
   matches: ReadonlySet<string> | null;
-  /** Path of the gem that lifts, brightens and shows `focusLabel`. */
+  /** Path of the gem that lifts, grows a little and shows `focusLabel`. */
   focused: string | null;
   /** Path of the gem the camera flies to, left of centre so a panel fits on the right. */
   zoomed: string | null;
@@ -84,18 +81,32 @@ export interface SceneProps {
   onFrameInterval(ms: number): void;
 }
 
-const FOV = 36;
+const FOV = 28;
 const MAGNET_PX = 130;
 /** The focused gem wins magnet ties within this many pixels, so focus does not flicker. */
 const MAGNET_HYSTERESIS_PX = 10;
-/** How far a focused gem moves towards the camera. */
-const LIFT = 0.35;
-/** A zoomed gem's radius as a share of half the view height. */
+/** How far a focused gem rises, and how much it grows. */
+const LIFT = 0.3;
+const FOCUS_GROW = 0.06;
+/** Strength of a gem outside the filter: it fades this far from the paper. */
+const FILTER_FADE = 0.22;
+/** The overview looks down from this far above the sheet, at this point. */
+const ELEVATION = MathUtils.degToRad(56);
+const LOOK = new Vector3(0, 0, 0.3);
+/** The pointer tilts the view this far at the canvas edges. */
+const TILT_ELEVATION = MathUtils.degToRad(4);
+const TILT_AZIMUTH = 0.12;
+/** A zoomed gem is seen from lower down, so its facets read. */
+const ZOOM_ELEVATION = MathUtils.degToRad(35);
+/** A zoomed gem's girdle radius as a share of half the view height. */
 const ZOOM_FILL = 0.34;
 /** Where a zoomed gem sits horizontally, in normalised device coordinates. */
 const ZOOM_X = -0.4;
-/** How far a zoomed gem's facets and glow reach, as a share of half the view height. */
-export const ZOOM_REACH = 0.48;
+/**
+ * How far below its centre a zoomed gem reaches, rosette and ring included, as a share of
+ * half the view height: seen from 35°, the near side of the ring lies about 1.5 sizes down.
+ */
+export const ZOOM_REACH = 0.5;
 /**
  * Pixels kept clear at the bottom for the launch picker: its 24 px offset, its
  * 300 px maximum height (`.rf-picker` in ui.css) and a gap.
@@ -115,16 +126,44 @@ export function zoomLift(height: number): number {
   const px = Math.min(Math.max(0, PICKER_CLEAR_PX - room), Math.max(0, room - ZOOM_TOP_MARGIN_PX));
   return px / half;
 }
-const EXPOSURE = 1.1;
+
+/** Camera distance that fits a layout `radius` across in both directions (mockup `resize()`). */
+export function fitDistance(radius: number, aspect: number): number {
+  const vf = MathUtils.degToRad(FOV);
+  const hf = 2 * Math.atan(Math.tan(vf / 2) * aspect);
+  return ((radius + 0.4) / Math.sin(Math.min(vf * 1.25, hf) / 2)) * 1.05;
+}
+
+/** Opening timings in seconds (banknote spec §4). */
+const BURST_S = 1.5;
+const SHARD_S = 1.4;
+const DROP_S = 0.8;
+/** A later stone drops from this high. */
+const DROP_HEIGHT = 2.5;
+/** Rings draw in over RING_S, starting RING_AT into the opening. */
+const RING_AT = 1.3;
+const RING_S = 0.6;
+/** Turning speeds in radians per second; working stones turn faster and spin their rosette. */
+const TURN = 0.12;
+const TURN_WORKING = 0.45;
+const ROSETTE_SPIN = 0.5;
+/** The waiting wash: base, swing, and the share it holds at without motion. */
+const WAIT_BASE = 0.08;
+const WAIT_SWING = 0.3;
+const WAIT_STILL = 0.6;
+/** The smallest layout radius the camera and sheet are fitted to. */
+const MIN_RADIUS = 2;
+
 const GL_OPTIONS = { antialias: false, powerPreference: "high-performance" } as const;
-const CAMERA = { fov: FOV, near: 0.1, far: 120, position: [0, 0, 12] as [number, number, number] };
+const CAMERA = { fov: FOV, near: 0.5, far: 300, position: [0, 20, 14] as [number, number, number] };
 
 export function Scene(props: SceneProps) {
+  const root = useRef<HTMLDivElement>(null);
   const label = useRef<HTMLDivElement>(null);
   const markEls = useRef(new Map<string, HTMLDivElement>());
   const dpr = Math.min(window.devicePixelRatio || 1, TIERS[props.quality].maxPixelRatio);
   return (
-    <div className="scene">
+    <div className="scene" ref={root}>
       <Canvas
         frameloop={props.visible ? "demand" : "never"}
         dpr={dpr}
@@ -137,7 +176,7 @@ export function Scene(props: SceneProps) {
           </div>
         }
       >
-        <SceneContents {...props} label={label} markEls={markEls} />
+        <SceneContents {...props} root={root} label={label} markEls={markEls} />
       </Canvas>
       {props.marks &&
         [...props.marks].map(([path, node]) => (
@@ -162,28 +201,35 @@ export function Scene(props: SceneProps) {
 }
 
 interface ContentsProps extends SceneProps {
+  root: RefObject<HTMLDivElement | null>;
   label: RefObject<HTMLDivElement | null>;
   markEls: RefObject<Map<string, HTMLDivElement>>;
-}
-
-interface Post {
-  composer: EffectComposer;
-  dof: DepthOfFieldEffect | null;
 }
 
 /** Mutable state the frame loop and pointer handlers share; never drives a React render. */
 interface LoopState {
   first: boolean;
+  /** Seconds of ambient motion (turning, pulsing). */
   time: number;
+  /** Seconds of drawn frames, motion or not: drives the opening and drop-ins. */
+  clock: number;
+  /** `clock` when the opening started; NaN until there are repos. */
+  openAt: number;
+  /** The opening has played out, rings included (shown as `data-opening` on `.scene`). */
+  openingDone: boolean;
   /** Pointer in CSS pixels over the canvas, and whether it is over it at all. */
   px: number;
   py: number;
   inside: boolean;
-  /** Parallax offset, eased towards its target; both in -1 to 1 across the canvas. */
+  /** Pointer tilt, eased towards its target; both in -1 to 1 across the canvas. */
   ptr: Vector2;
   ptrTarget: Vector2;
-  /** Where the camera looks, eased. */
-  look: Vector3;
+  /** Camera, eased: elevation, distance, the point framed, and where it sits on screen (NDC). */
+  el: number;
+  dist: number;
+  target: Vector3;
+  ox: number;
+  oy: number;
   /** The last magnet focus reported to `onPointerFocus`. */
   magnet: string | null;
   /** The pointer moved since the last frame, so the magnet focus may have changed. */
@@ -191,8 +237,10 @@ interface LoopState {
   /** When the last drawn frame started, and whether it asked the ticker for another. */
   lastStart: number;
   followUp: boolean;
-  /** The scene's breathing scale as of the last frame. */
-  breathe: number;
+  /** Splinters still flying, and the layout radius and mesh they were last placed for. */
+  shardsLive: boolean;
+  shardsRadius: number;
+  shardsMesh: InstancedMesh | null;
   gem: GemFrame;
 }
 
@@ -200,61 +248,120 @@ interface LoopState {
 interface GemFrame {
   /** Easing step: frame seconds times the reduced-motion pace. */
   k: number;
-  /** Seconds of ambient motion this frame, and the running total. */
-  dt: number;
   T: number;
+  clock: number;
+  openAt: number;
   ambient: boolean;
-  breathe: number;
+  reduced: boolean;
   focused: string | null;
   matches: ReadonlySet<string> | null;
   /** Set when any gem is still easing towards its goal. */
   settling: boolean;
+  /** Set when a leaving gem has faded out. */
+  faded: boolean;
 }
 
 const tmp = new Vector3();
-const camGoal = new Vector3();
-const lookGoal = new Vector3();
+const targetGoal = new Vector3();
+const look = new Vector3();
+const mPos = new Vector3();
+const mScale = new Vector3();
+const mQuat = new Quaternion();
+const mSpin = new Quaternion();
+const mMat = new Matrix4();
+const AXIS_X = new Vector3(1, 0, 0);
+
+const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+const easeOutExpo = (t: number) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t));
 
 /** Share of the way to a goal to move this frame. */
 function ease(k: number, rate: number): number {
   return Math.min(1, k * rate);
 }
 
-/** Brightness of a gem that is not cloned, before filter dimming; focus lifts it a little. */
-const REMOTE_DIM = 0.42;
-const REMOTE_FOCUS_LIFT = 0.25;
-
-/** A slow pulse between 0 and 1. */
-function wave(T: number, speed: number, phase: number): number {
-  return 0.5 + 0.5 * Math.sin(T * speed + phase);
-}
+/** Splinters, seeded once: where each lands (angle, share of the layout radius), size and flight. */
+const SHARDS = (() => {
+  const r = rng(21);
+  return Array.from({ length: Math.max(...Object.values(TIERS).map((t) => t.splinters)) }, () => {
+    const a = r() * Math.PI * 2;
+    const reach = Math.pow(r(), 0.6);
+    const s = 0.06 + Math.pow(r(), 2) * 0.22;
+    const q = new Quaternion().setFromAxisAngle(new Vector3(0, 1, 0), a + (r() - 0.5) * 1.2);
+    q.multiply(new Quaternion().setFromAxisAngle(AXIS_X, (r() - 0.5) * 0.2));
+    return { a, reach, s, q, delay: r() * 0.08, spin: (r() - 0.5) * 12, hop: 0.6 + r() * 1.2 };
+  });
+})();
 
 function updateGem(this: GemFrame, g: GemHandle) {
-  const fGoal = g.path === this.focused ? 1 : 0;
+  if (Number.isNaN(g.born)) {
+    g.born = this.clock;
+    g.burst = this.clock === this.openAt;
+  }
+  const fGoal = !g.leaving && g.path === this.focused ? 1 : 0;
   const mGoal = !this.matches || this.matches.has(g.path) ? 1 : 0;
+  const lGoal = g.leaving ? 0 : 1;
   g.f += (fGoal - g.f) * ease(this.k, 9);
   g.m += (mGoal - g.m) * ease(this.k, 6);
-  if (Math.abs(fGoal - g.f) > 0.002 || Math.abs(mGoal - g.m) > 0.002) this.settling = true;
-  else {
+  g.life += (lGoal - g.life) * ease(this.k, 5);
+  g.home.lerp(g.base, ease(this.k, 4));
+  if (
+    Math.abs(fGoal - g.f) > 0.002 ||
+    Math.abs(mGoal - g.m) > 0.002 ||
+    Math.abs(lGoal - g.life) > 0.002 ||
+    g.home.distanceToSquared(g.base) > 1e-6
+  ) {
+    this.settling = true;
+  } else {
     g.f = fGoal;
     g.m = mGoal;
+    g.life = lGoal;
+    g.home.copy(g.base);
   }
-  g.outer.position.copy(g.base).multiplyScalar(this.breathe);
-  g.outer.position.z += LIFT * g.f;
-  g.outer.scale.setScalar(1 - 0.15 * (1 - g.m));
-  g.spinner.rotation.y += g.spin * this.dt;
-  g.spinner.scale.setScalar(1 + 0.18 * g.f);
-  const dim = (0.25 + 0.75 * g.m) * (g.remoteOnly ? REMOTE_DIM + REMOTE_FOCUS_LIFT * g.f : 1);
-  const T = this.T;
-  const u = g.shell.uniforms;
-  u.uFocus.value = g.f;
-  u.uDim.value = dim;
-  u.uTime.value = T;
-  g.core.color.copy(g.coreColor).multiplyScalar(dim);
-  const ambient = this.ambient;
-  if (g.halo) g.halo.uniforms.k.value = (ambient ? 0.25 + 0.6 * wave(T, 1.5, g.phase) : 0.7) * dim;
-  if (g.wait) g.wait.uniforms.k.value = (ambient ? 0.15 + 0.75 * wave(T, 1.1, g.phase) : 0.6) * dim;
-  if (g.edges) g.edges.opacity = (ambient ? 0.25 + 0.75 * wave(T, 2.6, g.phase) : 0.8) * dim;
+  if (g.leaving && g.life < 0.01) this.faded = true;
+
+  // The opening burst flies in from above the centre; later stones drop into place.
+  const e = this.clock - g.born;
+  const p = this.reduced ? 1 : easeOutExpo(clamp01(g.burst ? (e - g.delay) / BURST_S : e / DROP_S));
+  if (p < 1) this.settling = true;
+  const h = g.holder;
+  const grow = (1 + FOCUS_GROW * g.f) * g.life;
+  if (g.burst) {
+    h.position.lerpVectors(g.start, g.home, p);
+    h.position.y = g.home.y + (1 - p) * g.start.y + g.f * LIFT;
+    h.rotation.y = (1 - p) * g.spinIn;
+    h.scale.setScalar((0.35 + 0.65 * p) * grow);
+  } else {
+    h.position.copy(g.home);
+    h.position.y += (1 - p) * DROP_HEIGHT + g.f * LIFT;
+    h.rotation.y = 0;
+    h.scale.setScalar(grow);
+  }
+  g.spot.position.set(g.home.x, 0, g.home.z);
+  g.spot.scale.setScalar(g.life);
+  const T = this.ambient ? this.T : 0;
+  g.spinner.rotation.y = g.phase + T * (g.working ? TURN_WORKING : TURN) * g.spinDir;
+
+  const fade = (FILTER_FADE + (1 - FILTER_FADE) * g.m) * g.life;
+  const su = g.stone.uniforms;
+  su.fade.value = fade;
+  su.accentAmt.value = g.waiting
+    ? WAIT_BASE + WAIT_SWING * (this.ambient ? 0.5 + 0.5 * Math.sin(T * 1.57 + g.phase) : WAIT_STILL)
+    : 0;
+  g.rosette.uniforms.fade.value = fade;
+  g.rosette.uniforms.spin.value = g.working ? T * ROSETTE_SPIN : 0;
+  if (g.ring) {
+    // Rings of stones in the opening draw in partway through it; later ones at once.
+    if (Number.isNaN(g.ringAt)) {
+      g.ringAt =
+        g.burst && this.clock < this.openAt + RING_AT ? this.openAt + RING_AT : this.clock;
+    }
+    const draw = this.reduced ? 1 : clamp01((this.clock - g.ringAt) / RING_S);
+    if (draw < 1) this.settling = true;
+    g.ring.uniforms.draw.value = draw;
+    g.ring.uniforms.fade.value = fade;
+  } else {
+    g.ringAt = Number.NaN;
+  }
 }
 
 /**
@@ -269,13 +376,13 @@ function nearestGem(
   height: number,
   x: number,
   y: number,
-  breathe: number,
   prefer: string | null,
 ): string | null {
   let best: string | null = null;
   let bestDist = MAGNET_PX;
   for (const g of gems.values()) {
-    tmp.copy(g.base).multiplyScalar(breathe).project(camera);
+    if (g.leaving) continue;
+    tmp.copy(g.base).project(camera);
     if (tmp.z > 1) continue;
     const d =
       Math.hypot((tmp.x * 0.5 + 0.5) * width - x, (-tmp.y * 0.5 + 0.5) * height - y) -
@@ -286,6 +393,19 @@ function nearestGem(
     }
   }
   return best;
+}
+
+/**
+ * Projects a gem's centre into `tmp` (pixels in x and y) and returns its radius in pixels,
+ * or NaN when it is behind the camera.
+ */
+function screenCircle(g: GemHandle, camera: Camera, W: number, H: number, tv: number): number {
+  tmp.copy(g.holder.position);
+  const dist = camera.position.distanceTo(tmp);
+  tmp.project(camera);
+  if (!(dist > 0) || tmp.z > 1) return Number.NaN;
+  tmp.set((tmp.x * 0.5 + 0.5) * W, (-tmp.y * 0.5 + 0.5) * H, 0);
+  return ((g.size * g.holder.scale.x) / (dist * tv)) * (H / 2);
 }
 
 /** Centres each mark on its gem and sets `--r` to the gem's radius in pixels; hides marks without one. */
@@ -299,20 +419,13 @@ function placeMarks(
 ) {
   for (const [path, el] of els) {
     const g = gems.get(path);
-    if (!g) {
+    const radiusPx = g && !g.leaving ? screenCircle(g, camera, W, H, tv) : Number.NaN;
+    if (Number.isNaN(radiusPx)) {
       el.hidden = true;
       continue;
     }
-    tmp.setFromMatrixPosition(g.outer.matrixWorld);
-    const dist = camera.position.distanceTo(tmp);
-    tmp.project(camera);
-    if (!(dist > 0) || tmp.z > 1) {
-      el.hidden = true;
-      continue;
-    }
-    const radiusPx = ((g.radius * g.outer.scale.x * g.spinner.scale.x) / (dist * tv)) * (H / 2);
     el.hidden = false;
-    el.style.transform = `translate(${((tmp.x * 0.5 + 0.5) * W).toFixed(1)}px, ${((-tmp.y * 0.5 + 0.5) * H).toFixed(1)}px)`;
+    el.style.transform = `translate(${tmp.x.toFixed(1)}px, ${tmp.y.toFixed(1)}px)`;
     el.style.setProperty("--r", `${radiusPx.toFixed(1)}px`);
   }
 }
@@ -327,26 +440,27 @@ function placeLabel(
   tv: number,
 ) {
   if (!el) return;
-  if (!g) {
+  const radiusPx = g && !g.leaving ? screenCircle(g, camera, W, H, tv) : Number.NaN;
+  if (Number.isNaN(radiusPx)) {
     el.hidden = true;
     return;
   }
-  tmp.setFromMatrixPosition(g.outer.matrixWorld);
-  const dist = camera.position.distanceTo(tmp);
-  const radiusPx = ((g.radius * g.outer.scale.x * g.spinner.scale.x) / (dist * tv)) * (H / 2);
-  tmp.project(camera);
-  const x = (tmp.x * 0.5 + 0.5) * W;
-  const y = (-tmp.y * 0.5 + 0.5) * H;
   el.hidden = false;
   const lw = el.offsetWidth;
   const lh = el.offsetHeight;
-  const lx = Math.max(8, Math.min(W - lw - 8, x + radiusPx + 14));
-  const ly = Math.max(8, Math.min(H - lh - 8, y - lh / 2));
+  const lx = Math.max(8, Math.min(W - lw - 8, tmp.x + radiusPx + 14));
+  const ly = Math.max(8, Math.min(H - lh - 8, tmp.y - lh / 2));
   el.style.transform = `translate(${lx}px, ${ly}px)`;
 }
 
+/** A repo that went away, drawn where it was until it has faded out. */
+interface Leaving {
+  repo: RepoSnapshot;
+  pos: GemPosition;
+}
+
 function SceneContents(props: ContentsProps) {
-  const { repos, remoteOnly, quality, reducedMotion, matches, focused, zoomed, focusLabel, visible, marks } =
+  const { repos, remoteOnly, quality, theme, reducedMotion, matches, focused, zoomed, focusLabel, visible, marks } =
     props;
   const tier = TIERS[quality];
   const gl = useThree((s) => s.gl);
@@ -363,100 +477,129 @@ function SceneContents(props: ContentsProps) {
   });
 
   const layout = useMemo(() => layoutGems(repos), [repos]);
-  const bounds = useMemo(() => {
-    let maxX = 0;
-    let maxY = 0;
-    for (const p of layout.values()) {
-      maxX = Math.max(maxX, Math.abs(p.x) + p.radius);
-      maxY = Math.max(maxY, Math.abs(p.y) + p.radius);
-    }
-    return { maxX, maxY };
-  }, [layout]);
+  const radius = useMemo(() => Math.max(MIN_RADIUS, layoutRadius(layout)), [layout]);
   const gems = useMemo(() => new Map<string, GemHandle>(), []);
 
-  // The refraction image: everything but the glass, at the tier's share of the canvas.
-  const back = useMemo(() => new WebGLRenderTarget(2, 2, { type: HalfFloatType }), []);
-  const res = useMemo(() => new Vector2(1, 1), []);
-  useEffect(() => () => back.dispose(), [back]);
+  // Repos that went away stay drawn until they fade out (adjusting state on a prop change).
+  const [leaving, setLeaving] = useState<ReadonlyMap<string, Leaving>>(() => new Map());
+  const [prev, setPrev] = useState({ repos, layout });
+  if (prev.repos !== repos) {
+    const now = new Set(repos.map((r) => r.path));
+    const next = new Map(leaving);
+    for (const r of prev.repos) {
+      const pos = prev.layout.get(r.path);
+      if (!now.has(r.path) && pos) next.set(r.path, { repo: r, pos });
+    }
+    for (const path of now) next.delete(path);
+    setLeaving(next);
+    setPrev({ repos, layout });
+  }
 
-  const backdrop = useMemo(makeBackdrop, []);
-  useEffect(() => () => disposeObject(backdrop), [backdrop]);
-  const dust = useMemo(() => makeDust(bounds.maxX), [bounds.maxX]);
-  useEffect(() => () => disposeObject(dust), [dust]);
+  // Palette uniforms shared by every material; a mode switch changes only their values.
+  const sheetUniforms = useMemo(makeSheetUniforms, []);
+  useLayoutEffect(() => {
+    applyPalette(sheetUniforms, theme);
+  }, [sheetUniforms, theme]);
+  useLayoutEffect(() => {
+    sheetUniforms.px.value = dpr;
+  }, [sheetUniforms, dpr]);
+
+  const sheet = useMemo(() => makeSheet(sheetUniforms), [sheetUniforms]);
+  useEffect(
+    () => () => {
+      sheet.geometry.dispose();
+      sheet.material.dispose();
+    },
+    [sheet],
+  );
+  useLayoutEffect(() => {
+    sheet.material.uniforms.reach.value = radius * 1.5;
+  }, [sheet, radius]);
 
   useEffect(() => {
-    scene.background = linearHex(0x040509);
-    gl.toneMappingExposure = EXPOSURE;
+    scene.background = sheetUniforms.edge.value;
     return () => {
       scene.background = null;
     };
-  }, [scene, gl]);
+  }, [scene, sheetUniforms]);
 
-  // Bloom (Medium, High), depth of field (High) and ACES tone mapping. Built in an effect,
-  // not a memo, because disposing a composer empties it.
-  const [post, setPost] = useState<Post | null>(null);
+  // Splinters: engraved paper shards, without a wash.
+  const shardGeo = useMemo(() => prepare(shardGeometry(rng(5), 1, 0.32, 0.06)), []);
+  const shardMat = useMemo(
+    () => makeStoneMaterial(sheetUniforms, sheetUniforms.paper.value, { value: 0 }),
+    [sheetUniforms],
+  );
+  const shards = useMemo(() => {
+    const m = new InstancedMesh(shardGeo, shardMat, tier.splinters);
+    // Instances move after the bounds would be computed, so never cull.
+    m.frustumCulled = false;
+    m.visible = false;
+    return m;
+  }, [shardGeo, shardMat, tier.splinters]);
+  useEffect(() => () => shardGeo.dispose(), [shardGeo]);
+  useEffect(() => () => shardMat.dispose(), [shardMat]);
+  useEffect(() => () => shards.dispose(), [shards]);
+
+  // The scene into a half-float target, multisampled above Low, then out to sRGB. Built in
+  // an effect, not a memo, because disposing a composer empties it.
+  const [composer, setComposer] = useState<EffectComposer | null>(null);
   useEffect(() => {
-    const composer = new EffectComposer(gl, { frameBufferType: HalfFloatType });
-    composer.addPass(new RenderPass(scene, camera));
-    const effects: Effect[] = [];
-    const dof = tier.depthOfField
-      ? new DepthOfFieldEffect(camera, { focusDistance: 12, focusRange: 9, bokehScale: 1 })
-      : null;
-    if (dof) effects.push(dof);
-    if (tier.bloom) {
-      effects.push(
-        new BloomEffect({
-          luminanceThreshold: 0.85,
-          luminanceSmoothing: 0.03,
-          intensity: tier.depthOfField ? 1.2 : 1.0,
-          radius: 0.55,
-          mipmapBlur: true,
-        }),
-      );
-    }
-    effects.push(new ToneMappingEffect({ mode: ToneMappingMode.ACES_FILMIC }));
-    composer.addPass(new EffectPass(camera, ...effects));
-    setPost({ composer, dof });
+    const target = new WebGLRenderTarget(1, 1, { type: HalfFloatType, samples: tier.msaa });
+    const c = new EffectComposer(gl, target);
+    const render = new RenderPass(scene, camera);
+    const output = new OutputPass();
+    c.addPass(render);
+    c.addPass(output);
+    setComposer(c);
     return () => {
-      setPost(null);
-      composer.dispose();
+      setComposer(null);
+      render.dispose();
+      output.dispose();
+      c.dispose();
     };
-  }, [gl, scene, camera, tier]);
+  }, [gl, scene, camera, tier.msaa]);
 
   useEffect(() => {
-    if (!post) return;
-    post.composer.setSize(size.width, size.height, false);
-    gl.getDrawingBufferSize(res);
-    back.setSize(
-      Math.max(2, Math.round(res.x * tier.backScale)),
-      Math.max(2, Math.round(res.y * tier.backScale)),
-    );
+    if (!composer) return;
+    composer.setPixelRatio(dpr);
+    composer.setSize(size.width, size.height);
     invalidate();
-  }, [post, gl, back, res, size, dpr, tier.backScale, invalidate]);
+  }, [composer, size, dpr, invalidate]);
 
   const loop = useRef<LoopState>({
     first: true,
     time: 0,
+    clock: 0,
+    openAt: Number.NaN,
+    openingDone: false,
     px: 0,
     py: 0,
     inside: false,
     ptr: new Vector2(),
     ptrTarget: new Vector2(),
-    look: new Vector3(),
+    el: ELEVATION,
+    dist: 20,
+    target: new Vector3(),
+    ox: 0,
+    oy: 0,
     magnet: null,
     moved: false,
     lastStart: 0,
     followUp: false,
-    breathe: 1,
+    shardsLive: false,
+    shardsRadius: 0,
+    shardsMesh: null,
     gem: {
       k: 0,
-      dt: 0,
       T: 0,
+      clock: 0,
+      openAt: Number.NaN,
       ambient: false,
-      breathe: 1,
+      reduced: false,
       focused: null,
       matches: null,
       settling: false,
+      faded: false,
     },
   });
   const ticker = useMemo(() => createTicker(invalidate), [invalidate]);
@@ -478,7 +621,7 @@ function SceneContents(props: ContentsProps) {
   const markKeys = marks ? [...marks.keys()].join("\n") : "";
   useEffect(() => {
     ticker.request(tier.fpsCap, loop.current.lastStart);
-  }, [ticker, tier, repos, remoteOnly, reducedMotion, matches, focused, zoomed, hasLabel, markKeys, visible]);
+  }, [ticker, tier, repos, leaving, remoteOnly, theme, reducedMotion, matches, focused, zoomed, hasLabel, markKeys, visible]);
 
   useEffect(() => {
     const el = gl.domElement;
@@ -508,16 +651,7 @@ function SceneContents(props: ContentsProps) {
     };
     const click = (ev: MouseEvent) => {
       const b = place(ev);
-      const hit = nearestGem(
-        gems,
-        camera,
-        b.width,
-        b.height,
-        s.px,
-        s.py,
-        s.breathe,
-        latest.current.focused,
-      );
+      const hit = nearestGem(gems, camera, b.width, b.height, s.px, s.py, latest.current.focused);
       if (hit) latest.current.onSelect(hit);
       else latest.current.onBackgroundClick();
     };
@@ -533,16 +667,16 @@ function SceneContents(props: ContentsProps) {
 
   // Priority 1 takes over rendering from R3F.
   useFrame((_, delta) => {
-    if (!post) return;
+    if (!composer) return;
     const start = performance.now();
     const s = loop.current;
     if (s.followUp) latest.current.onFrameInterval(start - s.lastStart);
     // After an idle pause the clock's delta spans the pause; step as one capped frame.
     const rdt = s.followUp ? Math.min(delta, 0.1) : 1 / tier.fpsCap;
     const ambient = tier.ambientMotion && !reducedMotion;
-    const dt = ambient ? rdt : 0;
-    s.time += dt;
-    const T = s.time;
+    if (ambient) s.time += rdt;
+    s.clock += rdt;
+    if (Number.isNaN(s.openAt) && repos.length > 0) s.openAt = s.clock;
     // Reduced motion keeps the easing but makes it quick.
     const k = rdt * (reducedMotion ? 4 : 1);
     const W = size.width;
@@ -555,46 +689,117 @@ function SceneContents(props: ContentsProps) {
     s.ptr.lerp(s.ptrTarget, ease(k, 6));
     if (s.ptr.distanceTo(s.ptrTarget) > 0.002) settling = true;
 
-    // The camera fits every gem, or frames the zoomed one left of centre and above the picker.
-    const breathe = ambient ? 1 + 0.022 * Math.sin(T * 0.5) : 1;
-    s.breathe = breathe;
+    // The camera fits the layout from 56° up, or flies in to frame the zoomed gem from 35°,
+    // left of centre and above the picker.
     const zoomGem = zoomed ? gems.get(zoomed) : undefined;
+    let elGoal = ELEVATION;
+    let distGoal = fitDistance(radius, aspect);
+    let oxGoal = 0;
+    let oyGoal = 0;
+    targetGoal.copy(LOOK);
     if (zoomGem) {
-      const dist = zoomGem.radius / (tv * ZOOM_FILL);
-      lookGoal.copy(zoomGem.base).multiplyScalar(breathe);
-      lookGoal.x -= ZOOM_X * tv * aspect * dist;
-      lookGoal.y -= zoomLift(H) * tv * dist;
-      camGoal.set(lookGoal.x + s.ptr.x * 0.4, lookGoal.y - s.ptr.y * 0.25, lookGoal.z + dist);
-    } else {
-      const fit =
-        Math.max((bounds.maxY + 0.5) / tv, (bounds.maxX + 0.5) / (tv * aspect)) + 1.0;
-      lookGoal.set(0, 0, 0);
-      camGoal.set(s.ptr.x * 1.6, -s.ptr.y * 1.0, fit);
+      elGoal = ZOOM_ELEVATION;
+      distGoal = zoomGem.size / (tv * ZOOM_FILL);
+      oxGoal = ZOOM_X;
+      oyGoal = zoomLift(H);
+      targetGoal.copy(zoomGem.base);
     }
     if (s.first) {
-      camera.position.copy(camGoal);
-      s.look.copy(lookGoal);
+      s.el = elGoal;
+      s.dist = distGoal;
+      s.ox = oxGoal;
+      s.oy = oyGoal;
+      s.target.copy(targetGoal);
       s.first = false;
     }
-    camera.position.lerp(camGoal, ease(k, 3));
-    s.look.lerp(lookGoal, ease(k, 3));
-    if (camera.position.distanceTo(camGoal) > 0.003 || s.look.distanceTo(lookGoal) > 0.003) {
+    const kc = ease(k, 3);
+    s.el += (elGoal - s.el) * kc;
+    s.dist += (distGoal - s.dist) * kc;
+    s.ox += (oxGoal - s.ox) * kc;
+    s.oy += (oyGoal - s.oy) * kc;
+    s.target.lerp(targetGoal, kc);
+    if (
+      Math.abs(elGoal - s.el) > 1e-4 ||
+      Math.abs(distGoal - s.dist) > 0.003 ||
+      Math.abs(oxGoal - s.ox) > 1e-4 ||
+      Math.abs(oyGoal - s.oy) > 1e-4 ||
+      s.target.distanceTo(targetGoal) > 0.003
+    ) {
       settling = true;
     }
-    camera.lookAt(s.look);
+    // Orbit the framed point by the eased angles plus the pointer's tilt, offsetting along
+    // the camera's own right and up so the framed point keeps its place on screen.
+    const el = s.el - s.ptr.y * TILT_ELEVATION;
+    const az = s.ptr.x * TILT_AZIMUTH;
+    const ce = Math.cos(el);
+    const se = Math.sin(el);
+    const ca = Math.cos(az);
+    const sa = Math.sin(az);
+    const hx = s.ox * tv * aspect * s.dist;
+    const hy = s.oy * tv * s.dist;
+    look.set(
+      s.target.x - ca * hx + sa * se * hy,
+      s.target.y - ce * hy,
+      s.target.z + sa * hx + ca * se * hy,
+    );
+    camera.position.set(look.x + sa * ce * s.dist, look.y + se * s.dist, look.z + ca * ce * s.dist);
+    camera.lookAt(look);
 
     const gf = s.gem;
     gf.k = k;
-    gf.dt = dt;
-    gf.T = T;
+    gf.T = s.time;
+    gf.clock = s.clock;
+    gf.openAt = s.openAt;
     gf.ambient = ambient;
-    gf.breathe = breathe;
+    gf.reduced = reducedMotion;
     gf.focused = focused;
     gf.matches = matches;
     gf.settling = false;
+    gf.faded = false;
     gems.forEach(updateGem, gf);
     if (gf.settling) settling = true;
-    dust.scale.setScalar(breathe);
+    if (gf.faded) {
+      const done: string[] = [];
+      for (const g of gems.values()) if (g.leaving && g.life < 0.01) done.push(g.path);
+      setLeaving((m) => {
+        const next = new Map(m);
+        for (const path of done) next.delete(path);
+        return next;
+      });
+    }
+
+    // Splinters fly out with the opening, then rest; placed again only if the layout grows.
+    const opened = !Number.isNaN(s.openAt);
+    shards.visible = opened;
+    if (opened && (s.shardsLive || s.shardsRadius !== radius || s.shardsMesh !== shards)) {
+      const e = s.clock - s.openAt;
+      let done = true;
+      for (let i = 0; i < shards.count; i++) {
+        const d = SHARDS[i];
+        const p = reducedMotion ? 1 : easeOutExpo(clamp01((e - d.delay) / SHARD_S));
+        if (p < 1) done = false;
+        const reach = 0.8 + d.reach * (radius + 0.6);
+        const y = d.s * 0.03;
+        mPos.set(
+          Math.cos(d.a) * reach * p,
+          y + d.hop * 4 * p * (1 - p) * (1 - p) + (1 - p) * 1.4,
+          Math.sin(d.a) * reach * 0.85 * p,
+        );
+        mQuat.copy(d.q).multiply(mSpin.setFromAxisAngle(AXIS_X, (1 - p) * d.spin));
+        shards.setMatrixAt(i, mMat.compose(mPos, mQuat, mScale.setScalar(d.s)));
+      }
+      shards.instanceMatrix.needsUpdate = true;
+      s.shardsLive = !done;
+      s.shardsRadius = radius;
+      s.shardsMesh = shards;
+      if (!done) settling = true;
+    }
+    // Tests and recordings wait on this rather than on a guessed delay.
+    const openingDone = opened && (reducedMotion || s.clock - s.openAt >= RING_AT + RING_S);
+    if (opened && (openingDone !== s.openingDone || !props.root.current?.dataset.opening)) {
+      s.openingDone = openingDone;
+      if (props.root.current) props.root.current.dataset.opening = openingDone ? "done" : "playing";
+    }
     scene.updateMatrixWorld();
     camera.updateMatrixWorld();
 
@@ -602,7 +807,7 @@ function SceneContents(props: ContentsProps) {
     // pointer does not.
     if (s.inside && s.moved) {
       s.moved = false;
-      const hit = nearestGem(gems, camera, W, H, s.px, s.py, breathe, focused);
+      const hit = nearestGem(gems, camera, W, H, s.px, s.py, focused);
       if (hit !== s.magnet) {
         s.magnet = hit;
         latest.current.onPointerFocus(hit);
@@ -618,16 +823,7 @@ function SceneContents(props: ContentsProps) {
     );
     placeMarks(props.markEls.current, gems, camera, W, H, tv);
 
-    if (post.dof) post.dof.cocMaterial.focusDistance = camera.position.distanceTo(s.look);
-
-    // Pass 1: everything except the glass, into the texture the shells refract.
-    camera.layers.set(0);
-    gl.setRenderTarget(back);
-    gl.render(scene, camera);
-    gl.setRenderTarget(null);
-    // Pass 2: the full scene through glow, depth of field and tone mapping.
-    camera.layers.enable(GLASS_LAYER);
-    post.composer.render(rdt);
+    composer.render(rdt);
 
     s.lastStart = start;
     s.followUp = ambient || settling;
@@ -635,34 +831,34 @@ function SceneContents(props: ContentsProps) {
     else ticker.cancel();
   }, 1);
 
+  const gemFor = (repo: RepoSnapshot, p: GemPosition, gone: boolean) => {
+    const st = repoStatus(repo);
+    return (
+      <Gem
+        key={repo.path}
+        path={repo.path}
+        x={p.x}
+        z={-p.y}
+        size={p.size}
+        language={repo.language}
+        dirty={st.dirty}
+        interrupted={st.interrupted}
+        working={st.working}
+        waiting={st.waiting}
+        remoteOnly={remoteOnly.has(repo.path)}
+        leaving={gone}
+        sheet={sheetUniforms}
+        registry={gems}
+      />
+    );
+  };
+
   return (
     <>
-      <primitive object={backdrop} />
-      <primitive object={dust} />
-      {repos.map((repo) => {
-        const p = layout.get(repo.path)!;
-        const st = repoStatus(repo);
-        return (
-          <Gem
-            key={repo.path}
-            path={repo.path}
-            x={p.x}
-            y={p.y}
-            z={p.z}
-            radius={p.radius}
-            language={repo.language}
-            dirty={st.dirty}
-            interrupted={st.interrupted}
-            working={st.working}
-            waiting={st.waiting}
-            remoteOnly={remoteOnly.has(repo.path)}
-            tier={tier}
-            back={back.texture}
-            res={res}
-            registry={gems}
-          />
-        );
-      })}
+      <primitive object={sheet} />
+      <primitive object={shards} />
+      {repos.map((repo) => gemFor(repo, layout.get(repo.path)!, false))}
+      {[...leaving.values()].map((l) => gemFor(l.repo, l.pos, true))}
     </>
   );
 }
