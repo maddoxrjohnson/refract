@@ -148,6 +148,13 @@ const RING_S = 0.6;
 const TURN = 0.12;
 const TURN_WORKING = 0.45;
 const ROSETTE_SPIN = 0.5;
+
+/** The rosette's turn at time `t` (seconds), wrapped to one revolution: float32 in the
+ * shader would step visibly after days of uptime, and the guilloche's whole-number
+ * wave counts make the pattern repeat exactly every full turn. */
+export function rosetteSpin(t: number): number {
+  return (t * ROSETTE_SPIN) % (2 * Math.PI);
+}
 /**
  * A stone whose agent waits on you knocks once a period: a hop of `KNOCK_LIFT` stone
  * sizes with a wobble of `KNOCK_TILT` radians, over `KNOCK_S` seconds. A ping ring
@@ -375,7 +382,7 @@ function updateGem(this: GemFrame, g: GemHandle) {
     g.ping.uniforms.fade.value = this.ambient ? fade : 0;
   }
   g.rosette.uniforms.fade.value = fade;
-  g.rosette.uniforms.spin.value = g.working ? T * ROSETTE_SPIN : 0;
+  g.rosette.uniforms.spin.value = g.working ? rosetteSpin(T) : 0;
   if (g.ring) {
     // Rings of stones in the opening draw in partway through it; later ones at once.
     if (Number.isNaN(g.ringAt)) {
