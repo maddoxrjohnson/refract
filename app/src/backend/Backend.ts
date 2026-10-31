@@ -26,6 +26,7 @@ import type {
   RepoList,
   RepoSnapshot,
 } from "./types";
+import type { ThemeSetting } from "../theme";
 
 /** Stops a subscription. */
 export type Unsubscribe = () => void;
@@ -62,6 +63,8 @@ export interface Backend {
   getSettings(): Promise<Settings>;
   /** Saves settings; the next `listRemotes` uses them. */
   setSettings(settings: Settings): Promise<void>;
+  /** Matches the window's title bar to the theme; `system` follows Windows. */
+  setWindowTheme(theme: ThemeSetting): Promise<void>;
   credentials(): Promise<Credentials>;
   /** Stores a token in Windows Credential Manager; `null` removes it. */
   setToken(kind: RemoteKind, token: string | null): Promise<void>;

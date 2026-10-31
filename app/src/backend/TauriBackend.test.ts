@@ -1,5 +1,5 @@
 import { emit } from "@tauri-apps/api/event";
-import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
+import { clearMocks, mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import { afterEach, describe, expect, it } from "vitest";
 import { EVENTS, TauriBackend } from "./TauriBackend";
 import type {
@@ -136,6 +136,7 @@ describe("TauriBackend", () => {
         enabled: true,
         prices: [{ match: "sonnet", input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.1 }],
       },
+      theme: "dark",
     };
     mockIPC((cmd, args) => {
       calls.push({ cmd, args });
@@ -160,6 +161,21 @@ describe("TauriBackend", () => {
       { cmd: "settings_get", args: {} },
       { cmd: "settings_set", args: { settings } },
       { cmd: "credentials", args: {} },
+    ]);
+  });
+
+  it("sets the window's theme, with system as no theme", async () => {
+    mockWindows("main");
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+    });
+    const backend = new TauriBackend();
+    await backend.setWindowTheme("dark");
+    await backend.setWindowTheme("system");
+    expect(calls).toEqual([
+      { cmd: "plugin:window|set_theme", args: { label: "main", value: "dark" } },
+      { cmd: "plugin:window|set_theme", args: { label: "main", value: null } },
     ]);
   });
 

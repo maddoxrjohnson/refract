@@ -90,6 +90,9 @@ describe("DetailPanel", () => {
     const running = { ...testSession("s2", { kind: "live", detail: "waitingOnUser" }, 1, "Shall I?"), focusable: true };
     const { panel, props } = setup(testRepo({ sessions: [running], preselect: { kind: "focus", sessionId: "s2" } }));
     expect(panel.textContent).toContain("go to the running agent");
+    // Waiting for you: the status line and the hint are the red ones.
+    expect(panel.querySelector(".rf-detail__header .rf-state--attention .rf-sw--waiting")).not.toBeNull();
+    expect(panel.querySelector(".rf-hint--attention")?.textContent).toContain("go to the running agent");
     fireEvent.click(screen.getByRole("button", { name: /Launch/ }));
     expect(props.onPrimary).toHaveBeenCalledOnce();
     fireEvent.click(screen.getByRole("button", { name: "Go to agent" }));

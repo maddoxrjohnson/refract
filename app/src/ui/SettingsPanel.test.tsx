@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Backend } from "../backend/Backend";
 import type { Settings } from "../backend/types";
@@ -16,6 +16,7 @@ const SETTINGS: Settings = {
     enabled: false,
     prices: [{ match: "opus", input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 }],
   },
+  theme: "system",
 };
 
 function fakeBackend() {
@@ -97,6 +98,29 @@ describe("SettingsPanel", () => {
     });
     expect(props.onChange).toHaveBeenCalledWith({ ...SETTINGS, gitlabUrl: "https://gitlab.example.com" });
     expect(props.onRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("picks light, dark or system under Appearance", async () => {
+    const { props } = await setup();
+    const group = screen.getByRole("radiogroup", { name: "Appearance" });
+    const radios = within(group).getAllByRole("radio") as HTMLInputElement[];
+    expect(radios.map((r) => r.labels?.[0]?.textContent)).toEqual(["Light", "Dark", "System"]);
+    expect(within(group).getByRole("radio", { name: "System" })).toHaveProperty("checked", true);
+    await act(async () => {
+      fireEvent.click(within(group).getByRole("radio", { name: "Dark" }));
+    });
+    expect(props.onChange).toHaveBeenLastCalledWith({ ...SETTINGS, theme: "dark" });
+  });
+
+  it("shows why a theme did not save", async () => {
+    const { props } = await setup({
+      onChange: vi.fn().mockRejectedValue({ kind: "io", message: "Could not write settings.json." }),
+    });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("radio", { name: "Light" }));
+    });
+    expect(props.onChange).toHaveBeenCalledWith({ ...SETTINGS, theme: "light" });
+    expect(screen.getByRole("alert").textContent).toContain("Could not write settings.json.");
   });
 
   it("toggles forks and archived repos", async () => {

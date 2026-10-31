@@ -1,6 +1,8 @@
 // Mirrors of the Rust/serde shapes the interface reads. Field names follow the wire
 // format (camelCase); see crates/refract-core/src/protocol.rs and crates/refract-client.
 
+import type { ThemeSetting } from "../theme";
+
 /** State of the WSL helper process, from refract-client's `AgentStatus`. */
 export type AgentStatus =
   | { state: "starting" }
@@ -200,6 +202,8 @@ export interface Settings {
   hidden: string[];
   /** The usage widget's optional cost estimate (spec §3.5). */
   costEstimate: CostEstimate;
+  /** Light, dark, or following Windows (banknote spec §5). */
+  theme: ThemeSetting;
 }
 
 /** Whether the usage widget estimates cost, and at what prices. */

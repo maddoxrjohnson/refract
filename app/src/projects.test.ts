@@ -17,6 +17,7 @@ const SETTINGS: Settings = {
   showArchived: false,
   hidden: [],
   costEstimate: { enabled: false, prices: [] },
+  theme: "system",
 };
 
 function remote(name: string, extra: Partial<RemoteRepo> = {}): RemoteRepo {

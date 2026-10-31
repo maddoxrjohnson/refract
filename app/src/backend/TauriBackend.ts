@@ -1,5 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import type { ThemeSetting } from "../theme";
 import type { Backend, Unsubscribe } from "./Backend";
 import type {
   AgentEvent,
@@ -136,6 +138,10 @@ export class TauriBackend implements Backend {
 
   setSettings(settings: Settings): Promise<void> {
     return invoke<void>("settings_set", { settings });
+  }
+
+  setWindowTheme(theme: ThemeSetting): Promise<void> {
+    return getCurrentWindow().setTheme(theme === "system" ? null : theme);
   }
 
   credentials(): Promise<Credentials> {

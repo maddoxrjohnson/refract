@@ -139,6 +139,24 @@ test("the settings panel opens and closes", async ({ page }) => {
   await expect(settings).toBeHidden();
 });
 
+test("Appearance switches the panels between paper and ink", async ({ page }) => {
+  await page.emulateMedia({ colorScheme: "light" });
+  const background = () => page.evaluate(() => getComputedStyle(document.body).backgroundColor);
+  await expect.poll(background).toBe("rgb(224, 227, 212)");
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  const appearance = page.getByRole("radiogroup", { name: "Appearance" });
+  await expect(appearance.getByRole("radio", { name: "System" })).toBeChecked();
+  await appearance.getByRole("radio", { name: "Dark" }).check();
+  await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+  await expect.poll(background).toBe("rgb(8, 16, 13)");
+  // Back to System, which follows the browser's (Windows') mode.
+  await appearance.getByRole("radio", { name: "System" }).check();
+  await expect(page.locator("html")).not.toHaveAttribute("data-theme", /.*/);
+  await expect.poll(background).toBe("rgb(224, 227, 212)");
+  await page.emulateMedia({ colorScheme: "dark" });
+  await expect.poll(background).toBe("rgb(8, 16, 13)");
+});
+
 test.describe("at 1280×800", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
