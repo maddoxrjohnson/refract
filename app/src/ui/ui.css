@@ -1,23 +1,60 @@
-/* Glass overlays over the scene. Every component imports this file. */
+/* Paper panels over the scene. Every component imports this file. */
 @import "@fontsource/ibm-plex-sans/400.css";
 @import "@fontsource/ibm-plex-sans/500.css";
 @import "@fontsource/ibm-plex-mono/400.css";
 @import "@fontsource/ibm-plex-mono/500.css";
 
+/* Paper and ink (banknote spec §1.1, §6). Light on :root; dark when the setting says so
+   (data-theme on <html>) or, with no override, when Windows does. */
 :root {
-  --bg: #0a0c12;
-  --fg: #e9eaf0;
-  --muted: #979db0;
-  --glass: #a9d8ff;
-  --amber: #ffb347;
-  --halo: #6fd3ff;
-  --danger: #ff8a8a;
-  --line: #222737;
-  --panel: rgb(16 19 28 / 0.72);
-  --panel-strong: rgb(16 19 28 / 0.86);
+  color-scheme: light;
+  --bg: #e0e3d4;
+  --paper: #eef0e4;
+  --fg: #1f4a3d;
+  /* Paper mixed 78% towards ink, not the spec's 62%: 62% is 3.2:1 on the panel, under
+     WCAG AA; 78% is 4.8:1. */
+  --muted: #4d6f62;
+  --on-fg: #eef0e4;
+  --accent: #b8322a;
+  --line: rgb(31 74 61 / 0.17);
+  --panel: rgb(238 240 228 / 0.86);
+  /* Hover and selected rows, meter tracks. */
+  --wash: rgb(31 74 61 / 0.07);
+  --shadow: 0 6px 20px rgb(0 0 0 / 0.06);
   --sans: "IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", monospace;
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #08100d;
+  --paper: #0e1713;
+  --fg: #d8c78f;
+  /* Paper mixed 62% towards ink: 4.8:1 on the panel. */
+  --muted: #8b8460;
+  --on-fg: #0e1713;
+  --accent: #ff7a5c;
+  --line: rgb(216 199 143 / 0.17);
+  --panel: rgb(14 23 19 / 0.86);
+  --wash: rgb(216 199 143 / 0.08);
+  --shadow: none;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #08100d;
+    --paper: #0e1713;
+    --fg: #d8c78f;
+    --muted: #8b8460;
+    --on-fg: #0e1713;
+    --accent: #ff7a5c;
+    --line: rgb(216 199 143 / 0.17);
+    --panel: rgb(14 23 19 / 0.86);
+    --wash: rgb(216 199 143 / 0.08);
+    --shadow: none;
+  }
 }
 
 .rf-glass {
@@ -28,12 +65,10 @@
   line-height: 1.45;
   background: var(--panel);
   border: 1px solid var(--line);
-  border-radius: 14px;
-  box-shadow:
-    0 1px 0 rgb(255 255 255 / 0.04) inset,
-    0 18px 48px rgb(0 0 0 / 0.45);
-  backdrop-filter: blur(18px) saturate(1.2);
-  -webkit-backdrop-filter: blur(18px) saturate(1.2);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
 }
 
 .rf-glass *,
@@ -55,9 +90,9 @@
   font-family: var(--mono);
   font-size: 11px;
   padding: 1px 6px;
-  border: 1px solid rgb(169 216 255 / 0.28);
+  border: 1px solid var(--line);
   border-radius: 5px;
-  color: var(--glass);
+  color: var(--muted);
 }
 
 /* Buttons */
@@ -71,9 +106,9 @@
   padding: 6px 12px;
   font: 500 13px/1.2 var(--sans);
   color: var(--fg);
-  background: rgb(255 255 255 / 0.04);
+  background: var(--paper);
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 8px;
   cursor: pointer;
   transition:
     background-color 140ms var(--ease-out),
@@ -82,8 +117,8 @@
 }
 
 .rf-button:hover {
-  background: rgb(255 255 255 / 0.08);
-  border-color: #313850;
+  background: color-mix(in srgb, var(--fg) 6%, var(--paper));
+  border-color: color-mix(in srgb, var(--fg) 40%, transparent);
 }
 
 .rf-button:active {
@@ -95,34 +130,35 @@
   width: 100%;
   min-height: 40px;
   padding: 8px 14px;
-  color: #0a0c12;
-  background: var(--glass);
-  border-color: transparent;
+  color: var(--on-fg);
+  background: var(--fg);
+  border-color: var(--fg);
 }
 
 .rf-button--primary:hover {
-  background: #c3e4ff;
+  background: color-mix(in srgb, var(--fg) 86%, var(--paper));
   border-color: transparent;
 }
 
 .rf-button--primary .rf-kbd {
-  color: #0a0c12;
-  border-color: rgb(10 12 18 / 0.3);
+  color: var(--on-fg);
+  border-color: color-mix(in srgb, var(--on-fg) 40%, transparent);
 }
 
 /* The main action in a card, without the full-width launch button's layout. */
 .rf-button--accent {
-  color: #0a0c12;
-  background: var(--glass);
-  border-color: transparent;
+  color: var(--on-fg);
+  background: var(--fg);
+  border-color: var(--fg);
 }
 
 .rf-button--accent:hover {
-  background: #c3e4ff;
+  background: color-mix(in srgb, var(--fg) 86%, var(--paper));
   border-color: transparent;
 }
 
-.rf-button--ghost {
+.rf-button--ghost,
+.rf-button--ghost:hover {
   background: transparent;
   border-color: transparent;
   color: var(--muted);
@@ -141,7 +177,7 @@
 }
 
 .rf-glass :focus-visible {
-  outline: 2px solid var(--halo);
+  outline: 2px solid var(--fg);
   outline-offset: 2px;
 }
 
@@ -149,8 +185,7 @@
 
 .rf-focus-label {
   padding: 8px 12px;
-  border-radius: 12px;
-  max-width: 260px;
+  max-width: 300px;
   pointer-events: none;
   white-space: nowrap;
 }
@@ -174,27 +209,44 @@
   margin-top: 2px;
 }
 
-.rf-state::before {
-  content: "";
-  width: 6px;
-  height: 6px;
+/* Red only when the repo needs you: waiting, or a session stopped mid-task. */
+.rf-state--attention {
+  color: var(--accent);
+}
+
+/* Status swatches (banknote spec §6), one per line, as the scene draws the state. */
+.rf-sw {
+  box-sizing: border-box;
+  width: 10px;
+  height: 10px;
   border-radius: 50%;
-  background: var(--muted);
   flex: none;
 }
 
-.rf-state--dirty::before {
-  background: var(--halo);
-  box-shadow: 0 0 6px var(--halo);
+.rf-sw--clean {
+  border: 1px solid var(--fg);
 }
 
-.rf-state--attention {
-  color: var(--amber);
+.rf-sw--dirty {
+  border: 2px solid var(--accent);
 }
 
-.rf-state--attention::before {
-  background: var(--amber);
-  box-shadow: 0 0 6px var(--amber);
+.rf-sw--working {
+  background: var(--fg);
+}
+
+.rf-sw--waiting {
+  background: var(--accent);
+}
+
+.rf-sw--interrupted {
+  border-radius: 2px;
+  background: var(--accent);
+  clip-path: polygon(0 0, 100% 0, 100% 45%, 45% 100%, 0 100%);
+}
+
+.rf-sw--remote {
+  border: 1px dashed var(--fg);
 }
 
 /* Detail panel: docked on the right */
@@ -207,8 +259,6 @@
   width: min(360px, calc(100vw - 32px));
   display: flex;
   flex-direction: column;
-  border-radius: 16px;
-  background: var(--panel-strong);
   overflow: hidden;
   animation: rf-slide-in 220ms var(--ease-out);
 }
@@ -240,7 +290,7 @@
 
 .rf-section {
   padding: 12px 0;
-  border-bottom: 1px solid rgb(34 39 55 / 0.7);
+  border-bottom: 1px solid var(--line);
 }
 
 .rf-section:last-child {
@@ -276,7 +326,7 @@
 .rf-quote {
   margin: 6px 0 0;
   padding-left: 10px;
-  border-left: 2px solid rgb(169 216 255 / 0.35);
+  border-left: 2px solid color-mix(in srgb, var(--fg) 35%, transparent);
   color: var(--fg);
   display: -webkit-box;
   -webkit-line-clamp: 3;
@@ -296,6 +346,11 @@
   margin: 0;
   font-size: 12px;
   color: var(--muted);
+}
+
+/* "Go to the running agent" while that agent waits for you. */
+.rf-hint--attention {
+  color: var(--accent);
 }
 
 .rf-row {
@@ -323,8 +378,6 @@
   min-width: min(320px, calc(100vw - 32px));
   transform: translateX(-50%);
   padding: 14px;
-  border-radius: 16px;
-  background: var(--panel-strong);
   animation: rf-rise 200ms var(--ease-out);
 }
 
@@ -354,17 +407,17 @@
 .rf-option {
   padding: 9px 12px;
   border: 1px solid transparent;
-  border-radius: 10px;
+  border-radius: 8px;
   cursor: pointer;
 }
 
 .rf-option[aria-selected="true"] {
-  background: rgb(169 216 255 / 0.1);
-  border-color: rgb(169 216 255 / 0.35);
+  background: var(--wash);
+  border-color: color-mix(in srgb, var(--fg) 45%, transparent);
 }
 
 .rf-picker__list:focus-visible .rf-option[aria-selected="true"] {
-  outline: 2px solid var(--halo);
+  outline: 2px solid var(--fg);
   outline-offset: -1px;
 }
 
@@ -409,14 +462,14 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 6px 6px 6px 14px;
-  border-radius: 12px;
+  padding: 6px 6px 6px 16px;
+  border-radius: 999px;
   max-width: calc(100vw - 32px);
 }
 
 .rf-filter__text {
   font: 500 15px/1.3 var(--mono);
-  color: var(--glass);
+  color: var(--fg);
   white-space: pre;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -429,7 +482,7 @@
 }
 
 .rf-filter__count--none {
-  color: var(--amber);
+  color: var(--fg);
 }
 
 /* Quality control */
@@ -467,7 +520,7 @@
   width: 36px;
   height: 36px;
   padding: 0;
-  border-radius: 10px;
+  border-radius: 999px;
   color: var(--muted);
   cursor: pointer;
   transition:
@@ -478,11 +531,11 @@
 .rf-gear:hover,
 .rf-gear[aria-expanded="true"] {
   color: var(--fg);
-  border-color: #313850;
+  border-color: color-mix(in srgb, var(--fg) 40%, transparent);
 }
 
 .rf-gear:focus-visible {
-  outline: 2px solid var(--halo);
+  outline: 2px solid var(--fg);
   outline-offset: 2px;
 }
 
@@ -511,7 +564,7 @@
   gap: 2px;
   padding: 2px;
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 999px;
 }
 
 .rf-quality__option {
@@ -530,7 +583,7 @@
 .rf-quality__option span {
   display: block;
   padding: 5px 10px;
-  border-radius: 7px;
+  border-radius: 999px;
   text-align: center;
   white-space: nowrap;
   color: var(--muted);
@@ -540,13 +593,51 @@
 }
 
 .rf-quality__option input:checked + span {
-  color: var(--fg);
-  background: rgb(169 216 255 / 0.14);
+  color: var(--on-fg);
+  background: var(--fg);
 }
 
-.rf-quality__option input:focus-visible + span {
-  outline: 2px solid var(--halo);
+.rf-quality__option input:focus-visible + span,
+.rf-segmented__option input:focus-visible + span {
+  outline: 2px solid var(--fg);
   outline-offset: 1px;
+}
+
+/* The same pill segments in the settings dialog (Appearance). */
+.rf-segmented {
+  display: inline-flex;
+  gap: 2px;
+  margin: 0 0 4px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+}
+
+.rf-segmented__option {
+  position: relative;
+}
+
+.rf-segmented__option input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  margin: 0;
+  cursor: pointer;
+}
+
+.rf-segmented__option span {
+  display: block;
+  padding: 5px 14px;
+  border-radius: 999px;
+  color: var(--muted);
+  transition:
+    background-color 140ms var(--ease-out),
+    color 140ms var(--ease-out);
+}
+
+.rf-segmented__option input:checked + span {
+  color: var(--on-fg);
+  background: var(--fg);
 }
 
 /* Always laid out, so switching away from Auto doesn't change the control's height. */
@@ -581,19 +672,20 @@
 }
 
 .rf-ci__status--success::before {
-  background: #7ee2a8;
+  background: var(--fg);
 }
 
 .rf-ci__status--failure {
-  color: var(--danger);
+  color: var(--accent);
 }
 
 .rf-ci__status--failure::before {
-  background: var(--danger);
+  background: var(--accent);
 }
 
 .rf-ci__status--pending::before {
-  background: var(--amber);
+  background: transparent;
+  border: 1px solid var(--fg);
 }
 
 .rf-updated {
@@ -608,11 +700,11 @@
   padding: 0;
   font: inherit;
   font-size: 12px;
-  color: var(--glass);
+  color: var(--fg);
   background: none;
   border: 0;
   text-decoration: underline;
-  text-decoration-color: rgb(169 216 255 / 0.4);
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
   text-underline-offset: 2px;
   cursor: pointer;
 }
@@ -624,14 +716,14 @@
 .rf-error {
   margin: 6px 0 0;
   font-size: 12px;
-  color: var(--danger);
+  color: var(--accent);
   overflow-wrap: anywhere;
 }
 
 .rf-ok {
   margin: 6px 0 0;
   font-size: 12px;
-  color: var(--glass);
+  color: var(--fg);
   overflow-wrap: anywhere;
 }
 
@@ -662,8 +754,6 @@
   flex-direction: column;
   width: min(400px, calc(100vw - 32px));
   min-height: 0;
-  border-radius: 16px;
-  background: var(--panel-strong);
   overflow: hidden;
   animation: rf-rise 200ms var(--ease-out);
 }
@@ -730,9 +820,9 @@
   padding: 6px 10px;
   font: 13px/1.2 var(--sans);
   color: var(--fg);
-  background: rgb(0 0 0 / 0.25);
-  border: 1px solid var(--line);
-  border-radius: 9px;
+  background: var(--paper);
+  border: 1px solid color-mix(in srgb, var(--fg) 28%, transparent);
+  border-radius: 8px;
 }
 
 .rf-input.rf-mono {
@@ -741,11 +831,12 @@
 }
 
 .rf-input::placeholder {
-  color: rgb(151 157 176 / 0.6);
+  color: var(--muted);
+  opacity: 0.8;
 }
 
 .rf-input:focus-visible {
-  outline: 2px solid var(--halo);
+  outline: 2px solid var(--fg);
   outline-offset: 0;
   border-color: transparent;
 }
@@ -762,7 +853,7 @@
   width: 15px;
   height: 15px;
   margin: 0;
-  accent-color: var(--glass);
+  accent-color: var(--fg);
 }
 
 .rf-button:disabled {
@@ -877,8 +968,6 @@
   flex-direction: column;
   width: min(360px, calc(100vw - 32px));
   min-height: 0;
-  border-radius: 16px;
-  background: var(--panel-strong);
   overflow: hidden;
   animation: rf-rise 200ms var(--ease-out);
 }
@@ -930,22 +1019,24 @@
   line-height: 1.5;
   white-space: pre;
   color: var(--muted);
-  background: rgb(0 0 0 / 0.3);
+  background: var(--wash);
   border: 1px solid var(--line);
-  border-radius: 9px;
+  border-radius: 8px;
 }
 
 .rf-diff__body:focus-visible {
-  outline: 2px solid var(--halo);
+  outline: 2px solid var(--fg);
   outline-offset: 0;
 }
 
 .rf-diff__add {
-  color: #7ee2a8;
+  color: var(--fg);
+  font-weight: 500;
 }
 
 .rf-diff__del {
-  color: var(--danger);
+  color: var(--muted);
+  text-decoration: line-through;
 }
 
 /* Move to WSL: the gem marks, the panel section and the dialog */
@@ -961,13 +1052,12 @@
   position: absolute;
   left: calc(var(--r, 20px) * -0.66 - 6px);
   top: calc(var(--r, 20px) * -0.66 - 6px);
-  fill: rgb(169 216 255 / 0.16);
-  stroke: rgb(169 216 255 / 0.62);
+  fill: color-mix(in srgb, var(--fg) 14%, transparent);
+  stroke: var(--fg);
   stroke-width: 0.8;
-  filter: drop-shadow(0 0 3px rgb(111 211 255 / 0.45));
 }
 
-/* A thin ring just outside the facets, inside the halo; it fills as the move goes on. */
+/* A thin ring just outside the stone; it fills as the move goes on. */
 .rf-move-ring {
   position: absolute;
   width: calc(var(--r, 20px) * 2.24);
@@ -985,19 +1075,17 @@
 }
 
 .rf-move-ring__track {
-  stroke: rgb(169 216 255 / 0.14);
+  stroke: color-mix(in srgb, var(--fg) 16%, transparent);
 }
 
 .rf-move-ring__fill {
-  stroke: var(--glass);
+  stroke: var(--fg);
   stroke-linecap: round;
-  filter: drop-shadow(0 0 4px rgb(111 211 255 / 0.7));
   transition: stroke-dasharray 400ms var(--ease-out);
 }
 
 .rf-move-ring--failed .rf-move-ring__fill {
-  stroke: var(--amber);
-  filter: drop-shadow(0 0 4px rgb(255 179 71 / 0.6));
+  stroke: var(--accent);
 }
 
 .rf-focus-label__drive {
@@ -1008,13 +1096,15 @@
   white-space: normal;
 }
 
-.rf-state--move {
-  color: var(--glass);
-}
-
 .rf-state--move::before {
-  background: var(--glass);
-  box-shadow: 0 0 6px var(--halo);
+  content: "";
+  width: 10px;
+  height: 10px;
+  box-sizing: border-box;
+  border: 1px solid var(--fg);
+  border-right-color: transparent;
+  border-radius: 50%;
+  flex: none;
 }
 
 .rf-move-section__line {
@@ -1022,7 +1112,7 @@
 }
 
 .rf-move-section__line--failed {
-  color: var(--amber);
+  color: var(--accent);
 }
 
 .rf-move-section__step {
@@ -1038,14 +1128,13 @@
   height: 4px;
   overflow: hidden;
   border-radius: 2px;
-  background: rgb(255 255 255 / 0.08);
+  background: var(--wash);
 }
 
 .rf-move-bar__fill {
   height: 100%;
   border-radius: 2px;
-  background: var(--glass);
-  box-shadow: 0 0 6px var(--halo);
+  background: var(--fg);
   transition: width 400ms var(--ease-out);
 }
 
@@ -1069,8 +1158,6 @@
   width: min(420px, calc(100vw - 32px));
   display: flex;
   flex-direction: column;
-  border-radius: 16px;
-  background: var(--panel-strong);
   overflow: hidden;
   animation: rf-slide-in 220ms var(--ease-out);
 }
@@ -1139,7 +1226,7 @@
 }
 
 .rf-move-warn {
-  color: var(--amber);
+  color: var(--accent);
 }
 
 .rf-move-list {
@@ -1172,7 +1259,7 @@
 .rf-move-list code,
 .rf-move-check code {
   font-size: 12px;
-  color: var(--glass);
+  color: var(--fg);
 }
 
 .rf-move-warnings {
@@ -1181,7 +1268,7 @@
 }
 
 .rf-move-warnings li::marker {
-  color: var(--amber);
+  color: var(--accent);
 }
 
 .rf-move-warnings li + li {
@@ -1217,7 +1304,7 @@
 .rf-move-refusals {
   margin: 0;
   padding-left: 18px;
-  color: var(--amber);
+  color: var(--accent);
 }
 
 .rf-move-refusals li + li {
@@ -1249,7 +1336,7 @@
 }
 
 .rf-move-verdict--failed {
-  color: var(--amber);
+  color: var(--accent);
 }
 
 .rf-move-checks {
@@ -1274,12 +1361,12 @@
 }
 
 .rf-move-check--passed .rf-move-check__icon {
-  color: #7ee2a8;
+  color: var(--fg);
 }
 
 .rf-move-check--failed .rf-move-check__icon,
 .rf-move-check--failed .rf-move-check__advice {
-  color: var(--amber);
+  color: var(--accent);
 }
 
 .rf-move-check__body {
@@ -1307,13 +1394,13 @@
 }
 
 .rf-button--danger {
-  color: var(--danger);
-  border-color: rgb(255 138 138 / 0.35);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
 }
 
 .rf-button--danger:hover {
-  background: rgb(255 138 138 / 0.08);
-  border-color: rgb(255 138 138 / 0.55);
+  background: color-mix(in srgb, var(--accent) 7%, var(--paper));
+  border-color: color-mix(in srgb, var(--accent) 60%, transparent);
 }
 
 /* Widgets: system load top right, Claude usage bottom right. Both fade while the detail
@@ -1340,7 +1427,7 @@
 }
 
 .rf-widget--usage:focus-visible {
-  outline: 2px solid var(--halo);
+  outline: 2px solid var(--fg);
   outline-offset: 2px;
 }
 
@@ -1379,7 +1466,7 @@
   position: relative;
   height: 6px;
   border-radius: 3px;
-  background: rgb(255 255 255 / 0.07);
+  background: var(--wash);
   overflow: hidden;
 }
 
@@ -1392,13 +1479,12 @@
 }
 
 .rf-meter__fill {
-  background: rgb(169 216 255 / 0.4);
+  background: color-mix(in srgb, var(--fg) 32%, transparent);
 }
 
 /* Refract's share, from the start of the bar. */
 .rf-meter__own {
-  background: var(--halo);
-  box-shadow: 0 0 6px var(--halo);
+  background: var(--fg);
 }
 
 .rf-meter__value {
@@ -1420,8 +1506,7 @@
   width: 8px;
   height: 8px;
   border-radius: 2px;
-  background: var(--halo);
-  box-shadow: 0 0 6px var(--halo);
+  background: var(--fg);
 }
 
 .rf-usage__totals {
@@ -1487,8 +1572,7 @@
 }
 
 .rf-usage__agents--live::before {
-  background: var(--halo);
-  box-shadow: 0 0 6px var(--halo);
+  background: var(--fg);
 }
 
 /* Plan limits from the status line: a line of text over a thin meter per window. */
@@ -1529,7 +1613,7 @@
   height: 3px;
   margin-top: 3px;
   border-radius: 2px;
-  background: rgb(255 255 255 / 0.07);
+  background: var(--wash);
   overflow: hidden;
 }
 
@@ -1537,14 +1621,13 @@
   position: absolute;
   inset: 0 auto 0 0;
   border-radius: 2px;
-  background: rgb(169 216 255 / 0.55);
+  background: color-mix(in srgb, var(--fg) 60%, transparent);
   transition: width 600ms var(--ease-out);
 }
 
-/* Close to the limit, the bar turns amber like a gem that needs attention. */
+/* Close to the limit, the bar turns red: it needs you. */
 .rf-limit__fill--high {
-  background: var(--amber);
-  box-shadow: 0 0 6px var(--amber);
+  background: var(--accent);
 }
 
 /* The 7-day breakdown grows the widget upward, short of the system widget. */
@@ -1630,11 +1713,11 @@
 }
 
 .rf-toast__line--error {
-  color: var(--danger);
+  color: var(--accent);
 }
 
 .rf-toast__line--done {
-  color: var(--glass);
+  color: var(--fg);
 }
 
 .rf-toast--done {
@@ -1678,6 +1761,7 @@
   .rf-button,
   .rf-gear,
   .rf-quality__option span,
+  .rf-segmented__option span,
   .rf-meter__fill,
   .rf-meter__own,
   .rf-limit__fill,
@@ -1706,15 +1790,14 @@
   display: grid;
   place-items: center;
   padding: 16px;
-  background: rgb(4 5 9 / 0.35);
+  background: color-mix(in srgb, var(--bg) 45%, transparent);
   animation: rf-term-fade 180ms var(--ease-out);
 }
 
 .rf-term {
   width: min(720px, 100%);
   overflow: hidden;
-  border-radius: 12px;
-  background: rgb(14 16 23 / 0.88);
+  background: var(--panel);
   animation: rf-term-rise 240ms var(--ease-out);
 }
 
@@ -1742,11 +1825,11 @@
   line-height: 1.55;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
-  color: #d4d7e2;
+  color: var(--fg);
 }
 
 .rf-term__prompt {
-  color: var(--halo);
+  color: var(--muted);
 }
 
 .rf-term__cursor {
@@ -1754,7 +1837,7 @@
   width: 0.6em;
   height: 1.1em;
   vertical-align: text-bottom;
-  background: #d4d7e2;
+  background: var(--fg);
   animation: rf-term-blink 1s steps(1) infinite;
 }
 
@@ -1762,7 +1845,7 @@
   padding: 8px 16px;
   border-top: 1px solid var(--line);
   font-size: 12px;
-  color: var(--amber);
+  color: var(--muted);
 }
 
 .rf-demo-badge {

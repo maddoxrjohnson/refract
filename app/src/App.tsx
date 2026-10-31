@@ -29,6 +29,7 @@ import { hideKey, mergeProjects } from "./projects";
 import { createQualityController } from "./quality/controller";
 import type { QualityLevel, QualitySetting } from "./quality/tiers";
 import { initialRepoState, repoReducer } from "./repoState";
+import { useThemeMode } from "./theme";
 import { layoutGems } from "./scene/layout";
 import { SceneBoundary } from "./scene/SceneBoundary";
 import { DetailPanel } from "./ui/DetailPanel";
@@ -79,6 +80,7 @@ const DEFAULT_SETTINGS: Settings = {
   showArchived: false,
   hidden: [],
   costEstimate: { enabled: false, prices: [...DEFAULT_PRICES] },
+  theme: "system",
 };
 
 /** The host name (no port) of a GitLab address, or `null` when it does not parse. */
@@ -324,6 +326,7 @@ export function App({ backend }: { backend: Backend }) {
   const repos = useMemo(() => new Map(repoList.map((r) => [r.path, r])), [repoList]);
   const positions = useMemo(() => layoutGems(repoList), [repoList]);
   const reducedMotion = useReducedMotion();
+  const themeMode = useThemeMode(settings?.theme ?? DEFAULT_SETTINGS.theme, backend);
   const quality = useQuality(backend);
 
   // One launch at a time: a held or repeated Enter must not start several agents.
@@ -545,7 +548,7 @@ export function App({ backend }: { backend: Backend }) {
             remoteOnly={projects.remoteOnly}
             visible={visible}
             quality={quality.level}
-            theme="light"
+            theme={themeMode}
             reducedMotion={reducedMotion}
             matches={matches}
             focused={nav.focused}

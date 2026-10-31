@@ -3,6 +3,7 @@ import type { Backend } from "../backend/Backend";
 import type { Credentials, RemoteKind, RemoteSource, Settings } from "../backend/types";
 import type { HookControls } from "../hooks/useHook";
 import { describeKey } from "../projects";
+import type { ThemeSetting } from "../theme";
 import { CostSection } from "./CostSection";
 import { HookSection } from "./HookOffer";
 import { describeError } from "./StatusToast";
@@ -31,6 +32,13 @@ const GITHUB_SOURCE: Record<Credentials["github"], string> = {
   stored: "Stored token",
   missing: "Missing",
 };
+
+/** The Appearance choices, in the order shown. */
+const THEMES: ReadonlyArray<readonly [ThemeSetting, string]> = [
+  ["light", "Light"],
+  ["dark", "Dark"],
+  ["system", "System"],
+];
 
 /** A one-line result under a form: done, or what went wrong. */
 type Note = { tone: "ok" | "error"; text: string } | null;
@@ -96,8 +104,8 @@ function TokenForm({
 }
 
 /**
- * GitLab URL, tokens, forks and archived, hidden repos and extra folders (spec §5), the
- * usage cost estimate (spec §3.5) and the status hook (spec §6.2).
+ * Appearance (banknote spec §5), GitLab URL, tokens, forks and archived, hidden repos and
+ * extra folders (spec §5), the usage cost estimate (spec §3.5) and the status hook (spec §6.2).
  */
 export function SettingsPanel({
   backend,
@@ -215,6 +223,27 @@ export function SettingsPanel({
         <p className="rf-settings__body rf-muted">Loading…</p>
       ) : (
         <div className="rf-settings__body">
+          <section className="rf-section" aria-labelledby={`${titleId}-appearance`}>
+            <h3 id={`${titleId}-appearance`} className="rf-section__label">
+              Appearance
+            </h3>
+            <div className="rf-segmented" role="radiogroup" aria-labelledby={`${titleId}-appearance`}>
+              {THEMES.map(([value, label]) => (
+                <label key={value} className="rf-segmented__option">
+                  <input
+                    type="radio"
+                    name={`${titleId}-theme`}
+                    value={value}
+                    checked={settings.theme === value}
+                    onChange={() => void save({ ...settings, theme: value }, "theme")}
+                  />
+                  <span>{label}</span>
+                </label>
+              ))}
+            </div>
+            <NoteLine note={notes.theme ?? null} />
+          </section>
+
           <section className="rf-section" aria-labelledby={`${titleId}-github`}>
             <h3 id={`${titleId}-github`} className="rf-section__label">
               GitHub

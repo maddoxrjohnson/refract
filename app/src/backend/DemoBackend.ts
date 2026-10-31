@@ -409,6 +409,7 @@ export class DemoBackend implements Backend {
     hidden: [],
     // On in the demo, so it shows what the estimate looks like.
     costEstimate: { enabled: true, prices: [...DEFAULT_PRICES] },
+    theme: "system",
   };
   private creds: Credentials = { github: "ghCli", gitlab: "stored" };
   private hookInstalled = false;
@@ -564,6 +565,10 @@ export class DemoBackend implements Backend {
 
   setSettings(settings: Settings): Promise<void> {
     this.settings = structuredClone(settings);
+    return Promise.resolve();
+  }
+
+  setWindowTheme(): Promise<void> {
     return Promise.resolve();
   }
 

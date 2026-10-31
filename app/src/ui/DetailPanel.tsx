@@ -8,7 +8,8 @@ import type {
   SessionInfo,
 } from "../backend/types";
 import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
-import { hostLabel, remoteUrl } from "../repoStatus";
+import { hostLabel, remoteUrl, repoStatus } from "../repoStatus";
+import { StatusLine } from "./FocusLabel";
 import { firstLine, relativeTime, sessionStateLabel } from "./format";
 import { focusableSession, newAgentMode, resumableSession } from "./navigation";
 import "./ui.css";
@@ -204,6 +205,7 @@ export function DetailPanel({
         <div className="rf-muted">
           {host} · {repo.language ?? "Unknown language"}
         </div>
+        <StatusLine repo={repo} notCloned={remoteOnly} />
       </div>
       <button
         type="button"
@@ -331,7 +333,10 @@ export function DetailPanel({
             Enter
           </kbd>
         </button>
-        <p id={hintId} className="rf-hint">
+        <p
+          id={hintId}
+          className={`rf-hint${running && repoStatus(repo).waiting ? " rf-hint--attention" : ""}`}
+        >
           {direct
             ? "Enter starts a new agent in VS Code."
             : running

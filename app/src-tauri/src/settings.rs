@@ -42,6 +42,29 @@ pub struct Settings {
     /// shape gives the defaults rather than failing the whole file.
     #[serde(deserialize_with = "lenient_cost_estimate")]
     pub cost_estimate: CostEstimate,
+    /// Light, dark, or following Windows (banknote spec §5). An unknown value reads as
+    /// following Windows.
+    #[serde(deserialize_with = "lenient_theme")]
+    pub theme: Theme,
+}
+
+/// What the user chose under Appearance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Theme {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Reads `theme`, falling back to following Windows when it is not a known value.
+fn lenient_theme<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Theme, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).unwrap_or_else(|err| {
+        eprintln!("refract: the saved theme is not valid: {err}; following Windows");
+        Theme::System
+    }))
 }
 
 /// Reads `costEstimate`, falling back to the defaults, after saying why on stderr, when
@@ -355,7 +378,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             wire,
-            json!({"gitlabUrl": null, "showForks": false, "showArchived": false, "hidden": []})
+            json!({"gitlabUrl": null, "showForks": false, "showArchived": false, "hidden": [],
+                "theme": "system"})
         );
         assert_eq!(cost["enabled"], false);
         assert_eq!(
@@ -485,6 +509,33 @@ mod tests {
     }
 
     #[test]
+    fn theme_reads_leniently() {
+        assert_eq!(parse("{}").unwrap().theme, Theme::System);
+        for (text, theme) in [
+            (r#"{"theme": "light"}"#, Theme::Light),
+            (r#"{"theme": "dark"}"#, Theme::Dark),
+            (r#"{"theme": "system"}"#, Theme::System),
+            (r#"{"theme": "sepia", "showForks": true}"#, Theme::System),
+            (r#"{"theme": 3, "showForks": true}"#, Theme::System),
+            (r#"{"theme": null, "showForks": true}"#, Theme::System),
+        ] {
+            assert_eq!(parse(text).unwrap().theme, theme, "{text}");
+        }
+        // A bad theme leaves the rest of the file alone.
+        assert!(
+            parse(r#"{"theme": "sepia", "showForks": true}"#)
+                .unwrap()
+                .show_forks
+        );
+        let wire = serde_json::to_value(Settings {
+            theme: Theme::Dark,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(wire["theme"], "dark");
+    }
+
+    #[test]
     fn price_tables_are_checked() {
         let row = |pattern: &str, input: f64| PriceRow {
             pattern: pattern.into(),
@@ -574,6 +625,7 @@ mod tests {
                     cache_read: 0.1,
                 }],
             },
+            theme: Theme::Dark,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), settings);

@@ -1,6 +1,5 @@
 /* App frame. Colours, fonts and the overlay panels live in ui/ui.css. */
 :root {
-  color-scheme: dark;
   font-family: var(--sans);
   font-size: 14px;
 }
@@ -24,7 +23,7 @@ main.app {
 .scene {
   position: absolute;
   inset: 0;
-  background: #040509;
+  background: var(--bg);
 }
 
 .scene canvas {
@@ -67,6 +66,6 @@ main.app {
   transform: translateX(-50%);
   margin: 0;
   max-width: 60ch;
-  color: var(--danger);
+  color: var(--accent);
   font-size: 12px;
 }
