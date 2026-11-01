@@ -12,7 +12,7 @@
 //! a worktree is only deleted when its real path is under the worktrees directory and
 //! the repo's `git worktree list` names it.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -25,10 +25,10 @@ use refract_core::classify::{classify_report, LiveState, SessionState};
 use refract_core::launch::folder_uri;
 use refract_core::protocol::{
     code, ErrorBody, Event, LaunchMode, LaunchTicket, MergeBlock, MergeBlockReason, MergeOutcome,
-    RefactorCommit, RefactorInfo, RefactorState,
+    RefactorCommit, RefactorInfo, RefactorState, Reply,
 };
 use refract_core::refactor::{self as rules, ResultFile};
-use refract_core::sessions::paths_match;
+use refract_core::sessions::{path_within, paths_match};
 use refract_core::transcript::SessionSummary;
 use serde::{Deserialize, Serialize};
 
@@ -42,10 +42,20 @@ use crate::state::{path_str, Agent, Refresh};
 /// interrupted rather than starting.
 pub const START_GRACE: TimeDelta = TimeDelta::minutes(2);
 
-/// How often refactors are looked at again while one is starting or its agent runs.
+/// Without a hook status, a live agent whose transcript ends with a finished turn
+/// counts as idle only once the transcript has not been written for this long.
+pub const IDLE_QUIET: TimeDelta = TimeDelta::seconds(20);
+
+/// Seconds to use instead of [`START_GRACE`], for tests.
+pub const GRACE_ENV: &str = "REFRACT_REFACTOR_GRACE_SECS";
+
+/// Seconds to use instead of [`IDLE_QUIET`], for tests.
+pub const QUIET_ENV: &str = "REFRACT_REFACTOR_QUIET_SECS";
+
+/// How often refactors are looked at again while one is starting or its agent works.
 pub const ACTIVE_POLL: Duration = Duration::from_secs(3);
 
-/// How often they are looked at otherwise.
+/// How often all of them are looked at.
 pub const IDLE_POLL: Duration = Duration::from_secs(30);
 
 /// What the helper remembers about a refactor, as `<uuid>.json` in the records
@@ -62,17 +72,29 @@ pub struct Record {
     /// Empty when no session is known (an adopted worktree without transcripts).
     #[serde(default)]
     pub session_id: String,
+    /// The last launch request written for it; empty when none is known.
+    #[serde(default)]
+    pub request_id: String,
     #[serde(default)]
     pub focus: Option<String>,
     pub created_at: DateTime<Utc>,
     /// When an agent was last launched for it; `createdAt` until it is resumed.
     #[serde(default)]
     pub launched_at: Option<DateTime<Utc>>,
+    /// Found on disk without a record, so never starting.
+    #[serde(default)]
+    pub adopted: bool,
     #[serde(default)]
     pub blocked: Option<MergeBlock>,
     /// The branch's commit when the merge stopped: a new commit clears `blocked`.
     #[serde(default)]
     pub blocked_head: Option<String>,
+    /// Merged, but its worktree could not be removed; only a discard is left.
+    #[serde(default)]
+    pub leftover: bool,
+    /// Why the worktree was kept.
+    #[serde(default)]
+    pub leftover_reason: Option<String>,
 }
 
 #[derive(Debug)]
@@ -84,6 +106,8 @@ struct Entry {
     git_dir: Option<PathBuf>,
     /// The state last reported.
     info: Option<RefactorInfo>,
+    /// The sessions last seen live in the worktree, so their hook statuses refresh it.
+    live_ids: Vec<String>,
 }
 
 /// Every refactor, by repo path.
@@ -92,7 +116,13 @@ pub struct Refactors {
     records_dir: PathBuf,
     worktrees_dir: PathBuf,
     distro: Option<String>,
+    grace: TimeDelta,
+    quiet: TimeDelta,
     entries: BTreeMap<PathBuf, Entry>,
+    /// Repos whose start, merge or discard runs on the worker (see [`Job`]).
+    busy: BTreeSet<PathBuf>,
+    /// When every refactor was last looked at by [`Refactors::poll`].
+    last_full: Option<DateTime<Utc>>,
 }
 
 type Fail = ErrorBody;
@@ -104,18 +134,481 @@ fn fail(message: impl Into<String>) -> Fail {
     }
 }
 
+fn busy() -> Fail {
+    fail("This repo's refactor is busy with another action; try again in a moment.")
+}
+
+/// Whole seconds from the environment variable `name`, if set and valid.
+fn env_secs(name: &str) -> Option<TimeDelta> {
+    let secs: i64 = std::env::var(name).ok()?.trim().parse().ok()?;
+    (secs >= 0).then(|| TimeDelta::seconds(secs))
+}
+
+/// What a refactor request does next: run on the worker, or answer at once.
+pub enum Step {
+    Run(Job),
+    Answer(Reply, Vec<Event>),
+}
+
+/// A start, merge or discard, which runs git and so runs on a worker thread, away from
+/// the agent's state. [`Refactors::finish`] takes in its [`Done`].
+#[derive(Debug)]
+pub struct Job {
+    repo: PathBuf,
+    records_dir: PathBuf,
+    worktrees_dir: PathBuf,
+    distro: Option<String>,
+    now: DateTime<Utc>,
+    kind: Kind,
+}
+
+#[derive(Debug)]
+enum Kind {
+    Start {
+        focus: Option<String>,
+        launch_dir: PathBuf,
+    },
+    Merge(Record),
+    Discard(Record),
+}
+
+/// What a [`Job`] did.
+#[derive(Debug)]
+pub struct Done {
+    repo: PathBuf,
+    kind: DoneKind,
+}
+
+#[derive(Debug)]
+enum DoneKind {
+    Started(Result<Box<Started>, Fail>),
+    Merged(Result<Merged, Fail>),
+    Discarded(Result<(), Fail>),
+    Failed(Fail),
+}
+
+#[derive(Debug)]
+struct Started {
+    ticket: LaunchTicket,
+    id: String,
+    record: Record,
+    git_dir: PathBuf,
+}
+
+#[derive(Debug)]
+enum Merged {
+    Blocked {
+        reason: MergeBlockReason,
+        files: Vec<String>,
+    },
+    Done {
+        commits: u32,
+        kept: Vec<String>,
+        /// Why the worktree could not be removed.
+        leftover: Option<String>,
+    },
+}
+
+impl Job {
+    /// The repo the job is for.
+    pub fn repo(&self) -> &Path {
+        &self.repo
+    }
+
+    /// Runs the job: git and files only, no agent state.
+    pub fn run(self) -> Done {
+        let kind = match &self.kind {
+            Kind::Start { focus, launch_dir } => {
+                DoneKind::Started(self.start(focus.as_deref(), launch_dir).map(Box::new))
+            }
+            Kind::Merge(record) => DoneKind::Merged(self.merge(record)),
+            Kind::Discard(record) => DoneKind::Discarded(self.discard(record)),
+        };
+        Done {
+            repo: self.repo,
+            kind,
+        }
+    }
+
+    fn start(&self, focus: Option<&str>, launch_dir: &Path) -> Result<Started, Fail> {
+        let repo = &self.repo;
+        let Some(base) = commit_of(repo, "HEAD") else {
+            return Err(fail("The repo has no commits yet."));
+        };
+        let Some(target) = current_branch(repo) else {
+            return Err(fail("Check out a branch first."));
+        };
+        fs::create_dir_all(&self.worktrees_dir).map_err(|e| {
+            fail(format!(
+                "cannot create {}: {e}",
+                self.worktrees_dir.display()
+            ))
+        })?;
+        let stamp = rules::stamp(chrono::Local::now().naive_local());
+        let repo_name = repo
+            .file_name()
+            .map_or_else(|| "repo".into(), |n| n.to_string_lossy().into_owned());
+        // Both are free now, so whatever is there after a failure was made by this call.
+        let worktree = (1..)
+            .map(|n| {
+                self.worktrees_dir.join(rules::numbered(
+                    &rules::worktree_name(&repo_name, &stamp),
+                    n,
+                ))
+            })
+            .find(|p| fs::symlink_metadata(p).is_err())
+            .expect("a free name");
+        let branch = (1..)
+            .map(|n| rules::numbered(&rules::branch_name(&stamp), n))
+            .find(|b| !branch_exists(repo, b))
+            .expect("a free branch");
+        let wt = path_str(&worktree);
+        // A failure takes back the worktree and branch this call made.
+        let undo = |why: Fail| {
+            if fs::symlink_metadata(&worktree).is_ok()
+                && check_safe(&self.worktrees_dir, repo, &worktree).is_ok()
+            {
+                let _ = run_git(repo, &["worktree", "remove", "--force", &wt]);
+            }
+            if branch_exists(repo, &branch) {
+                let _ = run_git(repo, &["branch", "-q", "-D", &branch]);
+            }
+            why
+        };
+        let added = run_git(repo, &["worktree", "add", "-q", "-b", &branch, &wt, &base])
+            .map_err(|e| undo(fail(format!("cannot run git: {e}"))))?;
+        if !added.ok {
+            return Err(undo(fail(format!(
+                "git worktree add failed: {}",
+                added.stderr.trim()
+            ))));
+        }
+        let git_dir = absolute_git_dir(&worktree)
+            .ok_or_else(|| undo(fail("cannot find the new worktree's git directory")))?;
+        let result_path = path_str(&git_dir.join(rules::RESULT_FILE));
+        let focus = focus.and_then(rules::clean_focus);
+        let mode = LaunchMode::New {
+            prompt: Some(rules::prompt(&branch, &result_path, focus.as_deref())),
+            plan_mode: true,
+        };
+        let ids = launch::Ids::new(&mode);
+        let record = Record {
+            repo: path_str(repo),
+            worktree: wt.clone(),
+            branch: branch.clone(),
+            base_commit: base,
+            target_branch: target,
+            session_id: ids.session_id.clone(),
+            request_id: ids.request_id.clone(),
+            focus,
+            created_at: self.now.trunc_subsecs(0),
+            launched_at: None,
+            adopted: false,
+            blocked: None,
+            blocked_head: None,
+            leftover: false,
+            leftover_reason: None,
+        };
+        // The record first, so a launched agent always has one.
+        let id = uuid::Uuid::new_v4().to_string();
+        write_record(&self.records_dir, &id, &record)
+            .map_err(|e| undo(fail(format!("cannot save the refactor's record: {e}"))))?;
+        let ticket = launch::prepare_planned(
+            &wt,
+            &mode,
+            rules::TITLE,
+            &ids,
+            launch_dir,
+            self.distro.as_deref(),
+            self.now,
+        )
+        .map_err(|e| {
+            let _ = fs::remove_file(self.records_dir.join(format!("{id}.json")));
+            undo(e)
+        })?;
+        Ok(Started {
+            ticket,
+            id,
+            record,
+            git_dir,
+        })
+    }
+
+    /// Spec §5.2–3: checks, then the rebase in the worktree, then the fast-forward of
+    /// the target, then the clean-up. Anything that stops it before the fast-forward
+    /// leaves the repo, the worktree and the branch as they were (a finished rebase
+    /// aside).
+    fn merge(&self, record: &Record) -> Result<Merged, Fail> {
+        let repo = &self.repo;
+        let worktree = Path::new(&record.worktree);
+        let blocked = |reason, files| Ok(Merged::Blocked { reason, files });
+        check_safe(&self.worktrees_dir, repo, worktree)?;
+        let target_ref = format!("refs/heads/{}", record.target_branch);
+        let branch_ref = format!("refs/heads/{}", record.branch);
+        if commit_of(repo, &branch_ref).is_none() {
+            return Err(fail(format!("The branch {} is gone.", record.branch)));
+        }
+        if commit_of(repo, &target_ref).is_none() {
+            return blocked(MergeBlockReason::TargetMissing, vec![]);
+        }
+        if !is_ancestor(repo, &record.base_commit, &target_ref) {
+            return blocked(MergeBlockReason::TargetRewound, vec![]);
+        }
+        // The worktree must be on its branch, with nothing under way and nothing
+        // uncommitted.
+        let wt_git = absolute_git_dir(worktree)
+            .ok_or_else(|| fail("cannot find the worktree's git directory"))?;
+        let under_way = [
+            "rebase-merge",
+            "rebase-apply",
+            "MERGE_HEAD",
+            "CHERRY_PICK_HEAD",
+            "REVERT_HEAD",
+        ]
+        .iter()
+        .any(|f| fs::symlink_metadata(wt_git.join(f)).is_ok());
+        if under_way || symbolic_head(worktree).as_deref() != Some(branch_ref.as_str()) {
+            return blocked(MergeBlockReason::WorktreeBusy, vec![]);
+        }
+        let dirty = changed_in_worktree(worktree)?;
+        if !dirty.is_empty() {
+            return blocked(MergeBlockReason::WorktreeDirty, dirty);
+        }
+        let range = format!("{target_ref}..{branch_ref}");
+        if count(repo, &range) == 0 {
+            return Err(fail("The refactor has no commits to merge."));
+        }
+        let holders = target_holders(repo, worktree, &target_ref)?;
+        if !holders.is_empty() {
+            return blocked(MergeBlockReason::TargetBusy, holders);
+        }
+        // Where the target is checked out in the repo itself, its uncommitted files must
+        // not be ones the refactor changed.
+        let checked_out = symbolic_head(repo).as_deref() == Some(target_ref.as_str());
+        if checked_out {
+            let clash = dirty_overlap(repo, &target_ref, &branch_ref)?;
+            if !clash.is_empty() {
+                return blocked(MergeBlockReason::DirtyOverlap, clash);
+            }
+        }
+        // The branch onto the target, in the worktree; undone on conflict.
+        if !is_ancestor(repo, &target_ref, &branch_ref) {
+            let mut args = REBASE.to_vec();
+            args.push(&target_ref);
+            let rebase =
+                run_git(worktree, &args).map_err(|e| fail(format!("cannot run git: {e}")))?;
+            if !rebase.ok {
+                let conflicted = run_git(worktree, &["diff", "--name-only", "--diff-filter=U"])
+                    .map(|o| lines(&o.stdout))
+                    .unwrap_or_default();
+                // None was under way before, so this one is Refract's.
+                if rebase_under_way(&wt_git) {
+                    let _ = run_git(worktree, &["rebase", "--abort"]);
+                }
+                if conflicted.is_empty() {
+                    return Err(fail(format!("git rebase failed: {}", rebase.stderr.trim())));
+                }
+                return blocked(MergeBlockReason::Conflict, conflicted);
+            }
+        }
+        let commits = count(repo, &range);
+        let Some(head) = commit_of(repo, &branch_ref) else {
+            return Err(fail(format!("The branch {} is gone.", record.branch)));
+        };
+        // HEAD may have moved since: then the target moves as a ref, if no worktree has
+        // it now.
+        let mut checked_out = checked_out;
+        if checked_out && symbolic_head(repo).as_deref() != Some(target_ref.as_str()) {
+            let holders = target_holders(repo, worktree, &target_ref)?;
+            if !holders.is_empty() {
+                return blocked(MergeBlockReason::TargetBusy, holders);
+            }
+            checked_out = false;
+        }
+        let merged = if checked_out {
+            let mut args = MERGE.to_vec();
+            args.push(&branch_ref);
+            run_git(repo, &args)
+        } else {
+            let refspec = format!("{branch_ref}:{target_ref}");
+            let mut args = FETCH.to_vec();
+            args.push(&refspec);
+            run_git(repo, &args)
+        }
+        .map_err(|e| fail(format!("cannot run git: {e}")))?;
+        if !merged.ok {
+            return Err(fail(format!(
+                "Moving {} failed, so everything is kept: {}",
+                record.target_branch,
+                merged.stderr.trim()
+            )));
+        }
+        if commit_of(repo, &target_ref).as_deref() != Some(head.as_str()) {
+            return Err(fail(format!(
+                "{} is not at the refactor's last commit after the merge, so the worktree \
+                 and branch are kept.",
+                record.target_branch
+            )));
+        }
+        // Merged: the worktree and branch go, unless git refuses.
+        let mut kept = Vec::new();
+        let mut leftover = None;
+        let removed = run_git(repo, &["worktree", "remove", &record.worktree]);
+        match removed {
+            Ok(out) if out.ok => {
+                let deleted = run_git(repo, &["branch", "-q", "-d", &record.branch]);
+                if !deleted.as_ref().is_ok_and(|o| o.ok) {
+                    // `-d` wants the branch merged into HEAD, which is another branch
+                    // when the target is not checked out. It is merged into the target,
+                    // so delete it only if it still points where it was merged.
+                    let merged_in = is_ancestor(repo, &branch_ref, &target_ref);
+                    let gone = merged_in
+                        && run_git(repo, &["update-ref", "-d", &branch_ref, &head])
+                            .is_ok_and(|o| o.ok);
+                    if !gone {
+                        let why = deleted.map(|o| o.stderr).unwrap_or_else(|e| e.to_string());
+                        kept.push(format!("Kept the branch {}: {}", record.branch, why.trim()));
+                    }
+                }
+            }
+            Ok(out) => {
+                let why = out.stderr.trim().to_owned();
+                kept.push(format!(
+                    "Kept the worktree at {} and its branch {}: {why}",
+                    record.worktree, record.branch,
+                ));
+                leftover = Some(why);
+            }
+            Err(e) => {
+                kept.push(format!("Kept the worktree at {}: {e}", record.worktree));
+                leftover = Some(e.to_string());
+            }
+        }
+        Ok(Merged::Done {
+            commits,
+            kept,
+            leftover,
+        })
+    }
+
+    /// Spec §5.4.
+    fn discard(&self, record: &Record) -> Result<(), Fail> {
+        let repo = &self.repo;
+        if !record.branch.starts_with(rules::BRANCH_PREFIX) {
+            return Err(fail(format!(
+                "{} is not a refactor branch, so it is not deleted.",
+                record.branch
+            )));
+        }
+        let worktree = PathBuf::from(&record.worktree);
+        let listed = worktrees(repo)
+            .map_err(|e| fail(format!("cannot list the repo's worktrees: {e}")))?
+            .iter()
+            .any(|w| same_dir(&w.path, &worktree));
+        if listed || fs::symlink_metadata(&worktree).is_ok() {
+            check_safe(&self.worktrees_dir, repo, &worktree)?;
+            let out = run_git(repo, &["worktree", "remove", "--force", &record.worktree])
+                .map_err(|e| fail(format!("cannot run git: {e}")))?;
+            if !out.ok {
+                return Err(fail(format!(
+                    "git worktree remove failed: {}",
+                    out.stderr.trim()
+                )));
+            }
+        }
+        if branch_exists(repo, &record.branch) {
+            let out = run_git(repo, &["branch", "-q", "-D", &record.branch])
+                .map_err(|e| fail(format!("cannot run git: {e}")))?;
+            if !out.ok {
+                return Err(fail(format!("git branch -D failed: {}", out.stderr.trim())));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Done {
+    /// A job for `repo` that could not run, or panicked.
+    pub fn failed(repo: PathBuf, why: impl Into<String>) -> Done {
+        Done {
+            repo,
+            kind: DoneKind::Failed(fail(why)),
+        }
+    }
+}
+
+/// The rebase of a merge, whatever the user's config says: no stash, no squash or
+/// fixup reordering, no other branches moved, no fork point, merges flattened.
+const REBASE: &[&str] = &[
+    "-c",
+    "rebase.autoStash=false",
+    "-c",
+    "rebase.autoSquash=false",
+    "-c",
+    "rebase.updateRefs=false",
+    "-c",
+    "rebase.forkPoint=false",
+    "-c",
+    "rebase.rebaseMerges=false",
+    "rebase",
+    "-q",
+    "--no-autostash",
+    "--no-autosquash",
+    "--no-update-refs",
+    "--no-fork-point",
+    "--no-rebase-merges",
+];
+
+/// The fast-forward of a checked-out target, whatever the user's config says.
+const MERGE: &[&str] = &[
+    "-c",
+    "merge.autoStash=false",
+    "-c",
+    "merge.ff=only",
+    "-c",
+    "submodule.recurse=false",
+    "merge",
+    "-q",
+    "--ff-only",
+    "--no-autostash",
+    "--no-squash",
+    "--no-verify-signatures",
+    "--no-edit",
+];
+
+/// The fast-forward of a target that is not checked out: a ref update that git
+/// refuses unless it is a fast-forward, or while a worktree has the target.
+const FETCH: &[&str] = &[
+    "-c",
+    "submodule.recurse=false",
+    "fetch",
+    "-q",
+    "--no-tags",
+    "--no-recurse-submodules",
+    "--no-write-fetch-head",
+    ".",
+];
+
 impl Refactors {
     /// Records in `<state dir>/refactors`, worktrees in `$HOME/projects/.refract-worktrees`,
-    /// folder URIs for `WSL_DISTRO_NAME`.
+    /// folder URIs for `WSL_DISTRO_NAME`; [`GRACE_ENV`] and [`QUIET_ENV`] override the
+    /// times.
     pub fn from_env() -> Refactors {
         let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from);
-        Refactors::new(
+        let mut refactors = Refactors::new(
             launch::state_dir().join("refactors"),
             home.join(rules::WORKTREES_DIR),
             std::env::var("WSL_DISTRO_NAME")
                 .ok()
                 .filter(|d| !d.is_empty()),
-        )
+        );
+        if let Some(grace) = env_secs(GRACE_ENV) {
+            refactors.grace = grace;
+        }
+        if let Some(quiet) = env_secs(QUIET_ENV) {
+            refactors.quiet = quiet;
+        }
+        refactors
     }
 
     /// Reads the records in `records_dir`. One that cannot be read is skipped; of two
@@ -135,6 +628,7 @@ impl Refactors {
                 record,
                 git_dir: None,
                 info: None,
+                live_ids: Vec::new(),
             };
             entries.insert(repo, entry);
         }
@@ -142,7 +636,11 @@ impl Refactors {
             records_dir,
             worktrees_dir,
             distro,
+            grace: START_GRACE,
+            quiet: IDLE_QUIET,
             entries,
+            busy: BTreeSet::new(),
+            last_full: None,
         }
     }
 
@@ -155,27 +653,50 @@ impl Refactors {
         Some(&self.entries.get(&self.key(path)?)?.record)
     }
 
-    /// How long until the refactors should be looked at again; `None` without any. Often
-    /// while an agent was just launched, runs, or is starting.
-    pub fn poll_interval(&self) -> Option<Duration> {
-        if self.entries.is_empty() {
+    /// True when the refactor of `repo` needs the fast poll: its repo is known, no job
+    /// runs for it, and its agent was just launched, works or waits on the user.
+    fn active(&self, agent: &Agent, repo: &Path, entry: &Entry, now: DateTime<Utc>) -> bool {
+        if agent.repo(repo).is_none() || self.busy.contains(repo) || entry.record.leftover {
+            return false;
+        }
+        let record = &entry.record;
+        let launched = record.launched_at.unwrap_or(record.created_at);
+        (!record.adopted && now - launched < self.grace)
+            || entry.info.as_ref().is_none_or(|i| {
+                matches!(
+                    i.state,
+                    RefactorState::Starting | RefactorState::Working | RefactorState::NeedsYou
+                )
+            })
+    }
+
+    /// How long until the refactors should be looked at again; `None` without any of a
+    /// known repo. Often while one is active (see [`Refactors::poll`]).
+    pub fn poll_interval(&self, agent: &Agent, now: DateTime<Utc>) -> Option<Duration> {
+        if !self.entries.keys().any(|r| agent.repo(r).is_some()) {
             return None;
         }
-        let now = Utc::now();
-        let active = self.entries.values().any(|e| {
-            let launched = e.record.launched_at.unwrap_or(e.record.created_at);
-            now - launched < START_GRACE
-                || e.info.as_ref().is_none_or(|i| {
-                    i.live
-                        || matches!(
-                            i.state,
-                            RefactorState::Starting
-                                | RefactorState::Working
-                                | RefactorState::NeedsYou
-                        )
-                })
-        });
+        let active = self
+            .entries
+            .iter()
+            .any(|(repo, e)| self.active(agent, repo, e, now));
         Some(if active { ACTIVE_POLL } else { IDLE_POLL })
+    }
+
+    /// Looks at the active refactors again, and at all of them every [`IDLE_POLL`].
+    pub fn poll(&mut self, agent: &mut Agent, now: DateTime<Utc>) -> Vec<Event> {
+        let every = TimeDelta::from_std(IDLE_POLL).expect("small");
+        if self.last_full.is_none_or(|at| now - at >= every) {
+            self.last_full = Some(now);
+            return self.refresh(agent, None, now);
+        }
+        let active: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|(repo, e)| self.active(agent, repo, e, now))
+            .map(|(repo, _)| repo.clone())
+            .collect();
+        self.refresh(agent, Some(&active), now)
     }
 
     fn key(&self, path: &str) -> Option<PathBuf> {
@@ -185,16 +706,41 @@ impl Refactors {
             .cloned()
     }
 
-    /// Starts a refactor of the repo at `path`: worktree, branch, launch request, record.
-    /// Returns the ticket and the events for the repo's new snapshot.
+    /// The repo of the refactor at `path`, refusing one of an unknown repo or with a job
+    /// running.
+    fn known(&self, agent: &Agent, path: &str) -> Result<PathBuf, Fail> {
+        let repo = self
+            .key(path)
+            .filter(|r| agent.repo(r).is_some())
+            .ok_or_else(no_refactor)?;
+        if self.busy.contains(&repo) {
+            return Err(busy());
+        }
+        Ok(repo)
+    }
+
+    fn job(&mut self, repo: PathBuf, now: DateTime<Utc>, kind: Kind) -> Job {
+        self.busy.insert(repo.clone());
+        Job {
+            repo,
+            records_dir: self.records_dir.clone(),
+            worktrees_dir: self.worktrees_dir.clone(),
+            distro: self.distro.clone(),
+            now,
+            kind,
+        }
+    }
+
+    /// Checks a start of a refactor of the repo at `path`, and returns the job that makes
+    /// its worktree, branch, record and launch request.
     pub fn start(
         &mut self,
-        agent: &mut Agent,
+        agent: &Agent,
         path: &str,
         focus: Option<&str>,
         launch_dir: &Path,
         now: DateTime<Utc>,
-    ) -> Result<(LaunchTicket, Vec<Event>), Fail> {
+    ) -> Result<Job, Fail> {
         let Some(repo) = agent
             .repo_paths()
             .find(|p| paths_match(&path_str(p), path))
@@ -205,6 +751,9 @@ impl Refactors {
                 message: format!("no repo at {path}"),
             });
         };
+        if self.busy.contains(&repo) {
+            return Err(busy());
+        }
         if self.entries.contains_key(&repo) {
             return Err(fail("This repo already has a refactor."));
         }
@@ -215,99 +764,17 @@ impl Refactors {
                     .into(),
             });
         }
-        let Some(base) = commit_of(&repo, "HEAD") else {
-            return Err(fail("The repo has no commits yet."));
+        let kind = Kind::Start {
+            focus: focus.map(str::to_owned),
+            launch_dir: launch_dir.to_owned(),
         };
-        let Some(target) = current_branch(&repo) else {
-            return Err(fail("Check out a branch first."));
-        };
-        fs::create_dir_all(&self.worktrees_dir).map_err(|e| {
-            fail(format!(
-                "cannot create {}: {e}",
-                self.worktrees_dir.display()
-            ))
-        })?;
-        let stamp = rules::stamp(chrono::Local::now().naive_local());
-        let repo_name = repo
-            .file_name()
-            .map_or_else(|| "repo".into(), |n| n.to_string_lossy().into_owned());
-        let worktree = (1..)
-            .map(|n| {
-                self.worktrees_dir.join(rules::numbered(
-                    &rules::worktree_name(&repo_name, &stamp),
-                    n,
-                ))
-            })
-            .find(|p| fs::symlink_metadata(p).is_err())
-            .expect("a free name");
-        let branch = (1..)
-            .map(|n| rules::numbered(&rules::branch_name(&stamp), n))
-            .find(|b| !branch_exists(&repo, b))
-            .expect("a free branch");
-        let wt = path_str(&worktree);
-        let added = run_git(&repo, &["worktree", "add", "-q", "-b", &branch, &wt, &base])
-            .map_err(|e| fail(format!("cannot run git: {e}")))?;
-        if !added.ok {
-            return Err(fail(format!(
-                "git worktree add failed: {}",
-                added.stderr.trim()
-            )));
-        }
-        // From here on, a failure takes back the worktree and branch just made.
-        let undo = |why: Fail| {
-            let _ = run_git(&repo, &["worktree", "remove", "--force", &wt]);
-            let _ = run_git(&repo, &["branch", "-D", &branch]);
-            why
-        };
-        let git_dir = absolute_git_dir(&worktree)
-            .ok_or_else(|| undo(fail("cannot find the new worktree's git directory")))?;
-        let result_path = path_str(&git_dir.join(rules::RESULT_FILE));
-        let focus = focus.and_then(rules::clean_focus);
-        let mode = LaunchMode::New {
-            prompt: Some(rules::prompt(&branch, &result_path, focus.as_deref())),
-            plan_mode: true,
-        };
-        let ticket = launch::prepare_titled(
-            &wt,
-            &mode,
-            rules::TITLE,
-            launch_dir,
-            self.distro.as_deref(),
-            now,
-        )
-        .map_err(undo)?;
-        let record = Record {
-            repo: path_str(&repo),
-            worktree: wt.clone(),
-            branch: branch.clone(),
-            base_commit: base,
-            target_branch: target,
-            session_id: ticket.session_id.clone(),
-            focus,
-            created_at: now.trunc_subsecs(0),
-            launched_at: None,
-            blocked: None,
-            blocked_head: None,
-        };
-        let id = uuid::Uuid::new_v4().to_string();
-        write_record(&self.records_dir, &id, &record)
-            .map_err(|e| undo(fail(format!("cannot save the refactor's record: {e}"))))?;
-        self.entries.insert(
-            repo.clone(),
-            Entry {
-                id,
-                record,
-                git_dir: Some(git_dir),
-                info: None,
-            },
-        );
-        let events = self.refresh(agent, Some(&[repo]), now);
-        Ok((ticket, events))
+        Ok(self.job(repo, now, kind))
     }
 
     /// Launches the refactor's agent again: resumed with [`rules::CONTINUE_PROMPT`], or
     /// with the fix prompt when `fix`; started anew with the original prompt (or the fix
-    /// prompt) when its session never wrote a transcript.
+    /// prompt) when its session never wrote a transcript, after deleting its launch
+    /// request if that was never picked up.
     pub fn resume(
         &mut self,
         agent: &mut Agent,
@@ -316,14 +783,18 @@ impl Refactors {
         launch_dir: &Path,
         now: DateTime<Utc>,
     ) -> Result<(LaunchTicket, Vec<Event>), Fail> {
-        let repo = self.key(path).ok_or_else(no_refactor)?;
+        let repo = self.known(agent, path)?;
         let procs = procs::scan();
+        let quiet = self.quiet;
         let entry = self.entries.get_mut(&repo).expect("known");
+        if entry.record.leftover {
+            return Err(fail("This refactor is merged already."));
+        }
         let worktree = PathBuf::from(&entry.record.worktree);
         if !worktree.is_dir() {
             return Err(fail("The refactor's worktree is gone."));
         }
-        let look = look(entry, agent, &procs);
+        let look = look(entry, agent, &procs, quiet, now);
         if look.live {
             return Err(fail("The refactor's agent is still running."));
         }
@@ -334,22 +805,22 @@ impl Refactors {
             .ok_or_else(|| fail("cannot find the worktree's git directory"))?;
         entry.git_dir = Some(git_dir.clone());
         let result_path = path_str(&git_dir.join(rules::RESULT_FILE));
-        let record = &entry.record;
-        let fix_prompt = || rules::fix_prompt(&record.branch, &record.target_branch, &result_path);
+        let old = entry.record.clone();
+        let fix_prompt = || rules::fix_prompt(&old.branch, &old.target_branch, &result_path);
         let mode = match (&look.summary, fix) {
             (Some(_), false) => LaunchMode::Resume {
-                session_id: record.session_id.clone(),
+                session_id: old.session_id.clone(),
                 prompt: Some(rules::CONTINUE_PROMPT.into()),
             },
             (Some(_), true) => LaunchMode::Resume {
-                session_id: record.session_id.clone(),
+                session_id: old.session_id.clone(),
                 prompt: Some(fix_prompt()),
             },
             (None, false) => LaunchMode::New {
                 prompt: Some(rules::prompt(
-                    &record.branch,
+                    &old.branch,
                     &result_path,
-                    record.focus.as_deref(),
+                    old.focus.as_deref(),
                 )),
                 plan_mode: true,
             },
@@ -358,217 +829,190 @@ impl Refactors {
                 plan_mode: false,
             },
         };
-        let ticket = launch::prepare_titled(
-            &record.worktree,
-            &mode,
-            rules::TITLE,
-            launch_dir,
-            self.distro.as_deref(),
-            now,
-        )?;
-        let mut record = record.clone();
-        record.session_id = ticket.session_id.clone();
+        if matches!(mode, LaunchMode::New { .. }) {
+            // The old launch was never picked up, or its agent never wrote a word: so
+            // that it cannot start late beside the new one, its request goes.
+            if uuid::Uuid::try_parse(&old.request_id).is_ok() {
+                for ext in ["json", "claimed"] {
+                    let _ = fs::remove_file(launch_dir.join(format!("{}.{ext}", old.request_id)));
+                }
+            }
+        }
+        let ids = launch::Ids::new(&mode);
+        let mut record = old.clone();
+        record.session_id = ids.session_id.clone();
+        record.request_id = ids.request_id.clone();
         record.launched_at = Some(now.trunc_subsecs(0));
+        record.adopted = false;
         record.blocked = None;
         record.blocked_head = None;
         write_record(&self.records_dir, &entry.id, &record)
             .map_err(|e| fail(format!("cannot save the refactor's record: {e}")))?;
+        let ticket = match launch::prepare_planned(
+            &record.worktree,
+            &mode,
+            rules::TITLE,
+            &ids,
+            launch_dir,
+            self.distro.as_deref(),
+            now,
+        ) {
+            Ok(ticket) => ticket,
+            Err(e) => {
+                let _ = write_record(&self.records_dir, &entry.id, &old);
+                return Err(e);
+            }
+        };
         entry.record = record;
         let events = self.refresh(agent, Some(&[repo]), now);
         Ok((ticket, events))
     }
 
-    /// Merges the refactor into its target branch (spec §5.2–3). Returns the outcome
-    /// and the events for the repo.
+    /// Checks a merge of the refactor into its target branch: blocked at once while its
+    /// agent works, or the job that merges it (spec §5.2–3).
     pub fn merge(
         &mut self,
         agent: &mut Agent,
         path: &str,
         now: DateTime<Utc>,
-    ) -> Result<(MergeOutcome, Vec<Event>), Fail> {
-        let repo = self.key(path).ok_or_else(no_refactor)?;
+    ) -> Result<Step, Fail> {
+        let repo = self.known(agent, path)?;
         let procs = procs::scan();
+        let quiet = self.quiet;
         let entry = self.entries.get_mut(&repo).expect("known");
-        if look(entry, agent, &procs).busy() {
+        if entry.record.leftover {
+            return Err(fail("This refactor is merged already."));
+        }
+        if look(entry, agent, &procs, quiet, now).busy() {
             let outcome = MergeOutcome::Blocked {
                 reason: MergeBlockReason::Live,
                 files: Vec::new(),
             };
-            return Ok((outcome, Vec::new()));
+            return Ok(Step::Answer(Reply::RefactorMerge(outcome), Vec::new()));
         }
         let record = entry.record.clone();
-        let worktree = PathBuf::from(&record.worktree);
-        self.check_safe(&repo, &worktree)?;
-        let target_ref = format!("refs/heads/{}", record.target_branch);
-        let branch_ref = format!("refs/heads/{}", record.branch);
-        let Some(head) = commit_of(&repo, &branch_ref) else {
-            return Err(fail(format!("The branch {} is gone.", record.branch)));
-        };
-        if commit_of(&repo, &target_ref).is_none() {
-            return self.blocked(
-                agent,
-                &repo,
-                MergeBlockReason::TargetMissing,
-                vec![],
-                &head,
-                now,
-            );
-        }
-        let dirty = changed_in_worktree(&worktree)?;
-        if !dirty.is_empty() {
-            return Err(fail(format!(
-                "The refactor's worktree has uncommitted changes ({}). Commit or undo them there first.",
-                dirty.join(", ")
-            )));
-        }
-        let range = format!("{target_ref}..{branch_ref}");
-        if count(&repo, &range) == 0 {
-            return Err(fail("The refactor has no commits to merge."));
-        }
-        // Where the target is checked out in the repo itself, its uncommitted files must
-        // not be ones the refactor changed.
-        let checked_out = checked_out_here(&repo, &target_ref)?;
-        if checked_out {
-            let status = git::read_status(&repo)
-                .map_err(|e| fail(format!("cannot read the repo's status: {e}")))?;
-            let changed = changed_files(&repo, &target_ref, &branch_ref)?;
-            let clash = overlap(&status.paths, &changed);
-            if !clash.is_empty() {
-                return self.blocked(
-                    agent,
-                    &repo,
-                    MergeBlockReason::DirtyOverlap,
-                    clash,
-                    &head,
-                    now,
-                );
-            }
-        }
-        // The branch onto the target, in the worktree; undone on conflict.
-        if !is_ancestor(&repo, &target_ref, &branch_ref) {
-            let rebase = run_git(&worktree, &["rebase", "-q", &target_ref])
-                .map_err(|e| fail(format!("cannot run git: {e}")))?;
-            if !rebase.ok {
-                let conflicted = run_git(&worktree, &["diff", "--name-only", "--diff-filter=U"])
-                    .map(|o| lines(&o.stdout))
-                    .unwrap_or_default();
-                let _ = run_git(&worktree, &["rebase", "--abort"]);
-                if conflicted.is_empty() {
-                    return Err(fail(format!("git rebase failed: {}", rebase.stderr.trim())));
-                }
-                return self.blocked(
-                    agent,
-                    &repo,
-                    MergeBlockReason::Conflict,
-                    conflicted,
-                    &head,
-                    now,
-                );
-            }
-        }
-        let commits = count(&repo, &range);
-        let merged = if checked_out {
-            run_git(&repo, &["merge", "--ff-only", "-q", &branch_ref])
-        } else {
-            let refspec = format!("{branch_ref}:{target_ref}");
-            run_git(&repo, &["fetch", "-q", ".", &refspec])
-        }
-        .map_err(|e| fail(format!("cannot run git: {e}")))?;
-        if !merged.ok {
-            return Err(fail(format!(
-                "Moving {} failed: {}",
-                record.target_branch,
-                merged.stderr.trim()
-            )));
-        }
-        // Merged: the worktree and branch go, unless git refuses.
-        let mut kept = Vec::new();
-        let removed = run_git(&repo, &["worktree", "remove", &record.worktree]);
-        match removed {
-            Ok(out) if out.ok => {
-                let branch_head = commit_of(&repo, &branch_ref);
-                let deleted = run_git(&repo, &["branch", "-q", "-d", &record.branch]);
-                if !deleted.as_ref().is_ok_and(|o| o.ok) {
-                    // `-d` wants the branch merged into HEAD, which is another branch
-                    // when the target is not checked out. It is merged into the target,
-                    // so delete it only if it still points where it was merged.
-                    let merged_in = is_ancestor(&repo, &branch_ref, &target_ref);
-                    let gone = merged_in
-                        && branch_head.as_deref().is_some_and(|sha| {
-                            run_git(&repo, &["update-ref", "-d", &branch_ref, sha])
-                                .is_ok_and(|o| o.ok)
-                        });
-                    if !gone {
-                        let why = deleted.map(|o| o.stderr).unwrap_or_else(|e| e.to_string());
-                        kept.push(format!("Kept the branch {}: {}", record.branch, why.trim()));
-                    }
-                }
-            }
-            Ok(out) => kept.push(format!(
-                "Kept the worktree at {} and its branch {}: {}",
-                record.worktree,
-                record.branch,
-                out.stderr.trim()
-            )),
-            Err(e) => kept.push(format!("Kept the worktree at {}: {e}", record.worktree)),
-        }
-        self.forget(&repo);
-        let mut events = agent.set_refactor(&repo, None);
-        events.extend(agent.refresh(&repo, Refresh::ALL));
-        Ok((MergeOutcome::Merged { commits, kept }, events))
+        Ok(Step::Run(self.job(repo, now, Kind::Merge(record))))
     }
 
-    /// Deletes the refactor's worktree and branch (spec §5.4).
-    pub fn discard(&mut self, agent: &mut Agent, path: &str) -> Result<Vec<Event>, Fail> {
-        let repo = self.key(path).ok_or_else(no_refactor)?;
+    /// Checks a discard of the refactor, and returns the job that deletes its worktree
+    /// and branch (spec §5.4).
+    pub fn discard(
+        &mut self,
+        agent: &mut Agent,
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job, Fail> {
+        let repo = self.known(agent, path)?;
         let procs = procs::scan();
+        let quiet = self.quiet;
         let entry = self.entries.get_mut(&repo).expect("known");
-        if look(entry, agent, &procs).live {
+        if look(entry, agent, &procs, quiet, now).live {
             return Err(fail("The refactor's agent is still running."));
         }
         let record = entry.record.clone();
-        if !record.branch.starts_with(rules::BRANCH_PREFIX) {
-            return Err(fail(format!(
-                "{} is not a refactor branch, so it is not deleted.",
-                record.branch
-            )));
-        }
-        let worktree = PathBuf::from(&record.worktree);
-        let listed = worktrees(&repo)
-            .map_err(|e| fail(format!("cannot list the repo's worktrees: {e}")))?
-            .iter()
-            .any(|w| same_dir(&w.path, &worktree));
-        if listed || fs::symlink_metadata(&worktree).is_ok() {
-            self.check_safe(&repo, &worktree)?;
-            let out = run_git(&repo, &["worktree", "remove", "--force", &record.worktree])
-                .map_err(|e| fail(format!("cannot run git: {e}")))?;
-            if !out.ok {
-                return Err(fail(format!(
-                    "git worktree remove failed: {}",
-                    out.stderr.trim()
-                )));
+        Ok(self.job(repo, now, Kind::Discard(record)))
+    }
+
+    /// Takes in what a job did, and returns the reply and the events for the repo.
+    pub fn finish(
+        &mut self,
+        agent: &mut Agent,
+        done: Done,
+        now: DateTime<Utc>,
+    ) -> Result<(Reply, Vec<Event>), Fail> {
+        let repo = done.repo;
+        self.busy.remove(&repo);
+        match done.kind {
+            DoneKind::Started(Ok(started)) => {
+                self.entries.insert(
+                    repo.clone(),
+                    Entry {
+                        id: started.id,
+                        record: started.record,
+                        git_dir: Some(started.git_dir),
+                        info: None,
+                        live_ids: Vec::new(),
+                    },
+                );
+                let events = self.refresh(agent, Some(&[repo]), now);
+                Ok((Reply::Launch(started.ticket), events))
             }
-        }
-        if branch_exists(&repo, &record.branch) {
-            let out = run_git(&repo, &["branch", "-q", "-D", &record.branch])
-                .map_err(|e| fail(format!("cannot run git: {e}")))?;
-            if !out.ok {
-                return Err(fail(format!("git branch -D failed: {}", out.stderr.trim())));
+            DoneKind::Merged(Ok(Merged::Blocked { reason, files })) => {
+                let (outcome, events) = self.blocked(agent, &repo, reason, files, now)?;
+                Ok((Reply::RefactorMerge(outcome), events))
             }
+            DoneKind::Merged(Ok(Merged::Done {
+                commits,
+                kept,
+                leftover: None,
+            })) => {
+                self.forget(&repo);
+                let mut events = agent.set_refactor(&repo, None);
+                events.extend(agent.refresh(&repo, Refresh::ALL));
+                Ok((
+                    Reply::RefactorMerge(MergeOutcome::Merged { commits, kept }),
+                    events,
+                ))
+            }
+            DoneKind::Merged(Ok(Merged::Done {
+                commits,
+                kept,
+                leftover: Some(why),
+            })) => {
+                // Kept, so only a discard is offered and adoption leaves it alone.
+                if let Some(entry) = self.entries.get_mut(&repo) {
+                    let mut record = entry.record.clone();
+                    record.leftover = true;
+                    record.leftover_reason = Some(why);
+                    record.blocked = None;
+                    record.blocked_head = None;
+                    if let Err(e) = write_record(&self.records_dir, &entry.id, &record) {
+                        eprintln!("refract-agent: cannot save the refactor's record: {e}");
+                    }
+                    entry.record = record;
+                }
+                let mut events = self.refresh(agent, Some(std::slice::from_ref(&repo)), now);
+                events.extend(agent.refresh(&repo, Refresh::ALL));
+                Ok((
+                    Reply::RefactorMerge(MergeOutcome::Merged { commits, kept }),
+                    events,
+                ))
+            }
+            DoneKind::Discarded(Ok(())) => {
+                self.forget(&repo);
+                let mut events = agent.set_refactor(&repo, None);
+                events.extend(agent.refresh(&repo, Refresh::ALL));
+                Ok((Reply::Done, events))
+            }
+            DoneKind::Started(Err(e))
+            | DoneKind::Merged(Err(e))
+            | DoneKind::Discarded(Err(e))
+            | DoneKind::Failed(e) => Err(e),
         }
-        self.forget(&repo);
-        let mut events = agent.set_refactor(&repo, None);
-        events.extend(agent.refresh(&repo, Refresh::ALL));
-        Ok(events)
     }
 
     /// Brings the records in line with git, once the repos are loaded: a record whose
-    /// worktree is gone (not listed, or its folder deleted) is dropped, its branch kept;
-    /// a refactor worktree of a known repo without a record is adopted. Returns the
-    /// events for the repos' snapshots.
+    /// repo is gone (or no longer a repo), or whose worktree is gone (not listed, or its
+    /// folder deleted), is dropped, with nothing on disk deleted; one of a repo that is
+    /// there but not known is kept, inactive. A refactor worktree of a known repo without
+    /// a record is adopted. Returns the events for the repos' snapshots.
     pub fn reconcile(&mut self, agent: &mut Agent, now: DateTime<Utc>) -> Vec<Event> {
         let repos: Vec<PathBuf> = self.entries.keys().cloned().collect();
         for repo in repos {
+            if self.busy.contains(&repo) {
+                continue;
+            }
+            if !repo.is_dir() || scan::git_dir(&repo).is_none() {
+                eprintln!(
+                    "refract-agent: the repo {} of a refactor is gone; forgetting it",
+                    repo.display()
+                );
+                self.forget(&repo);
+                continue;
+            }
+            if agent.repo(&repo).is_none() {
+                continue;
+            }
             let worktree = PathBuf::from(&self.entries[&repo].record.worktree);
             let Ok(list) = worktrees(&repo) else {
                 continue;
@@ -586,7 +1030,7 @@ impl Refactors {
         let root = fs::canonicalize(&self.worktrees_dir).ok();
         let known: Vec<PathBuf> = agent.repo_paths().cloned().collect();
         for repo in known {
-            if self.entries.contains_key(&repo) {
+            if self.entries.contains_key(&repo) || self.busy.contains(&repo) {
                 continue;
             }
             let Some(root) = &root else {
@@ -647,11 +1091,15 @@ impl Refactors {
             base_commit: base,
             target_branch: target,
             session_id,
+            request_id: String::new(),
             focus: None,
             created_at: now.trunc_subsecs(0),
             launched_at: None,
+            adopted: true,
             blocked: None,
             blocked_head: None,
+            leftover: false,
+            leftover_reason: None,
         };
         let id = uuid::Uuid::new_v4().to_string();
         if let Err(e) = write_record(&self.records_dir, &id, &record) {
@@ -669,12 +1117,14 @@ impl Refactors {
                 record,
                 git_dir: None,
                 info: None,
+                live_ids: Vec::new(),
             },
         );
     }
 
     /// Works out again the refactors of `repos` (all of them for `None`) whose repo is
-    /// known, and returns the events for the snapshots that changed.
+    /// known and whose job is not running, and returns the events for the snapshots
+    /// that changed.
     pub fn refresh(
         &mut self,
         agent: &mut Agent,
@@ -689,17 +1139,19 @@ impl Refactors {
                 .collect(),
             None => self.entries.keys().cloned().collect(),
         };
+        let paths: Vec<PathBuf> = paths
+            .into_iter()
+            .filter(|r| !self.busy.contains(r) && agent.repo(r).is_some())
+            .collect();
         if paths.is_empty() {
             return Vec::new();
         }
         let procs = procs::scan();
+        let times = (self.grace, self.quiet);
         let mut events = Vec::new();
         for repo in paths {
-            if agent.repo(&repo).is_none() {
-                continue;
-            }
             let entry = self.entries.get_mut(&repo).expect("known");
-            let info = work_out(entry, agent, &procs, self.distro.as_deref(), now);
+            let info = work_out(entry, agent, &procs, self.distro.as_deref(), times, now);
             if let Some(cleared) = info.1 {
                 let _ = write_record(&self.records_dir, &entry.id, &cleared);
                 entry.record = cleared;
@@ -710,6 +1162,30 @@ impl Refactors {
         events
     }
 
+    /// [`Refactors::refresh`] for the refactors of `repos`, and those whose agent is, or
+    /// was last seen live as, one of `sessions` (whose hook statuses changed).
+    pub fn refresh_touched(
+        &mut self,
+        agent: &mut Agent,
+        repos: &[PathBuf],
+        sessions: &[&str],
+        now: DateTime<Utc>,
+    ) -> Vec<Event> {
+        let touched: Vec<PathBuf> = self
+            .entries
+            .iter()
+            .filter(|(repo, e)| {
+                repos.contains(repo)
+                    || sessions.iter().any(|s| {
+                        (!s.is_empty() && e.record.session_id == *s)
+                            || e.live_ids.iter().any(|l| l == s)
+                    })
+            })
+            .map(|(repo, _)| repo.clone())
+            .collect();
+        self.refresh(agent, Some(&touched), now)
+    }
+
     /// Stores a blocked merge in the record and answers with it.
     fn blocked(
         &mut self,
@@ -717,7 +1193,6 @@ impl Refactors {
         repo: &Path,
         reason: MergeBlockReason,
         files: Vec<String>,
-        head: &str,
         now: DateTime<Utc>,
     ) -> Result<(MergeOutcome, Vec<Event>), Fail> {
         let entry = self.entries.get_mut(repo).expect("known");
@@ -726,34 +1201,12 @@ impl Refactors {
             reason,
             files: files.clone(),
         });
-        record.blocked_head = commit_of(repo, &format!("refs/heads/{}", record.branch))
-            .or_else(|| Some(head.to_owned()));
+        record.blocked_head = commit_of(repo, &format!("refs/heads/{}", record.branch));
         write_record(&self.records_dir, &entry.id, &record)
             .map_err(|e| fail(format!("cannot save the refactor's record: {e}")))?;
         entry.record = record;
         let events = self.refresh(agent, Some(&[repo.to_owned()]), now);
         Ok((MergeOutcome::Blocked { reason, files }, events))
-    }
-
-    /// Refuses unless `worktree` really lies under the worktrees directory and the
-    /// repo's `git worktree list` names it as a linked worktree.
-    fn check_safe(&self, repo: &Path, worktree: &Path) -> Result<(), Fail> {
-        let refuse = || {
-            fail(format!(
-                "{} is not a worktree Refract made for this repo, so it is left alone.",
-                worktree.display()
-            ))
-        };
-        let root = fs::canonicalize(&self.worktrees_dir).map_err(|_| refuse())?;
-        let real = fs::canonicalize(worktree).map_err(|_| refuse())?;
-        if !real.starts_with(&root) || real == root {
-            return Err(refuse());
-        }
-        let list = worktrees(repo).map_err(|e| fail(format!("cannot list worktrees: {e}")))?;
-        if !list.iter().skip(1).any(|w| same_dir(&w.path, &real)) {
-            return Err(refuse());
-        }
-        Ok(())
     }
 
     /// Drops the refactor of `repo` and its record file.
@@ -764,19 +1217,47 @@ impl Refactors {
     }
 }
 
+/// Refuses unless `worktree` really lies under `worktrees_dir` and the repo's `git
+/// worktree list` names it as a linked worktree.
+fn check_safe(worktrees_dir: &Path, repo: &Path, worktree: &Path) -> Result<(), Fail> {
+    let refuse = || {
+        fail(format!(
+            "{} is not a worktree Refract made for this repo, so it is left alone.",
+            worktree.display()
+        ))
+    };
+    let root = fs::canonicalize(worktrees_dir).map_err(|_| refuse())?;
+    let real = fs::canonicalize(worktree).map_err(|_| refuse())?;
+    if !real.starts_with(&root) || real == root {
+        return Err(refuse());
+    }
+    let list = worktrees(repo).map_err(|e| fail(format!("cannot list worktrees: {e}")))?;
+    if !list.iter().skip(1).any(|w| same_dir(&w.path, &real)) {
+        return Err(refuse());
+    }
+    Ok(())
+}
+
 fn no_refactor() -> Fail {
     fail("This repo has no refactor.")
 }
 
 /// What the refactor's agent is doing.
 struct Look {
+    /// The recorded session's process runs, or some other `claude` runs in the worktree.
     live: bool,
-    /// Live, and waiting for a prompt: its hook says its turn finished or, without a
-    /// hook status, its transcript ends with a finished turn.
+    /// Live, only as the recorded session, and waiting for a prompt: its hook says its
+    /// turn finished or, without a hook status, its transcript ends with a finished turn
+    /// and has been quiet for a while.
     idle: bool,
+    /// The recorded session's agent waits on the user.
+    waiting: bool,
     /// The agent's transcript, if it wrote one.
     summary: Option<SessionSummary>,
+    /// The recorded session's state.
     state: Option<SessionState>,
+    /// The sessions live in the worktree.
+    live_ids: Vec<String>,
 }
 
 impl Look {
@@ -786,60 +1267,95 @@ impl Look {
     }
 }
 
-fn look(entry: &Entry, agent: &mut Agent, procs: &[ClaudeProcess]) -> Look {
+fn look(
+    entry: &Entry,
+    agent: &mut Agent,
+    procs: &[ClaudeProcess],
+    quiet: TimeDelta,
+    now: DateTime<Utc>,
+) -> Look {
     let id = entry.record.session_id.as_str();
-    if id.is_empty() {
-        return Look {
-            live: false,
-            idle: false,
-            summary: None,
-            state: None,
-        };
-    }
     let worktree = entry.record.worktree.as_str();
     let sessions = agent.reader_mut().read_repo(worktree);
     let pairs: Vec<(&str, Option<DateTime<Utc>>)> = sessions
         .iter()
         .filter_map(|s| Some((s.session_id.as_deref()?, s.modified.or(s.last_timestamp))))
         .collect();
+    let claimed = procs::live_sessions(procs, worktree, &pairs);
     // A fresh `--session-id` process has no transcript yet, but names the session.
-    let live = procs.iter().any(|p| p.session_id.as_deref() == Some(id))
-        || procs::live_sessions(procs, worktree, &pairs).contains_key(id);
-    let summary = sessions
+    let named = !id.is_empty() && procs.iter().any(|p| p.session_id.as_deref() == Some(id));
+    let ours = !id.is_empty() && (named || claimed.contains_key(id));
+    // Any other `claude` in the worktree: what it does is not known, so it is busy.
+    let inside: Vec<&ClaudeProcess> = procs
         .iter()
-        .find(|s| s.session_id.as_deref() == Some(id))
-        .cloned();
-    let hook = agent.hooks().get(id).copied();
-    let state = classify_report(
-        summary.as_ref().unwrap_or(&SessionSummary::default()),
-        live,
-        hook,
-    );
-    let idle = match state {
-        SessionState::Live(LiveState::Idle) => true,
-        SessionState::Live(LiveState::Unknown) => summary
-            .as_ref()
-            .is_some_and(|s| matches!(classify_report(s, false, None), SessionState::Finished(_))),
-        _ => false,
-    };
+        .filter(|p| path_within(&p.cwd, worktree))
+        .collect();
+    let mut others = inside
+        .iter()
+        .filter(|p| id.is_empty() || p.session_id.as_deref() != Some(id))
+        .count();
+    if ours && !named && others > 0 {
+        // The recorded session runs in a process that names no session.
+        others -= 1;
+    }
+    let mut live_ids: Vec<String> = claimed.keys().cloned().collect();
+    live_ids.extend(inside.iter().filter_map(|p| p.session_id.clone()));
+    if ours {
+        live_ids.push(id.to_owned());
+    }
+    live_ids.sort();
+    live_ids.dedup();
+    let summary = (!id.is_empty())
+        .then(|| {
+            sessions
+                .iter()
+                .find(|s| s.session_id.as_deref() == Some(id))
+                .cloned()
+        })
+        .flatten();
+    let hook = (!id.is_empty())
+        .then(|| agent.hooks().get(id).copied())
+        .flatten();
+    let state = (!id.is_empty()).then(|| {
+        classify_report(
+            summary.as_ref().unwrap_or(&SessionSummary::default()),
+            ours,
+            hook,
+        )
+    });
+    let finished =
+        |s: &SessionSummary| matches!(classify_report(s, false, None), SessionState::Finished(_));
+    let idle = others == 0
+        && match state {
+            Some(SessionState::Live(LiveState::Idle)) => true,
+            Some(SessionState::Live(LiveState::Unknown)) => summary.as_ref().is_some_and(|s| {
+                finished(s) && (hook.is_some() || s.modified.is_some_and(|m| now - m >= quiet))
+            }),
+            _ => false,
+        };
     Look {
-        live,
+        live: ours || others > 0,
         idle,
+        waiting: state == Some(SessionState::Live(LiveState::WaitingOnUser)),
         summary,
-        state: Some(state),
+        state,
+        live_ids,
     }
 }
 
 /// The refactor's info, and its record with `blocked` cleared when the branch moved on
-/// since the merge stopped.
+/// since the merge stopped. `times` are the start grace and the idle quiet time.
 fn work_out(
     entry: &mut Entry,
     agent: &mut Agent,
     procs: &[ClaudeProcess],
     distro: Option<&str>,
+    times: (TimeDelta, TimeDelta),
     now: DateTime<Utc>,
 ) -> (RefactorInfo, Option<Record>) {
-    let look = look(entry, agent, procs);
+    let (grace, quiet) = times;
+    let look = look(entry, agent, procs, quiet, now);
+    entry.live_ids = look.live_ids.clone();
     let record = &entry.record;
     let repo = Path::new(&record.repo);
     let worktree = Path::new(&record.worktree);
@@ -875,19 +1391,30 @@ fn work_out(
         fresh.blocked_head = None;
         cleared = Some(fresh);
     }
-    let waiting = look.state == Some(SessionState::Live(LiveState::WaitingOnUser));
     let interrupted = !look.live && look.state.is_some_and(SessionState::is_unfinished);
     let launched = record.launched_at.unwrap_or(record.created_at);
-    let state = derive_state(&Facts {
-        live: look.live,
-        idle: look.idle,
-        waiting,
-        blocked: blocked.is_some(),
-        commits: commits.len(),
-        transcript: look.summary.is_some(),
-        fresh: now - launched < START_GRACE,
-        nothing_reported: result.as_ref().is_some_and(|r| r.refactors.is_empty()),
-    });
+    let state = if record.leftover {
+        RefactorState::NothingToDo
+    } else {
+        derive_state(&Facts {
+            live: look.live,
+            idle: look.idle,
+            waiting: look.waiting,
+            blocked: blocked.is_some(),
+            commits: commits.len(),
+            transcript: look.summary.is_some(),
+            fresh: !record.adopted && now - launched < grace,
+            nothing_reported: result.as_ref().is_some_and(|r| r.refactors.is_empty()),
+        })
+    };
+    let summary = if record.leftover {
+        Some(format!(
+            "Merged; the worktree could not be removed: {}",
+            record.leftover_reason.as_deref().unwrap_or("git refused")
+        ))
+    } else {
+        result.as_ref().and_then(|r| r.summary.clone())
+    };
     let info = RefactorInfo {
         state,
         worktree: record.worktree.clone(),
@@ -898,14 +1425,14 @@ fn work_out(
         session_id: record.session_id.clone(),
         created_at: record.created_at,
         live: look.live,
-        interrupted,
+        interrupted: interrupted && !record.leftover,
         commits,
         files_changed,
         insertions,
         deletions,
-        checks: result.as_ref().map(|r| r.checks.clone()),
-        summary: result.and_then(|r| r.summary),
-        blocked,
+        checks: result.map(|r| r.checks),
+        summary,
+        blocked: blocked.filter(|_| !record.leftover),
     };
     (info, cleared)
 }
@@ -1085,11 +1612,26 @@ fn branch_exists(repo: &Path, branch: &str) -> bool {
     commit_of(repo, &format!("refs/heads/{branch}")).is_some()
 }
 
-/// The branch checked out in `repo`; `None` on a detached HEAD.
-fn current_branch(repo: &Path) -> Option<String> {
-    read_git(repo, &["symbolic-ref", "-q", "--short", "HEAD"])
+/// The full ref HEAD names in `dir`; `None` on a detached HEAD.
+fn symbolic_head(dir: &Path) -> Option<String> {
+    read_git(dir, &["symbolic-ref", "-q", "HEAD"])
         .map(|s| s.trim().to_owned())
         .filter(|s| !s.is_empty())
+}
+
+/// The branch checked out in `repo`, without `refs/heads/`; `None` on a detached HEAD.
+fn current_branch(repo: &Path) -> Option<String> {
+    symbolic_head(repo)?
+        .strip_prefix("refs/heads/")
+        .filter(|b| !b.is_empty())
+        .map(str::to_owned)
+}
+
+/// True when a rebase is under way in the worktree whose git directory is `git_dir`.
+fn rebase_under_way(git_dir: &Path) -> bool {
+    ["rebase-merge", "rebase-apply"]
+        .iter()
+        .any(|d| fs::symlink_metadata(git_dir.join(d)).is_ok())
 }
 
 fn absolute_git_dir(worktree: &Path) -> Option<PathBuf> {
@@ -1167,20 +1709,66 @@ fn changed_files(repo: &Path, target: &str, branch: &str) -> Result<Vec<String>,
         .ok_or_else(|| fail("cannot list the files the refactor changed"))
 }
 
-/// Tracked files with changes in the worktree.
+/// Tracked files with changes in the worktree, both paths of a rename or copy.
 fn changed_in_worktree(worktree: &Path) -> Result<Vec<String>, Fail> {
-    read_git(
+    let out = read_git(
         worktree,
-        &["status", "--porcelain", "-z", "--untracked-files=no"],
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--untracked-files=no",
+            "--ignore-submodules=dirty",
+        ],
     )
-    .map(|out| {
-        out.split('\0')
-            .filter_map(|r| r.get(3..))
-            .filter(|p| !p.is_empty())
-            .map(str::to_owned)
-            .collect()
-    })
-    .ok_or_else(|| fail("cannot read the worktree's status"))
+    .ok_or_else(|| fail("cannot read the worktree's status"))?;
+    Ok(parse_porcelain(&out))
+}
+
+/// The paths in `git status --porcelain -z`, with the original path of each rename or
+/// copy (the record after it).
+pub fn parse_porcelain(out: &str) -> Vec<String> {
+    let mut paths = Vec::new();
+    let mut records = out.split('\0').filter(|r| !r.is_empty());
+    while let Some(record) = records.next() {
+        let (Some(xy), Some(path)) = (record.get(..2), record.get(3..)) else {
+            continue;
+        };
+        paths.push(path.to_owned());
+        if xy.contains(['R', 'C']) {
+            if let Some(origin) = records.next() {
+                paths.push(origin.to_owned());
+            }
+        }
+    }
+    paths
+}
+
+/// The uncommitted paths in `repo` that are, or hold, files the refactor changed:
+/// changed, staged (both paths of a rename) and untracked ones. Where `git status`
+/// leaves untracked files out (a Windows drive), they are looked for among the
+/// refactor's paths only.
+fn dirty_overlap(repo: &Path, target: &str, branch: &str) -> Result<Vec<String>, Fail> {
+    let status =
+        git::read_status(repo).map_err(|e| fail(format!("cannot read the repo's status: {e}")))?;
+    let changed = changed_files(repo, target, branch)?;
+    let mut dirty = status.paths;
+    dirty.extend(status.origins);
+    if git::untracked_arg(repo) == "-uno" && !changed.is_empty() {
+        let mut args = vec![
+            "--literal-pathspecs",
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard",
+            "--",
+        ];
+        args.extend(changed.iter().map(String::as_str));
+        let out =
+            read_git(repo, &args).ok_or_else(|| fail("cannot list the repo's untracked files"))?;
+        dirty.extend(out.split('\0').filter(|p| !p.is_empty()).map(str::to_owned));
+    }
+    Ok(overlap(&dirty, &changed))
 }
 
 /// The uncommitted paths that are, or hold, files the refactor changed, sorted.
@@ -1232,13 +1820,46 @@ fn worktrees(repo: &Path) -> io::Result<Vec<Worktree>> {
     Ok(list)
 }
 
-/// True when `target` (a full ref) is checked out in the worktree at `repo` itself.
-fn checked_out_here(repo: &Path, target: &str) -> Result<bool, Fail> {
+/// The worktrees of `repo`, other than the repo itself and `own`, that have `target`
+/// (a full ref) checked out, and any worktree, the repo's own too, that is rebasing it.
+fn target_holders(repo: &Path, own: &Path, target: &str) -> Result<Vec<String>, Fail> {
     let list = worktrees(repo).map_err(|e| fail(format!("cannot list worktrees: {e}")))?;
     let branch = target.strip_prefix("refs/heads/").unwrap_or(target);
-    Ok(list
+    let mut holders: Vec<String> = list
         .iter()
-        .any(|w| same_dir(&w.path, repo) && w.branch.as_deref() == Some(branch)))
+        .filter(|w| w.branch.as_deref() == Some(branch))
+        .filter(|w| !same_dir(&w.path, repo) && !same_dir(&w.path, own))
+        .map(|w| path_str(&w.path))
+        .collect();
+    // Each worktree's git directory: the common one for the main worktree, and
+    // `worktrees/<name>` (whose `gitdir` names `<worktree>/.git`) for linked ones.
+    let git_dir =
+        scan::git_dir(repo).ok_or_else(|| fail("cannot find the repo's git directory"))?;
+    let common = scan::common_dir(&git_dir).unwrap_or(git_dir);
+    let mut dirs: Vec<(PathBuf, Option<PathBuf>)> =
+        vec![(common.clone(), list.first().map(|w| w.path.clone()))];
+    if let Ok(entries) = fs::read_dir(common.join("worktrees")) {
+        for admin in entries.flatten().map(|e| e.path()) {
+            let path = fs::read_to_string(admin.join("gitdir"))
+                .ok()
+                .and_then(|t| Path::new(t.trim()).parent().map(Path::to_owned));
+            dirs.push((admin, path));
+        }
+    }
+    for (dir, path) in dirs {
+        if path.as_deref().is_some_and(|p| same_dir(p, own)) {
+            continue;
+        }
+        let rebasing = ["rebase-merge", "rebase-apply"].iter().any(|d| {
+            fs::read_to_string(dir.join(d).join("head-name")).is_ok_and(|n| n.trim() == target)
+        });
+        if rebasing {
+            holders.push(path.map_or_else(|| path_str(&dir), |p| path_str(&p)));
+        }
+    }
+    holders.sort();
+    holders.dedup();
+    Ok(holders)
 }
 
 /// True when the repo's git directory has linked worktrees, without running git.
@@ -1337,6 +1958,15 @@ mod tests {
         );
         assert_eq!(parse_shortstat(" 1 file changed, 1 deletion(-)"), (1, 0, 1));
         assert_eq!(parse_shortstat(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn porcelain_names_both_paths_of_a_rename() {
+        let out = "R  src/new.rs\0src/old.rs\0 M README.md\0C  b.rs\0a.rs\0";
+        assert_eq!(
+            parse_porcelain(out),
+            ["src/new.rs", "src/old.rs", "README.md", "b.rs", "a.rs"]
+        );
     }
 
     #[test]

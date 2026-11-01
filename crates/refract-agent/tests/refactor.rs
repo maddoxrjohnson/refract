@@ -26,6 +26,11 @@ struct Agent {
 
 impl Agent {
     fn spawn(env: &Env) -> Agent {
+        Agent::spawn_with(env, &[])
+    }
+
+    /// [`Agent::spawn`] with more environment variables, such as shorter refactor times.
+    fn spawn_with(env: &Env, vars: &[(&str, &str)]) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
@@ -35,6 +40,7 @@ impl Agent {
             .env("REFRACT_AGENT_CONFIG", &env.config)
             .env("WSL_DISTRO_NAME", "Ubuntu")
             .envs(GIT_ENV.iter().copied())
+            .envs(vars.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -960,5 +966,539 @@ fn a_record_pointing_outside_the_worktrees_folder_is_never_deleted() {
     assert!(branch_exists(&repo, "refactor/20200101-0000"));
     assert_eq!(rev(&repo, "main"), record["baseCommit"].as_str().unwrap());
     assert_eq!(env.records().len(), 1);
+    agent.shutdown();
+}
+
+/// Runs git in `dir`, which may fail; returns whether it succeeded.
+fn try_git(dir: &Path, args: &[&str]) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .envs(GIT_ENV.iter().copied())
+        .env("GIT_EDITOR", "true")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+        .success()
+}
+
+#[track_caller]
+fn assert_blocked(reply: &Value, reason: &str, files: Value) {
+    assert_eq!(
+        reply["result"],
+        json!({"outcome": "blocked", "reason": reason, "files": files}),
+        "{reply}"
+    );
+}
+
+#[test]
+fn an_untracked_file_or_a_staged_rename_the_refactor_touches_blocks_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let (_, refactor) = start(&mut agent, &repo, None);
+    let worktree = path(&refactor["worktree"]);
+    commit_file(
+        &worktree,
+        "src/tide.rs",
+        "pub fn tide() {}\n",
+        "Split out tide",
+    );
+    commit_file(
+        &worktree,
+        "README.md",
+        "# demo, tidied\n",
+        "Tidy the readme",
+    );
+    agent.wait_state(&repo, "ready");
+
+    // An untracked file where the refactor adds one.
+    write(&repo.join("src/tide.rs"), "mine\n");
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "dirtyOverlap", json!(["src/tide.rs"]));
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/tide.rs")).unwrap(),
+        "mine\n"
+    );
+    std::fs::remove_file(repo.join("src/tide.rs")).unwrap();
+
+    // A staged rename away from a file the refactor changed.
+    git(&repo, &["mv", "README.md", "DOCS.md"]);
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "dirtyOverlap", json!(["README.md"]));
+    assert!(repo.join("DOCS.md").is_file());
+    git(&repo, &["mv", "DOCS.md", "README.md"]);
+
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    agent.shutdown();
+}
+
+#[test]
+fn a_target_checked_out_in_another_worktree_blocks_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    let main = rev(&repo, "main");
+    git(&repo, &["checkout", "-q", "-b", "spike"]);
+    let hold = env.tmp.join("hold");
+    git(
+        &repo,
+        &["worktree", "add", "-q", hold.to_str().unwrap(), "main"],
+    );
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "targetBusy", json!([hold.to_str().unwrap()]));
+    assert_eq!(rev(&repo, "main"), main);
+    assert!(worktree.is_dir());
+    agent.wait_state(&repo, "mergeBlocked");
+
+    git(&repo, &["worktree", "remove", hold.to_str().unwrap()]);
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    assert_eq!(git(&repo, &["branch", "--show-current"]), "spike");
+    agent.shutdown();
+}
+
+#[test]
+fn a_repo_rebasing_its_target_blocks_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let head = rev(&path(&refactor["worktree"]), "HEAD");
+    commit_file(&repo, "docs/tides.md", "# Tides\n", "Document tides");
+    // A rebase of main that stops half way.
+    assert!(!try_git(
+        &repo,
+        &["rebase", "-q", "--exec", "false", "HEAD~1"]
+    ));
+    let git_dir = repo.join(".git");
+    assert_eq!(
+        std::fs::read_to_string(git_dir.join("rebase-merge/head-name"))
+            .unwrap()
+            .trim(),
+        "refs/heads/main"
+    );
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "targetBusy", json!([repo.to_str().unwrap()]));
+    assert!(git_dir.join("rebase-merge").is_dir());
+
+    git(&repo, &["rebase", "--abort"]);
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    assert_eq!(
+        git(&repo, &["log", "-1", "--format=%s"]),
+        "Tidy the entry point"
+    );
+    assert_ne!(rev(&repo, "HEAD"), head);
+    agent.shutdown();
+}
+
+#[test]
+fn uncommitted_changes_in_the_worktree_block_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    write(&worktree.join("README.md"), "# half done\n");
+    let main = rev(&repo, "main");
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "worktreeDirty", json!(["README.md"]));
+    assert_eq!(rev(&repo, "main"), main);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("README.md")).unwrap(),
+        "# half done\n"
+    );
+    let state = agent.wait_state(&repo, "mergeBlocked");
+    assert_eq!(
+        state["blocked"],
+        json!({"reason": "worktreeDirty", "files": ["README.md"]})
+    );
+    agent.shutdown();
+}
+
+#[test]
+fn a_worktree_off_its_branch_or_mid_rebase_is_left_alone() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    let branch = refactor["branch"].as_str().unwrap().to_owned();
+    let main = rev(&repo, "main");
+
+    git(&worktree, &["checkout", "-q", "--detach"]);
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "worktreeBusy", json!([]));
+    git(&worktree, &["checkout", "-q", &branch]);
+
+    // The agent's own rebase, stopped half way, is not aborted.
+    commit_file(&repo, "docs/tides.md", "# Tides\n", "Document tides");
+    let main_moved = rev(&repo, "main");
+    assert!(!try_git(
+        &worktree,
+        &["rebase", "-q", "--exec", "false", "HEAD~1"]
+    ));
+    let git_dir = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]));
+    let todo = std::fs::read_to_string(git_dir.join("rebase-merge/head-name")).unwrap();
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "worktreeBusy", json!([]));
+    assert_eq!(
+        std::fs::read_to_string(git_dir.join("rebase-merge/head-name")).unwrap(),
+        todo
+    );
+    assert_eq!(rev(&repo, "main"), main_moved);
+    assert_ne!(main_moved, main);
+    git(&worktree, &["rebase", "--abort"]);
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    agent.shutdown();
+}
+
+#[test]
+fn stash_and_squash_config_does_not_change_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    for (key, value) in [
+        ("merge.autoStash", "true"),
+        ("rebase.autoStash", "true"),
+        ("rebase.autoSquash", "true"),
+        ("rebase.updateRefs", "true"),
+        ("merge.ff", "false"),
+    ] {
+        git(&repo, &["config", key, value]);
+    }
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    commit_file(
+        &worktree,
+        "src/lib.rs",
+        "pub fn x() {}\n",
+        "fixup! Tidy the entry point",
+    );
+    commit_file(&repo, "docs/tides.md", "# Tides\n", "Document tides");
+    write(&repo.join("notes.txt"), "draft\n");
+    git(&repo, &["add", "notes.txt"]);
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(
+        merged["result"],
+        json!({"outcome": "merged", "commits": 2}),
+        "{merged}"
+    );
+    assert_eq!(
+        git(&repo, &["diff", "--cached", "--name-only"]),
+        "notes.txt"
+    );
+    assert_eq!(git(&repo, &["stash", "list"]), "");
+    assert_eq!(
+        git(&repo, &["log", "-3", "--format=%s"]),
+        "fixup! Tidy the entry point\nTidy the entry point\nDocument tides"
+    );
+    agent.shutdown();
+}
+
+#[test]
+fn a_worktree_git_will_not_remove_after_a_merge_is_kept_until_discarded() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    let branch = refactor["branch"].as_str().unwrap().to_owned();
+    let head = rev(&worktree, "HEAD");
+    write(&worktree.join("scratch.txt"), "agent notes\n");
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    assert_eq!(merged["result"]["commits"], 1);
+    let kept = merged["result"]["kept"].as_array().unwrap();
+    assert_eq!(kept.len(), 1, "{merged}");
+    assert!(kept[0].as_str().unwrap().starts_with("Kept the worktree"));
+    assert_eq!(rev(&repo, "main"), head);
+    assert!(worktree.join("scratch.txt").is_file());
+    assert!(branch_exists(&repo, &branch));
+
+    let left = agent.wait_state(&repo, "nothingToDo");
+    let summary = left["summary"].as_str().unwrap();
+    assert!(
+        summary.starts_with("Merged; the worktree could not be removed: "),
+        "{summary}"
+    );
+    let records = env.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["leftover"], true);
+    let again = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(again["error"]["code"], 8, "{again}");
+
+    // After a restart it is kept, not adopted afresh.
+    agent.shutdown();
+    let mut agent = Agent::spawn(&env);
+    agent.wait_state(&repo, "nothingToDo");
+    assert_eq!(env.records().len(), 1);
+    let discarded = agent.request("discardRefactor", json!({"path": repo}));
+    assert_eq!(discarded["result"], Value::Null, "{discarded}");
+    assert!(!worktree.exists());
+    assert!(!branch_exists(&repo, &branch));
+    assert_eq!(rev(&repo, "main"), head);
+    assert!(env.records().is_empty());
+    agent.shutdown();
+}
+
+#[test]
+fn a_launch_never_picked_up_is_interrupted_and_resumes_as_a_new_session() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn_with(&env, &[("REFRACT_REFACTOR_GRACE_SECS", "2")]);
+    let (ticket, refactor) = start(&mut agent, &repo, Some("the parser"));
+    assert_eq!(refactor["state"], "starting");
+    let old_session = ticket["sessionId"].as_str().unwrap().to_owned();
+    let old_request = ticket["requestId"].as_str().unwrap().to_owned();
+    assert_eq!(env.records()[0]["requestId"], old_request);
+    let interrupted = agent.wait_state(&repo, "interrupted");
+    assert_eq!(interrupted["live"], false);
+
+    // The extension had half claimed it; both files go.
+    let launch = env.state.join("launch");
+    let old_json = launch.join(format!("{old_request}.json"));
+    let old_claimed = launch.join(format!("{old_request}.claimed"));
+    std::fs::copy(&old_json, &old_claimed).unwrap();
+    let resumed = agent.request("resumeRefactor", json!({"path": repo}));
+    let ticket = &resumed["result"];
+    let session = ticket["sessionId"].as_str().unwrap();
+    assert_ne!(session, old_session, "{resumed}");
+    assert!(!old_json.exists() && !old_claimed.exists());
+    let request = env.launch_request(ticket);
+    let argv = request["argv"].as_array().unwrap();
+    assert_eq!(
+        argv[..5],
+        [
+            json!("claude"),
+            json!("--session-id"),
+            json!(session),
+            json!("--permission-mode"),
+            json!("plan")
+        ]
+    );
+    assert!(argv[6].as_str().unwrap().ends_with("Focus on: the parser"));
+    let records = env.records();
+    assert_eq!(records[0]["sessionId"], session);
+    assert_eq!(records[0]["requestId"], ticket["requestId"]);
+    let state = agent.repo(&repo)["refactor"].clone();
+    assert_eq!(state["state"], "starting");
+    assert_eq!(state["sessionId"], session);
+    agent.shutdown();
+}
+
+#[test]
+fn a_folder_git_does_not_list_for_the_repo_is_never_deleted() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let other = env.repo("kelp-cli");
+    // A folder of another repo's worktree, under the worktrees folder.
+    let theirs = env.worktrees().join("kelp-cli-20200101-0000");
+    git(
+        &other,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "spike",
+            theirs.to_str().unwrap(),
+        ],
+    );
+    let record = json!({
+        "repo": repo,
+        "worktree": theirs,
+        "branch": "refactor/20200101-0000",
+        "baseCommit": rev(&repo, "main"),
+        "targetBranch": "main",
+        "sessionId": "",
+        "createdAt": "2026-10-31T14:05:00Z",
+    });
+    write(
+        &env.state
+            .join("refactors/0b7e0000-0000-4000-8000-00000000000a.json"),
+        &record.to_string(),
+    );
+    let mut agent = Agent::spawn(&env);
+    let discard = agent.request("discardRefactor", json!({"path": repo}));
+    assert_eq!(discard["error"]["code"], 8, "{discard}");
+    assert!(theirs.join("README.md").is_file());
+    assert!(branch_exists(&other, "spike"));
+
+    // A refactor whose worktree git stops listing while the helper runs.
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    let git_dir = PathBuf::from(git(&worktree, &["rev-parse", "--absolute-git-dir"]));
+    std::fs::remove_dir_all(&git_dir).unwrap();
+    let discard = agent.request("discardRefactor", json!({"path": repo}));
+    assert_eq!(discard["error"]["code"], 8, "{discard}");
+    let merge = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merge["error"]["code"], 8, "{merge}");
+    assert!(worktree.join("src/main.rs").is_file());
+    agent.shutdown();
+}
+
+#[test]
+fn two_repos_of_one_name_get_their_own_worktrees() {
+    let env = Env::new();
+    let first = env.repo("north/tidepool-api");
+    let second = env.repo("south/tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let (_, a) = start(&mut agent, &first, None);
+    let (_, b) = start(&mut agent, &second, None);
+    let (wa, wb) = (path(&a["worktree"]), path(&b["worktree"]));
+    assert_ne!(wa, wb);
+    assert!(wa.starts_with(env.worktrees()) && wb.starts_with(env.worktrees()));
+    assert!(git(&first, &["worktree", "list"]).contains(wa.to_str().unwrap()));
+    assert!(git(&second, &["worktree", "list"]).contains(wb.to_str().unwrap()));
+    assert_eq!(env.records().len(), 2);
+    let discarded = agent.request("discardRefactor", json!({"path": first}));
+    assert_eq!(discarded["result"], Value::Null, "{discarded}");
+    assert!(!wa.exists() && wb.is_dir());
+    assert_eq!(agent.repo(&second)["refactor"]["worktree"], b["worktree"]);
+    agent.shutdown();
+}
+
+#[test]
+fn records_of_gone_or_unknown_repos_are_dropped_or_kept_without_deleting() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    // A repo outside the roots, with a refactor worktree.
+    let outside = env.tmp.join("elsewhere/kelp-cli");
+    init_repo(&outside);
+    let kept = env.worktrees().join("kelp-cli-20200101-0000");
+    git(
+        &outside,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "refactor/20200101-0000",
+            kept.to_str().unwrap(),
+        ],
+    );
+    // A folder for a repo that is gone.
+    let orphan = env.worktrees().join("reef-maps-20200101-0000");
+    write(&orphan.join("notes.txt"), "keep me\n");
+    let record = |repo: &Path, worktree: &Path| {
+        json!({
+            "repo": repo,
+            "worktree": worktree,
+            "branch": "refactor/20200101-0000",
+            "baseCommit": rev(&outside, "main"),
+            "targetBranch": "main",
+            "sessionId": "",
+            "createdAt": "2026-10-31T14:05:00Z",
+        })
+        .to_string()
+    };
+    let records = env.state.join("refactors");
+    write(
+        &records.join("0b7e0000-0000-4000-8000-00000000000b.json"),
+        &record(&outside, &kept),
+    );
+    write(
+        &records.join("0b7e0000-0000-4000-8000-00000000000c.json"),
+        &record(&env.root.join("reef-maps"), &orphan),
+    );
+    let mut agent = Agent::spawn(&env);
+    let list = agent.request("listRepos", Value::Null);
+    assert_eq!(list["result"]["repos"].as_array().unwrap().len(), 1);
+    assert_eq!(agent.repo(&repo)["refactor"], Value::Null);
+    let left = env.records();
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert_eq!(left[0]["repo"], outside.to_str().unwrap());
+    assert!(orphan.join("notes.txt").is_file());
+    assert!(kept.join("README.md").is_file());
+    let discard = agent.request("discardRefactor", json!({"path": outside}));
+    assert_eq!(discard["error"]["code"], 8, "{discard}");
+    assert!(kept.is_dir());
+    agent.shutdown();
+}
+
+#[test]
+fn without_a_hook_an_open_agent_counts_as_idle_only_once_quiet() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn_with(&env, &[("REFRACT_REFACTOR_QUIET_SECS", "5")]);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    let session = refactor["sessionId"].as_str().unwrap().to_owned();
+    let _claude = FakeClaude::start(&worktree, &session);
+    env.transcript(&session, &worktree, true);
+    // Just written: it may still be at work.
+    agent.wait_state(&repo, "working");
+    let merge = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&merge, "live", json!([]));
+
+    // Quiet for a minute: its turn is over.
+    let file = project_dir(&env.projects, &worktree).join(format!("{session}.jsonl"));
+    let past = format!("@{}", (Utc::now() - TimeDelta::minutes(1)).timestamp());
+    let touched = Command::new("touch")
+        .args(["-d", &past])
+        .arg(&file)
+        .status()
+        .unwrap();
+    assert!(touched.success());
+    let ready = agent.wait_state(&repo, "ready");
+    assert_eq!(ready["live"], true);
+
+    // Another agent in the worktree is busy whatever it does.
+    let other = FakeClaude::start(
+        &worktree.join("src"),
+        "5e2a7c10-0000-4000-8000-0000000000b2",
+    );
+    agent.wait_state(&repo, "working");
+    let merge = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&merge, "live", json!([]));
+    let discard = agent.request("discardRefactor", json!({"path": repo}));
+    assert_eq!(discard["error"]["code"], 8, "{discard}");
+    drop(other);
+    agent.wait_state(&repo, "ready");
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    agent.shutdown();
+}
+
+#[test]
+fn a_tag_named_like_the_target_does_not_get_in_the_way() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    git(&repo, &["tag", "main"]);
+    let tagged = rev(&repo, "refs/tags/main");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    assert_eq!(refactor["targetBranch"], "main");
+    commit_file(&repo, "docs/tides.md", "# Tides\n", "Document tides");
+    let moved = rev(&repo, "refs/heads/main");
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    assert_eq!(rev(&repo, "refs/heads/main~1"), moved);
+    assert_eq!(rev(&repo, "refs/tags/main"), tagged);
+    assert!(repo.join("docs/tides.md").is_file());
+    agent.shutdown();
+}
+
+#[test]
+fn a_target_rewritten_under_the_refactor_blocks_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    git(&repo, &["commit", "-q", "--amend", "-m", "Start over"]);
+    let main = rev(&repo, "main");
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "targetRewound", json!([]));
+    assert_eq!(rev(&repo, "main"), main);
+    assert!(worktree.is_dir());
     agent.shutdown();
 }

@@ -27,6 +27,8 @@ pub struct Status {
     /// untracked directory git still reports as a whole (such as a nested repo) keeps
     /// its trailing `/`.
     pub paths: Vec<String>,
+    /// The original paths of the renames and copies in `paths`.
+    pub origins: Vec<String>,
 }
 
 /// Facts about HEAD: refreshed when HEAD or refs move.
@@ -299,7 +301,9 @@ pub fn parse_status(out: &[u8]) -> Status {
             Some(b'1') => record.splitn(9, ' ').nth(8),
             Some(b'2') => {
                 // A rename or copy; the original path is the next record.
-                records.next();
+                if let Some(origin) = records.next().filter(|o| !o.is_empty()) {
+                    status.origins.push(origin);
+                }
                 record.splitn(10, ' ').nth(9)
             }
             Some(b'u') => record.splitn(11, ' ').nth(10),
@@ -390,6 +394,7 @@ mod tests {
                 "scratch.txt"
             ]
         );
+        assert_eq!(s.origins, ["src/old.rs"]);
         assert_eq!(s.ahead_behind, None);
     }
 

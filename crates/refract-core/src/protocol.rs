@@ -807,8 +807,9 @@ pub enum CheckOutcome {
 #[serde(rename_all = "camelCase")]
 pub struct MergeBlock {
     pub reason: MergeBlockReason,
-    /// Paths relative to the repo: the uncommitted files the refactor also changed, or
-    /// the files the rebase could not merge.
+    /// Paths relative to the repo: the uncommitted files the refactor also changed, the
+    /// files the rebase could not merge, or the worktree's uncommitted files; for
+    /// `targetBusy`, the absolute paths of the worktrees that hold the target.
     pub files: Vec<String>,
 }
 
@@ -824,6 +825,15 @@ pub enum MergeBlockReason {
     TargetMissing,
     /// The refactor agent is still working on a turn or waiting on the user.
     Live,
+    /// Another worktree has the target branch checked out, or is rebasing it.
+    TargetBusy,
+    /// The refactor's worktree is not on its branch, or a rebase, merge or cherry-pick
+    /// is under way there.
+    WorktreeBusy,
+    /// The refactor's worktree has uncommitted changes to tracked files.
+    WorktreeDirty,
+    /// The target branch no longer holds the commit the refactor started from.
+    TargetRewound,
 }
 
 /// The result of `mergeRefactor`.
@@ -1393,6 +1403,14 @@ mod tests {
             }),
             json!({"outcome": "blocked", "reason": "dirtyOverlap", "files": ["src/lib.rs"]})
         );
+        for (reason, wire) in [
+            (MergeBlockReason::TargetBusy, "targetBusy"),
+            (MergeBlockReason::WorktreeBusy, "worktreeBusy"),
+            (MergeBlockReason::WorktreeDirty, "worktreeDirty"),
+            (MergeBlockReason::TargetRewound, "targetRewound"),
+        ] {
+            assert_eq!(round_trip(&reason), json!(wire));
+        }
         let info = round_trip(&refactor_info());
         assert_eq!(info["state"], "ready");
         assert_eq!(info["targetBranch"], "main");
@@ -1673,6 +1691,22 @@ mod tests {
             }),
             Reply::RefactorMerge(MergeOutcome::Blocked {
                 reason: MergeBlockReason::Live,
+                files: vec![],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Blocked {
+                reason: MergeBlockReason::TargetBusy,
+                files: vec!["/home/dev/projects/tidepool-api-spike".into()],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Blocked {
+                reason: MergeBlockReason::WorktreeBusy,
+                files: vec![],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Blocked {
+                reason: MergeBlockReason::WorktreeDirty,
+                files: vec!["src/lib.rs".into()],
+            }),
+            Reply::RefactorMerge(MergeOutcome::Blocked {
+                reason: MergeBlockReason::TargetRewound,
                 files: vec![],
             }),
             Reply::Path("/home/dev/projects/kelp-cli".into()),

@@ -71,7 +71,55 @@ pub fn prepare_titled(
     distro: Option<&str>,
     now: DateTime<Utc>,
 ) -> Result<LaunchTicket, ErrorBody> {
-    prepare_full(path, mode, None, procs_chain, title, dir, distro, now)
+    prepare_full(path, mode, None, procs_chain, title, None, dir, distro, now)
+}
+
+/// The ids of a launch, chosen before its request is written, so they can be recorded
+/// first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ids {
+    /// For a new agent; a resume keeps the id it names.
+    pub session_id: String,
+    pub request_id: String,
+}
+
+impl Ids {
+    /// Fresh ids for `mode`.
+    pub fn new(mode: &LaunchMode) -> Ids {
+        let session_id = match mode {
+            LaunchMode::Resume { session_id, .. } | LaunchMode::Focus { session_id } => {
+                session_id.clone()
+            }
+            LaunchMode::New { .. } => uuid::Uuid::new_v4().to_string(),
+        };
+        Ids {
+            session_id,
+            request_id: uuid::Uuid::new_v4().to_string(),
+        }
+    }
+}
+
+/// [`prepare_titled`] with the ids chosen beforehand.
+pub fn prepare_planned(
+    path: &str,
+    mode: &LaunchMode,
+    title: &str,
+    ids: &Ids,
+    dir: &Path,
+    distro: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<LaunchTicket, ErrorBody> {
+    prepare_full(
+        path,
+        mode,
+        None,
+        procs_chain,
+        title,
+        Some(ids),
+        dir,
+        distro,
+        now,
+    )
 }
 
 /// A running `claude` process and its ancestors, or nothing once it has exited or its
@@ -97,10 +145,10 @@ fn prepare_with(
     now: DateTime<Utc>,
 ) -> Result<LaunchTicket, ErrorBody> {
     let title = launch_title(mode);
-    prepare_full(path, mode, running, chain, title, dir, distro, now)
+    prepare_full(path, mode, running, chain, title, None, dir, distro, now)
 }
 
-/// [`prepare_with`], naming the terminal tab `title`.
+/// [`prepare_with`], naming the terminal tab `title`, with `ids` when chosen beforehand.
 #[allow(clippy::too_many_arguments)]
 fn prepare_full(
     path: &str,
@@ -108,6 +156,7 @@ fn prepare_full(
     running: Option<LiveProcess>,
     chain: impl Fn(&LiveProcess) -> Vec<u32>,
     title: &str,
+    ids: Option<&Ids>,
     dir: &Path,
     distro: Option<&str>,
     now: DateTime<Utc>,
@@ -128,7 +177,10 @@ fn prepare_full(
         ));
     };
     let session_id = match mode {
-        LaunchMode::New { .. } => uuid::Uuid::new_v4().to_string(),
+        LaunchMode::New { .. } => ids.map_or_else(
+            || uuid::Uuid::new_v4().to_string(),
+            |ids| ids.session_id.clone(),
+        ),
         LaunchMode::Resume { session_id, .. } | LaunchMode::Focus { session_id } => {
             // Only the hyphenated form, which is the only one 36 characters long.
             if session_id.len() != 36 || uuid::Uuid::try_parse(session_id).is_err() {
@@ -161,7 +213,10 @@ fn prepare_full(
         }
         _ => None,
     };
-    let request_id = uuid::Uuid::new_v4().to_string();
+    let request_id = ids.map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |ids| ids.request_id.clone(),
+    );
     let request = LaunchRequest {
         version: LAUNCH_REQUEST_VERSION,
         request_id: request_id.clone(),

@@ -9,7 +9,9 @@
 //! fifth runs `setupServer` requests one at a time, sending each response back through
 //! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
 //! time, sending each result back for this thread to report and answer. A seventh keeps
-//! token usage totals up to date (see [`crate::usage`]). Each migration runs on a
+//! token usage totals up to date (see [`crate::usage`]). An eighth runs the git work of
+//! `startRefactor`, `mergeRefactor` and `discardRefactor` one job at a time, sending
+//! each result back for this thread to take in and answer (see [`crate::refactor`]). Each migration runs on a
 //! thread of its own (see [`crate::migrate`]), sending its responses and events back
 //! through the channel; this thread only routes requests to it and updates the config
 //! when one finishes.
@@ -44,7 +46,7 @@ use crate::launch;
 use crate::limits::LimitsFile;
 use crate::migrate::{self, Phase};
 use crate::procs;
-use crate::refactor::Refactors;
+use crate::refactor::{self, Refactors, Step};
 use crate::repos;
 use crate::scan;
 use crate::setup;
@@ -119,6 +121,11 @@ enum Msg {
     },
     /// A migration's worker has something for this thread.
     Migration(migrate::Update),
+    /// A refactor job the refactor thread finished.
+    Refactored {
+        id: Id,
+        done: refactor::Done,
+    },
 }
 
 /// One line of input, without its newline.
@@ -291,6 +298,8 @@ struct Server<W: Write> {
     setup_jobs: Option<Sender<setup::Job>>,
     /// Queues `cloneRepo` jobs for the clone thread, once it is started.
     clone_jobs: Option<Sender<repos::Job>>,
+    /// Queues refactor jobs for the refactor thread, once it is started.
+    refactor_jobs: Option<Sender<(Id, refactor::Job)>>,
     /// Refreshes asked for since the load started, re-applied to each repo it reads.
     touched: HashMap<PathBuf, Refresh>,
     /// `getRepo` requests for repos not loaded yet, answered when they are.
@@ -374,6 +383,10 @@ where
             Ok(Msg::Answer(response)) => server.send(&response)?,
             Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
             Ok(Msg::Migration(update)) => server.migration(update)?,
+            Ok(Msg::Refactored { id, done }) => {
+                let finished = server.refactors.finish(&mut server.agent, done, Utc::now());
+                server.answer_refactor(id, finished)?;
+            }
             Err(RecvTimeoutError::Timeout) => {}
         }
         let now = Instant::now();
@@ -393,9 +406,7 @@ where
         }
         if server.next_refactor.is_some_and(|d| d <= now) {
             server.next_refactor = None;
-            let events = server
-                .refactors
-                .refresh(&mut server.agent, None, Utc::now());
+            let events = server.refactors.poll(&mut server.agent, Utc::now());
             server.send_all(&events)?;
         }
         server.schedule_live();
@@ -534,6 +545,7 @@ impl<W: Write> Server<W> {
             tx,
             setup_jobs: None,
             clone_jobs: None,
+            refactor_jobs: None,
             touched: HashMap::new(),
             waiting: Vec::new(),
             prewatched: Vec::new(),
@@ -685,14 +697,10 @@ impl<W: Write> Server<W> {
             Method::StartRefactor { path, focus } => {
                 self.ensure_loaded()?;
                 let dir = launch::launch_dir();
-                let started = self.refactors.start(
-                    &mut self.agent,
-                    &path,
-                    focus.as_deref(),
-                    &dir,
-                    Utc::now(),
-                );
-                return self.answer_refactor(id, started.map(|(t, e)| (Reply::Launch(t), e)));
+                let started =
+                    self.refactors
+                        .start(&self.agent, &path, focus.as_deref(), &dir, Utc::now());
+                return self.run_refactor(id, started.map(Step::Run));
             }
             Method::ResumeRefactor { path, fix } => {
                 self.ensure_loaded()?;
@@ -700,17 +708,18 @@ impl<W: Write> Server<W> {
                 let resumed = self
                     .refactors
                     .resume(&mut self.agent, &path, fix, &dir, Utc::now());
-                return self.answer_refactor(id, resumed.map(|(t, e)| (Reply::Launch(t), e)));
+                self.answer_refactor(id, resumed.map(|(t, e)| (Reply::Launch(t), e)))?;
+                return Ok(true);
             }
             Method::MergeRefactor { path } => {
                 self.ensure_loaded()?;
                 let merged = self.refactors.merge(&mut self.agent, &path, Utc::now());
-                return self.answer_refactor(id, merged.map(|(o, e)| (Reply::RefactorMerge(o), e)));
+                return self.run_refactor(id, merged);
             }
             Method::DiscardRefactor { path } => {
                 self.ensure_loaded()?;
-                let discarded = self.refactors.discard(&mut self.agent, &path);
-                return self.answer_refactor(id, discarded.map(|e| (Reply::Done, e)));
+                let discarded = self.refactors.discard(&mut self.agent, &path, Utc::now());
+                return self.run_refactor(id, discarded.map(Step::Run));
             }
             Method::Migrate(params) => {
                 // Any of the two folders within, or holding, one of another migration's.
@@ -1605,11 +1614,66 @@ impl<W: Write> Server<W> {
         // A refactor's commits show as changes in its repo's git directory; its agent's
         // hook status as a status file.
         if self.load == Load::Done && !self.refactors.is_empty() {
-            let hooks_moved = pending.reload || !pending.hook_files.is_empty();
-            let which = (!hooks_moved).then_some(refreshed.as_slice());
-            events.extend(self.refactors.refresh(&mut self.agent, which, Utc::now()));
+            let now = Utc::now();
+            if pending.reload {
+                events.extend(self.refactors.refresh(&mut self.agent, None, now));
+            } else {
+                let sessions: Vec<&str> = pending
+                    .hook_files
+                    .iter()
+                    .filter_map(|n| refract_core::hook::status_file_session(n))
+                    .collect();
+                events.extend(self.refactors.refresh_touched(
+                    &mut self.agent,
+                    &refreshed,
+                    &sessions,
+                    now,
+                ));
+            }
         }
         self.send_all(&events)
+    }
+
+    /// Answers a refactor request at once, or queues its job for the refactor thread,
+    /// which answers it once done.
+    fn run_refactor(&mut self, id: Id, step: Result<Step, ErrorBody>) -> io::Result<bool> {
+        match step {
+            Ok(Step::Run(job)) => self.start_refactor_job(id, job)?,
+            Ok(Step::Answer(reply, events)) => self.answer_refactor(id, Ok((reply, events)))?,
+            Err(e) => self.answer_refactor(id, Err(e))?,
+        }
+        Ok(true)
+    }
+
+    /// Queues `job` for the refactor thread, starting it on first use. Jobs run one at a
+    /// time and each result arrives as [`Msg::Refactored`]. If the thread cannot start,
+    /// the job fails at once.
+    fn start_refactor_job(&mut self, id: Id, job: refactor::Job) -> io::Result<()> {
+        let (id, job) = match &self.refactor_jobs {
+            Some(jobs) => match jobs.send((id, job)) {
+                Ok(()) => return Ok(()),
+                // The thread is gone (it panicked); start another.
+                Err(mpsc::SendError(queued)) => queued,
+            },
+            None => (id, job),
+        };
+        let (jobs, rx) = mpsc::channel::<(Id, refactor::Job)>();
+        let tx = self.tx.clone();
+        let started = std::thread::Builder::new()
+            .name("refactor".into())
+            .spawn(move || run_refactor_jobs(rx, &tx));
+        if let Err(e) = started {
+            let done = refactor::Done::failed(
+                job.repo().to_owned(),
+                format!("cannot start the refactor thread: {e}"),
+            );
+            let finished = self.refactors.finish(&mut self.agent, done, Utc::now());
+            return self.answer_refactor(id, finished);
+        }
+        // The thread holds the receiver until it has run a job, so this cannot fail.
+        let _ = jobs.send((id, job));
+        self.refactor_jobs = Some(jobs);
+        Ok(())
     }
 
     /// Answers a refactor request, then sends the events it caused. The refactors are
@@ -1618,21 +1682,20 @@ impl<W: Write> Server<W> {
         &mut self,
         id: Id,
         result: Result<(Reply, Vec<Event>), ErrorBody>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<()> {
         self.next_refactor = None;
         match result {
             Ok((reply, events)) => {
                 self.send(&Response::ok(id, reply))?;
-                self.send_all(&events)?;
+                self.send_all(&events)
             }
-            Err(e) => self.send(&Response::err(id, e.code, e.message))?,
+            Err(e) => self.send(&Response::err(id, e.code, e.message)),
         }
-        Ok(true)
     }
 
     /// Arms the refactor timer once the repos are loaded and some refactor exists.
     fn schedule_refactors(&mut self) {
-        match self.refactors.poll_interval() {
+        match self.refactors.poll_interval(&self.agent, Utc::now()) {
             Some(every) if self.load == Load::Done => {
                 if self.next_refactor.is_none() {
                     self.next_refactor = Some(Instant::now() + every);
@@ -1703,6 +1766,20 @@ fn run_clone_jobs(
         let result = catch_unwind(AssertUnwindSafe(|| run(&job)))
             .unwrap_or_else(|_| Err("internal error".into()));
         if tx.send(Msg::Cloned { id: job.id, result }).is_err() {
+            return;
+        }
+    }
+}
+
+/// The refactor thread: runs each job and sends what it did to the main thread, until
+/// either side goes away. A job that panics fails with "internal error" and the thread
+/// goes on to the next.
+fn run_refactor_jobs(jobs: Receiver<(Id, refactor::Job)>, tx: &SyncSender<Msg>) {
+    for (id, job) in jobs {
+        let repo = job.repo().to_owned();
+        let done = catch_unwind(AssertUnwindSafe(|| job.run()))
+            .unwrap_or_else(|_| refactor::Done::failed(repo, "internal error"));
+        if tx.send(Msg::Refactored { id, done }).is_err() {
             return;
         }
     }
