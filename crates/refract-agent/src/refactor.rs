@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::launch;
-use crate::procs::{self, ClaudeProcess};
+use crate::procs::{self, ClaudeProcess, LiveProcess};
 use crate::scan;
 use crate::state::{path_str, Agent, Refresh};
 
@@ -1361,12 +1361,27 @@ fn look(
     let hook = (!id.is_empty())
         .then(|| agent.hooks().get(id).copied())
         .flatten();
+    // Background agents of the refactor's agent work in the worktree too.
+    let background = if ours {
+        let process = procs
+            .iter()
+            .find(|p| p.session_id.as_deref() == Some(id))
+            .map(|p| LiveProcess {
+                pid: p.pid,
+                started: p.started,
+                refract_folder: p.refract_folder.clone(),
+            })
+            .or_else(|| claimed.get(id).cloned().flatten());
+        agent.background_count(procs, worktree, id, process.as_ref())
+    } else {
+        0
+    };
     let state = (!id.is_empty()).then(|| {
         classify_report(
             summary.as_ref().unwrap_or(&SessionSummary::default()),
             ours,
             hook,
-            0,
+            background,
         )
     });
     let finished = |s: &SessionSummary| {
@@ -1379,7 +1394,9 @@ fn look(
         && match state {
             Some(SessionState::Live(LiveState::Idle)) => true,
             Some(SessionState::Live(LiveState::Unknown)) => summary.as_ref().is_some_and(|s| {
-                finished(s) && (hook.is_some() || s.modified.is_some_and(|m| now - m >= quiet))
+                background == 0
+                    && finished(s)
+                    && (hook.is_some() || s.modified.is_some_and(|m| now - m >= quiet))
             }),
             _ => false,
         };

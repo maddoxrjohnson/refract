@@ -67,7 +67,8 @@ pub struct RepoState {
     pub live: HashMap<String, Option<LiveProcess>>,
     /// Status hook statuses of this repo's sessions, by session id.
     pub hooks: HashMap<String, HookReport>,
-    /// Background subagents running, by live session id; sessions with none are left out.
+    /// Background subagents and workflow runs running, by live session id; sessions with
+    /// none are left out.
     pub background: HashMap<String, u32>,
     pub snapshot: RepoSnapshot,
     /// What the repo was on disk when it was first read.
@@ -116,6 +117,8 @@ pub struct Agent {
     hooks: HashMap<String, HookReport>,
     /// Each repo's refactor, by repo path, as [`crate::refactor`] last worked it out.
     refactors: HashMap<PathBuf, RefactorInfo>,
+    /// What live sessions' transcripts said about their background work.
+    subagents: subagents::Tracker,
 }
 
 impl Agent {
@@ -129,6 +132,7 @@ impl Agent {
             procs: Vec::new(),
             hooks: HashMap::new(),
             refactors: HashMap::new(),
+            subagents: subagents::Tracker::default(),
         }
     }
 
@@ -257,7 +261,7 @@ impl Agent {
         let (sessions, live, background) = if what.sessions {
             let sessions = self.reader.read_repo(&path_str(path));
             let live = live_set(&self.procs, path, &sessions);
-            let background = self.background_for(&live);
+            let background = self.background_for(path, &live);
             (sessions, live, background)
         } else {
             (
@@ -403,7 +407,9 @@ impl Agent {
     }
 
     /// Re-checks running processes for repos with live or recent sessions and returns
-    /// events for sessions whose state changed.
+    /// events for sessions whose state changed. Sessions with background work running
+    /// are counted again too, since work falls silent without any file changing (see
+    /// [`subagents::STALE_AFTER`]).
     pub fn recheck_live(&mut self, now: DateTime<Utc>) -> Vec<Event> {
         self.procs = procs::scan();
         let watched: Vec<PathBuf> = self
@@ -425,35 +431,44 @@ impl Agent {
                 repo.head.clone(),
                 repo.sessions.clone(),
             );
-            let background = self.background_for(&live);
+            let background = self.background_for(&path, &live);
             self.store(path.clone(), status, head, sessions, live, background);
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
+        events.extend(self.recount(|r| !r.background.is_empty()));
         events
     }
 
-    /// Counts the background subagents of live sessions again, of those in `only` or of
+    /// Counts the background work of live sessions again, of those in `only` or of
     /// every live session, and returns events for the sessions whose state changed.
     pub fn refresh_background(&mut self, only: Option<&HashSet<String>>) -> Vec<Event> {
-        let wanted = |id: &String| only.is_none_or(|ids| ids.contains(id));
-        let stale: Vec<(PathBuf, HashMap<String, u32>)> = self
+        self.recount(|r| {
+            r.live
+                .keys()
+                .any(|id| only.is_none_or(|ids| ids.contains(id)))
+        })
+    }
+
+    /// Counts the background work of the live sessions of repos `which` picks again.
+    fn recount(&mut self, which: impl Fn(&RepoState) -> bool) -> Vec<Event> {
+        let picked: Vec<(PathBuf, HashMap<String, Option<LiveProcess>>)> = self
             .repos
             .iter()
-            .filter(|(_, r)| r.live.keys().any(wanted))
-            .filter_map(|(p, r)| {
-                let background = self.background_for(&r.live);
-                (background != r.background).then(|| (p.clone(), background))
-            })
+            .filter(|(_, r)| !r.live.is_empty() && which(r))
+            .map(|(p, r)| (p.clone(), r.live.clone()))
             .collect();
         let mut events = Vec::new();
-        for (path, background) in stale {
+        for (path, live) in picked {
+            let background = self.background_for(&path, &live);
             let repo = &self.repos[&path];
+            if background == repo.background {
+                continue;
+            }
             let old = repo.snapshot.clone();
-            let (status, head, sessions, live) = (
+            let (status, head, sessions) = (
                 repo.status.clone(),
                 repo.head.clone(),
                 repo.sessions.clone(),
-                repo.live.clone(),
             );
             self.store(path.clone(), status, head, sessions, live, background);
             events.extend(diff(&old, &self.repos[&path].snapshot));
@@ -461,9 +476,10 @@ impl Agent {
         events
     }
 
-    /// Every live session's id and the directory beside its transcript, whose
-    /// `subagents` tree says which background agents it runs.
-    pub fn live_session_dirs(&self) -> Vec<(String, PathBuf)> {
+    /// Every live session's id and the directory beside its transcript, which says what
+    /// background work it runs (see [`subagents::watched_dirs`]). Forgets what the
+    /// transcripts of other sessions said.
+    pub fn live_session_dirs(&mut self) -> Vec<(String, PathBuf)> {
         let mut dirs: Vec<(String, PathBuf)> = self
             .repos
             .values()
@@ -472,27 +488,58 @@ impl Agent {
             .collect();
         dirs.sort();
         dirs.dedup();
+        let kept: Vec<PathBuf> = dirs.iter().map(|(_, d)| d.clone()).collect();
+        self.subagents.retain(&kept);
         dirs
     }
 
-    /// Background subagents running for each session in `live` (see
-    /// [`crate::subagents`]), counting only those started since its process did when
-    /// that is known. Sessions with none are left out.
-    fn background_for(&self, live: &HashMap<String, Option<LiveProcess>>) -> HashMap<String, u32> {
-        live.iter()
+    /// Background work running for session `id`, live in `cwd` in `process` when that
+    /// is known (see [`crate::subagents`]). Only work started since the process did
+    /// counts; when the process is not known, since the earliest of the processes in
+    /// `cwd` that name no session, one of which runs it. `procs` are the running
+    /// `claude` processes.
+    pub fn background_count(
+        &mut self,
+        procs: &[ClaudeProcess],
+        cwd: &str,
+        id: &str,
+        process: Option<&LiveProcess>,
+    ) -> u32 {
+        let Some(dir) = self.reader.session_dir(id) else {
+            return 0;
+        };
+        let since = match process {
+            Some(p) => p.started,
+            None => procs::earliest_unnamed_start(procs, cwd),
+        };
+        self.subagents
+            .count(&dir, since, std::time::SystemTime::now())
+    }
+
+    /// [`Agent::background_count`] for each session in `live`, the repo at `repo`'s.
+    /// Sessions with none are left out.
+    fn background_for(
+        &mut self,
+        repo: &Path,
+        live: &HashMap<String, Option<LiveProcess>>,
+    ) -> HashMap<String, u32> {
+        let procs = std::mem::take(&mut self.procs);
+        let cwd = path_str(repo);
+        let counts = live
+            .iter()
             .filter_map(|(id, process)| {
-                let dir = subagents::dir(&self.reader.session_dir(id)?);
-                let since = process.as_ref().and_then(|p| p.started);
-                let count = subagents::count_running(&dir, since);
+                let count = self.background_count(&procs, &cwd, id, process.as_ref());
                 (count > 0).then(|| (id.clone(), count))
             })
-            .collect()
+            .collect();
+        self.procs = procs;
+        counts
     }
 
     fn insert(&mut self, path: PathBuf, status: Status, head: HeadInfo) {
         let sessions = self.reader.read_repo(&path_str(&path));
         let live = live_set(&self.procs, &path, &sessions);
-        let background = self.background_for(&live);
+        let background = self.background_for(&path, &live);
         self.store(path, status, head, sessions, live, background);
     }
 
@@ -1065,7 +1112,7 @@ mod tests {
             [(id.to_owned(), session_dir.clone())]
         );
 
-        let meta = subagents::dir(&session_dir).join("agent-a1.meta.json");
+        let meta = session_dir.join("subagents/agent-a1.meta.json");
         fs::create_dir_all(meta.parent().unwrap()).unwrap();
         let running = r#"{"agentType":"implementer","requestShape":"background"}"#;
         fs::write(&meta, running).unwrap();

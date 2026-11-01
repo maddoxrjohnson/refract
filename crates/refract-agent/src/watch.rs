@@ -16,9 +16,9 @@
 //! git directory of each repo the search found but git could not read yet (for it
 //! becoming readable; the server also tries such a repo again on a timer, see
 //! [`crate::server::RETRY_DELAYS`]), the status hook's directory of status files, and
-//! for each live session its directory beside the transcript and every directory of
-//! its `subagents` tree, for background agents starting and finishing (see
-//! [`crate::subagents`]).
+//! for each live session the directories that say what background work it runs, for
+//! subagents and workflow runs starting and ending (see
+//! [`crate::subagents::watched_dirs`]).
 //!
 //! Re-watching a repo only adds and removes the directories that differ, so events
 //! already queued for unchanged watches still map to their repo. When the kernel drops a
@@ -73,10 +73,8 @@ pub enum Target {
     UnreadRepo(PathBuf),
     /// The status hook's directory of `<session id>.json` files.
     HookDir,
-    /// The directory beside a live session's transcript, by session id, for its
-    /// `subagents` directory appearing.
-    SessionDir(String),
-    /// A directory of a live session's `subagents` tree, by session id.
+    /// A directory that says what background work a live session runs, by session id
+    /// (see [`crate::subagents::watched_dirs`]).
     Subagents(String),
 }
 
@@ -324,37 +322,23 @@ impl Watcher {
         self.add(dir, mask, Target::HookDir);
     }
 
-    /// Watches each live session's directory (`sessions` holds its id and the directory
-    /// beside its transcript) and every directory of its `subagents` tree, replacing the
-    /// previous set.
+    /// Watches each live session's directories that say what background work it runs
+    /// (see [`crate::subagents::watched_dirs`]; `sessions` holds its id and the
+    /// directory beside its transcript), replacing the previous set.
     ///
     /// Returns true when it watched a directory that was not watched before. What changed
-    /// there before the watch was not seen, so the caller counts the agents again.
+    /// there before the watch was not seen, so the caller counts the work again.
     pub fn watch_subagents(&mut self, sessions: &[(String, PathBuf)]) -> bool {
-        let session_mask = WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::ONLYDIR;
-        let mask = WatchMask::CLOSE_WRITE
-            | WatchMask::CREATE
-            | WatchMask::DELETE
-            | WatchMask::MOVED_FROM
-            | WatchMask::MOVED_TO
-            | WatchMask::ONLYDIR;
-        let mut wanted = Vec::new();
-        for (id, dir) in sessions {
-            wanted.push((dir.clone(), session_mask, Target::SessionDir(id.clone())));
-            let mut dirs = Vec::new();
-            collect_dirs(
-                &crate::subagents::dir(dir),
-                &mut dirs,
-                crate::subagents::MAX_DIRS,
-            );
-            for sub in dirs {
-                wanted.push((sub, mask, Target::Subagents(id.clone())));
-            }
-        }
-        self.sync(
-            |t| matches!(t, Target::SessionDir(_) | Target::Subagents(_)),
-            wanted,
-        )
+        let mask =
+            WatchMask::CLOSE_WRITE | WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::ONLYDIR;
+        let wanted = sessions
+            .iter()
+            .flat_map(|(id, dir)| {
+                crate::subagents::watched_dirs(dir)
+                    .map(|d| (d, mask, Target::Subagents(id.clone())))
+            })
+            .collect();
+        self.sync(|t| matches!(t, Target::Subagents(_)), wanted)
     }
 
     /// Number of inotify watches held.
@@ -502,6 +486,8 @@ pub fn change_for(
     let name = name.map(|n| n.to_string_lossy());
     let name = name.as_deref();
     let gone = mask.intersects(EventMask::DELETE_SELF | EventMask::MOVE_SELF);
+    let new_dir =
+        mask.contains(EventMask::ISDIR) && mask.intersects(EventMask::CREATE | EventMask::MOVED_TO);
     match target {
         Target::GitDir(repo) => {
             if gone {
@@ -543,6 +529,9 @@ pub fn change_for(
         Target::ProjectsRoot => name
             .filter(|_| mask.contains(EventMask::ISDIR))
             .map(|n| Change::NewProjectDir(n.to_owned())),
+        // A session's directory appearing may be where a live session's background
+        // work starts; the server ignores names that are no live session.
+        Target::ProjectDir(_) if new_dir => name.map(|n| Change::Background(n.to_owned())),
         Target::ProjectDir(dir) => (gone || name.is_some_and(|n| n.ends_with(".jsonl")))
             .then(|| Change::Sessions(dir.clone())),
         Target::ScanDir { descend } => {
@@ -575,13 +564,11 @@ pub fn change_for(
         Target::HookDir => name
             .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
             .map(|n| Change::Hook(n.to_owned())),
-        Target::SessionDir(id) => (name? == "subagents").then(|| Change::Background(id.clone())),
-        // Transcripts beside the meta files are written often and say nothing here. A new
-        // directory (a workflow run) needs watching and may already hold meta files.
+        // A meta file or a workflow run's record (`.json`) changed, or a directory
+        // appeared: `subagents`, `workflows`, or a workflow run starting. Transcripts
+        // beside the meta files are written often and say nothing here.
         Target::Subagents(id) => {
-            let new_dir = mask.contains(EventMask::ISDIR)
-                && mask.intersects(EventMask::CREATE | EventMask::MOVED_TO);
-            (new_dir || name?.ends_with(".meta.json")).then(|| Change::Background(id.clone()))
+            (new_dir || name?.ends_with(".json")).then(|| Change::Background(id.clone()))
         }
     }
 }
@@ -790,28 +777,33 @@ mod tests {
     fn subagent_events() {
         let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
         let background = Some(Change::Background(id.into()));
-        let session = Target::SessionDir(id.into());
         let mkdir = EventMask::CREATE | EventMask::ISDIR;
-        assert_eq!(change(session.clone(), mkdir, "subagents"), background);
-        assert_eq!(change(session, mkdir, "tool-results"), None);
-        let tree = Target::Subagents(id.into());
+        let target = Target::Subagents(id.into());
+        for name in ["subagents", "workflows", "wf_kelp-001"] {
+            assert_eq!(change(target.clone(), mkdir, name), background);
+        }
+        for name in ["agent-a1.meta.json", "wf_kelp-001.json"] {
+            assert_eq!(
+                change(target.clone(), EventMask::CLOSE_WRITE, name),
+                background
+            );
+            assert_eq!(
+                change(target.clone(), EventMask::MOVED_TO, name),
+                background
+            );
+        }
         assert_eq!(
-            change(tree.clone(), EventMask::CLOSE_WRITE, "agent-a1.meta.json"),
-            background
-        );
-        assert_eq!(
-            change(tree.clone(), EventMask::MOVED_TO, "agent-a1.meta.json"),
-            background
-        );
-        assert_eq!(
-            change(tree.clone(), EventMask::CLOSE_WRITE, "agent-a1.jsonl"),
+            change(target, EventMask::CLOSE_WRITE, "agent-a1.jsonl"),
             None
         );
-        assert_eq!(change(tree, mkdir, "workflows"), background);
+        // A session's directory appearing in a project directory.
+        let project = Target::ProjectDir("-home-dev-projects-tidepool-api".into());
+        assert_eq!(change(project.clone(), mkdir, id), background);
+        assert_eq!(change(project, EventMask::CREATE, "notes.tmp"), None);
     }
 
     #[test]
-    fn subagent_trees_of_live_sessions_are_watched_at_any_depth() {
+    fn the_background_work_directories_of_live_sessions_are_watched() {
         let tmp = tempfile::tempdir().unwrap();
         let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
         let session = tmp.path().join(id);
@@ -820,6 +812,7 @@ mod tests {
         let mut watcher = start(move |batch| tx.send(batch).is_ok()).unwrap();
         let sessions = vec![(id.to_owned(), session.clone())];
         assert!(watcher.watch_subagents(&sessions));
+        assert!(!watcher.watch_subagents(&sessions));
         fn changes(watcher: &Watcher, rx: &std::sync::mpsc::Receiver<Vec<FsEvent>>) -> Vec<Change> {
             fs_events(rx)
                 .iter()
@@ -828,18 +821,27 @@ mod tests {
         }
         let background = Change::Background(id.into());
 
-        let nested = session.join("subagents/workflows/run-kelp");
-        fs::create_dir_all(&nested).unwrap();
+        let subagents = session.join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
         assert!(changes(&watcher, &rx).contains(&background));
-        // The tree grew: watching it again adds its new directories.
+        // The directory appeared: watching again adds it.
         assert!(watcher.watch_subagents(&sessions));
-        assert_eq!(watcher.len(), 4);
-        fs::write(nested.join("agent-a1.jsonl"), "{}\n").unwrap();
+        assert_eq!(watcher.len(), 2);
+        fs::write(subagents.join("agent-a1.jsonl"), "{}\n").unwrap();
         assert!(changes(&watcher, &rx).is_empty());
-        fs::write(nested.join("agent-a1.meta.json"), "{}").unwrap();
+        fs::write(subagents.join("agent-a1.meta.json"), "{}").unwrap();
         // Created, then written: the server takes both as one.
         let seen = changes(&watcher, &rx);
         assert!(!seen.is_empty() && seen.iter().all(|c| *c == background));
+        // Workflow runs start under `subagents/workflows` and end in `workflows`; the
+        // directories of the runs themselves are not watched.
+        fs::create_dir_all(subagents.join("workflows/wf_kelp-001")).unwrap();
+        fs::create_dir_all(session.join("workflows")).unwrap();
+        assert!(changes(&watcher, &rx).contains(&background));
+        assert!(watcher.watch_subagents(&sessions));
+        assert_eq!(watcher.len(), 4);
+        fs::write(session.join("workflows/wf_kelp-001.json"), "{}").unwrap();
+        assert!(changes(&watcher, &rx).contains(&background));
 
         // A session no longer live is no longer watched.
         assert!(!watcher.watch_subagents(&[]));

@@ -573,6 +573,58 @@ fn a_live_agent_blocks_merge_discard_and_resume() {
     agent.shutdown();
 }
 
+#[test]
+fn background_agents_of_an_idle_refactor_agent_block_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let installed = agent.request("installHook", Value::Null);
+    assert_eq!(installed["result"]["installed"], true, "{installed}");
+    let (ticket, refactor) = start(&mut agent, &repo, None);
+    let session = ticket["sessionId"].as_str().unwrap().to_owned();
+    let worktree = path(&refactor["worktree"]);
+    let _claude = FakeClaude::start(&worktree, &session);
+    agent.wait_state(&repo, "working");
+    env.transcript(&session, &worktree, true);
+    commit_file(
+        &worktree,
+        "src/lib.rs",
+        "pub fn tide() {}\n",
+        "Split out tide",
+    );
+    // Its turn over: ready.
+    write(
+        &env.state.join(format!("sessions/{session}.json")),
+        &json!({"status": "finished", "event": "Stop", "at": Utc::now().timestamp()}).to_string(),
+    );
+    agent.wait_state(&repo, "ready");
+
+    // A background agent it launched still runs: merging would pull the worktree from
+    // under it.
+    let meta = project_dir(&env.projects, &worktree)
+        .join(&session)
+        .join("subagents/agent-a1.meta.json");
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background"}"#,
+    );
+    let merge = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(
+        merge["result"],
+        json!({"outcome": "blocked", "reason": "live", "files": []})
+    );
+    assert!(worktree.is_dir());
+
+    // Once it finishes, the merge goes ahead.
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background","finished":true}"#,
+    );
+    let merged = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
+    agent.shutdown();
+}
+
 /// Starts a refactor and commits `file` in its worktree; returns the refactor.
 fn ready(agent: &mut Agent, repo: &Path, file: &str, text: &str) -> Value {
     let (_, refactor) = start(agent, repo, None);

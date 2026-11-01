@@ -52,8 +52,8 @@ pub mod code {
     /// `migrateBeginDelete` or `migrateResync` named a migration that is unknown or not
     /// at that step, or that is refused there (see [`Method::MigrateBeginDelete`]).
     pub const MIGRATE_FAILED: i32 = 6;
-    /// `stopAgent` named a session that is working on a turn, so stopping it could lose
-    /// work.
+    /// `stopAgent` named a session that is working on a turn or has background agents
+    /// or workflow runs going, so stopping it could lose work.
     pub const AGENT_BUSY: i32 = 7;
     /// `startRefactor` was refused (detached HEAD, no commits, a refactor already under
     /// way) or failed, or `resumeRefactor`, `mergeRefactor` or `discardRefactor` named a
@@ -572,7 +572,9 @@ pub struct PendingMigration {
 /// session that is idle or waiting on the user is stopped; one that is working is
 /// refused with [`code::AGENT_BUSY`]. Without a status hook the live state is unknown,
 /// and the transcript decides: stopped when its last turn ended, refused otherwise. A
-/// session with no process known for certain is refused with [`code::NOT_RUNNING`].
+/// session with background agents or workflow runs going is refused with
+/// [`code::AGENT_BUSY`] whatever its state. A session with no process known for certain
+/// is refused with [`code::NOT_RUNNING`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopAgentParams {

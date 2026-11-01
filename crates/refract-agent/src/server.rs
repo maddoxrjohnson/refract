@@ -1051,6 +1051,15 @@ impl<W: Write> Server<W> {
             let message = "the agent is working; stop it in its terminal, or wait";
             return Ok(Response::err(id, code::AGENT_BUSY, message));
         }
+        // Stopping the session would stop its background agents too, whatever it waits on.
+        if state
+            .background
+            .get(&params.session_id)
+            .is_some_and(|&n| n > 0)
+        {
+            let message = "the agent has background work running; stop it in its terminal, or wait";
+            return Ok(Response::err(id, code::AGENT_BUSY, message));
+        }
         let Some(process) = self.agent.live_process(&repo, &params.session_id) else {
             let message = "which process runs this session is not certain";
             return Ok(Response::err(id, code::NOT_RUNNING, message));
@@ -1471,11 +1480,11 @@ impl<W: Write> Server<W> {
         }
     }
 
-    /// Watches the `subagents` trees of live sessions, dropping those of sessions no
-    /// longer live, and returns events for sessions whose background agents changed
+    /// Watches the directories that say what background work live sessions run, dropping
+    /// those of sessions no longer live, and returns events for sessions whose work changed
     /// before their directories were watched. Unless `force`, it does nothing while the
-    /// live sessions are the same; after file changes it is forced, since a session's
-    /// directory or tree may have appeared or grown.
+    /// live sessions are the same; a change in those directories forces it, since one
+    /// may have appeared.
     fn watch_subagents(&mut self, force: bool) -> Vec<Event> {
         let Some(watcher) = &mut self.watcher else {
             return Vec::new();
@@ -1588,6 +1597,16 @@ impl<W: Write> Server<W> {
             }
         }
 
+        // Background work is counted before hook statuses are taken in, so a turn that
+        // ends as an agent starts is not shown idle first.
+        if !pending.background.is_empty() {
+            events.extend(self.agent.refresh_background(Some(&pending.background)));
+        }
+        if !loading {
+            let force = pending.reload || !pending.background.is_empty();
+            events.extend(self.watch_subagents(force));
+        }
+
         if pending.reload || !pending.hook_files.is_empty() {
             let paths = hook::Paths::from_env();
             let dir = &paths.status_dir;
@@ -1647,11 +1666,9 @@ impl<W: Write> Server<W> {
         for path in rewatch {
             self.watch_repo(&path);
         }
-        if !pending.reload && !pending.background.is_empty() {
-            events.extend(self.agent.refresh_background(Some(&pending.background)));
-        }
+        // Sessions that became live above get their directories watched.
         if !loading {
-            events.extend(self.watch_subagents(true));
+            events.extend(self.watch_subagents(false));
         }
         // A refactor's commits show as changes in its repo's git directory; its agent's
         // hook status as a status file.

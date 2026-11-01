@@ -1021,6 +1021,45 @@ fn stop_agent_stops_an_idle_session_and_refuses_a_working_one() {
     let _ = working_proc.wait();
 }
 
+#[test]
+fn stop_agent_refuses_a_session_with_background_agents_running() {
+    let world = World::new();
+    let repo = world.root.join("tidepool-api");
+    init_repo(&repo);
+    let id = "5e2a7c10-0000-4000-8000-0000000000c3";
+    let dir = project_dir(&world.projects(), &repo);
+    let at = Utc::now() - TimeDelta::seconds(30);
+    // Its last turn ended, so without background work it would be stopped.
+    write(
+        &dir.join(format!("{id}.jsonl")),
+        &transcript(id, &repo, &repo.join("src/main.rs"), at, true),
+    );
+    let mut claude = fake_claude(&repo, id);
+    let meta = dir.join(id).join("subagents/agent-a1.meta.json");
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background"}"#,
+    );
+    let mut agent = world.agent(None);
+    agent.list_when_loaded();
+
+    let busy = agent.request("stopAgent", json!({"path": repo, "sessionId": id}));
+    assert_eq!(busy["error"]["code"], 7, "{busy}");
+    assert!(claude.try_wait().unwrap().is_none());
+
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background","finished":true}"#,
+    );
+    let stopped = agent.request("stopAgent", json!({"path": repo, "sessionId": id}));
+    assert_eq!(stopped["result"], Value::Null, "{stopped}");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while claude.try_wait().unwrap().is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(claude.try_wait().unwrap().is_some());
+}
+
 /// Starts a migration with `hook` and waits for its report, which must allow deleting.
 fn placed_migration(world: &World, hook: Option<&Path>) -> (Agent, String) {
     let mut agent = world.agent(hook);

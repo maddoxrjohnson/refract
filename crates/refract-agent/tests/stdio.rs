@@ -1311,3 +1311,108 @@ fn prints_its_version() {
         format!("refract-agent {}\n", env!("CARGO_PKG_VERSION"))
     );
 }
+
+/// A process that looks like `claude --session-id <id>` running in `cwd`, until killed.
+struct FakeClaude(Child);
+
+impl FakeClaude {
+    fn start(cwd: &Path, id: &str) -> FakeClaude {
+        use std::os::unix::process::CommandExt;
+        let child = Command::new("bash")
+            .arg0("claude")
+            .args(["-c", "read -r _", "claude", "--session-id", id])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn fake claude");
+        FakeClaude(child)
+    }
+}
+
+impl Drop for FakeClaude {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn background_work_keeps_a_live_session_whose_turn_ended_working() {
+    // Its own id: the other tests here see this live process too.
+    const SESSION: &str = "7d3e9b20-0000-4000-8000-0000000000b7";
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, root, config) = setup(tmp.path());
+    let repo = root.join("tidepool-api");
+    init_repo(&repo);
+    let dir = project_dir(&home.join(".claude/projects"), &repo);
+    let transcript_path = dir.join(format!("{SESSION}.jsonl"));
+    let at = Utc::now() - TimeDelta::minutes(1);
+    write(
+        &transcript_path,
+        &transcript(SESSION, &repo, &repo.join("src/main.rs"), at, true),
+    );
+    let _claude = FakeClaude::start(&repo, SESSION);
+    let mut agent = Agent::spawn(&home, &config);
+    agent.list_when_loaded(1);
+    agent.send(json!({"id": 2, "method": "installHook"}));
+    assert_eq!(agent.response()["result"]["installed"], true);
+    let state_is = |detail: &'static str| {
+        move |e: &Value| {
+            e["event"] == "sessionChanged"
+                && e["data"]["session"]["id"] == SESSION
+                && e["data"]["session"]["state"] == json!({"kind": "live", "detail": detail})
+        }
+    };
+    write(
+        &home.join(format!(".local/state/refract/sessions/{SESSION}.json")),
+        &json!({"status": "finished", "event": "Stop", "at": Utc::now().timestamp()}).to_string(),
+    );
+    agent.event(state_is("idle"));
+
+    // A background agent starts after the session went live, in a session directory
+    // that did not exist yet, and later finishes.
+    let session_dir = dir.join(SESSION);
+    let meta = session_dir.join("subagents/agent-a1.meta.json");
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background"}"#,
+    );
+    agent.event(state_is("working"));
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background","finished":true}"#,
+    );
+    agent.event(state_is("idle"));
+
+    // One that ends without `finished` (stopped), told by its task notification.
+    let meta = session_dir.join("subagents/agent-a2.meta.json");
+    write(
+        &meta,
+        r#"{"agentType":"implementer","requestShape":"background"}"#,
+    );
+    agent.event(state_is("working"));
+    let notification = json!({
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "timestamp": Utc::now().to_rfc3339(),
+        "sessionId": SESSION,
+        "content": "<task-notification>\n<task-id>a2</task-id>\n<status>killed</status>\n</task-notification>",
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript_path)
+        .unwrap();
+    writeln!(file, "{notification}").unwrap();
+    drop(file);
+    agent.event(state_is("idle"));
+
+    // A workflow run, until its record says it completed.
+    std::fs::create_dir_all(session_dir.join("subagents/workflows/wf_kelp-001")).unwrap();
+    agent.event(state_is("working"));
+    write(
+        &session_dir.join("workflows/wf_kelp-001.json"),
+        r#"{"runId":"wf_kelp-001","status":"completed"}"#,
+    );
+    agent.event(state_is("idle"));
+}

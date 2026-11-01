@@ -352,6 +352,23 @@ pub fn live_sessions(
     live
 }
 
+/// The earliest start of the processes in `cwd` that name no session, for a session
+/// matched to one of several of them (see [`live_sessions`]): whichever runs it started
+/// no earlier. `None` when there is none or a start time is unknown.
+pub fn earliest_unnamed_start(procs: &[ClaudeProcess], cwd: &str) -> Option<DateTime<Utc>> {
+    let starts: Vec<Option<DateTime<Utc>>> = procs
+        .iter()
+        .filter(|p| p.session_id.is_none() && paths_match(&p.cwd, cwd))
+        .map(|p| p.started)
+        .collect();
+    starts
+        .iter()
+        .copied()
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .min()
+}
+
 fn live_process(process: &ClaudeProcess) -> LiveProcess {
     LiveProcess {
         pid: process.pid,
@@ -713,5 +730,24 @@ mod tests {
     fn start_time_is_boot_time_plus_ticks() {
         let started = start_time(1_773_446_400, 4250).unwrap();
         assert_eq!(started.to_rfc3339(), "2026-03-14T00:00:42.500+00:00");
+    }
+
+    #[test]
+    fn the_earliest_unnamed_start_in_a_directory() {
+        const REPO: &str = "/home/dev/projects/tidepool-api";
+        let named = ClaudeProcess {
+            started: at(7),
+            ..proc(REPO, Some("5e2a7c10-0000-4000-8000-0000000000a1"))
+        };
+        let procs = [
+            started_at(REPO, 10),
+            started_at(REPO, 9),
+            started_at("/home/dev/projects/kelp-cli", 8),
+            named,
+        ];
+        assert_eq!(earliest_unnamed_start(&procs, REPO), at(9));
+        assert_eq!(earliest_unnamed_start(&procs, "/home/dev/other"), None);
+        let unknown = [started_at(REPO, 9), proc(REPO, None)];
+        assert_eq!(earliest_unnamed_start(&unknown, REPO), None);
     }
 }

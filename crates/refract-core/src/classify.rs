@@ -94,8 +94,8 @@ pub fn classify(summary: &SessionSummary, live: bool, hook: Option<HookStatus>) 
 /// ends a turn without a `Stop` hook, so a live session whose transcript ends in a user
 /// interrupt written after a working or waiting status counts as idle.
 ///
-/// `background` is how many background subagents the live session's process has
-/// running. A live session that would be idle while any run counts as working: its own
+/// `background` is how many background subagents and workflow runs the live session's
+/// process has running. A live session that would be idle while any run counts as working: its own
 /// turn ended, but work it started goes on. It is ignored when the session is not live.
 pub fn classify_report(
     summary: &SessionSummary,
