@@ -10,11 +10,14 @@ use crate::config::Config;
 /// Directory names never searched: build output and dependencies.
 const SKIPPED_DIRS: &[&str] = &["node_modules", "target"];
 
-/// Returns every repo under the roots, plus the extra repos, minus hidden ones, sorted.
+/// Returns every repo under the roots, plus the extra repos, plus the linked worktrees
+/// of those, minus hidden ones, sorted.
 ///
 /// A repo is a directory containing `.git` (a directory, or a file for worktrees and
 /// submodules). The search does not descend into repos, hidden directories, symlinks or
-/// [`SKIPPED_DIRS`], and goes at most `config.depth` levels below each root.
+/// [`SKIPPED_DIRS`], and goes at most `config.depth` levels below each root. Linked
+/// worktrees are found from their main repo's git directory (see [`linked_worktrees`]),
+/// so those outside the roots or nested in a repo's folder are reported too.
 pub fn find_repos(config: &Config) -> Vec<PathBuf> {
     walk_roots(config).repos
 }
@@ -42,6 +45,7 @@ pub fn walk_roots(config: &Config) -> Walk {
             found.insert(extra.clone());
         }
     }
+    add_linked_worktrees(&mut found);
     let repos = found
         .into_iter()
         .filter(|repo| !config.hidden.contains(repo))
@@ -107,6 +111,155 @@ pub fn under_roots(config: &Config, repo: &Path) -> bool {
             dir.push(part);
         }
         true
+    })
+}
+
+/// Adds to `found` the linked worktrees of its repos that it does not hold yet, under
+/// the same path or (through a symlink) another.
+fn add_linked_worktrees(found: &mut BTreeSet<PathBuf>) {
+    let mut seen = BTreeSet::new();
+    let mut linked = Vec::new();
+    for repo in found.iter() {
+        let Some(git_dir) = git_dir(repo) else {
+            continue;
+        };
+        // Only a `.git` file can point to another common directory.
+        let common = if git_dir == repo.join(".git") {
+            git_dir
+        } else {
+            common_dir(&git_dir).unwrap_or(git_dir)
+        };
+        // Worktrees of one repo share the common directory: list them once.
+        if seen.insert(common.clone()) {
+            linked.extend(linked_worktrees(&common));
+        }
+    }
+    linked.retain(|w| !found.contains(w));
+    if linked.is_empty() {
+        return;
+    }
+    let real: BTreeSet<PathBuf> = found
+        .iter()
+        .filter_map(|r| fs::canonicalize(r).ok())
+        .collect();
+    for worktree in linked {
+        if fs::canonicalize(&worktree).is_ok_and(|r| !real.contains(&r)) {
+            found.insert(worktree);
+        }
+    }
+}
+
+/// The folders of the linked worktrees of the repo whose common git directory is
+/// `common`, from each `worktrees/<name>/gitdir`, that exist, are repos, and are not
+/// Refract's refactor worktrees. Without a `worktrees` directory this is one failed
+/// `read_dir`.
+pub fn linked_worktrees(common: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for admin in entries.flatten().map(|e| e.path()) {
+        let Ok(text) = fs::read_to_string(admin.join("gitdir")) else {
+            continue;
+        };
+        let dot_git = from_windows_path(text.trim());
+        // A relative `gitdir` (`worktree.useRelativePaths`) is relative to the admin dir.
+        let dot_git = admin.join(dot_git);
+        let Some(folder) = dot_git.parent().map(normalize) else {
+            continue;
+        };
+        if folder.is_dir() && is_repo(&folder) && !is_refactor_worktree(&folder) {
+            out.push(folder);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A Windows path git for Windows wrote (`C:/Users/...` or `C:\Users\...`) as WSL sees
+/// it (`/mnt/c/Users/...`); any other path unchanged.
+pub fn from_windows_path(path: &str) -> PathBuf {
+    let bytes = path.as_bytes();
+    let drive = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\');
+    if !drive {
+        return PathBuf::from(path);
+    }
+    let rest = path[3..].replace('\\', "/");
+    let letter = (bytes[0] as char).to_ascii_lowercase();
+    PathBuf::from(format!("/mnt/{letter}/{rest}"))
+}
+
+/// `path` with `.` and `..` components resolved by name, not through the file system.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Where Refract's refactor worktrees go: `$HOME/projects/.refract-worktrees`.
+pub fn refactor_worktrees_dir() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").filter(|h| !h.is_empty())?;
+    Some(PathBuf::from(home).join(refract_core::refactor::WORKTREES_DIR))
+}
+
+/// True when `path` lies in [`refactor_worktrees_dir`], by its path or its real path.
+/// Those belong to the Refactor flow, never to the worktree list.
+pub fn is_refactor_worktree(path: &Path) -> bool {
+    let Some(dir) = refactor_worktrees_dir() else {
+        return false;
+    };
+    if path.starts_with(&dir) {
+        return true;
+    }
+    match (fs::canonicalize(path), fs::canonicalize(&dir)) {
+        (Ok(real), Ok(dir)) => real.starts_with(dir),
+        _ => false,
+    }
+}
+
+/// A linked worktree, as its own `.git` file and git directory say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Linked {
+    /// The worktree's own git directory, `<common>/worktrees/<name>`.
+    pub git_dir: PathBuf,
+    /// The real path of the common git directory.
+    pub common: PathBuf,
+    /// The main working tree: the parent of `common`, a `.git` directory.
+    pub main: PathBuf,
+}
+
+/// The repo at `repo` as a linked worktree: `.git` is a file naming a git directory
+/// with a `commondir`, and that common directory is a `.git` directory of a main
+/// working tree. `None` for main checkouts, submodules, worktrees of bare repos and
+/// Refract's refactor worktrees.
+pub fn linked(repo: &Path) -> Option<Linked> {
+    if fs::symlink_metadata(repo.join(".git")).ok()?.is_dir() {
+        return None;
+    }
+    let git_dir = git_dir(repo)?;
+    let common = fs::canonicalize(common_dir(&git_dir)?).ok()?;
+    if common.file_name()? != ".git" {
+        return None;
+    }
+    let main = common.parent()?.to_owned();
+    if is_refactor_worktree(repo) {
+        return None;
+    }
+    Some(Linked {
+        git_dir,
+        common,
+        main,
     })
 }
 
@@ -271,6 +424,26 @@ mod tests {
         assert_eq!(common_dir(&wt), None);
         fs::write(wt.join("commondir"), "../..\n").unwrap();
         assert_eq!(common_dir(&wt), Some(wt.join("../..")));
+    }
+
+    #[test]
+    fn windows_gitdirs_are_read_as_wsl_paths() {
+        assert_eq!(
+            from_windows_path("C:/Users/dev/harbor-notes-wide/.git"),
+            PathBuf::from("/mnt/c/Users/dev/harbor-notes-wide/.git")
+        );
+        assert_eq!(
+            from_windows_path(r"D:\work\harbor-notes\.git"),
+            PathBuf::from("/mnt/d/work/harbor-notes/.git")
+        );
+        assert_eq!(
+            from_windows_path("/home/dev/projects/harbor-notes-wide/.git"),
+            PathBuf::from("/home/dev/projects/harbor-notes-wide/.git")
+        );
+        assert_eq!(
+            normalize(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
     }
 
     #[test]

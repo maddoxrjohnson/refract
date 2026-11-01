@@ -6,13 +6,16 @@
 
 use std::collections::BTreeSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use refract_core::language::main_language;
-use refract_core::protocol::LastCommit;
+use refract_core::protocol::{GitOperation, LastCommit};
 use refract_core::sessions::is_windows_mount;
+use refract_core::worktree::{WorktreeFacts, MAX_ONLY_HERE};
+
+use crate::scan;
 
 /// What `git status` says: cheap, refreshed on every working-tree change.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -29,7 +32,23 @@ pub struct Status {
     pub paths: Vec<String>,
     /// The original paths of the renames and copies in `paths`.
     pub origins: Vec<String>,
+    /// What else a linked worktree holds; `None` for every other repo.
+    pub worktree: Option<Worktree>,
 }
+
+/// Facts about a linked worktree (spec §4), read with its status.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Worktree {
+    /// The main working tree's real path.
+    pub main: PathBuf,
+    /// The git part of its status, with `changes` from the status's `paths`.
+    pub facts: WorktreeFacts,
+    /// Top-level ignored entries, at most [`MAX_IGNORED`]; empty on a Windows drive.
+    pub ignored: Vec<String>,
+}
+
+/// The most top-level ignored entries kept: 8 to show, and one more to say "and more".
+pub const MAX_IGNORED: usize = 9;
 
 /// Facts about HEAD: refreshed when HEAD or refs move.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -58,7 +77,153 @@ pub fn read_status(path: &Path) -> io::Result<Status> {
         untracked_arg(path),
     ]);
     let out = git(path, &args)?.ok_or_else(|| io::Error::other("git status failed"))?;
-    Ok(parse_status(&out))
+    let mut status = parse_status(&out);
+    if let Some(linked) = scan::linked(path) {
+        status.worktree = Some(read_worktree(path, &linked, status.paths.len()));
+    }
+    Ok(status)
+}
+
+/// True when the worktree at `path` counts as on a Windows drive: there untracked files
+/// are not listed and Refract does not remove it. Also under the test prefix
+/// [`crate::state::TEST_SLOW_PREFIX`].
+pub fn worktree_on_windows_drive(path: &Path) -> bool {
+    on_windows_drive(path) || crate::state::under_test_slow_prefix(path)
+}
+
+/// Reads the facts of the linked worktree at `path` that has `changes` status entries.
+/// Only reads git: nothing touches the network. A fact git cannot give stays empty.
+fn read_worktree(path: &Path, linked: &scan::Linked, changes: usize) -> Worktree {
+    let windows = worktree_on_windows_drive(path);
+    let only_here = only_here(path).unwrap_or(0);
+    let merged = default_branch(path).filter(|(_, full)| is_ancestor(path, "HEAD", full));
+    let release = git(path, &["tag", "--contains", "HEAD", "--sort=creatordate"])
+        .ok()
+        .flatten()
+        .and_then(|out| {
+            let text = String::from_utf8_lossy(&out);
+            text.lines().next().map(str::to_owned)
+        })
+        .filter(|t| !t.is_empty());
+    let ignored = if windows {
+        Vec::new()
+    } else {
+        git(
+            path,
+            &[
+                "status",
+                "--porcelain",
+                "-z",
+                "--ignored=traditional",
+                "--untracked-files=normal",
+                "--ignore-submodules=all",
+            ],
+        )
+        .ok()
+        .flatten()
+        .map(|out| parse_ignored(&out))
+        .unwrap_or_default()
+    };
+    Worktree {
+        main: linked.main.clone(),
+        facts: WorktreeFacts {
+            locked: is_locked(&linked.git_dir),
+            operation: operation(&linked.git_dir),
+            changes: changes as u32,
+            untracked_checked: !windows,
+            windows_drive: windows,
+            only_here,
+            merged: merged.map(|(name, _)| name),
+            release,
+        },
+        ignored,
+    }
+}
+
+/// True when the worktree whose git directory is `git_dir` is locked.
+pub fn is_locked(git_dir: &Path) -> bool {
+    std::fs::symlink_metadata(git_dir.join("locked")).is_ok()
+}
+
+/// The operation under way in the working tree whose own git directory is `git_dir`.
+pub fn operation(git_dir: &Path) -> Option<GitOperation> {
+    let has = |name: &str| std::fs::symlink_metadata(git_dir.join(name)).is_ok();
+    if has("rebase-merge") || has("rebase-apply") {
+        Some(GitOperation::Rebase)
+    } else if has("MERGE_HEAD") {
+        Some(GitOperation::Merge)
+    } else if has("CHERRY_PICK_HEAD") {
+        Some(GitOperation::CherryPick)
+    } else if has("REVERT_HEAD") {
+        Some(GitOperation::Revert)
+    } else if has("BISECT_LOG") {
+        Some(GitOperation::Bisect)
+    } else {
+        None
+    }
+}
+
+/// Commits on HEAD that no remote-tracking ref (of any remote) has, at most
+/// [`MAX_ONLY_HERE`]. `None` when git cannot count them (no commits).
+pub fn only_here(path: &Path) -> Option<u32> {
+    let max = format!("--max-count={MAX_ONLY_HERE}");
+    let out = git(
+        path,
+        &["rev-list", "--count", &max, "HEAD", "--not", "--remotes"],
+    )
+    .ok()??;
+    String::from_utf8_lossy(&out).trim().parse().ok()
+}
+
+/// The default branch, as its name and the full ref to compare with: the target of
+/// `refs/remotes/origin/HEAD` (named without `origin/`), else local `main`, else local
+/// `master`.
+pub fn default_branch(path: &Path) -> Option<(String, String)> {
+    let origin_head = git(path, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+        .ok()
+        .flatten()
+        .map(|out| String::from_utf8_lossy(&out).trim().to_owned())
+        .filter(|r| r.starts_with("refs/remotes/origin/"));
+    if let Some(full) = origin_head {
+        let name = full["refs/remotes/origin/".len()..].to_owned();
+        return Some((name, full));
+    }
+    ["main", "master"].iter().find_map(|name| {
+        let full = format!("refs/heads/{name}");
+        git(path, &["rev-parse", "--verify", "-q", &full])
+            .ok()
+            .flatten()
+            .map(|_| ((*name).to_owned(), full))
+    })
+}
+
+/// True when `ancestor` is an ancestor of (or the same commit as) `of`.
+pub fn is_ancestor(path: &Path, ancestor: &str, of: &str) -> bool {
+    git(path, &["merge-base", "--is-ancestor", ancestor, of]).is_ok_and(|out| out.is_some())
+}
+
+/// The top-level ignored entries in `git status --porcelain -z --ignored`, in order,
+/// at most [`MAX_IGNORED`]. A directory, or a path inside one, is its first component
+/// with a trailing `/`.
+pub fn parse_ignored(out: &[u8]) -> Vec<String> {
+    let mut entries: Vec<String> = Vec::new();
+    for record in out.split(|&b| b == 0) {
+        let Some(path) = record.strip_prefix(b"!! ") else {
+            continue;
+        };
+        let path = String::from_utf8_lossy(path);
+        let top = match path.split_once('/') {
+            Some((first, _)) => format!("{first}/"),
+            None => path.into_owned(),
+        };
+        if !entries.contains(&top) {
+            entries.push(top);
+            if entries.len() == MAX_IGNORED {
+                break;
+            }
+        }
+    }
+    entries
 }
 
 /// Config for `git status` in `repo`.
@@ -396,6 +561,22 @@ mod tests {
         );
         assert_eq!(s.origins, ["src/old.rs"]);
         assert_eq!(s.ahead_behind, None);
+    }
+
+    #[test]
+    fn ignored_entries_are_top_level_and_capped() {
+        let out = z(&[
+            "?? notes.txt",
+            "!! .env",
+            "!! target/",
+            "!! sub/build.log",
+            "!! sub/cache/",
+            "!! a b.tmp",
+        ]);
+        assert_eq!(parse_ignored(&out), [".env", "target/", "sub/", "a b.tmp"]);
+        let many: Vec<String> = (0..12).map(|i| format!("!! f{i}.log")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(parse_ignored(&z(&many)).len(), MAX_IGNORED);
     }
 
     #[test]

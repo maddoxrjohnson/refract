@@ -60,6 +60,10 @@ pub mod code {
     /// repo with no refactor, was refused (its agent is running, its worktree is not one
     /// Refract made) or failed.
     pub const REFACTOR_FAILED: i32 = 8;
+    /// `removeWorktree` was refused: the path is not a linked worktree, or something in
+    /// it could be lost (see [`Method::RemoveWorktree`]). The message names the rule that
+    /// failed, in words for the app. Nothing was changed.
+    pub const WORKTREE_REFUSED: i32 = 9;
 }
 
 /// A request from the app.
@@ -181,6 +185,14 @@ pub enum Method {
     /// Deletes the refactor's worktree and branch: answered with `null`. Refused while
     /// the agent runs.
     DiscardRefactor { path: String },
+    /// Removes the linked worktree at `path` (its snapshot's `path`) with `git worktree
+    /// remove`, never forced, keeping its branch: answered with `null`. The helper checks
+    /// again that nothing can be lost (clean, every commit on a remote or merged, no
+    /// agent running, not locked or mid-operation, not on a Windows drive, not a
+    /// refactor worktree) and otherwise refuses with [`code::WORKTREE_REFUSED`]. On
+    /// success the worktree goes with [`Event::RepoRemoved`] and its main repo, when
+    /// known, gets a fresh [`Event::RepoChanged`].
+    RemoveWorktree { path: String },
 }
 
 /// A request id: any JSON number or string, echoed back unchanged.
@@ -699,6 +711,85 @@ pub struct RepoSnapshot {
     /// The repo's refactor, while it has one (see [`Method::StartRefactor`]).
     #[serde(default)]
     pub refactor: Option<RefactorInfo>,
+    /// For a linked worktree: the path of its main working tree (same form as that repo's
+    /// `path`), whether or not that repo is known. `None` for main checkouts, submodules,
+    /// worktrees of bare repos, and Refract's refactor worktrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_of: Option<String>,
+    /// Facts for a linked worktree (set exactly when `worktree_of` is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
+}
+
+/// What a linked worktree holds that removing it could lose, and the status that
+/// follows (spec §4 rows 3-10; the app puts the agent rows 1-2 on top).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeInfo {
+    /// `git worktree lock` was used on it.
+    pub locked: bool,
+    /// A rebase, merge, cherry-pick, revert or bisect under way in it.
+    pub operation: Option<GitOperation>,
+    /// False on a Windows drive, where untracked files aren't listed.
+    pub untracked_checked: bool,
+    /// Commits on HEAD not on any remote-tracking ref, capped at 100.
+    pub only_here: u32,
+    /// The default branch's name when HEAD is its ancestor.
+    pub merged: Option<String>,
+    /// The oldest tag containing HEAD.
+    pub release: Option<String>,
+    /// Top-level ignored entries relative to the worktree (directories end in `/`), at
+    /// most 9 (8 shown and "more"); empty on a Windows drive.
+    pub ignored: Vec<String>,
+    /// Spec §4 rows 3-10.
+    pub status: WorktreeStatus,
+    /// Rows 8-10 and not on a Windows drive. The app ANDs this with "no agent working or
+    /// waiting".
+    pub removable: bool,
+}
+
+/// A git operation under way in a working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitOperation {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+/// The git part of a linked worktree's status: the first matching row of spec §4 rows
+/// 3-10 (see [`crate::worktree::derive_worktree_status`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum WorktreeStatus {
+    Locked,
+    Operation {
+        op: GitOperation,
+    },
+    /// Uncommitted changes, untracked files included where they are listed.
+    Changes {
+        count: u32,
+    },
+    /// On a Windows drive with no changes seen, but untracked files unknown.
+    Unchecked,
+    /// Commits only on this computer; `count` 100 means "100+".
+    OnlyHere {
+        count: u32,
+    },
+    Release {
+        tag: String,
+    },
+    Merged {
+        branch: String,
+    },
+    /// Every commit is on a remote, though not merged.
+    Pushed,
 }
 
 /// The newest commit on HEAD.
@@ -1008,7 +1099,7 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
         | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateBeginDelete"
         | "migrateResync" | "stopAgent" | "startRefactor" | "resumeRefactor" | "mergeRefactor"
-        | "discardRefactor" => true,
+        | "discardRefactor" | "removeWorktree" => true,
         "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
         | "shutdown" | "migratePending" => false,
         _ => {
@@ -1104,6 +1195,8 @@ mod tests {
             }],
             preselect: Preselect::Resume("3f6c1a52-0000-4000-8000-000000000001".into()),
             refactor: Some(refactor_info()),
+            worktree_of: None,
+            worktree: None,
         }
     }
 
@@ -1160,6 +1253,8 @@ mod tests {
             sessions: vec![],
             preselect: Preselect::NoPicker,
             refactor: None,
+            worktree_of: None,
+            worktree: None,
         }
     }
 
@@ -1384,6 +1479,10 @@ mod tests {
             (
                 r#"{"id":1,"method":"discardRefactor","params":{"path":"/x"}}"#,
                 Method::DiscardRefactor { path: "/x".into() },
+            ),
+            (
+                r#"{"id":1,"method":"removeWorktree","params":{"path":"/x"}}"#,
+                Method::RemoveWorktree { path: "/x".into() },
             ),
         ] {
             assert_eq!(parse_request(line).unwrap().method, method, "{line}");
@@ -1866,6 +1965,81 @@ mod tests {
         );
         let empty = serde_json::to_value(empty_snapshot()).unwrap();
         assert_eq!(empty["preselect"], json!({"kind": "noPicker"}));
+    }
+
+    #[test]
+    fn worktree_fields_are_left_out_unless_set() {
+        for value in [
+            serde_json::to_value(snapshot()).unwrap(),
+            serde_json::to_value(empty_snapshot()).unwrap(),
+        ] {
+            assert!(value.get("worktreeOf").is_none());
+            assert!(value.get("worktree").is_none());
+        }
+        let mut linked = empty_snapshot();
+        linked.path = "/home/dev/projects/aurora-notes-wide-cards".into();
+        linked.worktree_of = Some("/home/dev/projects/aurora-notes".into());
+        linked.worktree = Some(WorktreeInfo {
+            locked: false,
+            operation: Some(GitOperation::CherryPick),
+            untracked_checked: true,
+            only_here: 3,
+            merged: None,
+            release: Some("v1.4.0".into()),
+            ignored: vec![".env".into(), "target/".into()],
+            status: WorktreeStatus::Operation {
+                op: GitOperation::CherryPick,
+            },
+            removable: false,
+        });
+        let value = round_trip(&linked);
+        assert_eq!(value["worktreeOf"], "/home/dev/projects/aurora-notes");
+        assert_eq!(
+            value["worktree"],
+            json!({
+                "locked": false,
+                "operation": "cherryPick",
+                "untrackedChecked": true,
+                "onlyHere": 3,
+                "merged": null,
+                "release": "v1.4.0",
+                "ignored": [".env", "target/"],
+                "status": {"kind": "operation", "op": "cherryPick"},
+                "removable": false
+            })
+        );
+        for (status, wire) in [
+            (WorktreeStatus::Locked, json!({"kind": "locked"})),
+            (
+                WorktreeStatus::Changes { count: 2 },
+                json!({"kind": "changes", "count": 2}),
+            ),
+            (WorktreeStatus::Unchecked, json!({"kind": "unchecked"})),
+            (
+                WorktreeStatus::OnlyHere { count: 100 },
+                json!({"kind": "onlyHere", "count": 100}),
+            ),
+            (
+                WorktreeStatus::Release {
+                    tag: "v0.13.3".into(),
+                },
+                json!({"kind": "release", "tag": "v0.13.3"}),
+            ),
+            (
+                WorktreeStatus::Merged {
+                    branch: "main".into(),
+                },
+                json!({"kind": "merged", "branch": "main"}),
+            ),
+            (WorktreeStatus::Pushed, json!({"kind": "pushed"})),
+        ] {
+            assert_eq!(round_trip(&status), wire);
+        }
+        // An older helper's snapshot, without the fields, still reads.
+        let mut old = serde_json::to_value(empty_snapshot()).unwrap();
+        old.as_object_mut().unwrap().remove("refactor");
+        let back: RepoSnapshot = serde_json::from_value(old).unwrap();
+        assert_eq!(back, empty_snapshot());
     }
 
     #[test]

@@ -10,8 +10,9 @@
 //! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
 //! time, sending each result back for this thread to report and answer. A seventh keeps
 //! token usage totals up to date (see [`crate::usage`]). An eighth runs the git work of
-//! `startRefactor`, `mergeRefactor` and `discardRefactor` one job at a time, sending
-//! each result back for this thread to take in and answer (see [`crate::refactor`]). Each migration runs on a
+//! `startRefactor`, `mergeRefactor`, `discardRefactor` and `removeWorktree` one job at a
+//! time, sending each result back for this thread to take in and answer (see
+//! [`crate::refactor`] and [`crate::worktree`]). Each migration runs on a
 //! thread of its own (see [`crate::migrate`]), sending its responses and events back
 //! through the channel; this thread only routes requests to it and updates the config
 //! when one finishes.
@@ -391,8 +392,15 @@ where
             Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
             Ok(Msg::Migration(update)) => server.migration(update)?,
             Ok(Msg::Refactored { id, done }) => {
+                let removed = done.removed_worktree();
                 let finished = server.refactors.finish(&mut server.agent, done, Utc::now());
                 server.answer_refactor(id, finished)?;
+                if removed {
+                    // The removed worktree goes with `repoRemoved`.
+                    server.pending.rescan = true;
+                    server.pending.touch(Instant::now());
+                    server.flush()?;
+                }
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -729,6 +737,13 @@ impl<W: Write> Server<W> {
                 self.ensure_loaded()?;
                 let discarded = self.refactors.discard(&mut self.agent, &path, Utc::now());
                 return self.run_refactor(id, discarded.map(Step::Run));
+            }
+            Method::RemoveWorktree { path } => {
+                self.ensure_loaded()?;
+                let removal = self
+                    .refactors
+                    .remove_worktree(&self.agent, &path, Utc::now());
+                return self.run_refactor(id, removal.map(Step::Run));
             }
             Method::Migrate(params) => {
                 // Any of the two folders within, or holding, one of another migration's.

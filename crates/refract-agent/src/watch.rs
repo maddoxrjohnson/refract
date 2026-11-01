@@ -10,7 +10,9 @@
 //!
 //! Watched per repo: the git directory (HEAD, index, packed-refs, ...), `refs/heads` and
 //! `refs/remotes` with their subdirectories (in the common git directory for linked
-//! worktrees), and every working-tree directory that holds tracked files. Also watched:
+//! worktrees, with `refs/tags` too, for the release a worktree is in), the `worktrees`
+//! directory of a repo that has linked worktrees (for one being added or removed), and
+//! every working-tree directory that holds tracked files. Also watched:
 //! Claude Code's `projects` directory, the project directory of each repo, every
 //! directory the repo search walks (for repos appearing or vanishing), the directory and
 //! git directory of each repo the search found but git could not read yet (for it
@@ -55,6 +57,9 @@ pub enum Target {
     GitDir(PathBuf),
     /// The common git directory of a linked worktree, for `packed-refs` and `config`.
     CommonDir(PathBuf),
+    /// The `worktrees` directory of a repo's common git directory, for linked worktrees
+    /// being added or removed.
+    Worktrees(PathBuf),
     Refs(PathBuf),
     Tree(PathBuf),
     ProjectsRoot,
@@ -82,7 +87,11 @@ impl Target {
     /// The repo a per-repo target belongs to.
     fn repo(&self) -> Option<&Path> {
         match self {
-            Target::GitDir(p) | Target::CommonDir(p) | Target::Refs(p) | Target::Tree(p) => Some(p),
+            Target::GitDir(p)
+            | Target::CommonDir(p)
+            | Target::Worktrees(p)
+            | Target::Refs(p)
+            | Target::Tree(p) => Some(p),
             _ => None,
         }
     }
@@ -193,8 +202,21 @@ impl Watcher {
                 None => git_dir,
             };
             let mut ref_dirs = Vec::new();
-            for sub in ["refs/heads", "refs/remotes"] {
+            let subs: &[&str] = match common_dir {
+                Some(_) => &["refs/heads", "refs/remotes", "refs/tags"],
+                None => &["refs/heads", "refs/remotes"],
+            };
+            for sub in subs {
                 collect_dirs(&refs_dir.join(sub), &mut ref_dirs, MAX_REF_DIRS);
+            }
+            let worktrees = refs_dir.join("worktrees");
+            if worktrees.is_dir() {
+                let mask = WatchMask::CREATE
+                    | WatchMask::DELETE
+                    | WatchMask::MOVED_TO
+                    | WatchMask::MOVED_FROM
+                    | WatchMask::ONLYDIR;
+                wanted.push((worktrees, mask, Target::Worktrees(repo_buf.clone())));
             }
             let mask = WatchMask::MOVED_TO | WatchMask::CREATE | WatchMask::DELETE;
             for dir in ref_dirs {
@@ -493,8 +515,14 @@ pub fn change_for(
             if gone {
                 return Some(Change::Rescan);
             }
+            // The first linked worktree added, or the last removed.
+            if name? == "worktrees" {
+                return Some(Change::Rescan);
+            }
             git_dir_refresh(name?).map(|r| Change::Repo(repo.clone(), r))
         }
+        // A linked worktree added or removed: it is found from here.
+        Target::Worktrees(_) => mask.contains(EventMask::ISDIR).then_some(Change::Rescan),
         // `config` holds the remotes and each branch's upstream for every worktree.
         Target::CommonDir(repo) => matches!(name?, "packed-refs" | "config").then(|| {
             Change::Repo(
@@ -660,6 +688,16 @@ mod tests {
             "packed-refs",
         );
         assert!(matches!(packed, Some(Change::Repo(_, r)) if r.head && r.status));
+        let added = change(
+            Target::Worktrees(repo()),
+            EventMask::CREATE | EventMask::ISDIR,
+            "wide-cards",
+        );
+        assert_eq!(added, Some(Change::Rescan));
+        assert_eq!(
+            change(Target::GitDir(repo()), EventMask::CREATE, "worktrees"),
+            Some(Change::Rescan)
+        );
         let config = change(Target::CommonDir(repo()), EventMask::MOVED_TO, "config");
         assert!(matches!(config, Some(Change::Repo(_, r)) if r.head && r.status));
         assert_eq!(

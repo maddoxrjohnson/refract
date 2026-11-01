@@ -10,10 +10,11 @@ use refract_core::classify::{classify_report, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
 use refract_core::protocol::{
-    Event, RefactorInfo, RemoteId, RepoSnapshot, SessionChange, SessionInfo,
+    Event, RefactorInfo, RemoteId, RepoSnapshot, SessionChange, SessionInfo, WorktreeInfo,
 };
-use refract_core::sessions::paths_match;
+use refract_core::sessions::{path_within, paths_match};
 use refract_core::transcript::SessionSummary;
+use refract_core::worktree::derive_worktree_status;
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
@@ -223,7 +224,7 @@ impl Agent {
     /// the repo and for sessions started since the last liveness check.
     pub fn live_process(&mut self, path: &Path, id: &str) -> Option<LiveProcess> {
         self.procs = procs::scan();
-        let sessions = self.reader.read_repo(&path_str(path));
+        let sessions = self.read_sessions(path);
         live_set(&self.procs, path, &sessions).remove(id)?
     }
 
@@ -259,7 +260,7 @@ impl Agent {
             self.procs = procs::scan();
         }
         let (sessions, live, background) = if what.sessions {
-            let sessions = self.reader.read_repo(&path_str(path));
+            let sessions = self.read_sessions(path);
             let live = live_set(&self.procs, path, &sessions);
             let background = self.background_for(path, &live);
             (sessions, live, background)
@@ -537,7 +538,7 @@ impl Agent {
     }
 
     fn insert(&mut self, path: PathBuf, status: Status, head: HeadInfo) {
-        let sessions = self.reader.read_repo(&path_str(&path));
+        let sessions = self.read_sessions(&path);
         let live = live_set(&self.procs, &path, &sessions);
         let background = self.background_for(&path, &live);
         self.store(path, status, head, sessions, live, background);
@@ -568,6 +569,10 @@ impl Agent {
         );
         snapshot.mass = mass;
         snapshot.refactor = self.refactors.get(&path).cloned();
+        if let Some(worktree) = &status.worktree {
+            snapshot.worktree_of = Some(path_str(&self.known_form(&worktree.main)));
+            snapshot.worktree = Some(worktree_info(worktree));
+        }
         self.repos.insert(
             path,
             RepoState {
@@ -581,6 +586,34 @@ impl Agent {
                 id,
             },
         );
+    }
+
+    /// `path` as a known repo names it, when one is the same directory under another
+    /// path (through a symlink); else `path` unchanged.
+    pub fn known_form(&self, path: &Path) -> PathBuf {
+        if self.repos.contains_key(path) {
+            return path.to_owned();
+        }
+        let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_owned());
+        self.repos
+            .keys()
+            .find(|known| std::fs::canonicalize(known).is_ok_and(|k| k == real))
+            .cloned()
+            .unwrap_or_else(|| path.to_owned())
+    }
+
+    /// Reads the sessions of `repo`, leaving out those that belong to a known repo
+    /// nested in it, such as a worktree inside its folder.
+    fn read_sessions(&mut self, repo: &Path) -> Vec<SessionSummary> {
+        let root = path_str(repo);
+        let nested: Vec<String> = self
+            .repos
+            .keys()
+            .map(|p| path_str(p))
+            .filter(|p| !paths_match(p, &root) && path_within(p, &root))
+            .collect();
+        let nested: Vec<&str> = nested.iter().map(String::as_str).collect();
+        self.reader.read_repo_within(&root, &nested)
     }
 
     fn repo_events<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Vec<Event> {
@@ -805,6 +838,25 @@ pub fn build_snapshot(
         sessions,
         preselect,
         refactor: None,
+        worktree_of: None,
+        worktree: None,
+    }
+}
+
+/// The snapshot part of a linked worktree's facts, with its status worked out.
+fn worktree_info(worktree: &git::Worktree) -> WorktreeInfo {
+    let (status, removable) = derive_worktree_status(&worktree.facts);
+    let facts = &worktree.facts;
+    WorktreeInfo {
+        locked: facts.locked,
+        operation: facts.operation,
+        untracked_checked: facts.untracked_checked,
+        only_here: facts.only_here,
+        merged: facts.merged.clone(),
+        release: facts.release.clone(),
+        ignored: worktree.ignored.clone(),
+        status,
+        removable,
     }
 }
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
-use refract_core::sessions::{path_within, paths_match, project_dir_matches};
+use refract_core::sessions::{paths_match, project_dir_matches, within_deepest};
 use refract_core::transcript::{parse_lines, SessionSummary};
 
 /// How much of the end of a transcript is read.
@@ -85,6 +85,13 @@ impl SessionReader {
     /// of the file). When the start names no `cwd`, a `cwd` in the tail at or under
     /// `repo` counts instead. Transcripts that cannot be read are left out.
     pub fn read_repo(&mut self, repo: &str) -> Vec<SessionSummary> {
+        self.read_repo_within(repo, &[])
+    }
+
+    /// Like [`SessionReader::read_repo`], but a session whose `cwd` lies in one of
+    /// `nested` (known repos inside `repo`, such as a worktree in its folder) belongs to
+    /// that repo instead, the deepest one.
+    pub fn read_repo_within(&mut self, repo: &str, nested: &[&str]) -> Vec<SessionSummary> {
         let mut files: Vec<(PathBuf, SystemTime, u64)> = self
             .project_dirs(repo)
             .iter()
@@ -118,7 +125,7 @@ impl SessionReader {
                     .summary
                     .cwd
                     .as_deref()
-                    .is_some_and(|cwd| path_within(cwd, repo)),
+                    .is_some_and(|cwd| within_deepest(cwd, repo, nested)),
             };
             if belongs {
                 out.push(cached.summary.clone());

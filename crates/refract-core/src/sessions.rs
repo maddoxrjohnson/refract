@@ -55,6 +55,17 @@ pub fn path_within(path: &str, dir: &str) -> bool {
     }
 }
 
+/// True when `path` belongs to `repo` rather than to a repo nested in it: it lies within
+/// `repo`, and within none of `others` that lie within `repo` themselves. So a session
+/// goes to the deepest known repo holding its directory, such as a worktree inside its
+/// main repo's folder. `others` may include `repo` itself.
+pub fn within_deepest(path: &str, repo: &str, others: &[&str]) -> bool {
+    path_within(path, repo)
+        && !others.iter().any(|other| {
+            !paths_match(other, repo) && path_within(other, repo) && path_within(path, other)
+        })
+}
+
 /// True for paths on a Windows drive mounted under `/mnt/`.
 pub fn is_windows_mount(path: &str) -> bool {
     path.get(..5)
@@ -173,5 +184,21 @@ mod tests {
             "/mnt/c/Users/dev/Tidepool-API"
         ));
         assert!(path_within("/home/dev", "/"));
+    }
+
+    #[test]
+    fn paths_go_to_the_deepest_repo() {
+        let main = "/home/dev/projects/tidepool-api";
+        let nested = "/home/dev/projects/tidepool-api/.claude/worktrees/wide-cards";
+        let sibling = "/home/dev/projects/tidepool-api-old";
+        let others = [main, nested, sibling];
+        assert!(within_deepest(main, main, &others));
+        assert!(within_deepest(&format!("{main}/src"), main, &others));
+        assert!(!within_deepest(nested, main, &others));
+        assert!(!within_deepest(&format!("{nested}/src"), main, &others));
+        assert!(within_deepest(&format!("{nested}/src"), nested, &others));
+        assert!(!within_deepest(sibling, main, &others));
+        // A repo around this one does not take its paths away.
+        assert!(within_deepest(nested, nested, &["/home/dev/projects"]));
     }
 }

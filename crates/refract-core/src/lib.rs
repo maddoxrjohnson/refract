@@ -2,7 +2,7 @@
 //! transcripts, classifying session state, choosing what the launch picker
 //! preselects, scoring repo mass, adding up token usage, reading plan limits,
 //! building launch commands, the rules for moving a repo into WSL, the prompts and
-//! result file of a refactor, the messages between app and agent, and the app's log
+//! result file of a refactor, the status of a linked worktree, the messages between app and agent, and the app's log
 //! lines. Nothing here touches the file
 //! system or spawns processes.
 
@@ -21,3 +21,4 @@ pub mod refactor;
 pub mod sessions;
 pub mod transcript;
 pub mod usage;
+pub mod worktree;

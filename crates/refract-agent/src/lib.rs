@@ -19,6 +19,7 @@ pub mod state;
 pub mod subagents;
 pub mod usage;
 pub mod watch;
+pub mod worktree;
 
 /// What `refract-agent --version` prints: the name and the crate version, which is
 /// kept equal to the app's.

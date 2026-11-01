@@ -37,6 +37,7 @@ use crate::launch;
 use crate::procs::{self, ClaudeProcess, LiveProcess};
 use crate::scan;
 use crate::state::{path_str, Agent, Refresh};
+use crate::worktree;
 
 /// A refactor with no agent and no transcript this long after its launch counts as
 /// interrupted rather than starting.
@@ -174,6 +175,8 @@ enum Kind {
     /// which were idle.
     Merge(Record, Vec<u32>),
     Discard(Record),
+    /// A linked worktree's removal, serialised with the refactor jobs of its main repo.
+    RemoveWorktree(Box<worktree::Removal>),
 }
 
 /// What a [`Job`] did.
@@ -188,6 +191,7 @@ enum DoneKind {
     Started(Result<Box<Started>, Fail>),
     Merged(Result<Merged, Fail>),
     Discarded(Result<(), Fail>),
+    WorktreeRemoved(Result<(), Fail>),
     Failed(Fail),
 }
 
@@ -227,6 +231,7 @@ impl Job {
             }
             Kind::Merge(record, idle) => DoneKind::Merged(self.merge(record, idle)),
             Kind::Discard(record) => DoneKind::Discarded(self.discard(record)),
+            Kind::RemoveWorktree(removal) => DoneKind::WorktreeRemoved(worktree::remove(removal)),
         };
         Done {
             repo: self.repo,
@@ -539,6 +544,12 @@ impl Job {
 }
 
 impl Done {
+    /// True for a worktree removal that worked, after which the repos should be searched
+    /// again so the worktree goes.
+    pub fn removed_worktree(&self) -> bool {
+        matches!(self.kind, DoneKind::WorktreeRemoved(Ok(())))
+    }
+
     /// A job for `repo` that could not run, or panicked.
     pub fn failed(repo: PathBuf, why: impl Into<String>) -> Done {
         Done {
@@ -928,6 +939,47 @@ impl Refactors {
         Ok(self.job(repo, now, Kind::Discard(record)))
     }
 
+    /// Checks a removal of the linked worktree at `path` (`removeWorktree`), and returns
+    /// the job that checks every rule again and removes it (spec §5 in
+    /// `.plans/worktrees-spec.md`). The job is keyed by the worktree's main repo, so it
+    /// waits for no other job and none starts for that repo while it runs (rule 10).
+    pub fn remove_worktree(
+        &mut self,
+        agent: &Agent,
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job, Fail> {
+        let given = PathBuf::from(path);
+        let main = worktree::main_of(&given)?;
+        let repo = agent.known_form(&main);
+        if self.busy.contains(&repo) {
+            return Err(worktree::refuse(
+                "This repo is busy with another action; try again in a moment.",
+            ));
+        }
+        let agent_live = agent
+            .repo_paths()
+            .find(|p| paths_match(&path_str(p), path))
+            .and_then(|p| agent.repo(p))
+            .is_some_and(|r| {
+                r.snapshot
+                    .sessions
+                    .iter()
+                    .any(|s| matches!(s.state, SessionState::Live(_)))
+            });
+        let removal = worktree::Removal {
+            path: given,
+            refactor_worktrees: self
+                .entries
+                .values()
+                .map(|e| PathBuf::from(&e.record.worktree))
+                .collect(),
+            agent_live,
+            refactor_dir: Some(self.worktrees_dir.clone()),
+        };
+        Ok(self.job(repo, now, Kind::RemoveWorktree(Box::new(removal))))
+    }
+
     /// Takes in what a job did, and returns the reply and the events for the repo.
     pub fn finish(
         &mut self,
@@ -1012,9 +1064,23 @@ impl Refactors {
                 events.extend(agent.refresh(&repo, Refresh::ALL));
                 Ok((Reply::Done, events))
             }
+            // The main repo, when known, is sent again whether or not its snapshot moved;
+            // the caller searches the repos again, which drops the worktree.
+            DoneKind::WorktreeRemoved(Ok(())) => {
+                let mut events = agent.refresh(&repo, Refresh::ALL);
+                let main = path_str(&repo);
+                let sent = events
+                    .iter()
+                    .any(|e| matches!(e, Event::RepoChanged(s) if s.path == main));
+                if let Some(state) = agent.repo(&repo).filter(|_| !sent) {
+                    events.push(Event::RepoChanged(Box::new(state.snapshot.clone())));
+                }
+                Ok((Reply::Done, events))
+            }
             DoneKind::Started(Err(e))
             | DoneKind::Merged(Err(e))
             | DoneKind::Discarded(Err(e))
+            | DoneKind::WorktreeRemoved(Err(e))
             | DoneKind::Failed(e) => Err(e),
         }
     }
@@ -1627,15 +1693,15 @@ fn write_record(dir: &Path, id: &str, record: &Record) -> io::Result<()> {
 }
 
 /// What git printed, and whether it succeeded.
-struct Out {
-    ok: bool,
-    stdout: String,
-    stderr: String,
+pub(crate) struct Out {
+    pub(crate) ok: bool,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
 }
 
 /// Runs git in `dir`, looking no higher than it for a repo, never prompting and never
 /// opening an editor.
-fn run_git(dir: &Path, args: &[&str]) -> io::Result<Out> {
+pub(crate) fn run_git(dir: &Path, args: &[&str]) -> io::Result<Out> {
     let mut command = Command::new("git");
     command
         .arg("-C")
@@ -1858,14 +1924,18 @@ pub fn overlap(dirty: &[String], changed: &[String]) -> Vec<String> {
 
 /// One entry of `git worktree list --porcelain`.
 #[derive(Debug, Clone)]
-struct Worktree {
-    path: PathBuf,
+pub(crate) struct Worktree {
+    pub(crate) path: PathBuf,
     /// The branch checked out, without `refs/heads/`.
-    branch: Option<String>,
+    pub(crate) branch: Option<String>,
+    /// `git worktree lock` was used on it.
+    pub(crate) locked: bool,
+    /// Git would prune it: its folder or `.git` file is gone.
+    pub(crate) prunable: bool,
 }
 
 /// The repo's worktrees, the main one first.
-fn worktrees(repo: &Path) -> io::Result<Vec<Worktree>> {
+pub(crate) fn worktrees(repo: &Path) -> io::Result<Vec<Worktree>> {
     let out = run_git(
         repo,
         &["--no-optional-locks", "worktree", "list", "--porcelain"],
@@ -1879,10 +1949,16 @@ fn worktrees(repo: &Path) -> io::Result<Vec<Worktree>> {
             list.push(Worktree {
                 path: PathBuf::from(path),
                 branch: None,
+                locked: false,
+                prunable: false,
             });
-        } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
-            if let Some(last) = list.last_mut() {
+        } else if let Some(last) = list.last_mut() {
+            if let Some(branch) = line.strip_prefix("branch refs/heads/") {
                 last.branch = Some(branch.to_owned());
+            } else if line == "locked" || line.starts_with("locked ") {
+                last.locked = true;
+            } else if line == "prunable" || line.starts_with("prunable ") {
+                last.prunable = true;
             }
         }
     }
@@ -1941,7 +2017,7 @@ fn has_linked_worktrees(repo: &Path) -> bool {
 }
 
 /// True when two paths name the same directory, by their real paths when both exist.
-fn same_dir(a: &Path, b: &Path) -> bool {
+pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         _ => paths_match(&path_str(a), &path_str(b)),
