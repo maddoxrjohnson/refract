@@ -216,6 +216,33 @@ describe("TauriBackend", () => {
     ]);
   });
 
+  it("starts, resumes, merges, discards and opens refactors through their commands", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const ticket = { requestId: "r-1", sessionId: "s-1", folderUri: "vscode-remote://wsl+Ubuntu/w" };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "start_refactor" || cmd === "resume_refactor") return ticket;
+      if (cmd === "merge_refactor") return { outcome: "merged", commits: 2 };
+      if (cmd === "discard_refactor") throw { kind: "refactor", message: "The refactor agent is running." };
+    });
+    const backend = new TauriBackend();
+    const path = "/home/dev/projects/reef-maps";
+    expect(await backend.startRefactor(path)).toEqual(ticket);
+    await backend.startRefactor(path, "the parser");
+    await backend.resumeRefactor(path, true);
+    expect(await backend.mergeRefactor(path)).toEqual({ outcome: "merged", commits: 2 });
+    await expect(backend.discardRefactor(path)).rejects.toMatchObject({ kind: "refactor" });
+    await backend.openRefactor(ticket.folderUri);
+    expect(calls).toEqual([
+      { cmd: "start_refactor", args: { path, focus: null } },
+      { cmd: "start_refactor", args: { path, focus: "the parser" } },
+      { cmd: "resume_refactor", args: { path, fix: true } },
+      { cmd: "merge_refactor", args: { path } },
+      { cmd: "discard_refactor", args: { path } },
+      { cmd: "open_refactor", args: { folderUri: ticket.folderUri } },
+    ]);
+  });
+
   it("asks about the hook and usage through their commands", async () => {
     const calls: Array<{ cmd: string; args: unknown }> = [];
     const info: HookInfo = {

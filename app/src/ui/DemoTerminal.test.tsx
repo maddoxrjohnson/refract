@@ -36,6 +36,10 @@ describe("demoCommand", () => {
       `claude --session-id ${ID} 'it'\\''s dirty'`,
     );
     expect(demoCommand(launch({ kind: "focus", sessionId: ID }))).toBe("");
+    expect(demoCommand(launch({ kind: "new", prompt: "Refactor", planMode: true }))).toBe(
+      `claude --session-id ${ID} --permission-mode plan 'Refactor'`,
+    );
+    expect(demoCommand(launch({ kind: "resume", sessionId: ID, prompt: "Go on" }))).toBe(`claude --resume ${ID} 'Go on'`);
   });
 });
 

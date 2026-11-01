@@ -15,6 +15,7 @@ import type {
   LaunchMode,
   LaunchStep,
   LaunchTicket,
+  MergeOutcome,
   MigratePreflight,
   MigrateSnapshotProgress,
   PendingMigration,
@@ -158,6 +159,28 @@ export class TauriBackend implements Backend {
 
   addRepo(path: string): Promise<void> {
     return invoke<void>("add_repo", { path });
+  }
+
+  // Starting and resuming a refactor are launches; merge and discard reject with `CommandError`.
+
+  startRefactor(path: string, focus?: string): Promise<LaunchTicket> {
+    return invoke<LaunchTicket>("start_refactor", { path, focus: focus ?? null });
+  }
+
+  resumeRefactor(path: string, fix: boolean): Promise<LaunchTicket> {
+    return invoke<LaunchTicket>("resume_refactor", { path, fix });
+  }
+
+  mergeRefactor(path: string): Promise<MergeOutcome> {
+    return invoke<MergeOutcome>("merge_refactor", { path });
+  }
+
+  discardRefactor(path: string): Promise<void> {
+    return invoke<void>("discard_refactor", { path });
+  }
+
+  openRefactor(folderUri: string): Promise<void> {
+    return invoke<void>("open_refactor", { folderUri });
   }
 
   // The hook and usage commands reject with `AgentRequestError`, as `agent_request` does.

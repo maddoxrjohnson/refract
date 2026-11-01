@@ -1,11 +1,13 @@
 //! Bringing repos into view: cloning a remote repo into `~/projects` in WSL, and adding
 //! a folder outside the helper's roots. The helper does the work (`cloneRepo`,
 //! `addRepo`) and reports the repo with `repoChanged`; these commands only ask it.
+//! Merging and discarding a repo's refactor go the same way (`mergeRefactor`,
+//! `discardRefactor`); starting one is a launch (see `launch.rs`).
 
 use std::time::Duration;
 
 use refract_client::RequestError;
-use refract_core::protocol::{check_clone, code, Method, Reply};
+use refract_core::protocol::{check_clone, code, MergeOutcome, Method, Reply};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
@@ -17,6 +19,10 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(11 * 60);
 /// How long `add_repo` waits: git runs once and the roots are searched again, which is
 /// slow under `/mnt/`.
 const ADD_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long `merge_refactor` and `discard_refactor` wait: the helper runs them on a
+/// worker, and a rebase, or removing a worktree that holds installed dependencies, can
+/// take a while.
+const REFACTOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// The parts of the interface's `RemoteRepo` a clone needs; the rest is ignored.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -44,6 +50,8 @@ pub enum RepoErrorKind {
     Clone,
     /// The folder to add is not in a git working tree.
     NotARepo,
+    /// The helper refused or failed to merge or discard a refactor.
+    Refactor,
     /// The helper failed, is not running or did not answer.
     Agent,
     /// The command's task itself failed.
@@ -67,6 +75,7 @@ impl RepoError {
                     code::INVALID_PARAMS => RepoErrorKind::Invalid,
                     code::CLONE_FAILED => RepoErrorKind::Clone,
                     code::REPO_NOT_FOUND => RepoErrorKind::NotARepo,
+                    code::REFACTOR_FAILED => RepoErrorKind::Refactor,
                     _ => RepoErrorKind::Agent,
                 };
                 RepoError::new(kind, format!("{doing}: {message}"))
@@ -124,6 +133,28 @@ pub async fn add_repo(app: AppHandle, path: String) -> Result<(), RepoError> {
         Ok(Reply::Done) => Ok(()),
         Ok(other) => Err(RepoError::unexpected("addRepo", &other)),
         Err(err) => Err(RepoError::agent("Cannot add the folder", err)),
+    }
+}
+
+/// Merges the refactor of the repo at `path` into its target branch (spec §5). A merge
+/// that stopped is an `Ok` [`MergeOutcome::Blocked`]; nothing is pushed.
+#[tauri::command]
+pub async fn merge_refactor(app: AppHandle, path: String) -> Result<MergeOutcome, RepoError> {
+    match request(app, Method::MergeRefactor { path }, REFACTOR_TIMEOUT).await? {
+        Ok(Reply::RefactorMerge(outcome)) => Ok(outcome),
+        Ok(other) => Err(RepoError::unexpected("mergeRefactor", &other)),
+        Err(err) => Err(RepoError::agent("Cannot merge the refactor", err)),
+    }
+}
+
+/// Deletes the refactor of the repo at `path`: its worktree and branch. The helper
+/// refuses while the refactor agent runs.
+#[tauri::command]
+pub async fn discard_refactor(app: AppHandle, path: String) -> Result<(), RepoError> {
+    match request(app, Method::DiscardRefactor { path }, REFACTOR_TIMEOUT).await? {
+        Ok(Reply::Done) => Ok(()),
+        Ok(other) => Err(RepoError::unexpected("discardRefactor", &other)),
+        Err(err) => Err(RepoError::agent("Cannot discard the refactor", err)),
     }
 }
 
@@ -198,6 +229,11 @@ mod tests {
         assert_eq!(
             RepoError::agent("x", agent(code::INTERNAL_ERROR)).kind,
             RepoErrorKind::Agent
+        );
+        assert_eq!(
+            serde_json::to_value(RepoError::agent("x", agent(code::REFACTOR_FAILED))).unwrap()
+                ["kind"],
+            json!("refactor")
         );
         let timeout = RepoError::agent("x", RequestError::Timeout);
         assert_eq!(

@@ -1781,6 +1781,191 @@
   }
 }
 
+/* Refactor: the panel section and the dialog (.plans/refactor-spec.md) */
+
+.rf-refactor__line {
+  margin: 0 0 6px;
+}
+
+.rf-refactor__attention {
+  color: var(--accent);
+}
+
+.rf-refactor__busy {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+}
+
+.rf-spinner {
+  width: 12px;
+  height: 12px;
+  border: 1.5px solid color-mix(in srgb, var(--fg) 25%, transparent);
+  border-top-color: var(--fg);
+  border-radius: 50%;
+  animation: rf-spin 900ms linear infinite;
+}
+
+@keyframes rf-spin {
+  to {
+    rotate: 1turn;
+  }
+}
+
+.rf-refactor__commits,
+.rf-refactor__files {
+  margin: 0 0 8px;
+  padding-left: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  overflow-wrap: anywhere;
+}
+
+.rf-refactor__files {
+  font-size: 12px;
+}
+
+.rf-refactor__checks {
+  width: 100%;
+  margin: 0 0 8px;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.rf-refactor__checks th,
+.rf-refactor__checks td {
+  padding: 3px 6px 3px 0;
+  text-align: left;
+  font-weight: 400;
+  border-bottom: 1px solid var(--line);
+}
+
+.rf-refactor__checks thead th {
+  color: var(--muted);
+}
+
+.rf-refactor__checks tbody th {
+  overflow-wrap: anywhere;
+}
+
+.rf-check-fail {
+  color: var(--accent);
+}
+
+.rf-check-notRun {
+  color: var(--muted);
+}
+
+.rf-refactor__summary {
+  margin: 0 0 8px;
+}
+
+.rf-refactor .rf-row {
+  margin-top: 4px;
+}
+
+.rf-refactor .rf-row > .rf-button,
+.rf-refactor-dialog .rf-button {
+  gap: 8px;
+}
+
+.rf-refactor__confirm {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.rf-refactor__question {
+  margin: 0;
+  font-weight: 500;
+}
+
+.rf-refactor__merged .rf-ok {
+  margin: 0 0 6px;
+}
+
+.rf-refactor__merged .rf-hint {
+  margin: 0 0 6px;
+}
+
+/* Placed like the picker: under the zoomed gem, left of the panel. */
+.rf-refactor-dialog {
+  position: fixed;
+  z-index: 12;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  left: max(16px, calc((100vw - 392px) / 2));
+  bottom: 24px;
+  width: min(480px, calc(100vw - 424px));
+  min-width: min(320px, calc(100vw - 32px));
+  max-height: calc(100vh - 48px);
+  overflow-y: auto;
+  transform: translateX(-50%);
+  padding: 14px 16px;
+  animation: rf-rise 200ms var(--ease-out);
+}
+
+.rf-refactor-dialog .rf-picker__title {
+  margin: 2px 0 0;
+}
+
+.rf-refactor-dialog__text {
+  margin: 0;
+}
+
+.rf-refactor-dialog .rf-field {
+  align-items: stretch;
+  margin: 0;
+}
+
+.rf-refactor-dialog .rf-field > span {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.rf-refactor-dialog .rf-input {
+  flex: none;
+  width: 100%;
+}
+
+.rf-refactor-dialog__hook {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.rf-refactor-dialog .rf-picker__footer {
+  margin: 0;
+}
+
+.rf-refactor-dialog .rf-picker__footer .rf-button--primary {
+  width: auto;
+}
+
+.rf-toast__notice {
+  color: var(--fg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rf-refactor-dialog {
+    animation: rf-fade 120ms linear;
+  }
+
+  .rf-spinner {
+    animation: none;
+    border-color: var(--fg);
+    border-style: dotted;
+  }
+}
+
 /* Web demo only: the pretend VS Code terminal a launch shows, and the invented-repos badge. */
 
 .rf-term-backdrop {

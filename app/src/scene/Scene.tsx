@@ -26,6 +26,7 @@ import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import type { RepoSnapshot } from "../backend/types";
 import type { ThemeMode } from "../theme";
 import { TIERS, type QualityLevel } from "../quality/tiers";
+import { refactorMark } from "../refactors";
 import { repoStatus } from "../repoStatus";
 import { applyPalette, makeSheet, makeSheetUniforms, makeStoneMaterial } from "./banknote";
 import { shardGeometry, prepare } from "./cuts";
@@ -154,6 +155,12 @@ const ROSETTE_SPIN = 0.5;
  * wave counts make the pattern repeat exactly every full turn. */
 export function rosetteSpin(t: number): number {
   return (t * ROSETTE_SPIN) % (2 * Math.PI);
+}
+/** The refactor mark's ticks turn slowly; 48 ticks repeat every 1/48 turn, so it wraps there. */
+const REFACTOR_SPIN = 0.2;
+const REFACTOR_TICK = (2 * Math.PI) / 48;
+export function refactorSpin(t: number): number {
+  return (t * REFACTOR_SPIN) % REFACTOR_TICK;
 }
 /**
  * A stone whose agent waits on you knocks once a period: a hop of `KNOCK_LIFT` stone
@@ -382,6 +389,15 @@ function updateGem(this: GemFrame, g: GemHandle) {
     g.ping.uniforms.fade.value = this.ambient ? fade : 0;
   }
   g.rosette.uniforms.fade.value = fade;
+  if (g.refactor) {
+    // Ambient time stops on Low and with reduced motion, so the ticks stand still there.
+    const mark = g.refactorMark;
+    const ru = g.refactor.uniforms;
+    ru.fade.value = fade;
+    ru.kind.value = mark === "ready" ? 2 : mark === "plain" ? 0 : 1;
+    ru.red.value = mark === "alert" ? 1 : 0;
+    ru.spin.value = mark === "turning" ? refactorSpin(T) : 0;
+  }
   g.rosette.uniforms.spin.value = g.working ? rosetteSpin(T) : 0;
   if (g.ring) {
     // Rings of stones in the opening draw in partway through it; later ones at once.
@@ -898,6 +914,7 @@ function SceneContents(props: ContentsProps) {
         interrupted={st.interrupted}
         working={st.working}
         waiting={st.waiting}
+        refactor={refactorMark(repo.refactor)}
         remoteOnly={remoteOnly.has(repo.path)}
         leaving={gone}
         sheet={sheetUniforms}

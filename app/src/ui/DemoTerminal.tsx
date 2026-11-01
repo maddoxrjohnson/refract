@@ -12,10 +12,14 @@ const LINE_MS = 260;
  * Going to a running agent runs nothing, so its command is empty.
  */
 export function demoCommand(launch: DemoLaunch): string {
+  const quote = (text: string) => ` '${text.replace(/'/g, "'\\''")}'`;
   if (launch.mode.kind === "focus") return "";
-  if (launch.mode.kind === "resume") return `claude --resume ${launch.sessionId}`;
-  const prompt = launch.mode.prompt ? ` '${launch.mode.prompt.replace(/'/g, "'\\''")}'` : "";
-  return `claude --session-id ${launch.sessionId}${prompt}`;
+  if (launch.mode.kind === "resume") {
+    return `claude --resume ${launch.sessionId}${launch.mode.prompt ? quote(launch.mode.prompt) : ""}`;
+  }
+  const plan = launch.mode.planMode ? " --permission-mode plan" : "";
+  const prompt = launch.mode.prompt ? quote(launch.mode.prompt) : "";
+  return `claude --session-id ${launch.sessionId}${plan}${prompt}`;
 }
 
 /** An invented reply; nothing here comes from a real agent. */
@@ -28,11 +32,23 @@ function demoReply(launch: DemoLaunch): string[] {
       "  Nothing new was started; it is where you left it.",
     ];
   }
+  if (launch.mode.kind === "resume" && launch.mode.prompt) {
+    return [...header, `> ${launch.mode.prompt}`, "", "● Checking the branch and re-running the checks…"];
+  }
   if (launch.mode.kind === "resume") {
     return [
       ...header,
       `● Picking up the session that stopped in ${launch.repoName}.`,
       "  I'll check where it got to before running anything again.",
+    ];
+  }
+  if (launch.mode.planMode) {
+    return [
+      ...header,
+      `> ${launch.mode.prompt ?? "Plan a refactor."}`,
+      "",
+      "⏸ plan mode on",
+      "● Surveying the repo and running its checks for a baseline…",
     ];
   }
   if (launch.mode.prompt) {

@@ -262,6 +262,61 @@ export function makeRingMaterial(u: SheetUniforms, seed: number): ShaderMaterial
   }) as ShaderMaterial & { uniforms: RingUniforms };
 }
 
+// The refactor mark: a thin engraved ring outside the rosette with a band of fine ticks,
+// like a coin's milled edge. `kind` 1 draws the ticks (turned by `spin` while Claude
+// works), 2 the "ready" seal (a double line with four diamonds, still) and 0 the bare
+// ring; `red` draws it in the accent while the refactor needs you.
+const refactorFrag = /* glsl */ `
+  uniform vec3 ink; uniform vec3 accent; uniform float red; uniform float kind;
+  uniform float spin; uniform float fade;
+  varying vec2 vUv;
+  float ringAt(float r, float rr, float w){ return 1.0 - smoothstep(w * 0.45, w * 1.3, abs(r - rr)); }
+  void main(){
+    vec2 q = vUv - 0.5; float r = length(q) * 2.0, w = fwidth(r) * 1.1;
+    float ang = atan(q.y, q.x);
+    float a;
+    if (kind > 1.5) {
+      // Two lines with a diamond at each quarter, between them.
+      float quarter = 1.5707963;
+      float off = abs(mod(ang + quarter * 0.5, quarter) - quarter * 0.5) * r;
+      float dm = abs(r - 0.915) / 0.05 + off / 0.06;
+      a = max(max(ringAt(r, 0.88, w), ringAt(r, 0.95, w)), 1.0 - smoothstep(0.8, 1.0, dm));
+    } else {
+      a = ringAt(r, 0.9, w);
+      if (kind > 0.5) {
+        float t = abs(fract((ang + spin) * 48.0 / 6.28318) - 0.5) * 2.0;
+        float tick = 1.0 - smoothstep(0.22, 0.22 + fwidth(t) * 1.5, t);
+        a = max(a, tick * step(0.92, r) * step(r, 0.97));
+      }
+    }
+    gl_FragColor = vec4(mix(ink, accent, red), a * mix(0.5, 0.85, red) * fade);
+  }`;
+
+export type RefactorUniforms = {
+  fade: { value: number };
+  spin: { value: number };
+  /** 0 bare ring, 1 ticks (working), 2 ready seal. */
+  kind: { value: number };
+  red: { value: number };
+};
+
+export function makeRefactorMaterial(u: SheetUniforms): ShaderMaterial & { uniforms: RefactorUniforms } {
+  return new ShaderMaterial({
+    vertexShader: decalVert,
+    fragmentShader: refactorFrag,
+    transparent: true,
+    depthWrite: false,
+    uniforms: {
+      ink: u.ink,
+      accent: u.accent,
+      red: { value: 0 },
+      kind: { value: 0 },
+      spin: { value: 0 },
+      fade: { value: 1 },
+    },
+  }) as ShaderMaterial & { uniforms: RefactorUniforms };
+}
+
 /** A unit square lying flat on the sheet, for the rosette and the rings. */
 export function makeDecalGeometry(): PlaneGeometry {
   return new PlaneGeometry(1, 1).rotateX(-Math.PI / 2);

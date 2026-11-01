@@ -146,6 +146,48 @@ test("a repo with an agent waiting on you preselects going to it", async ({ page
   await expect(terminal).toBeHidden();
 });
 
+test("a refactor runs from the dialog to a merge, and another is discarded", async ({ page }) => {
+  await page.keyboard.type("dotfiles");
+  await page.keyboard.press("Enter");
+  const panel = page.getByRole("complementary", { name: "dotfiles details" });
+  const section = panel.getByRole("region", { name: "Refactor" });
+  await expect(section).toBeVisible();
+  // Alt+R opens the dialog on the zoomed repo.
+  await page.keyboard.press("Alt+r");
+  const dialog = page.getByRole("dialog", { name: "Refactor dotfiles" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByText("need the status hook")).toBeVisible();
+  await dialog.getByRole("textbox", { name: /Focus on/ }).fill("the aliases");
+  await page.keyboard.press("Enter");
+  await expect(dialog).toBeHidden();
+  const terminal = page.getByRole("dialog", { name: "Simulated terminal for dotfiles" });
+  await expect(terminal.getByTestId("demo-terminal")).toContainText("--permission-mode plan");
+  await page.keyboard.press("Escape");
+  await expect(terminal).toBeHidden();
+  // The plan waits on you, then Claude works and the refactor is ready.
+  await expect(section.getByText("Claude needs you")).toBeVisible();
+  await expect(section.getByRole("button", { name: /Go to the refactor/ })).toBeVisible();
+  const merge = section.getByRole("button", { name: "Merge into main" });
+  await expect(merge).toBeVisible();
+  await expect(section.getByText("shellcheck *.sh")).toBeVisible();
+  await merge.click();
+  await expect(section.getByText("Merged 3 commits into main.")).toBeVisible();
+  await expect(panel.getByText("Give the request handlers clearer names")).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(panel).toBeHidden();
+
+  // sweep's refactor is already done; discard it.
+  await page.keyboard.press("Escape");
+  await page.keyboard.type("sweep");
+  await page.keyboard.press("Enter");
+  const sweep = page.getByRole("complementary", { name: "sweep details" }).getByRole("region", { name: "Refactor" });
+  await expect(sweep.getByText("No check results reported.")).toBeVisible();
+  await sweep.getByRole("button", { name: "Discard" }).click();
+  await expect(sweep.getByText("Discard 2 commits?")).toBeVisible();
+  await sweep.getByRole("group", { name: "Confirm discard" }).getByRole("button", { name: "Discard" }).click();
+  await expect(sweep.getByRole("button", { name: /Refactor…/ })).toBeVisible();
+});
+
 test("the settings panel opens and closes", async ({ page }) => {
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   const settings = page.getByRole("dialog", { name: "Settings", exact: true });

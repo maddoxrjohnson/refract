@@ -477,6 +477,7 @@ pub fn start(app: &AppHandle) {
                 }
                 ClientEvent::Event(event) => {
                     crate::migrate::on_helper_event(&handle, &event);
+                    crate::alerts::on_helper_event(&handle, &event);
                     handle.emit(EVENT_EVENT, event)
                 }
             };
@@ -545,6 +546,10 @@ pub async fn agent_request(agent: State<'_, Agent>, request: Value) -> Result<Va
         tauri::async_runtime::spawn_blocking(move || client.request(method, REQUEST_TIMEOUT))
             .await
             .map_err(|err| internal(format!("request task failed: {err}")))??;
+    // The refactor toasts compare later changes with what the interface was shown.
+    if let Reply::Repos(list) = &reply {
+        crate::alerts::on_list(&list.repos);
+    }
     serde_json::to_value(reply).map_err(|err| internal(err.to_string()))
 }
 

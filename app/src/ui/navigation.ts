@@ -1,5 +1,6 @@
 import type { LaunchMode, RepoSnapshot, SessionInfo } from "../backend/types";
 import { isRemoteKey, remoteKey } from "../projects";
+import { refactorBlocker } from "../refactors";
 import { DIRTY_REPO_PROMPT, focusableSessions, unfinishedSessions } from "../repoStatus";
 
 // Finding and choosing a project (spec §3.3, §4.3) as a pure state machine. Inputs are
@@ -70,6 +71,10 @@ export type NavInput =
 
 export type NavEffect =
   | { kind: "launch"; path: string; mode: LaunchMode }
+  /** Alt+R on a repo without a refactor: open the Refactor dialog. */
+  | { kind: "refactorDialog"; path: string }
+  /** Alt+R on a repo with a refactor: open or raise its worktree's VS Code window. */
+  | { kind: "openRefactor"; path: string }
   /** Clone a remote-only repo, then launch a new agent in it. `key` is its gem path. */
   | { kind: "clone"; key: string };
 
@@ -284,7 +289,20 @@ function pickerKey(state: NavState, picker: PickerState, key: string): NavResult
   }
 }
 
+/**
+ * Alt+R on the zoomed repo: Refactor, or Go to the refactor once it has one. Not on
+ * remote-only repos, nor while Refactor can't start (detached HEAD, no commits).
+ */
+function refactorKey(state: NavState, ctx: NavContext): NavResult {
+  const repo = state.zoomed ? ctx.repos.get(state.zoomed) : undefined;
+  if (!repo || state.picker || ctx.remoteOnly?.has(repo.path)) return unhandled(state);
+  if (repo.refactor) return result(state, [{ kind: "openRefactor", path: repo.path }]);
+  if (refactorBlocker(repo)) return unhandled(state);
+  return result(state, [{ kind: "refactorDialog", path: repo.path }]);
+}
+
 function onKey(state: NavState, k: NavKey, ctx: NavContext): NavResult {
+  if (k.alt && !k.ctrl && !k.meta && k.key.toLowerCase() === "r") return refactorKey(state, ctx);
   if (k.ctrl || k.meta || k.alt) return unhandled(state);
   if (state.picker) return pickerKey(state, state.picker, k.key);
 

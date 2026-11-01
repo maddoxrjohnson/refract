@@ -1,4 +1,4 @@
-import type { MigrationReport, RepoSnapshot, ResumeReason, SessionInfo } from "../backend/types";
+import type { MigrationReport, RefactorInfo, RepoSnapshot, ResumeReason, SessionInfo } from "../backend/types";
 
 // Fixtures for the overlay tests. Invented names only.
 
@@ -85,6 +85,37 @@ export function testReport(extra: Partial<MigrationReport> = {}): MigrationRepor
     history: { sessions: 2, fromDirs: [], toDirs: [] },
     linuxGit: false,
     warnings: [],
+    ...extra,
+  };
+}
+
+/** A refactor of the test repo: ready, with two commits and its checks. */
+export function testRefactor(extra: Partial<RefactorInfo> = {}): RefactorInfo {
+  const worktree = "/home/demo/projects/.refract-worktrees/tidepool-20261031-1405";
+  return {
+    state: "ready",
+    worktree,
+    folderUri: `vscode-remote://wsl+Ubuntu${worktree}`,
+    branch: "refactor/20261031-1405",
+    targetBranch: "main",
+    baseCommit: "0123456789abcdef0123456789abcdef01234567",
+    sessionId: "5f0c2a1e-0000-4000-8000-0000000000c1",
+    createdAt: "2026-10-31T14:05:00Z",
+    live: false,
+    interrupted: false,
+    commits: [
+      { sha: "b1c2d3e", summary: "Extract the retry policy" },
+      { sha: "c2d3e4f", summary: "Remove dead export helpers" },
+    ],
+    filesChanged: 5,
+    insertions: 80,
+    deletions: 120,
+    checks: [
+      { command: "npm test", before: "pass", after: "pass" },
+      { command: "npm run lint", before: "fail", after: "notRun" },
+    ],
+    summary: "Two refactors; the tests still pass.",
+    blocked: null,
     ...extra,
   };
 }

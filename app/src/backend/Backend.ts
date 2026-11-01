@@ -23,6 +23,7 @@ import type {
   LaunchMode,
   LaunchStep,
   LaunchTicket,
+  MergeOutcome,
   RepoList,
   RepoSnapshot,
 } from "./types";
@@ -72,6 +73,24 @@ export interface Backend {
   cloneRepo(repo: RemoteRepo): Promise<string>;
   /** Adds a local folder (a WSL path) to the repos the helper reports. */
   addRepo(path: string): Promise<void>;
+
+  // Refactors (.plans/refactor-spec.md). `path` is the repo's; its snapshot's `refactor`
+  // follows each change through `repoChanged`.
+
+  /**
+   * Makes a worktree on a new branch and opens it in VS Code with a plan-mode agent, as
+   * `launch` does (same progress, rejects with a `LaunchError`). `focus` is the optional
+   * "Focus on…" line.
+   */
+  startRefactor(path: string, focus?: string): Promise<LaunchTicket>;
+  /** Resumes the refactor agent; `fix` asks it to rebase after a merge hit conflicts. As `launch`. */
+  resumeRefactor(path: string, fix: boolean): Promise<LaunchTicket>;
+  /** Merges into the target branch, or says why it stopped. Rejects with a `CommandError`. */
+  mergeRefactor(path: string): Promise<MergeOutcome>;
+  /** Deletes the worktree and branch; refused while the agent runs. Rejects with a `CommandError`. */
+  discardRefactor(path: string): Promise<void>;
+  /** Opens or raises the VS Code window on a refactor's worktree. Rejects with a `LaunchError`. */
+  openRefactor(folderUri: string): Promise<void>;
 
   /** Whether the status hook is installed, and what installing would change. */
   hookInfo(): Promise<HookInfo>;

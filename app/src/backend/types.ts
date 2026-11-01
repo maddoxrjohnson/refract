@@ -63,7 +63,96 @@ export interface LastCommit {
   summary: string;
   /** Unix seconds. */
   time: number;
+  /** Abbreviated commit id; missing from older helpers. */
+  sha?: string | null;
 }
+
+/** Where a refactor stands (refactor spec §4). */
+export type RefactorState =
+  | "starting"
+  | "working"
+  | "needsYou"
+  | "interrupted"
+  | "ready"
+  | "nothingToDo"
+  | "mergeBlocked";
+
+export interface RefactorCommit {
+  /** Abbreviated commit id. */
+  sha: string;
+  summary: string;
+}
+
+export type CheckOutcome = "pass" | "fail" | "notRun";
+
+/** One check the refactor agent ran, before its refactors and after them. */
+export interface CheckResult {
+  command: string;
+  before: CheckOutcome;
+  after: CheckOutcome;
+}
+
+export type MergeBlockReason =
+  | "dirtyOverlap"
+  | "conflict"
+  | "targetMissing"
+  | "live"
+  /** The target branch is checked out, or being rebased, in another worktree. */
+  | "targetBusy"
+  /** The refactor worktree is off its branch, or a rebase is under way in it. */
+  | "worktreeBusy"
+  /** Uncommitted changes in the refactor worktree; `files` lists them. */
+  | "worktreeDirty"
+  /** The target no longer contains the commit the refactor started from. */
+  | "targetRewound";
+
+/** Why a merge stopped; `files` are relative to the repo. */
+export interface MergeBlock {
+  reason: MergeBlockReason;
+  files: string[];
+}
+
+/** A repo's refactor, from refract-core's `RefactorInfo`. */
+export interface RefactorInfo {
+  state: RefactorState;
+  /** Absolute Linux path of the worktree. */
+  worktree: string;
+  /** What `code --folder-uri` opens to review the worktree. */
+  folderUri: string;
+  /** Such as `refactor/20261031-1405`. */
+  branch: string;
+  /** The branch a merge moves. */
+  targetBranch: string;
+  /** Full id of the commit the worktree started from. */
+  baseCommit: string;
+  /** Empty when none is known. */
+  sessionId: string;
+  /** RFC 3339. */
+  createdAt: string;
+  /** The refactor agent's `claude` process is running. */
+  live: boolean;
+  /** Not running and its transcript ends mid-turn: worth resuming, whatever the state. */
+  interrupted?: boolean;
+  /** Oldest first. */
+  commits: RefactorCommit[];
+  filesChanged: number;
+  insertions: number;
+  deletions: number;
+  /** `null` when the agent's result file is missing or not valid. */
+  checks: CheckResult[] | null;
+  summary: string | null;
+  blocked: MergeBlock | null;
+}
+
+/** What `mergeRefactor` did. */
+export type MergeOutcome =
+  /** The target holds the commits and the refactor is gone; `kept` says what git would not remove. */
+  | { outcome: "merged"; commits: number; kept?: string[] }
+  /** Nothing changed; the refactor stays. */
+  | { outcome: "blocked"; reason: MergeBlockReason; files: string[] };
+
+/** The helper's error code for a refused or failed refactor request. */
+export const REFACTOR_FAILED = 8;
 
 export interface RepoSnapshot {
   path: string;
@@ -83,6 +172,8 @@ export interface RepoSnapshot {
   mass: number;
   sessions: SessionInfo[];
   preselect: Preselect;
+  /** The repo's refactor, while it has one; missing from older helpers. */
+  refactor?: RefactorInfo | null;
 }
 
 export interface RepoList {
@@ -107,8 +198,8 @@ export type AgentEvent =
 
 /** How to start the agent, from refract-core's `LaunchMode`. */
 export type LaunchMode =
-  | { kind: "new"; prompt?: string }
-  | { kind: "resume"; sessionId: string }
+  | { kind: "new"; prompt?: string; planMode?: boolean }
+  | { kind: "resume"; sessionId: string; prompt?: string }
   /** Show the VS Code terminal already running this live session; starts nothing. */
   | { kind: "focus"; sessionId: string };
 

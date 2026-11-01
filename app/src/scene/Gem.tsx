@@ -1,13 +1,16 @@
 import { memo, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { Color, Group, Vector3, type Mesh, type ShaderMaterial } from "three";
+import type { RefactorMark } from "../refactors";
 import { stoneFor } from "../stones";
 import {
   makeDecalGeometry,
   makePingMaterial,
+  makeRefactorMaterial,
   makeRingMaterial,
   makeRosetteMaterial,
   makeStoneMaterial,
   type PingUniforms,
+  type RefactorUniforms,
   type RingUniforms,
   type RosetteUniforms,
   type SheetUniforms,
@@ -36,6 +39,9 @@ export interface GemHandle {
   ring: (ShaderMaterial & { uniforms: RingUniforms }) | null;
   /** The red rings spreading from a waiting stone; null while no agent waits. */
   ping: (ShaderMaterial & { uniforms: PingUniforms }) | null;
+  /** The engraved ring of the repo's refactor; null while it has none. */
+  refactor: (ShaderMaterial & { uniforms: RefactorUniforms }) | null;
+  refactorMark: RefactorMark | null;
   working: boolean;
   waiting: boolean;
   /** Gone from the repos; fades out, then the scene drops it. */
@@ -70,6 +76,8 @@ export interface GemProps {
   interrupted: boolean;
   working: boolean;
   waiting: boolean;
+  /** The repo's refactor, as its mark shows it. */
+  refactor?: RefactorMark | null;
   /** Exists only on GitHub or GitLab: stippled instead of lined. */
   remoteOnly: boolean;
   leaving: boolean;
@@ -110,6 +118,9 @@ export const Gem = memo(function Gem(props: GemProps) {
     () => (props.waiting ? makePingMaterial(sheet) : null),
     [props.waiting, sheet],
   );
+  const hasRefactor = props.refactor != null;
+  const refactor = useMemo(() => (hasRefactor ? makeRefactorMaterial(sheet) : null), [hasRefactor, sheet]);
+  useDispose(refactor);
   useDispose(geometry);
   useDispose(decal);
   useDispose(stone);
@@ -138,6 +149,8 @@ export const Gem = memo(function Gem(props: GemProps) {
       rosette,
       ring,
       ping,
+      refactor,
+      refactorMark: null,
       working: false,
       waiting: false,
       leaving: false,
@@ -161,6 +174,8 @@ export const Gem = memo(function Gem(props: GemProps) {
     h.rosette = rosette;
     h.ring = ring;
     h.ping = ping;
+    h.refactor = refactor;
+    h.refactorMark = props.refactor ?? null;
     h.working = props.working;
     h.waiting = props.waiting;
     h.leaving = props.leaving;
@@ -179,6 +194,7 @@ export const Gem = memo(function Gem(props: GemProps) {
       <group ref={spot} dispose={null}>
         <mesh geometry={decal} material={rosette} position-y={0.004} scale={size * 2.5} />
         {ring && <mesh geometry={decal} material={ring} position-y={0.006} scale={size * 3.1} />}
+        {refactor && <mesh geometry={decal} material={refactor} position-y={0.007} scale={size * 3.1} />}
         {ping && <mesh geometry={decal} material={ping} position-y={0.008} scale={size * 4.2} />}
       </group>
     </>

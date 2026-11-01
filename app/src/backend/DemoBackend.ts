@@ -9,6 +9,7 @@ import type {
   LaunchMode,
   LaunchStep,
   LaunchTicket,
+  MergeOutcome,
   ModelUsage,
   PlanLimits,
   Preselect,
@@ -18,6 +19,7 @@ import type {
   RemoteRef,
   RemoteRepo,
   RepoList,
+  RefactorInfo,
   RepoSnapshot,
   ResumeReason,
   SessionInfo,
@@ -64,6 +66,8 @@ interface Seed {
   preselect?: Preselect;
   /** Where it is cloned; `~/projects/<name>` by default. */
   path?: string;
+  /** A refactor already under way, for the refactor section and the stone's mark. */
+  refactor?: "ready";
 }
 
 /** The demo's repo on a Windows drive. */
@@ -158,7 +162,7 @@ const SEEDS: Seed[] = [
     ],
     preselect: { kind: "focus", sessionId: "5f0c2a1e-0000-4000-8000-000000000005" },
   },
-  { name: "sweep", host: "github.com", language: "C#", mass: 0.18, commit: ["Initial commit", 60 * 24 * HOUR] },
+  { name: "sweep", host: "github.com", language: "C#", mass: 0.18, commit: ["Initial commit", 60 * 24 * HOUR], refactor: "ready" },
   {
     name: "harbor-android",
     host: "github.com",
@@ -211,7 +215,7 @@ const SEEDS: Seed[] = [
 ];
 
 export function demoRepos(): RepoSnapshot[] {
-  return SEEDS.map((s) => {
+  return SEEDS.map((s, i) => {
     const path = s.path ?? `/home/demo/projects/${s.name}`;
     const remote = s.host ? { host: s.host, owner: "demo-user", name: s.name } : null;
     const changedFiles = s.changedFiles ?? 0;
@@ -225,16 +229,131 @@ export function demoRepos(): RepoSnapshot[] {
       behind: remote ? (s.behind ?? 0) : null,
       changedFiles,
       dirtyPaths: Array.from({ length: changedFiles }, (_, i) => `src/file-${i + 1}.txt`),
-      lastCommit: { summary: s.commit[0], time: now() - s.commit[1] },
+      lastCommit: { summary: s.commit[0], time: now() - s.commit[1], sha: demoSha(i) },
       language: s.language,
       trackedBytes: Math.round(s.mass * 8_000_000),
       commits30d: Math.round(s.mass * 60),
       mass: s.mass,
       sessions: s.sessions ?? [],
       preselect: s.preselect ?? { kind: "noPicker" },
+      refactor: s.refactor ? seededRefactor(s.name) : null,
     };
   });
 }
+
+/** An invented abbreviated commit id. */
+function demoSha(n: number): string {
+  return ((n + 1) * 0x9e3779b1 >>> 0).toString(16).padStart(8, "0").slice(0, 7);
+}
+
+// Refactors (.plans/refactor-spec.md), simulated: Starting, then Claude plans, waits on
+// you for the plan, works and ends ready with three commits. Merge and Discard act on the
+// demo's repos only.
+
+/** How long the simulated refactor stays in each state, in milliseconds. */
+export const DEMO_REFACTOR_STEPS: [state: "working" | "needsYou" | "ready", afterMs: number][] = [
+  ["working", 1200],
+  ["needsYou", 2500],
+  ["working", 4000],
+  ["ready", 3000],
+];
+
+const DEMO_REFACTOR_COMMITS = [
+  "Extract the retry policy into its own module",
+  "Remove the unused legacy export helpers",
+  "Give the request handlers clearer names",
+];
+
+/** The test and lint commands a repo in `language` would have. */
+function demoChecks(language: string | null): string[] {
+  switch (language) {
+    case "TypeScript":
+    case "JavaScript":
+      return ["npm test", "npm run lint"];
+    case "Rust":
+      return ["cargo test", "cargo clippy"];
+    case "Python":
+      return ["pytest", "ruff check ."];
+    case "Go":
+      return ["go test ./...", "go vet ./..."];
+    case "Swift":
+      return ["swift test"];
+    case "Kotlin":
+      return ["./gradlew test"];
+    case "C#":
+      return ["dotnet test"];
+    case "Shell":
+      return ["shellcheck *.sh"];
+    default:
+      return ["make test"];
+  }
+}
+
+/** A stamp like the helper's `20261031-1405`, in local time. */
+function stamp(date: Date): string {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}-${pad(date.getHours())}${pad(date.getMinutes())}`;
+}
+
+function newRefactor(name: string, base: string, created = new Date()): RefactorInfo {
+  const worktree = `/home/demo/projects/.refract-worktrees/${name}-${stamp(created)}`;
+  return {
+    state: "starting",
+    worktree,
+    folderUri: `vscode-remote://wsl+Demo${worktree}`,
+    branch: `refactor/${stamp(created)}`,
+    targetBranch: "main",
+    baseCommit: base.padEnd(40, "0"),
+    sessionId: crypto.randomUUID(),
+    createdAt: created.toISOString(),
+    live: false,
+    interrupted: false,
+    commits: [],
+    filesChanged: 0,
+    insertions: 0,
+    deletions: 0,
+    checks: null,
+    summary: null,
+    blocked: null,
+  };
+}
+
+/** The refactor a finished run leaves: three commits, checks before and after, a summary. */
+function finishedRefactor(info: RefactorInfo, language: string | null): RefactorInfo {
+  return {
+    ...info,
+    state: "ready",
+    live: false,
+    commits: DEMO_REFACTOR_COMMITS.map((summary, i) => ({ sha: demoSha(40 + i), summary })),
+    filesChanged: 7,
+    insertions: 142,
+    deletions: 188,
+    checks: demoChecks(language).map((command) => ({ command, before: "pass", after: "pass" })),
+    summary: "Three refactors, one commit each. Every check that passed before still passes.",
+    blocked: null,
+  };
+}
+
+/** The demo's refactor that is already done: two commits and no result file. */
+function seededRefactor(name: string): RefactorInfo {
+  const created = new Date(Date.now() - 2 * HOUR * 1000);
+  return {
+    ...newRefactor(name, demoSha(99), created),
+    state: "ready",
+    sessionId: "5f0c2a1e-0000-4000-8000-0000000000b1",
+    commits: [
+      { sha: demoSha(50), summary: "Split the sweep loop out of Program.cs" },
+      { sha: demoSha(51), summary: "Drop the unused settings reader" },
+    ],
+    filesChanged: 3,
+    insertions: 61,
+    deletions: 94,
+  };
+}
+
+/** The opening prompt the demo's pretend terminal shows for a refactor. */
+export const DEMO_REFACTOR_PROMPT =
+  "Refactor this repository: up to 3 behaviour-preserving refactors, one commit each.";
 
 interface RemoteSeed {
   name: string;
@@ -457,6 +576,8 @@ export class DemoBackend implements Backend {
   private moveCount = 0;
   private moveWindows: VsCodeWindow[] = [{ id: 4242, title: "marigold-site - Visual Studio Code" }];
   private moveOutcome: DemoMoveOutcome;
+  // Refactors: the pending step of each repo's simulated run, by path.
+  private refactorTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
    * `moveOutcome` is what Delete original first says; by default the original goes to the
@@ -671,6 +792,125 @@ export class DemoBackend implements Backend {
     };
     this.repos = [...this.repos, snapshot];
     this.emit({ event: "repoChanged", data: snapshot });
+  }
+
+  /** Replaces the repo at `path` with `change(repo)` and reports it. */
+  private updateRepo(path: string, change: (repo: RepoSnapshot) => RepoSnapshot): RepoSnapshot | undefined {
+    const repo = this.repos.find((r) => r.path === path);
+    if (!repo) return undefined;
+    const next = change(repo);
+    this.repos = this.repos.map((r) => (r.path === path ? next : r));
+    this.emit({ event: "repoChanged", data: next });
+    return next;
+  }
+
+  private setRefactor(path: string, change: (info: RefactorInfo, repo: RepoSnapshot) => RefactorInfo | null) {
+    return this.updateRepo(path, (repo) => (repo.refactor ? { ...repo, refactor: change(repo.refactor, repo) } : repo));
+  }
+
+  /** Walks the refactor through `steps`, each after its delay. */
+  private runRefactor(path: string, steps: typeof DEMO_REFACTOR_STEPS) {
+    clearTimeout(this.refactorTimers.get(path));
+    const [first, ...rest] = steps;
+    if (!first) {
+      this.refactorTimers.delete(path);
+      return;
+    }
+    const [state, afterMs] = first;
+    this.refactorTimers.set(
+      path,
+      setTimeout(() => {
+        this.setRefactor(path, (info, repo) =>
+          state === "ready" ? finishedRefactor(info, repo.language) : { ...info, state, live: true, blocked: null },
+        );
+        this.runRefactor(path, rest);
+      }, afterMs),
+    );
+  }
+
+  private refactorFail(message: string): never {
+    throw { kind: "refactor", message };
+  }
+
+  private demoRefactorLaunch(path: string, mode: LaunchMode, sessionId: string) {
+    const repo = this.repos.find((r) => r.path === path);
+    if (repo) for (const cb of this.demoLaunches) cb({ repoName: repo.name, path, mode, sessionId });
+  }
+
+  async startRefactor(path: string, focus?: string): Promise<LaunchTicket> {
+    const repo = this.repos.find((r) => r.path === path);
+    if (!repo) throw { kind: "agent", message: `No repo at ${path}.` };
+    if (repo.refactor) throw { kind: "agent", message: "This repo already has a refactor." };
+    if (!repo.branch) throw { kind: "agent", message: "Check out a branch first" };
+    const info = newRefactor(repo.name, repo.lastCommit?.sha ?? demoSha(0));
+    this.updateRepo(path, (r) => ({ ...r, refactor: info }));
+    for (const step of ["prepare", "opening", "done"] as const) {
+      await sleep(400);
+      for (const cb of this.progress) cb(step);
+    }
+    const prompt = focus?.trim() ? `${DEMO_REFACTOR_PROMPT} Focus on: ${focus.trim()}` : DEMO_REFACTOR_PROMPT;
+    this.demoRefactorLaunch(path, { kind: "new", prompt, planMode: true }, info.sessionId);
+    this.runRefactor(path, DEMO_REFACTOR_STEPS);
+    return { requestId: crypto.randomUUID(), sessionId: info.sessionId, folderUri: info.folderUri };
+  }
+
+  async resumeRefactor(path: string, fix: boolean): Promise<LaunchTicket> {
+    const info = this.repos.find((r) => r.path === path)?.refactor;
+    if (!info) throw { kind: "agent", message: "This repo has no refactor." };
+    if (info.live) throw { kind: "agent", message: "The refactor agent is still running." };
+    for (const step of ["prepare", "opening", "done"] as const) {
+      await sleep(400);
+      for (const cb of this.progress) cb(step);
+    }
+    const prompt = fix ? "Rebase the refactor onto main and resolve the conflicts." : "Continue the refactor from where it stopped.";
+    this.demoRefactorLaunch(path, { kind: "resume", sessionId: info.sessionId, prompt }, info.sessionId);
+    this.setRefactor(path, (i) => ({ ...i, state: "working", live: true, interrupted: false, blocked: null }));
+    this.runRefactor(path, [["ready", 3000]]);
+    return { requestId: crypto.randomUUID(), sessionId: info.sessionId, folderUri: info.folderUri };
+  }
+
+  /** Merges unless an uncommitted file is one the refactor changed (the demo's refactor touches `src/file-1.txt`). */
+  async mergeRefactor(path: string): Promise<MergeOutcome> {
+    await sleep(700);
+    const repo = this.repos.find((r) => r.path === path);
+    const info = repo?.refactor;
+    if (!repo || !info) this.refactorFail("This repo has no refactor.");
+    if (info.live) return { outcome: "blocked", reason: "live", files: [] };
+    const clash = repo.dirtyPaths.filter((p) => p === "src/file-1.txt");
+    if (clash.length > 0) {
+      this.setRefactor(path, (i) => ({ ...i, state: "mergeBlocked", blocked: { reason: "dirtyOverlap", files: clash } }));
+      return { outcome: "blocked", reason: "dirtyOverlap", files: clash };
+    }
+    const commits = info.commits.length;
+    const last = info.commits[commits - 1];
+    clearTimeout(this.refactorTimers.get(path));
+    this.updateRepo(path, (r) => ({
+      ...r,
+      refactor: null,
+      lastCommit: last ? { summary: last.summary, time: now(), sha: last.sha } : r.lastCommit,
+      ahead: r.ahead === null ? null : r.ahead + commits,
+      commits30d: r.commits30d + commits,
+    }));
+    return { outcome: "merged", commits };
+  }
+
+  async discardRefactor(path: string): Promise<void> {
+    await sleep(500);
+    const info = this.repos.find((r) => r.path === path)?.refactor;
+    if (!info) this.refactorFail("This repo has no refactor.");
+    if (info.live) this.refactorFail("The refactor agent is still running. Close it first.");
+    clearTimeout(this.refactorTimers.get(path));
+    this.refactorTimers.delete(path);
+    this.updateRepo(path, (r) => ({ ...r, refactor: null }));
+  }
+
+  /** Shows the pretend terminal of the refactor's window. */
+  openRefactor(folderUri: string): Promise<void> {
+    const repo = this.repos.find((r) => r.refactor?.folderUri === folderUri);
+    if (repo?.refactor) {
+      this.demoRefactorLaunch(repo.path, { kind: "focus", sessionId: repo.refactor.sessionId }, repo.refactor.sessionId);
+    }
+    return Promise.resolve();
   }
 
   hookInfo(): Promise<HookInfo> {

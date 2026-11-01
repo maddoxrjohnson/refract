@@ -13,6 +13,8 @@ import type { Backend } from "./backend/Backend";
 import type {
   AgentStatus,
   LaunchMode,
+  LaunchTicket,
+  RefactorInfo,
   RemoteList,
   RemoteRef,
   RepoSnapshot,
@@ -22,12 +24,14 @@ import type {
 } from "./backend/types";
 import { useHook } from "./hooks/useHook";
 import { useMigrations } from "./hooks/useMigrations";
+import { useRefactorNotices } from "./hooks/useRefactorNotices";
 import { isWindowsDrive, stepText } from "./migrations";
 import { useRemoteDetails } from "./hooks/useRemoteDetails";
 import { useVisibility } from "./hooks/useVisibility";
 import { hideKey, mergeProjects } from "./projects";
 import { createQualityController } from "./quality/controller";
 import type { QualityLevel, QualitySetting } from "./quality/tiers";
+import { NOTICE_TEXT } from "./refactors";
 import { initialRepoState, repoReducer } from "./repoState";
 import { rememberedTheme, useThemeMode } from "./theme";
 import { layoutGems } from "./scene/layout";
@@ -50,6 +54,8 @@ import {
   type NavState,
 } from "./ui/navigation";
 import { Picker } from "./ui/Picker";
+import { RefactorDialog } from "./ui/RefactorDialog";
+import { RefactorSection } from "./ui/RefactorSection";
 import { loadQualitySetting, QualityControl } from "./ui/QualityControl";
 import { SettingsPanel } from "./ui/SettingsPanel";
 import { describeError, StatusToast, type LaunchProgress } from "./ui/StatusToast";
@@ -330,24 +336,31 @@ export function App({ backend }: { backend: Backend }) {
   const quality = useQuality(backend);
 
   // One launch at a time: a held or repeated Enter must not start several agents.
+  // Starting and resuming a refactor are launches too, with the same progress and errors.
   const launching = useRef(false);
-  const startLaunch = useCallback(
-    (path: string, mode: LaunchMode) => {
+  const [launchBusy, setLaunchBusy] = useState(false);
+  const runLaunch = useCallback(
+    (path: string, start: () => Promise<LaunchTicket>) => {
       if (launching.current) return;
       launching.current = true;
+      setLaunchBusy(true);
       const repoName = repos.get(path)?.name ?? path;
       setLaunch({ repoName, step: "starting" });
-      backend
-        .launch(path, mode)
+      start()
         .then(
           () => setLaunch({ repoName, step: "done" }),
           (err: unknown) => setLaunch({ repoName, step: "failed", message: describeError(err) }),
         )
         .finally(() => {
           launching.current = false;
+          setLaunchBusy(false);
         });
     },
-    [backend, repos],
+    [repos],
+  );
+  const startLaunch = useCallback(
+    (path: string, mode: LaunchMode) => runLaunch(path, () => backend.launch(path, mode)),
+    [backend, runLaunch],
   );
 
   // Clone and launch (spec §4.4): one job with the launch, under the same guard. The zoom
@@ -420,6 +433,17 @@ export function App({ backend }: { backend: Backend }) {
     );
   };
 
+  // The Refactor dialog, by repo path; window keys stay with it while it is open.
+  const [refactorFor, setRefactorFor] = useState<string | null>(null);
+  const refactorOpenRef = useRef(false);
+  refactorOpenRef.current = refactorFor !== null;
+  const closeRefactor = useCallback(() => {
+    setRefactorFor(null);
+    (document.activeElement as HTMLElement | null)?.blur();
+  }, []);
+  const openRefactor = (info: RefactorInfo) =>
+    backend.openRefactor(info.folderUri).catch((err: unknown) => setOpenError(describeError(err)));
+
   // Navigation is a pure state machine; the ref lets window listeners read the latest
   // state without re-subscribing, and effects run outside the state update.
   const [nav, setNav] = useState<NavState>(initialNavState);
@@ -430,7 +454,11 @@ export function App({ backend }: { backend: Backend }) {
   runEffects.current = (effects) => {
     for (const e of effects) {
       if (e.kind === "clone") startClone(e.key);
-      else startLaunch(e.path, e.mode);
+      else if (e.kind === "refactorDialog") setRefactorFor(e.path);
+      else if (e.kind === "openRefactor") {
+        const info = repos.get(e.path)?.refactor;
+        if (info) void openRefactor(info);
+      } else startLaunch(e.path, e.mode);
     }
   };
   const send = useCallback((input: NavInput) => {
@@ -449,8 +477,8 @@ export function App({ backend }: { backend: Backend }) {
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === "Enter" && ev.repeat) return;
-      // The Move to WSL dialog handles its own keys, Escape included.
-      if (moveOpenRef.current) return;
+      // The Move to WSL and Refactor dialogs handle their own keys, Escape included.
+      if (moveOpenRef.current || refactorOpenRef.current) return;
       if (settingsOpenRef.current) {
         // Escape from outside the dialog (the dialog handles its own) still closes it.
         if (ev.key === "Escape") {
@@ -506,6 +534,9 @@ export function App({ backend }: { backend: Backend }) {
     return out;
   }, [repoList, projects.remoteOnly, moves.state]);
   const zoomedRepo = nav.zoomed ? repos.get(nav.zoomed) : undefined;
+  const refactorNotices = useRefactorNotices(localRepos, visible, nav.zoomed);
+  const notice = refactorNotices.notice;
+  const refactorRepo = refactorFor ? repos.get(refactorFor) : undefined;
   const zoomedRemote = zoomedRepo ? (projects.remotes.get(zoomedRepo.path) ?? null) : null;
   const zoomedRemoteOnly = !!zoomedRepo && projects.remoteOnly.has(zoomedRepo.path);
   // Details come from the listed remote, or from a local origin on a host Refract asks.
@@ -582,6 +613,25 @@ export function App({ backend }: { backend: Backend }) {
           remoteOnly={zoomedRemoteOnly}
           details={details.state}
           onRefreshDetails={details.refresh}
+          refactor={
+            !zoomedRemoteOnly && (
+              <RefactorSection
+                key={zoomedRepo.path}
+                repo={zoomedRepo}
+                launching={launchBusy}
+                onStart={() => {
+                  if (nav.picker) send({ type: "pickerClose" });
+                  setRefactorFor(zoomedRepo.path);
+                }}
+                onOpen={openRefactor}
+                onResume={(fix) =>
+                  runLaunch(zoomedRepo.path, () => backend.resumeRefactor(zoomedRepo.path, fix))
+                }
+                onMerge={() => backend.mergeRefactor(zoomedRepo.path)}
+                onDiscard={() => backend.discardRefactor(zoomedRepo.path)}
+              />
+            )
+          }
           move={
             !zoomedRemoteOnly &&
             (isWindowsDrive(zoomedRepo.path) || moves.state.has(zoomedRepo.path)) && (
@@ -610,6 +660,18 @@ export function App({ backend }: { backend: Backend }) {
           onMoved={(source, dest) => {
             send({ type: "rekey", from: source, to: dest });
             setRelist((n) => n + 1);
+          }}
+        />
+      )}
+      {refactorRepo && !moveSource && (
+        <RefactorDialog
+          repo={refactorRepo}
+          hook={hook}
+          onClose={closeRefactor}
+          onConfirm={(focus) => {
+            const path = refactorRepo.path;
+            closeRefactor();
+            runLaunch(path, () => backend.startRefactor(path, focus || undefined));
           }}
         />
       )}
@@ -666,6 +728,16 @@ export function App({ backend }: { backend: Backend }) {
         agent={status}
         launch={launch}
         onDismiss={launch?.step === "failed" ? () => setLaunch(null) : undefined}
+        notice={
+          notice && {
+            repoName: notice.repoName,
+            text: NOTICE_TEXT[notice.alert],
+            onShow: () => {
+              refactorNotices.dismiss();
+              send({ type: "select", path: notice.path });
+            },
+          }
+        }
       />
       {(error ?? openError) && (
         <p className="app-error" role="alert">

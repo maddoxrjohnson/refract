@@ -136,3 +136,72 @@ describe("demoHookDiff", () => {
     expect(lines.filter((l) => !l.startsWith("-")).length).toBe(Number(newCount));
   });
 });
+
+describe("DemoBackend's refactors", () => {
+  const DOTFILES = "/home/demo/projects/dotfiles";
+  const SWEEP = "/home/demo/projects/sweep";
+
+  it("seeds one ready refactor and gives every repo a short sha", () => {
+    const repos = demoRepos();
+    expect(repos.filter((r) => r.refactor).map((r) => [r.name, r.refactor!.state])).toEqual([["sweep", "ready"]]);
+    for (const r of repos) expect(r.lastCommit?.sha).toMatch(/^[0-9a-f]{7}$/);
+  });
+
+  it("runs start, plan, work and ready, then merges", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    const states: string[] = [];
+    backend.onAgentEvent((e) => {
+      if (e.event === "repoChanged" && e.data.path === DOTFILES) states.push(e.data.refactor?.state ?? "none");
+    });
+    const launches: string[] = [];
+    backend.onDemoLaunch((l) => launches.push(`${l.mode.kind}:${l.mode.kind === "new" ? l.mode.planMode : ""}`));
+    const ticket = await settle(backend.startRefactor(DOTFILES, "the aliases"));
+    expect(ticket.folderUri).toContain("/home/demo/projects/.refract-worktrees/dotfiles-");
+    expect(launches).toEqual(["new:true"]);
+    await expect(settle(backend.startRefactor(DOTFILES))).rejects.toMatchObject({ message: "This repo already has a refactor." });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(states).toEqual(["starting", "working", "needsYou", "working", "ready"]);
+    const repo = await backend.getRepo(DOTFILES);
+    expect(repo.refactor).toMatchObject({ live: false, filesChanged: 7, summary: expect.any(String) });
+    expect(repo.refactor!.checks!.map((c) => c.command)).toEqual(["shellcheck *.sh"]);
+
+    expect(await settle(backend.mergeRefactor(DOTFILES))).toEqual({ outcome: "merged", commits: 3 });
+    const merged = await backend.getRepo(DOTFILES);
+    expect(merged.refactor).toBeNull();
+    expect(merged.lastCommit?.summary).toBe("Give the request handlers clearer names");
+    expect(merged.ahead).toBe(3);
+  });
+
+  it("refuses to discard while live, discards the seeded one, and blocks a merge over a clashing file", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    await settle(backend.startRefactor("/home/demo/projects/ledger-sync"));
+    await vi.advanceTimersByTimeAsync(1500);
+    await expect(settle(backend.discardRefactor("/home/demo/projects/ledger-sync"))).rejects.toMatchObject({ kind: "refactor" });
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(await settle(backend.mergeRefactor("/home/demo/projects/ledger-sync"))).toEqual({
+      outcome: "blocked",
+      reason: "dirtyOverlap",
+      files: ["src/file-1.txt"],
+    });
+    expect((await backend.getRepo("/home/demo/projects/ledger-sync")).refactor?.state).toBe("mergeBlocked");
+
+    await settle(backend.discardRefactor(SWEEP));
+    expect((await backend.getRepo(SWEEP)).refactor).toBeNull();
+  });
+
+  it("resumes back to ready and opens the refactor's window as the pretend terminal", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    const modes: string[] = [];
+    backend.onDemoLaunch((l) => modes.push(l.mode.kind));
+    const info = (await backend.getRepo(SWEEP)).refactor!;
+    await backend.openRefactor(info.folderUri);
+    await settle(backend.resumeRefactor(SWEEP, false));
+    expect((await backend.getRepo(SWEEP)).refactor).toMatchObject({ state: "working", live: true });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect((await backend.getRepo(SWEEP)).refactor?.state).toBe("ready");
+    expect(modes).toEqual(["focus", "resume"]);
+  });
+});

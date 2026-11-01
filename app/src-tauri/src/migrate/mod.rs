@@ -358,7 +358,7 @@ pub fn on_helper_event(app: &AppHandle, event: &Event) {
 }
 
 /// Shows a Windows notification; a failure is only logged.
-fn notify(app: &AppHandle, title: &str, body: &str) {
+pub(crate) fn notify(app: &AppHandle, title: &str, body: &str) {
     use tauri_plugin_notification::NotificationExt;
     if let Err(err) = app.notification().builder().title(title).body(body).show() {
         eprintln!("refract: cannot show the notification {title:?}: {err}");

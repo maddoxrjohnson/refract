@@ -197,4 +197,14 @@ describe("DetailPanel remote details", () => {
     fireEvent.click(screen.getByRole("button", { name: "Hide" }));
     expect(props.onHide).toHaveBeenCalledOnce();
   });
+  it("says a remote-only repo must be cloned before it can be refactored", () => {
+    const { panel } = setup(testRepo(), { remoteOnly: true });
+    expect(panel.textContent).toContain("Clone it first.");
+    expect(screen.queryByRole("button", { name: /Refactor/ })).toBeNull();
+  });
+
+  it("shows the refactor section of a cloned repo", () => {
+    const { panel } = setup(testRepo(), { refactor: <section aria-label="Refactor">refactor here</section> });
+    expect(panel.textContent).toContain("refactor here");
+  });
 });

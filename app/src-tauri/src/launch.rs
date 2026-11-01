@@ -31,6 +31,9 @@ pub const PROGRESS_EVENT: &str = "launch://progress";
 const SERVER_SETUP_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the helper gets to write the request file.
 const PREPARE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long the helper gets to start a refactor: it runs on a worker, and `git worktree
+/// add` checks out the whole tree, which is slow for a big repo or under `/mnt/`.
+const REFACTOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// How long to wait for VS Code to record the profile before adding its settings.
 const SETTINGS_WAIT: Duration = Duration::from_secs(15);
 const SETTINGS_POLL: Duration = Duration::from_millis(500);
@@ -115,8 +118,22 @@ impl LaunchError {
                 LaunchErrorKind::Agent,
                 format!("Cannot go to the running agent: {message}."),
             ),
+            // Why a refactor cannot start or resume ("Check out a branch first").
+            RequestError::Agent {
+                code: code::REFACTOR_FAILED,
+                message,
+            } => LaunchError::new(LaunchErrorKind::Agent, message),
             err => LaunchError::agent("Cannot prepare the launch", err),
         }
+    }
+}
+
+/// The wire name of a method that answers with a [`LaunchTicket`], for messages.
+fn method_name(method: &Method) -> &'static str {
+    match method {
+        Method::StartRefactor { .. } => "startRefactor",
+        Method::ResumeRefactor { .. } => "resumeRefactor",
+        _ => "prepareLaunch",
     }
 }
 
@@ -269,9 +286,75 @@ pub async fn launch(
     path: String,
     mode: LaunchMode,
 ) -> Result<LaunchTicket, LaunchError> {
+    let method = Method::PrepareLaunch {
+        path: path.clone(),
+        mode,
+    };
+    launch_with(app, path, method, PREPARE_TIMEOUT).await
+}
+
+/// Starts a refactor of the repo at `path`: the helper makes its worktree and the
+/// launch request, then the worktree opens in its own VS Code window, as a launch does
+/// (spec §1). `focus` is the dialog's optional "Focus on…" line.
+#[tauri::command]
+pub async fn start_refactor(
+    app: AppHandle,
+    path: String,
+    focus: Option<String>,
+) -> Result<LaunchTicket, LaunchError> {
+    let focus = focus.filter(|f| !f.trim().is_empty());
+    let method = Method::StartRefactor {
+        path: path.clone(),
+        focus,
+    };
+    launch_with(app, path, method, REFACTOR_TIMEOUT).await
+}
+
+/// Resumes the refactor agent of the repo at `path` in its worktree window; with `fix`
+/// it is asked to rebase onto the target branch after a merge hit conflicts.
+#[tauri::command]
+pub async fn resume_refactor(
+    app: AppHandle,
+    path: String,
+    fix: bool,
+) -> Result<LaunchTicket, LaunchError> {
+    let method = Method::ResumeRefactor {
+        path: path.clone(),
+        fix,
+    };
+    launch_with(app, path, method, REFACTOR_TIMEOUT).await
+}
+
+/// Opens (or raises) the VS Code window on a refactor's worktree, `folder_uri` from its
+/// `RefactorInfo`, in the Refract profile. Asks the helper nothing and starts no agent.
+#[tauri::command]
+pub async fn open_refactor(folder_uri: String) -> Result<(), LaunchError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let result = open_folder_uri(&code_cli()?, &folder_uri);
+        if let Err(err) = &result {
+            eprintln!("refract: opening {folder_uri} failed: {}", err.message);
+        }
+        result
+    })
+    .await
+    .map_err(|err| {
+        LaunchError::new(
+            LaunchErrorKind::Internal,
+            format!("The launch task failed: {err}"),
+        )
+    })?
+}
+
+/// Runs [`run`] for `method` off the main thread, one launch at a time.
+async fn launch_with(
+    app: AppHandle,
+    path: String,
+    method: Method,
+    timeout: Duration,
+) -> Result<LaunchTicket, LaunchError> {
     tauri::async_runtime::spawn_blocking(move || {
         let _one_at_a_time = LAUNCHES.lock().unwrap_or_else(PoisonError::into_inner);
-        let result = run(&app, &path, &mode);
+        let result = run(&app, method, timeout);
         if let Err(err) = &result {
             eprintln!("refract: launching {path} failed: {}", err.message);
         }
@@ -292,10 +375,8 @@ fn progress(app: &AppHandle, step: Step) {
     }
 }
 
-fn run(app: &AppHandle, path: &str, mode: &LaunchMode) -> Result<LaunchTicket, LaunchError> {
-    let agent = app.state::<Agent>();
-
-    progress(app, Step::Setup);
+/// VS Code's command line, found as [`find_code_cmd`] says.
+fn code_cli() -> Result<CodeCli, LaunchError> {
     let local_app_data = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
     let path_var = std::env::var("PATH").ok();
     let code = find_code_cmd(
@@ -310,7 +391,39 @@ fn run(app: &AppHandle, path: &str, mode: &LaunchMode) -> Result<LaunchTicket, L
                  sure code.cmd is on your PATH.",
         )
     })?;
-    let cli = CodeCli::Direct { program: code };
+    Ok(CodeCli::Direct { program: code })
+}
+
+/// Runs `code` on `folder_uri` in the Refract profile. VS Code raises a window that
+/// already has the folder open.
+fn open_folder_uri(cli: &CodeCli, folder_uri: &str) -> Result<(), LaunchError> {
+    let args = vscode_args(PROFILE, folder_uri);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = Processes.run(&cli.command(&args)).map_err(|err| {
+        LaunchError::new(
+            LaunchErrorKind::Vscode,
+            format!("Cannot run VS Code: {err}"),
+        )
+    })?;
+    if !out.success {
+        return Err(LaunchError::new(
+            LaunchErrorKind::Vscode,
+            format!(
+                "VS Code could not open the folder: {}",
+                failure_output(&out)
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// The setup, then `method` (one answered with a [`LaunchTicket`]) with up to `timeout`
+/// for the helper's answer, then `code` on the ticket's folder.
+fn run(app: &AppHandle, method: Method, timeout: Duration) -> Result<LaunchTicket, LaunchError> {
+    let agent = app.state::<Agent>();
+
+    progress(app, Step::Setup);
+    let cli = code_cli()?;
     let user_dir = std::env::var_os("APPDATA")
         .map(|dir| Path::new(&dir).join(r"Code\User"))
         .ok_or_else(|| {
@@ -358,39 +471,20 @@ fn run(app: &AppHandle, path: &str, mode: &LaunchMode) -> Result<LaunchTicket, L
     }
 
     progress(app, Step::Prepare);
-    let method = Method::PrepareLaunch {
-        path: path.to_owned(),
-        mode: mode.clone(),
-    };
-    let ticket = match agent.request(method, PREPARE_TIMEOUT) {
+    let name = method_name(&method);
+    let ticket = match agent.request(method, timeout) {
         Ok(Reply::Launch(ticket)) => ticket,
         Ok(other) => {
             return Err(LaunchError::new(
                 LaunchErrorKind::Agent,
-                format!("The helper sent an unexpected answer to prepareLaunch: {other:?}"),
+                format!("The helper sent an unexpected answer to {name}: {other:?}"),
             ))
         }
         Err(err) => return Err(LaunchError::prepare(err)),
     };
 
     progress(app, Step::Opening);
-    let args = vscode_args(PROFILE, &ticket.folder_uri);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = Processes.run(&cli.command(&args)).map_err(|err| {
-        LaunchError::new(
-            LaunchErrorKind::Vscode,
-            format!("Cannot run VS Code: {err}"),
-        )
-    })?;
-    if !out.success {
-        return Err(LaunchError::new(
-            LaunchErrorKind::Vscode,
-            format!(
-                "VS Code could not open the folder: {}",
-                failure_output(&out)
-            ),
-        ));
-    }
+    open_folder_uri(&cli, &ticket.folder_uri)?;
 
     std::thread::spawn(move || add_profile_settings(&user_dir));
     progress(app, Step::Done);
@@ -646,6 +740,23 @@ mod tests {
         assert_eq!(
             err.message,
             "Cannot prepare the launch: the helper answered with error -32602: bad"
+        );
+    }
+
+    #[test]
+    fn a_refused_refactor_says_why_as_the_helper_put_it() {
+        let err = LaunchError::prepare(RequestError::Agent {
+            code: code::REFACTOR_FAILED,
+            message: "Check out a branch first".into(),
+        });
+        assert_eq!(err.kind, LaunchErrorKind::Agent);
+        assert_eq!(err.message, "Check out a branch first");
+        assert_eq!(
+            method_name(&Method::StartRefactor {
+                path: "/x".into(),
+                focus: None
+            }),
+            "startRefactor"
         );
     }
 }

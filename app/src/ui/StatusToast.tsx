@@ -43,12 +43,21 @@ export type LaunchProgress =
   | { repoName: string; step: "cloning" | "starting" | LaunchStep }
   | { repoName: string; step: "failed"; message: string };
 
+/** A refactor that moved on in a repo other than the zoomed one (refactor spec §4). */
+export interface ToastNotice {
+  repoName: string;
+  text: string;
+  /** Zooms to the repo; shows a Show button when given. */
+  onShow?(): void;
+}
+
 export interface StatusToastProps {
   /** Helper state; shown only while it is not running. */
   agent: AgentStatus | null;
   launch: LaunchProgress | null;
   /** Shows a dismiss button when given. */
   onDismiss?(): void;
+  notice?: ToastNotice | null;
 }
 
 function launchText(launch: LaunchProgress): string {
@@ -59,12 +68,12 @@ function launchText(launch: LaunchProgress): string {
 }
 
 /** Helper connection and launch progress, bottom left. Renders nothing when all is well. */
-export function StatusToast({ agent, launch, onDismiss }: StatusToastProps) {
+export function StatusToast({ agent, launch, onDismiss, notice = null }: StatusToastProps) {
   const showAgent = agent?.state !== "running";
-  if (!showAgent && !launch) return null;
+  if (!showAgent && !launch && !notice) return null;
   const failed = launch?.step === "failed";
   // A finished launch fades out on its own; App removes it once the fade is over.
-  const fading = !showAgent && launch?.step === "done";
+  const fading = !showAgent && !notice && launch?.step === "done";
   return (
     <div className={`rf-glass rf-toast${fading ? " rf-toast--done" : ""}`} role={failed ? "alert" : "status"} aria-live={failed ? "assertive" : "polite"}>
       {showAgent && (
@@ -77,6 +86,16 @@ export function StatusToast({ agent, launch, onDismiss }: StatusToastProps) {
           className={`rf-toast__line${failed ? " rf-toast__line--error" : launch.step === "done" ? " rf-toast__line--done" : ""}`}
         >
           <span className="rf-toast__repo">{launch.repoName}</span> {launchText(launch)}
+        </p>
+      )}
+      {notice && (
+        <p className="rf-toast__line rf-toast__notice">
+          <span className="rf-toast__repo">{notice.repoName}</span> {notice.text}
+          {notice.onShow && (
+            <button type="button" className="rf-link" onClick={notice.onShow}>
+              Show
+            </button>
+          )}
         </p>
       )}
       {onDismiss && (

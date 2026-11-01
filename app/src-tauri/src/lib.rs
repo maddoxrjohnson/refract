@@ -2,6 +2,7 @@
 //! the interface.
 
 mod agent;
+mod alerts;
 mod creds;
 mod gpu;
 mod hotkey;
@@ -86,6 +87,9 @@ pub fn run() {
             agent::agent_status,
             agent::agent_request,
             launch::launch,
+            launch::start_refactor,
+            launch::resume_refactor,
+            launch::open_refactor,
             migrate::migrate_preflight,
             migrate::migrate_start,
             migrate::migrate_cancel_snapshot,
@@ -109,6 +113,8 @@ pub fn run() {
             settings::settings_set,
             repos::clone_repo,
             repos::add_repo,
+            repos::merge_refactor,
+            repos::discard_refactor,
             widgets::hook_info,
             widgets::install_hook,
             widgets::uninstall_hook,

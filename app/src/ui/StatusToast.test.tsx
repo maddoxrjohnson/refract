@@ -61,4 +61,17 @@ describe("describeError", () => {
     );
     expect(describeError({ kind: "timeout" })).toBe("timeout");
   });
+  it("shows a refactor notice with a Show button, on its own", () => {
+    const onShow = vi.fn();
+    render(
+      <StatusToast
+        agent={{ state: "running" }}
+        launch={null}
+        notice={{ repoName: "quill", text: "refactor plan is ready for you", onShow }}
+      />,
+    );
+    expect(screen.getByRole("status").textContent).toContain("quill refactor plan is ready for you");
+    fireEvent.click(screen.getByRole("button", { name: "Show" }));
+    expect(onShow).toHaveBeenCalled();
+  });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { PICKER_CLEAR_PX, ZOOM_REACH, ZOOM_TOP_MARGIN_PX, rosetteSpin, zoomLift } from "./Scene";
+import { PICKER_CLEAR_PX, ZOOM_REACH, ZOOM_TOP_MARGIN_PX, refactorSpin, rosetteSpin, zoomLift } from "./Scene";
 
 describe("zoomLift", () => {
   // The gem's lowest and highest points in pixels from the top, for a window `height` tall.
@@ -45,5 +45,16 @@ describe("rosetteSpin", () => {
     const t = 86_400 * 5;
     const step = rosetteSpin(t + 1 / 60) - rosetteSpin(t);
     expect(Math.fround(step)).toBeCloseTo(0.5 / 60, 6);
+  });
+});
+
+describe("refactorSpin", () => {
+  it("turns slowly and wraps at one tick, where the pattern repeats", () => {
+    expect(refactorSpin(0.5)).toBeCloseTo(0.1);
+    const tick = (2 * Math.PI) / 48;
+    for (const t of [0, 10, 3600, 86_400 * 7]) {
+      expect(refactorSpin(t)).toBeGreaterThanOrEqual(0);
+      expect(refactorSpin(t)).toBeLessThan(tick);
+    }
   });
 });

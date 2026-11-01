@@ -37,6 +37,8 @@ export interface DetailPanelProps {
   onRefreshDetails?(): void;
   /** Move to WSL, for a cloned repo on a Windows drive (spec §2.1). */
   move?: ReactNode;
+  /** The Refactor section of a cloned repo (refactor spec §4). */
+  refactor?: ReactNode;
 }
 
 const CI_LABELS: Record<CiStatus, string> = {
@@ -161,6 +163,7 @@ export function DetailPanel({
   details = null,
   onRefreshDetails,
   move = null,
+  refactor = null,
 }: DetailPanelProps) {
   const hintId = useId();
   const direct = repo.preselect.kind === "noPicker";
@@ -241,6 +244,10 @@ export function DetailPanel({
             </dl>
           </section>
           {remoteSection}
+          <section className="rf-section" aria-label="Refactor">
+            <h3 className="rf-section__label">Refactor</h3>
+            <p className="rf-hint">Clone it first. Refactors work on a local copy.</p>
+          </section>
         </div>
         <div className="rf-detail__actions">
           <button
@@ -285,6 +292,8 @@ export function DetailPanel({
         </section>
 
         {move}
+
+        {refactor}
 
         <section className="rf-section">
           <h3 className="rf-section__label">Last commit</h3>

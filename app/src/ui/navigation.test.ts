@@ -432,6 +432,60 @@ describe("remote-only gems", () => {
   });
 });
 
+describe("Alt+R", () => {
+  const committed = (name: string, extra: Partial<RepoSnapshot> = {}): RepoSnapshot => ({
+    ...repo(name),
+    lastCommit: { summary: "Initial commit", time: 0, sha: "a1b2c3d" },
+    ...extra,
+  });
+  const info = { state: "working", worktree: "/w", folderUri: "vscode-remote://wsl+Demo/w" } as RepoSnapshot["refactor"];
+  const remoteKey = "remote:github.com/demo-user/orbit-cli";
+  const local = [
+    committed("plain"),
+    committed("busy", { refactor: info }),
+    committed("detached", { branch: null }),
+    repo("empty"),
+  ];
+  const c: NavContext = {
+    repos: new Map([...local, { ...committed("orbit-cli"), path: remoteKey }].map((r) => [r.path, r])),
+    positions: new Map(),
+    remoteOnly: new Set([remoteKey]),
+  };
+  const altR = (path: string, k = "r") =>
+    run([{ type: "select", path }, key(k, { alt: true })], initialNavState, c);
+
+  it("opens the Refactor dialog on the zoomed repo, with either case", () => {
+    for (const k of ["r", "R"]) {
+      const r = altR("/p/plain", k);
+      expect(r.handled).toBe(true);
+      expect(r.effects).toEqual([{ kind: "refactorDialog", path: "/p/plain" }]);
+    }
+  });
+
+  it("goes to the refactor once the repo has one", () => {
+    expect(altR("/p/busy").effects).toEqual([{ kind: "openRefactor", path: "/p/busy" }]);
+  });
+
+  it("does nothing unzoomed, on remote-only repos, detached HEADs, repos without commits or in the picker", () => {
+    for (const path of [remoteKey, "/p/detached", "/p/empty"]) {
+      const r = altR(path);
+      expect(r.handled, path).toBe(false);
+      expect(r.effects).toEqual([]);
+    }
+    expect(run([{ type: "pointerFocus", path: "/p/plain" }, key("r", { alt: true })], initialNavState, c).handled).toBe(
+      false,
+    );
+    const picker = { path: "/p/plain", options: [{ kind: "new" as const }], index: 0 };
+    const r = navigate({ ...initialNavState, zoomed: "/p/plain", picker }, key("r", { alt: true }), c);
+    expect(r.handled).toBe(false);
+  });
+
+  it("leaves Ctrl+Alt+R and other Alt keys alone", () => {
+    expect(run([{ type: "select", path: "/p/plain" }, key("r", { alt: true, ctrl: true })], initialNavState, c).effects).toEqual([]);
+    expect(run([{ type: "select", path: "/p/plain" }, key("t", { alt: true })], initialNavState, c).handled).toBe(false);
+  });
+});
+
 describe("sync", () => {
   it("drops focus, zoom and picker for repos that went away", () => {
     const state: NavState = {
