@@ -3,7 +3,10 @@
 //   npm run record:demo        (builds dist-demo, records, then runs make-gif.py)
 //
 // Software WebGL is far too slow to film in real time, so the page runs on Playwright's
-// fake clock: each frame advances time by exactly 1/FPS s and then takes a screenshot.
+// fake clock, paused: each frame advances time by exactly 1/FPS s and then takes a
+// screenshot. (An installed clock that isn't paused keeps flowing in real time, so every
+// slow screenshot would add seconds and the loop would play many times too fast.)
+// The page is filmed in the dark theme.
 // Frames go to test-results/demo-frames with frames.json (pointer position per frame);
 // scripts/make-gif.py draws the pointer and assembles docs/media/demo.gif. It also saves
 // the still docs/media/scene.png. Only DemoBackend's invented repos appear.
@@ -86,7 +89,7 @@ async function waitForServer() {
  * after it loads (enough for the opening to finish, or just for the repos to arrive).
  */
 async function openDemo(browser, viewport, settleMs = 2500) {
-  const page = await browser.newPage({ viewport, deviceScaleFactor: 1 });
+  const page = await browser.newPage({ viewport, deviceScaleFactor: 1, colorScheme: "dark" });
   await page.addInitScript(() => {
     localStorage.setItem("refract.hookOfferDismissed", "1");
     localStorage.setItem("refract.quality", "medium");
@@ -94,6 +97,8 @@ async function openDemo(browser, viewport, settleMs = 2500) {
   await page.clock.install();
   await page.goto(URL);
   await page.locator(".scene canvas").waitFor();
+  // The page loads on flowing time (a paused clock stalls it); film from here on.
+  await page.clock.pauseAt(await page.evaluate(() => Date.now() + 250));
   await page.clock.runFor(settleMs);
   return page;
 }

@@ -21,15 +21,15 @@ SAMPLES = 8
 # transparent, so the slow turn of the engraved stones costs little.
 STILL = 20
 
-# An arrow pointer, tip at (0, 0), in screenshot pixels, in the light palette's ink and accent.
+# An arrow pointer, tip at (0, 0), in screenshot pixels, in the dark palette's ink, paper and accent.
 ARROW = [(0, 0), (0, 17), (4, 13), (7, 20), (10, 19), (7, 12), (12, 12)]
 
 
 def draw_pointer(im: Image.Image, x: int, y: int, click: bool) -> None:
     d = ImageDraw.Draw(im)
     if click:
-        d.ellipse((x - 14, y - 14, x + 14, y + 14), outline=(184, 50, 42), width=2)
-    d.polygon([(x + px, y + py) for px, py in ARROW], fill=(255, 255, 255), outline=(31, 74, 61))
+        d.ellipse((x - 14, y - 14, x + 14, y + 14), outline=(255, 122, 92), width=2)
+    d.polygon([(x + px, y + py) for px, py in ARROW], fill=(216, 199, 143), outline=(14, 23, 19))
 
 
 def main() -> int:
