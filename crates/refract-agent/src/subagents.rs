@@ -15,8 +15,10 @@
 //! while its own background work ran, can end without it. So work also counts as ended
 //! when the session's transcript holds a `<task-notification>` for its task id (the
 //! agent id, or the workflow's task id from its launch result) written at or after the
-//! work was last active. An agent that resumes after a notification writes to its
-//! transcript again and counts again. As a backstop, work inactive for
+//! work was last active. An agent that resumes after a notification rewrites its meta
+//! file, and a meta file written after the notification counts it again; its
+//! transcript's last write, just after the notification, does not. As a backstop, work
+//! inactive for
 //! [`STALE_AFTER`] does not count.
 //!
 //! Only work started since the session's process did counts, so the leftovers of an
@@ -115,9 +117,18 @@ impl Notes {
     }
 
     fn take(&mut self, line: &[u8]) {
-        let has = |needle: &[u8]| line.windows(needle.len()).any(|w| w == needle);
-        let notification = has(b"<task-notification>");
-        let launch = has(b"\"async_launched\"") && has(b"\"runId\"");
+        // Parsing is skipped for most lines, among them the large request blobs that
+        // quote notifications, from one pass over the bytes.
+        let [notification, queued, attached, launch] = contains_each(
+            line,
+            [
+                b"<task-notification>",
+                b"\"type\":\"queue-operation\"",
+                b"\"type\":\"attachment\"",
+                b"\"async_launched\"",
+            ],
+        );
+        let notification = notification && (queued || attached);
         if !notification && !launch {
             return;
         }
@@ -139,9 +150,11 @@ impl Notes {
         let (Some(text), Some(at)) = (text.as_str(), entry["timestamp"].as_str()) else {
             return;
         };
+        // A notification is the whole text; a prompt that quotes one is not.
         let Some(task) = text
-            .split_once("<task-notification>")
-            .and_then(|(_, rest)| rest.split_once("<task-id>"))
+            .trim_start()
+            .strip_prefix("<task-notification>")
+            .and_then(|rest| rest.split_once("<task-id>"))
             .and_then(|(_, rest)| rest.split_once("</task-id>"))
             .map(|(id, _)| id.trim())
         else {
@@ -155,13 +168,28 @@ impl Notes {
         *latest = (*latest).max(at);
     }
 
-    /// True when a notification for `task` came at or after `active`, give or take
-    /// [`NOTIFY_SLACK`].
-    fn ended(&self, task: &str, active: SystemTime) -> bool {
-        self.ended
-            .get(task)
-            .is_some_and(|&at| at + NOTIFY_SLACK >= active)
+    /// True when a notification for `task` came after `started` (when its meta file or
+    /// record was last written: a resumed agent rewrites its meta file) and at or after
+    /// `wrote` (when its transcripts were last written), give or take [`NOTIFY_SLACK`]
+    /// for that, since an agent's transcript gets its last write just after.
+    fn ended(&self, task: &str, started: SystemTime, wrote: Option<SystemTime>) -> bool {
+        self.ended.get(task).is_some_and(|&at| {
+            started <= at && wrote.is_none_or(|wrote| at + NOTIFY_SLACK >= wrote)
+        })
     }
+}
+
+/// Whether `line` contains each of `needles`, from one pass over it.
+fn contains_each<const N: usize>(line: &[u8], needles: [&[u8]; N]) -> [bool; N] {
+    let mut found = [false; N];
+    for i in 0..line.len() {
+        for (needle, seen) in needles.iter().zip(found.iter_mut()) {
+            if !*seen && line[i..].starts_with(needle) {
+                *seen = true;
+            }
+        }
+    }
+    found
 }
 
 /// Background work that may still run, before the transcript is asked.
@@ -169,8 +197,18 @@ struct Candidate {
     /// The agent id, or the run id of a workflow run.
     id: String,
     workflow: bool,
+    /// When its meta file was last written (a resume rewrites it), or for a workflow run
+    /// when its directory was.
+    started: SystemTime,
+    /// When its transcripts were last written, if it has any.
+    wrote: Option<SystemTime>,
+}
+
+impl Candidate {
     /// When it last wrote anything.
-    active: SystemTime,
+    fn active(&self) -> SystemTime {
+        self.wrote.map_or(self.started, |w| w.max(self.started))
+    }
 }
 
 /// Counts live sessions' background work, keeping what their transcripts said.
@@ -207,11 +245,11 @@ impl Tracker {
                 continue;
             }
             let transcript = subagents.join(format!("agent-{id}.jsonl"));
-            let active = mtime(&transcript).map_or(modified, |t| t.max(modified));
             candidates.push(Candidate {
                 id: id.to_owned(),
                 workflow: false,
-                active,
+                started: modified,
+                wrote: mtime(&transcript),
             });
         }
         for run in dirs(&runs_dir) {
@@ -219,32 +257,36 @@ impl Tracker {
             if run_ended(&ends_dir.join(format!("{id}.json"))) {
                 continue;
             }
-            let active = files(&run)
-                .into_iter()
-                .map(|(_, t)| t)
-                .chain(mtime(&run))
-                .max();
-            if let Some(active) = active.filter(|&t| fresh(t)) {
-                candidates.push(Candidate {
-                    id: id.into_owned(),
-                    workflow: true,
-                    active,
-                });
+            let Some(started) = mtime(&run) else {
+                continue;
+            };
+            let wrote = files(&run).into_iter().map(|(_, t)| t).max();
+            let candidate = Candidate {
+                id: id.into_owned(),
+                workflow: true,
+                started,
+                wrote,
+            };
+            if fresh(candidate.active()) {
+                candidates.push(candidate);
             }
         }
-        candidates.retain(|c| live(c.active));
+        candidates.retain(|c| live(c.active()));
         if candidates.is_empty() {
             return 0;
         }
         let notes = self.notes.entry(session_dir.to_owned()).or_default();
         notes.update(&session_dir.with_extension("jsonl"));
         let running = candidates.iter().filter(|c| {
-            let task = if c.workflow {
-                notes.runs.get(&c.id).map(String::as_str)
+            // A workflow run does not resume; files written in its directory as it ends
+            // get the slack.
+            let (task, started, wrote) = if c.workflow {
+                let task = notes.runs.get(&c.id).map(String::as_str);
+                (task, SystemTime::UNIX_EPOCH, Some(c.active()))
             } else {
-                Some(c.id.as_str())
+                (Some(c.id.as_str()), c.started, c.wrote)
             };
-            !task.is_some_and(|task| notes.ended(task, c.active))
+            !task.is_some_and(|task| notes.ended(task, started, wrote))
         });
         running.count() as u32
     }
@@ -427,6 +469,57 @@ mod tests {
 
         // Silent for longer than `STALE_AFTER`: no longer counted.
         assert_eq!(tracker.count(&session, None, later + STALE_AFTER), 0);
+    }
+
+    #[test]
+    fn a_meta_file_rewritten_after_the_notification_is_a_resume() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session = tmp.path().join(SESSION);
+        let transcript = tmp.path().join(format!("{SESSION}.jsonl"));
+        let subagents = session.join("subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let meta_path = subagents.join("agent-a1.meta.json");
+        let jsonl = subagents.join("agent-a1.jsonl");
+        fs::write(&meta_path, meta("background", false)).unwrap();
+        fs::write(&jsonl, "{}\n").unwrap();
+        let notified = SystemTime::now() - Duration::from_secs(60);
+        append(&transcript, &notification("a1", notified));
+        let mut tracker = Tracker::default();
+        let now = SystemTime::now();
+
+        // Killed: its transcript gets a last write just after the notification, and its
+        // meta file is older.
+        set_mtime(&meta_path, notified - Duration::from_secs(900));
+        set_mtime(&jsonl, notified + Duration::from_millis(100));
+        assert_eq!(tracker.count(&session, None, now), 0);
+
+        // Resumed 2 s after the notification: its meta file is rewritten then, which
+        // counts with no slack.
+        set_mtime(&meta_path, notified + Duration::from_secs(2));
+        set_mtime(&jsonl, notified + Duration::from_secs(3));
+        assert_eq!(tracker.count(&session, None, now), 1);
+    }
+
+    #[test]
+    fn a_prompt_quoting_a_notification_ends_nothing() {
+        let mut notes = Notes::default();
+        let at = DateTime::<Utc>::from(SystemTime::now()).to_rfc3339();
+        let typed = serde_json::json!({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": at,
+            "content": "why did <task-notification><task-id>a1</task-id> arrive?",
+        });
+        notes.take(typed.to_string().as_bytes());
+        // A request blob quoting one is not even parsed.
+        let blob = serde_json::json!({
+            "type": "api-request-blob",
+            "message": "<task-notification>\n<task-id>a2</task-id>\n</task-notification>",
+        });
+        notes.take(blob.to_string().as_bytes());
+        assert!(notes.ended.is_empty());
+        notes.take(notification("a3", SystemTime::now()).as_bytes());
+        assert_eq!(notes.ended.keys().collect::<Vec<_>>(), ["a3"]);
     }
 
     #[test]
