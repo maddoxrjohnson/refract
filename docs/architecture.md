@@ -19,7 +19,7 @@ Windows                                              WSL (Ubuntu)
         └─────────────────────────────────────────────────────────────────┘
 ```
 
-Contents: [why the split](#why-the-work-is-split-this-way) · [layout](#repository-layout) · [protocol](#protocol-between-the-app-and-the-helper) · [client](#the-apps-client) · [session state](#session-state) · [interface](#the-interface) · [scene](#the-scene) · [remote repos](#remote-repos) · [status hook](#the-status-hook) · [usage and system stats](#usage-and-system-stats) · [resource use](#resource-use-while-hidden) · [build and release](#build-ci-and-release) · [privacy](#security-and-privacy). Choices that were weighed are recorded in [decisions](decisions/README.md).
+Contents: [why the split](#why-the-work-is-split-this-way) · [layout](#repository-layout) · [protocol](#protocol-between-the-app-and-the-helper) · [client](#the-apps-client) · [session state](#session-state) · [interface](#the-interface) · [scene](#the-scene) · [remote repos](#remote-repos) · [status hook](#the-status-hook) · [refactor](#refactor) · [usage and system stats](#usage-and-system-stats) · [resource use](#resource-use-while-hidden) · [build and release](#build-ci-and-release) · [privacy](#security-and-privacy). Choices that were weighed are recorded in [decisions](decisions/README.md).
 
 ## Why the work is split this way
 
@@ -100,6 +100,10 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `migrateCancel` | `{id}` | `{ended}` | Stops a running migration. Before the copy is placed it deletes the temporary copy and the migration is gone (`ended: true`); once placed (from the first `installing` progress on), or during a re-sync, the copy stays, the step stops and a `migrateReady` saying so follows (`ended: false`). Error `6` once the report is out, or while deleting |
 | `migratePending` | none | `[{id, report, deleting, copyMissing}]` | Reports waiting for `migrateFinish`, including those from before a restart; `deleting` when only `migrateFinish delete` (or `discard`, once the copy is gone) can end it; `copyMissing` when the placed copy is gone |
 | `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` process, unless it is working (error `7`) |
+| `startRefactor` | `{path, focus?}` | a launch ticket for the worktree | Makes a worktree and branch from the repo's last commit and launches a plan-mode agent there ([Refactor](#refactor)). Error `8` on a detached HEAD, a repo with no commits, or when the repo already has a refactor |
+| `resumeRefactor` | `{path, fix?}` | a launch ticket | Resumes the refactor's agent; with `fix`, asks it to rebase the branch onto the target after a conflict. Error `8` while the agent runs |
+| `mergeRefactor` | `{path}` | `{outcome: "merged", commits, kept?}` or `{outcome: "blocked", reason, files}` | Rebases the branch onto its target if needed, fast-forwards the target, removes the worktree and branch. A refusal that leaves everything as it was is `blocked`, not an error. Nothing is pushed |
+| `discardRefactor` | `{path}` | `null` | Deletes the refactor's worktree and branch. Error `8` while the agent runs |
 
 ### Events
 
@@ -116,7 +120,9 @@ Usage totals are not pushed. The app asks for them with `usage`.
 
 ### Errors
 
-Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working.
+Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working, `8` a refactor request was refused or failed (see [Refactor](#refactor)).
+
+A repo snapshot (`listRepos`, `getRepo`, `repoChanged`) carries two fields added with the refactor, both optional on the wire so older peers still parse it: `refactor`, the repo's [`RefactorInfo`](#refactor) while it has one, and `lastCommit.sha`, the abbreviated id of its newest commit, which the Refactor dialog shows as "Starts from a1b2c3d". `LaunchMode` gained `planMode` on `new` and `prompt` on `resume`. None of this changed `PROTOCOL_VERSION`.
 
 ### Rules of the line protocol
 
@@ -397,6 +403,117 @@ The diff that "Show what changes" displays is computed by the helper with a smal
 | Backup | `~/.local/state/refract/settings.backup.json` (or `settings.backup.missing`) | `XDG_STATE_HOME` |
 
 A relative `XDG_*` value is ignored. The helper watches the status directory with inotify and updates the affected session when a file is written or removed. Status files do not pile up: at startup, then hourly, the helper deletes `ended` files and the script's leftover temporary files older than 10 minutes. An ended session classifies the same as one with no report, so that changes nothing the interface shows. Full reads of the directory (startup, reload, install) also delete any status file untouched for seven days; a live session that quiet then shows as unknown until its next event.
+
+## Refactor
+
+**Refactor** on a zoomed repo (or Alt+R) has an agent make up to three behaviour-preserving refactors in a separate copy of the repo, and leaves the result for you to review, merge or discard. The helper does the work (`crates/refract-agent/src/refactor.rs`); the prompt, the result file's format and the naming rules are pure code in `crates/refract-core/src/refactor.rs`, so the helper and its tests share one wording. [Decision 0018](decisions/0018-refactor-in-a-worktree.md) records why it works this way.
+
+### The flow
+
+1. **Start.** The dialog shows the commit the refactor starts from and how many uncommitted files are left out, takes an optional "Focus on…" line (one line, at most 500 characters) and says alerts need the status hook when it is not installed. `startRefactor` refuses a detached HEAD ("Check out a branch first."), a repo with no commits, and a repo that already has a refactor. Remote-only repos have no button: the panel says to clone first.
+2. **Worktree.** The helper runs `git worktree add -b refactor/<yyyymmdd-hhmm> ~/projects/.refract-worktrees/<repo>-<yyyymmdd-hhmm> <HEAD>` (local time; `-2`, `-3` if either name is taken). The folder is inside `~/projects`, which VS Code already trusts, and the repo search skips dot directories, so the worktree never becomes a stone. The repo may be busy: a running agent and uncommitted files are fine, since the worktree starts from the last commit and touches nothing else. A failed start removes the worktree and branch it just made.
+3. **Agent.** A launch request opens the worktree in its own VS Code window and runs `claude --session-id <uuid> --permission-mode plan -- "<prompt>"` ([launch.md](launch.md)). Claude's default model is used. The prompt tells the agent to set up the project, run the repo's test, lint and type-check commands for a baseline, propose a plan of up to three refactors and wait for approval, then make each one as its own commit, re-run the checks, revert a refactor that breaks a check that passed in the baseline, never push or switch branches, and write the result file.
+4. **You approve the plan** in the terminal. With the hook installed, the stone turns red while the plan waits (`ExitPlanMode` marks the session waiting, see [Events and statuses](#events-and-statuses)).
+5. **Result.** When the agent is done the panel lists the commits, files changed and lines added and removed, the checks before and after, and the agent's summary. **Review in VS Code** raises the worktree's window; there is no diff viewer in Refract. **Merge into `<branch>`** and **Discard** end the refactor.
+
+One refactor per repo. While one exists the button reads **Go to the refactor**.
+
+### States
+
+A refactor's state is worked out by the helper from its record, the agent's process, transcript and hook status, the branch's commits and the result file, and sent in the repo's snapshot as `refactor` (`RefactorInfo`: `state`, `worktree`, `folderUri`, `branch`, `targetBranch`, `baseCommit`, `sessionId`, `createdAt`, `live`, `interrupted`, `commits`, `filesChanged`, `insertions`, `deletions`, `checks`, `summary`, `blocked`). The first row that applies wins.
+
+| State | How it is known | Mark on the stone | Panel actions |
+|---|---|---|---|
+| `working` | The agent's process runs and its turn is not over (hook `working`, or no hook status) | Turning | Go to the refactor |
+| `needsYou` | The agent runs and the hook says `waitingOnUser` (plan approval or a question); or it is open and idle with no commits and no finished result | Red | Go to the refactor |
+| `mergeBlocked` | The last merge stopped and nothing has moved since | Red | Merge again, Fix with Claude (conflict only), Go to the refactor (when the agent is open, or the worktree is busy or dirty), Discard |
+| `ready` | At least one commit on the branch that the target lacks, and the agent is stopped or idle | A "ready" seal | Merge into `<branch>`, Review in VS Code, Resume refactor (when `interrupted`), Discard |
+| `starting` | No agent, no transcript, launched under 2 minutes ago | Turning | none ("Opening VS Code…") |
+| `nothingToDo` | No commits and a valid result file with no refactors; or merged, but the worktree could not be removed | Plain | Remove (and Go to the refactor while the agent is open) |
+| `interrupted` | No agent and nothing committed: a transcript that did not finish, no result file, or no transcript after the 2 minutes | Red | Resume refactor, Discard |
+
+Where the code differs from the first spec:
+- An agent that is open but idle, its turn over, counts as stopped. With the hook, idle means the hook said the turn finished. Without it, the transcript ends with a finished turn and has been quiet for 20 seconds. The state is then `ready` (or `nothingToDo`) while `live` stays true and the terminal is still open, and the panel adds that Claude is still open. A merge goes ahead with an open idle agent (and blocks if one started working while it ran), but Discard, Resume refactor and Fix with Claude need the terminal closed.
+- Any other `claude` process in the worktree counts as busy.
+- A merged refactor whose worktree git refused to remove stays as `nothingToDo` with the summary "Merged; the worktree could not be removed: …"; only Remove is offered, and the helper does not adopt it again.
+- The result file is optional. Without a valid one the panel shows the commit list and diffstat from git and says "No check results reported".
+
+### Merge and the safety rules
+
+Refract never writes to the working copy except in the last step of a merge. Every step either leaves the repo, the worktree and the branch as they were, or is the one write. `mergeRefactor` runs on a worker thread, because git can be slow, and takes these steps in order. Each check that fails ends the merge as `blocked` with a `reason` and the `files` concerned (paths relative to the repo unless noted), and nothing changes.
+
+| Check | `reason` |
+|---|---|
+| The refactor's agent is working or waiting on you (an open idle one is fine) | `live` |
+| The target branch is gone | `targetMissing` |
+| The target no longer contains the commit the refactor started from (it was rewound or force-pushed over) | `targetRewound` |
+| The worktree is not on its branch, or a rebase, merge, cherry-pick or revert is under way there | `worktreeBusy` |
+| The worktree has uncommitted changes to tracked files (`files`: those) | `worktreeDirty` |
+| Another worktree has the target checked out, or is rebasing it (`files`: those worktrees' absolute paths) | `targetBusy` |
+| The target is checked out in the repo and an uncommitted file there is one the refactor changed, renames counted (`files`: the clashing files) | `dirtyOverlap` |
+| Rebasing the branch onto the target hits a conflict (`files`: the conflicted files) | `conflict` |
+
+1. **Rebase** (only when the target moved on): `git rebase <target>` in the worktree, with the user's rebase settings overridden (no autostash, autosquash, fork point or `updateRefs`, merges flattened). On conflict the rebase is aborted, so the worktree is as it was, and the panel offers **Fix with Claude**: `resumeRefactor {fix: true}` resumes the agent with a prompt to rebase onto the target and resolve the conflicts keeping both sides' intent, re-run the checks, keep one commit per refactor and update the result file.
+2. **Move the target.** Target checked out in the repo: `git merge --ff-only <branch>`, with `merge.autoStash` and `merge.ff` overridden. Git itself also refuses if an uncommitted file would be overwritten. Target not checked out: `git fetch . <branch>:<target>`, which updates the ref only if it is a fast-forward and no worktree has the target. The helper then checks that the target is at the branch's last commit; if not, it keeps everything and reports an error.
+3. **Clean up.** `git worktree remove` without `--force`, then `git branch -d`; when `-d` refuses because the target is not the current branch, the helper deletes the branch with `update-ref -d` only if it is merged into the target and still where it was merged. Whatever git refuses stays, and the reply lists it in `kept`.
+
+Other rules:
+- **Discard** (after "Discard N commits?" in the panel) runs `git worktree remove --force` and `git branch -D`, and only for a branch starting with `refactor/`. It is refused while any agent runs in the worktree, idle or not.
+- **Path check before anything is deleted.** The worktree's real path must lie under `~/projects/.refract-worktrees/` (not be that folder) and be a linked worktree in that repo's `git worktree list`, or the helper refuses. A record that points elsewhere cannot make it delete a folder.
+- **Nothing is pushed**, and the prompt tells the agent not to.
+- **One action at a time per repo.** A start, merge or discard marks the repo busy; another request for it is refused with "busy with another action" until it ends.
+- The git commands work on git 2.25 and later; newer settings are passed as `-c` overrides, which older git ignores.
+
+A merged refactor disappears: record, worktree and branch go, and the panel says "Merged N commits" until it closes.
+
+### Records and reconciling
+
+The helper keeps one JSON record per refactor in `~/.local/state/refract/refactors/<uuid>.json` (`XDG_STATE_HOME` applies), written through a temporary file and a rename. It holds the repo path, worktree, branch, base commit, target branch (the branch checked out when Refactor was pressed), session id, launch request id, focus line, creation and last launch times, and the merge block, with the branch commit it applies to. A new commit on the branch clears the block.
+
+After the first load, `reconcile` brings records in line with git, and deletes nothing:
+- A record whose repo is gone, or whose worktree is not in `git worktree list` or not on disk, is dropped.
+- A linked worktree of a known repo that is on a `refactor/` branch under the worktrees folder and has no record is adopted: the target is the repo's current branch, the base is the merge base, the session is the newest transcript for that folder (none leaves it `interrupted`).
+
+`resumeRefactor` without `fix` resumes the recorded session with "Continue the refactor from where it stopped." If that session never wrote a transcript, it starts a new plan-mode session with the original prompt and records the new session id, after deleting the old launch request if nothing had picked it up.
+
+### Polling and refreshing
+
+The refactor's state belongs to the parent repo's snapshot, so the stone's mark and the panel follow `repoChanged`; the helper sends it only when the `RefactorInfo` changed. A refactor's session is never attached to a stone: its working directory is the worktree, which is not a repo. The state is worked out again:
+- when the repo is refreshed and when a status-hook file for one of the refactor's live sessions changes;
+- every 3 seconds while a refactor is starting (within 2 minutes of its launch), working, or `needsYou` by the hook;
+- every 30 seconds for all of them otherwise, to catch a closed terminal or a commit.
+
+Tests shorten the two waits with `REFRACT_REFACTOR_GRACE_SECS` (the 2 minutes) and `REFRACT_REFACTOR_QUIET_SECS` (the 20 seconds).
+
+### The result file
+
+The agent writes `refract-refactor.json` into the worktree's own git directory (`git rev-parse --absolute-git-dir`, whose path the prompt gives in full), so it is outside the working tree and never committed:
+
+```json
+{
+  "checks": [
+    {"command": "cargo test", "before": "pass", "after": "pass"},
+    {"command": "cargo clippy -- -D warnings", "before": "fail", "after": "fail"}
+  ],
+  "refactors": [{"title": "Split parse.rs into lexer and parser", "commit": "a1b2c3d"}],
+  "summary": "Split the parser and removed two unused helpers; all checks as before."
+}
+```
+
+`before` and `after` are `pass`, `fail` or `notRun`. `checks` and `refactors` are required; `summary` and each `commit` are optional; unknown fields are ignored. A file over 256 KiB, not JSON, missing a required key or with another outcome string is invalid and treated as absent. `refactors: []` with no commits means the agent found nothing worth doing (`nothingToDo`). The commit list shown in the panel comes from git, not from this file.
+
+### Alerts
+
+There are two: the plan is ready (the refactor enters `needsYou` for the first time) and the refactor is ready (it enters `ready`). Both need the status hook to know when the agent waits. The Windows app decides each from the helper's `repoChanged` events (`app/src-tauri/src/alerts.rs`), so a hidden window, whose WebView2 is suspended, still gets them. How it is shown follows the window:
+- window hidden: a Windows toast;
+- window shown and the repo not zoomed: a notice in the interface (the `refactor://notice` event);
+- window shown and the repo zoomed: nothing, since the panel shows it.
+
+Each alert comes once per refactor. A refactor first seen by the app is not announced (it may have been there before the app started), and neither is a state it has already passed. A resume re-arms the "ready" alert.
+
+### In the interface
+
+The panel's Refactor section shows the button or the state's text and actions from the table above; `RefactorDialog` takes the focus line. Alt+R opens the dialog on the zoomed repo, or the refactor's window when it has one. The mark is a second engraved ring on the sheet: turning while the agent works, red for the three states that need you, a still seal when there is something to merge, plain when there was nothing. The web demo simulates the whole run (start, plan, approval, commits, merge, discard).
 
 ## Usage and system stats
 

@@ -39,7 +39,7 @@ Directory: `$XDG_STATE_HOME/refract/launch/`, defaulting to `~/.local/state/refr
 ```
 
 - `folder` is the repo's absolute Linux path, with no trailing slash.
-- `argv` is the command to run in the terminal. For a new agent it is `claude --session-id <uuid>`, followed by `--` and an opening prompt if there is one. The `--` ends `claude`'s options, so a prompt that starts with `-` is not read as a flag. For a resume it is `claude --resume <session-id>`.
+- `argv` is the command to run in the terminal. For a new agent it is `claude --session-id <uuid>`, with `--permission-mode plan` after it in plan mode (refactors use it), followed by `--` and an opening prompt if there is one. The `--` ends `claude`'s options, so a prompt that starts with `-` is not read as a flag. For a resume it is `claude --resume <session-id>`, followed by `--` and a prompt if one is given.
 - `title` names the terminal tab.
 - `focus`, present only on a focus request, names a running agent whose terminal to show. `argv` is then empty and nothing is started:
 
@@ -66,8 +66,8 @@ A window ignores requests for other folders, requests with an unknown `version` 
 `prepareLaunch` request params:
 
 ```json
-{"path": "/home/me/projects/example", "mode": {"kind": "new", "prompt": "optional"}}
-{"path": "/home/me/projects/example", "mode": {"kind": "resume", "sessionId": "0b7e…"}}
+{"path": "/home/me/projects/example", "mode": {"kind": "new", "prompt": "optional", "planMode": false}}
+{"path": "/home/me/projects/example", "mode": {"kind": "resume", "sessionId": "0b7e…", "prompt": "optional"}}
 {"path": "/home/me/projects/example", "mode": {"kind": "focus", "sessionId": "0b7e…"}}
 ```
 
