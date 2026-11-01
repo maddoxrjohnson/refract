@@ -99,11 +99,12 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `migrateFinish` | `{id, action}` | `null` | Ends a migration whose report is ready: `delete` (only in the deleting state, once the original is gone, and refused when the copy is gone: then only `discard` ends it), `keep` (refused while deleting, when the copy was never placed, or is gone) or `discard` (refused while deleting, when the original folder is gone, the copy changed since its last check, or the report's `recoveredChanges` is not empty; with the copy gone it only forgets the migration, in any state, also while a `migrateFinish delete` is finishing; it then deletes the transcript copies only while their originals are there, and never once `delete` began removing the old transcripts, which it saves in the state file before it does). The state file goes only once the config is written; if that fails, the same `migrateFinish` again finishes it |
 | `migrateCancel` | `{id}` | `{ended}` | Stops a running migration. Before the copy is placed it deletes the temporary copy and the migration is gone (`ended: true`); once placed (from the first `installing` progress on), or during a re-sync, the copy stays, the step stops and a `migrateReady` saying so follows (`ended: false`). Error `6` once the report is out, or while deleting |
 | `migratePending` | none | `[{id, report, deleting, copyMissing}]` | Reports waiting for `migrateFinish`, including those from before a restart; `deleting` when only `migrateFinish delete` (or `discard`, once the copy is gone) can end it; `copyMissing` when the placed copy is gone |
-| `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` process, unless it is working (error `7`) |
+| `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` process, unless it is working or has background agents running (error `7`) |
 | `startRefactor` | `{path, focus?}` | a launch ticket for the worktree | Makes a worktree and branch from the repo's last commit and launches a plan-mode agent there ([Refactor](#refactor)). Error `8` on a detached HEAD, a repo with no commits, or when the repo already has a refactor |
 | `resumeRefactor` | `{path, fix?}` | a launch ticket | Resumes the refactor's agent; with `fix`, asks it to rebase the branch onto the target after a conflict. Error `8` while the agent runs |
 | `mergeRefactor` | `{path}` | `{outcome: "merged", commits, kept?}` or `{outcome: "blocked", reason, files}` | Rebases the branch onto its target if needed, fast-forwards the target, removes the worktree and branch. A refusal that leaves everything as it was is `blocked`, not an error. Nothing is pushed |
 | `discardRefactor` | `{path}` | `null` | Deletes the refactor's worktree and branch. Error `8` while the agent runs |
+| `removeWorktree` | `{path}` | `null` | Removes a linked worktree's folder with `git worktree remove` (never `--force`) and keeps its branch, after re-checking that nothing can be lost ([Worktrees](#worktrees)). Error `9` names the rule that refused |
 
 ### Events
 
@@ -120,9 +121,9 @@ Usage totals are not pushed. The app asks for them with `usage`.
 
 ### Errors
 
-Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working, `8` a refactor request was refused or failed (see [Refactor](#refactor)).
+Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working, `8` a refactor request was refused or failed (see [Refactor](#refactor)), `9` `removeWorktree` refused (see [Worktrees](#worktrees)).
 
-A repo snapshot (`listRepos`, `getRepo`, `repoChanged`) carries two fields added with the refactor, both optional on the wire so older peers still parse it: `refactor`, the repo's [`RefactorInfo`](#refactor) while it has one, and `lastCommit.sha`, the abbreviated id of its newest commit, which the Refactor dialog shows as "Starts from a1b2c3d". `LaunchMode` gained `planMode` on `new` and `prompt` on `resume`. None of this changed `PROTOCOL_VERSION`.
+A repo snapshot (`listRepos`, `getRepo`, `repoChanged`) carries two fields added with the refactor, both optional on the wire so older peers still parse it: `refactor`, the repo's [`RefactorInfo`](#refactor) while it has one, and `lastCommit.sha`, the abbreviated id of its newest commit, which the Refactor dialog shows as "Starts from a1b2c3d". `LaunchMode` gained `planMode` on `new` and `prompt` on `resume`. None of this changed `PROTOCOL_VERSION`. The worktrees work added two more optional fields, set only on a linked worktree's snapshot: `worktreeOf`, the path of its main working tree, and `worktree`, its facts and status (`WorktreeInfo`, see [Worktrees](#worktrees)).
 
 ### Rules of the line protocol
 
@@ -514,6 +515,55 @@ Each alert comes once per refactor, which the app tells apart by worktree and cr
 ### In the interface
 
 The panel's Refactor section shows the button or the state's text and actions from the table above; `RefactorDialog` takes the focus line. Alt+R opens the dialog on the zoomed repo, or the refactor's window when it has one. The mark is a second engraved ring on the sheet: turning while the agent works, red for the three states that need you, a still seal when there is something to merge, plain when there was nothing. The web demo simulates the whole run (start, plan, approval, commits, merge, discard).
+
+## Worktrees
+
+A linked git worktree (a folder whose `.git` is a file pointing into another repo's `.git/worktrees/`) is the same repo checked out a second time, usually on another branch. Refract folds it into its main repo's stone instead of showing a second stone, and helps answer "am I done with this?". [Decision 0019](decisions/0019-fold-worktrees-into-their-repo.md) records why.
+
+### Finding them
+
+The helper keeps each linked worktree as a repo of its own: it has its own status, watches, sessions, status-hook state and launch, exactly like any repo. Besides the ones the root search finds, the helper reads each known repo's `<git dir>/worktrees/*/gitdir` and tracks those folders too, so worktrees outside the roots and worktrees nested inside the main folder (which the search never enters) are found. Hidden repos are left out before this, so hiding a repo hides its worktrees. Refract's own refactor worktrees under `~/projects/.refract-worktrees` are never tracked this way; they belong to [Refactor](#refactor). Worktrees made by Windows git (a `C:/…` gitdir) are skipped, because Linux git can't read them. A session whose folder is inside several known repos belongs to the deepest one.
+
+Each linked worktree's snapshot carries `worktreeOf`, the path of its main working tree, and `worktree` (`WorktreeInfo`): `locked`, `operation` (a rebase, merge, cherry-pick, revert or bisect in progress), `untrackedChecked` (false on Windows drives), `onlyHere` (commits on HEAD that no remote-tracking ref has, capped at 100), `merged` (the default branch, when HEAD is its ancestor: `origin/HEAD`'s target, else local `main`, else `master`), `release` (the oldest tag containing HEAD), `ignored` (top-level ignored entries, only when it could be removed), `status` and `removable`. The ref facts are read with HEAD, not on every status refresh, and the ignored listing is reused while HEAD and the status are unchanged. The common dir's `refs/tags` is watched for linked worktrees, so a fetched release tag shows without another change.
+
+### In the interface
+
+The app folds a worktree into its main repo's stone when that repo is shown; otherwise the worktree stays a stone of its own. Folded snapshots stay in the app's repo state (sessions keep patching them); only the stone list folds them. The main stone shows a small mark with the number of extra checkouts, with a dot when any is ready to remove, and its agent state is the most urgent across the main repo and its worktrees, so a waiting agent in a worktree turns the main stone red. Search also matches worktree folder and branch names and goes to the main stone.
+
+The panel's **Worktrees** section lists each one with its folder, branch, status, the last agent message there and how long ago, an **Open** button (the same as Enter on that folder) and, when nothing can be lost, **Remove**. The first matching status wins:
+
+| Status | When | Remove |
+|---|---|---|
+| Agent waiting for you | a session there waits on you | no |
+| Agent running | a session there is working | no |
+| Locked | `git worktree lock` | no |
+| Mid-rebase, Mid-merge, Mid-cherry-pick, Mid-revert, Bisecting | an operation is in progress | no |
+| N uncommitted changes | tracked or untracked changes | no |
+| Changes not checked (Windows drive) | on `/mnt`, untracked files aren't listed | no |
+| Holds another repo | another worktree, a repo, a submodule, or a `.git` in an ignored folder lies inside it | no |
+| Too many ignored files to check | the nested-repo search ran out of budget | no |
+| Can't tell if its commits are pushed | git couldn't count them | no |
+| N commits only on this computer | HEAD has commits no remote has, and isn't merged | no |
+| In `<tag>` | a tag contains HEAD | yes |
+| Merged into `<branch>` | HEAD is an ancestor of the default branch | yes |
+| Pushed, not merged | everything is on a remote | yes |
+
+The last three add "Ready to remove", except on Windows drives, where Remove isn't offered yet. A live agent in the folder, even an idle one, hides Remove and the row says to close it first; a worktree with its own refactor says "Has a refactor". The confirm names the folder, says the branch stays, and lists the ignored entries that will be deleted with it.
+
+### Remove and the safety rules
+
+`removeWorktree` re-checks everything when it runs and ignores what the app showed. It refuses unless all of these hold, with the nested and clean checks run last, right before the removal:
+
+1. the path is a non-main entry of the main repo's `git worktree list` (found from the path's own common dir);
+2. it is not a Refract refactor worktree, and no refactor record names it as its worktree or its repo;
+3. it is not on a Windows drive;
+4. it is not locked or prunable and no operation is in progress;
+5. HEAD has no commits that only this computer has, or is merged into the default branch;
+6. no session there is live and no `claude` process has its working directory inside the folder;
+7. nothing is nested inside it: no other worktree or known repo, no submodule, no `.git` in an ignored folder (searched up to 4 levels with a budget per folder; build and dependency folders such as `node_modules` and `target` aren't searched, so a plain repo kept inside one isn't seen), and no edits hidden by `--skip-worktree` or `--assume-unchanged`;
+8. `git status --porcelain --untracked-files=all` prints nothing.
+
+It then runs `git -c status.showUntrackedFiles=normal worktree remove <path>`, so git's own clean check can't be turned off by config, never with `--force` and never `rm`. The branch is never touched. It shares the per-repo job queue with refactor merges and discards. On success the worktree's `repoRemoved` and the main repo's `repoChanged` follow. Rule 6 only sees agents whose process runs inside the folder; an agent that started in the main repo and works in a nested worktree isn't seen, though rules 7 and 8 still protect its files.
 
 ## Usage and system stats
 

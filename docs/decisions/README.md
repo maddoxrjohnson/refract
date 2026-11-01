@@ -24,5 +24,6 @@ Format: a title, a status line, then **Context**, **Decision** and **Consequence
 | 0016 | [Go to the running agent, found by its window's folder and process ancestry](0016-go-to-the-running-agent.md) | Post-M7 |
 | 0017 | [The Banknote scene replaces Frozen shatter](0017-banknote-scene.md) | Post-M7 |
 | 0018 | [A refactor runs in its own worktree, in plan mode, and merges only on request](0018-refactor-in-a-worktree.md) | Post-M7 |
+| 0019 | [Linked worktrees fold into their repo, and Remove keeps the branch](0019-fold-worktrees-into-their-repo.md) | Post-M7 |
 
 See also [architecture.md](../architecture.md) for how the pieces fit together.
