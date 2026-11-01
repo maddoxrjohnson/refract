@@ -9,14 +9,20 @@ export interface GemMarkProps {
   windows: boolean;
   /** A Move to WSL of the repo: a ring around the gem, full once its report waits. */
   migration?: Migration;
+  /**
+   * Linked worktrees folded into the gem: their count at the gem's lower right, with a
+   * dot when one of them can be removed.
+   */
+  checkouts?: { count: number; removable: boolean };
 }
 
 /**
  * What the scene draws over a gem (its `marks`), sized from `--r`, the gem's radius in
- * pixels. Static: it changes only when the migration moves on. The focus label and the
- * detail panel say the same in words, so it is hidden from assistive technology.
+ * pixels. Static: it changes only when the migration moves on or the worktrees change. The
+ * focus label and the detail panel say the same in words, so it is hidden from assistive
+ * technology.
  */
-export function GemMark({ windows, migration }: GemMarkProps) {
+export function GemMark({ windows, migration, checkouts }: GemMarkProps) {
   const progress = migration ? overallProgress(migration.phase) : 0;
   const tone =
     migration?.phase.kind === "ready" ? (canDelete(migration.phase.report) ? "ready" : "failed") : "running";
@@ -42,6 +48,20 @@ export function GemMark({ windows, migration }: GemMarkProps) {
           <rect x="1" y="6.6" width="4.4" height="4.4" rx="0.8" />
           <rect x="6.6" y="6.6" width="4.4" height="4.4" rx="0.8" />
         </svg>
+      )}
+      {checkouts && checkouts.count > 0 && (
+        <span
+          className={`rf-checkout-mark${checkouts.removable ? " rf-checkout-mark--removable" : ""}`}
+          data-count={checkouts.count}
+        >
+          <svg viewBox="0 0 12 12" width="10" height="10">
+            <circle cx="3" cy="2.6" r="1.4" />
+            <circle cx="3" cy="9.4" r="1.4" />
+            <circle cx="9" cy="4.2" r="1.4" />
+            <path d="M3 4v4M9 5.6c0 2-2.4 2.2-5.4 3" />
+          </svg>
+          {checkouts.count}
+        </span>
       )}
     </div>
   );

@@ -560,3 +560,42 @@ describe("following a clone", () => {
     expect(r.state).toEqual(initialNavState);
   });
 });
+
+describe("worktrees folded into a gem", () => {
+  const wide = {
+    ...repo("centre-wide"),
+    branch: "wide-cards",
+    worktreeOf: "/p/centre",
+    sessions: [session("w1", 2)],
+    preselect: { kind: "resume", sessionId: "w1" } as Preselect,
+  };
+  const quiet = { ...repo("centre-search"), branch: "search", worktreeOf: "/p/centre" };
+  const folded: NavContext = { ...ctx, worktrees: new Map([["/p/centre", [wide, quiet]]]) };
+
+  it("search matches their names and branches and finds the main gem", () => {
+    expect(matchingPaths(repos, "wide", folded.worktrees)).toEqual(new Set(["/p/centre"]));
+    expect(matchingPaths(repos, "SEARCH", folded.worktrees)).toEqual(new Set(["/p/centre"]));
+    expect(matchingPaths(repos, "wide")).toEqual(new Set());
+    const r = run(typed("cards"), initialNavState, folded);
+    expect(r.state.focused).toBe("/p/centre");
+  });
+
+  it("are not gems: arrows and clicks skip them", () => {
+    expect(run([{ type: "select", path: quiet.path }], initialNavState, folded).handled).toBe(false);
+  });
+
+  it("launch by their own path, through the picker when they have sessions", () => {
+    const zoomed: NavState = { ...initialNavState, focused: "/p/centre", zoomed: "/p/centre" };
+    const direct = run([{ type: "launch", path: quiet.path }], zoomed, folded);
+    expect(direct.effects).toEqual([{ kind: "launch", path: quiet.path, mode: { kind: "new" } }]);
+    let r = run([{ type: "launch", path: wide.path }], zoomed, folded);
+    expect(r.state.picker?.path).toBe(wide.path);
+    expect(r.state.zoomed).toBe("/p/centre");
+    // The picker stays across a sync and accepts into the worktree.
+    r = run([{ type: "sync" }, key("Enter")], r.state, folded);
+    expect(r.effects).toEqual([{ kind: "launch", path: wide.path, mode: { kind: "resume", sessionId: "w1" } }]);
+    // Gone with its worktree.
+    r = run([{ type: "launch", path: wide.path }], zoomed, folded);
+    expect(run([{ type: "sync" }], r.state, ctx).state.picker).toBeNull();
+  });
+});

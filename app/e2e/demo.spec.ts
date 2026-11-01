@@ -188,6 +188,33 @@ test("a refactor runs from the dialog to a merge, and another is discarded", asy
   await expect(sweep.getByRole("button", { name: /Refactor…/ })).toBeVisible();
 });
 
+test("linked worktrees fold into their repo's gem, and the ready one is removed", async ({ page }) => {
+  const mark = page.locator(".rf-checkout-mark");
+  await expect(mark).toHaveAttribute("data-count", "2");
+  await expect(mark).toHaveClass(/rf-checkout-mark--removable/);
+  // Search finds the main gem by a worktree's branch.
+  await page.keyboard.type("wide-cards");
+  await expect(page.locator(".rf-focus-label__name")).toHaveText("harbor-android");
+  await page.keyboard.press("Enter");
+  const panel = page.getByRole("complementary", { name: "harbor-android details" });
+  const section = panel.getByRole("region", { name: "Worktrees" });
+  const cards = section.getByRole("listitem", { name: "harbor-android-wide-cards" });
+  const search = section.getByRole("listitem", { name: "harbor-android-search" });
+  await expect(cards).toContainText("In v1.4.0 · Ready to remove");
+  await expect(cards).toContainText("Should I tag v1.4.0?");
+  await expect(search).toContainText("3 uncommitted changes");
+  await expect(search.getByRole("button", { name: /Remove/ })).toHaveCount(0);
+  await cards.getByRole("button", { name: "Remove harbor-android-wide-cards…" }).click();
+  const confirm = cards.getByRole("group", { name: "Confirm removing harbor-android-wide-cards" });
+  await expect(confirm).toContainText("The branch wide-cards stays.");
+  await expect(confirm.getByRole("list", { name: "Ignored files" })).toContainText("local.properties");
+  await confirm.getByRole("button", { name: "Remove" }).click();
+  await expect(cards).toHaveCount(0);
+  await expect(search).toBeVisible();
+  await expect(mark).toHaveAttribute("data-count", "1");
+  await expect(mark).not.toHaveClass(/rf-checkout-mark--removable/);
+});
+
 test("the settings panel opens and closes", async ({ page }) => {
   await page.getByRole("button", { name: "Settings", exact: true }).click();
   const settings = page.getByRole("dialog", { name: "Settings", exact: true });

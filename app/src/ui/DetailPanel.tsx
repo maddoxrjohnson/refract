@@ -39,6 +39,10 @@ export interface DetailPanelProps {
   move?: ReactNode;
   /** The Refactor section of a cloned repo (refactor spec §4). */
   refactor?: ReactNode;
+  /** Linked worktrees folded into the gem: their agents count in the status line. */
+  worktrees?: readonly RepoSnapshot[];
+  /** The Worktrees section, after Working tree (worktrees spec §1). */
+  worktreeSection?: ReactNode;
 }
 
 const CI_LABELS: Record<CiStatus, string> = {
@@ -164,6 +168,8 @@ export function DetailPanel({
   onRefreshDetails,
   move = null,
   refactor = null,
+  worktrees,
+  worktreeSection = null,
 }: DetailPanelProps) {
   const hintId = useId();
   const direct = repo.preselect.kind === "noPicker";
@@ -208,7 +214,7 @@ export function DetailPanel({
         <div className="rf-muted">
           {host} · {repo.language ?? "Unknown language"}
         </div>
-        <StatusLine repo={repo} notCloned={remoteOnly} />
+        <StatusLine repo={repo} notCloned={remoteOnly} worktrees={worktrees} />
       </div>
       <button
         type="button"
@@ -290,6 +296,8 @@ export function DetailPanel({
             </dd>
           </dl>
         </section>
+
+        {worktreeSection}
 
         {move}
 

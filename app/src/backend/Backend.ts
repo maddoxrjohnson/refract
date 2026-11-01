@@ -103,6 +103,14 @@ export interface Backend {
   /** Tells the Rust side the zoomed repo, whose alerts its panel shows instead. */
   setZoomed(path: string | null): Promise<void>;
 
+  /**
+   * Removes the linked worktree at `path` (its snapshot's path) with `git worktree remove`,
+   * keeping its branch. The helper checks again that nothing can be lost; on success the
+   * worktree goes with `repoRemoved` and its main repo gets a `repoChanged`. Rejects with
+   * a `CommandError` whose message says why it was refused.
+   */
+  removeWorktree(path: string): Promise<void>;
+
   /** Whether the status hook is installed, and what installing would change. */
   hookInfo(): Promise<HookInfo>;
   installHook(): Promise<HookInfo>;

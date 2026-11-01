@@ -58,7 +58,10 @@ export type NavInput =
   | { type: "select"; path: string }
   | { type: "backgroundClick" }
   | { type: "key"; key: NavKey }
-  /** What Enter does on a zoomed gem: launch, or open the picker. `path` defaults to the zoomed gem. */
+  /**
+   * What Enter does on a zoomed gem: launch, or open the picker. `path` defaults to the
+   * zoomed gem; it may also be a worktree folded into a gem (its Open button).
+   */
   | { type: "launch"; path?: string }
   /** Highlight a picker option (pointer hover). */
   | { type: "pickerMove"; index: number }
@@ -86,6 +89,11 @@ export interface NavContext {
   positions: ReadonlyMap<string, { x: number; y: number }>;
   /** Paths of gems that are not cloned yet; launching one clones it first. */
   remoteOnly?: ReadonlySet<string>;
+  /**
+   * Linked worktrees folded into a gem, by the gem's path. Search matches their names and
+   * branches (and finds the gem); they can be launched, but are not gems themselves.
+   */
+  worktrees?: ReadonlyMap<string, readonly RepoSnapshot[]>;
 }
 
 export interface NavResult {
@@ -95,13 +103,34 @@ export interface NavResult {
   handled: boolean;
 }
 
-/** Paths whose name contains `filter`, ignoring case; `null` when there is no filter. */
-export function matchingPaths(repos: Iterable<RepoSnapshot>, filter: string): Set<string> | null {
+/**
+ * Paths whose name contains `filter`, ignoring case, or that hold a folded worktree whose
+ * name or branch does; `null` when there is no filter.
+ */
+export function matchingPaths(
+  repos: Iterable<RepoSnapshot>,
+  filter: string,
+  worktrees?: ReadonlyMap<string, readonly RepoSnapshot[]>,
+): Set<string> | null {
   if (!filter) return null;
   const needle = filter.toLowerCase();
+  const has = (text: string | null) => !!text && text.toLowerCase().includes(needle);
   const out = new Set<string>();
-  for (const r of repos) if (r.name.toLowerCase().includes(needle)) out.add(r.path);
+  for (const r of repos) {
+    if (has(r.name) || worktrees?.get(r.path)?.some((w) => has(w.name) || has(w.branch))) out.add(r.path);
+  }
   return out;
+}
+
+/** The repo at `path`: a gem, or a worktree folded into one. */
+export function findRepo(ctx: NavContext, path: string): RepoSnapshot | undefined {
+  const gem = ctx.repos.get(path);
+  if (gem || !ctx.worktrees) return gem;
+  for (const list of ctx.worktrees.values()) {
+    const w = list.find((r) => r.path === path);
+    if (w) return w;
+  }
+  return undefined;
 }
 
 /** How a new agent starts in this repo: with the review prompt when it has changes. */
@@ -196,7 +225,7 @@ function bestMatch(ctx: NavContext, matches: Set<string>, filter: string): strin
 
 /** Applies a new filter: focus follows the best match, a zoom on a hidden gem ends. */
 function withFilter(state: NavState, filter: string, ctx: NavContext): NavState {
-  const matches = matchingPaths(ctx.repos.values(), filter);
+  const matches = matchingPaths(ctx.repos.values(), filter, ctx.worktrees);
   if (!matches) return { ...state, filter };
   const zoomed = state.zoomed && matches.has(state.zoomed) ? state.zoomed : null;
   const focused =
@@ -216,7 +245,7 @@ const DIRECTIONS: Record<string, { x: number; y: number }> = {
  * zoomed gem when zoomed (the pointer may have focused another), else the focused one.
  */
 function step(state: NavState, dir: { x: number; y: number }, ctx: NavContext): string | null {
-  const matches = matchingPaths(ctx.repos.values(), state.filter);
+  const matches = matchingPaths(ctx.repos.values(), state.filter, ctx.worktrees);
   const candidates = [...ctx.positions].filter(
     ([path]) => ctx.repos.has(path) && (!matches || matches.has(path)),
   );
@@ -248,7 +277,7 @@ function step(state: NavState, dir: { x: number; y: number }, ctx: NavContext): 
 }
 
 function launch(state: NavState, path: string | null, ctx: NavContext): NavResult {
-  const repo = path ? ctx.repos.get(path) : undefined;
+  const repo = path ? findRepo(ctx, path) : undefined;
   if (!repo) return unhandled(state);
   if (ctx.remoteOnly?.has(repo.path)) {
     return result({ ...state, picker: null }, [{ kind: "clone", key: repo.path }]);
@@ -356,7 +385,7 @@ function sync(state: NavState, ctx: NavContext): NavState {
   };
   const focused = keep(state.focused);
   const zoomed = keep(state.zoomed);
-  const picker = state.picker && ctx.repos.has(state.picker.path) ? state.picker : null;
+  const picker = state.picker && findRepo(ctx, state.picker.path) ? state.picker : null;
   // A pending follow lasts while its gem is still focused or zoomed and has not arrived.
   const waiting =
     !follow && state.follow && (focused === state.follow.from || zoomed === state.follow.from)

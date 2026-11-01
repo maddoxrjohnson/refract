@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canDelete } from "../migrations";
-import { DEMO_WINDOWS_REPO, DemoBackend, demoHookDiff, demoRepos } from "./DemoBackend";
+import { DEMO_WINDOWS_REPO, DEMO_WORKTREE_MAIN, DemoBackend, demoHookDiff, demoRepos } from "./DemoBackend";
 import type { AgentEvent, MigrateError, MigrateSnapshotProgress } from "./types";
 
 afterEach(() => vi.useRealTimers());
@@ -210,5 +210,35 @@ describe("DemoBackend's refactors", () => {
     await vi.advanceTimersByTimeAsync(5000);
     expect((await backend.getRepo(SWEEP)).refactor?.state).toBe("ready");
     expect(modes).toEqual(["focus", "resume"]);
+  });
+});
+
+describe("DemoBackend's worktrees", () => {
+  it("seeds two linked worktrees of one repo, one ready to remove", () => {
+    const linked = demoRepos().filter((r) => r.worktreeOf);
+    expect(linked.map((r) => r.worktreeOf)).toEqual([DEMO_WORKTREE_MAIN, DEMO_WORKTREE_MAIN]);
+    const [cards, search] = linked;
+    expect(cards.worktree).toMatchObject({ status: { kind: "release", tag: "v1.4.0" }, removable: true });
+    expect(cards.sessions[0].lastAssistantText).toBe("Should I tag v1.4.0?");
+    expect(search.worktree).toMatchObject({ status: { kind: "changes", count: 3 }, removable: false });
+  });
+
+  it("removes the ready one as the helper does, and refuses the dirty one", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    const events: AgentEvent[] = [];
+    backend.onAgentEvent((e) => events.push(e));
+    const [cards, search] = (await backend.listRepos()).repos.filter((r) => r.worktreeOf);
+    await expect(settle(backend.removeWorktree(search.path))).rejects.toEqual({
+      kind: "worktree",
+      message: "Cannot remove the worktree: This worktree has uncommitted changes.",
+    });
+    await expect(settle(backend.removeWorktree(DEMO_WORKTREE_MAIN))).rejects.toMatchObject({ kind: "worktree" });
+    expect(events).toEqual([]);
+    await settle(backend.removeWorktree(cards.path));
+    expect(events.map((e) => e.event)).toEqual(["repoRemoved", "repoChanged"]);
+    expect(events[0]).toEqual({ event: "repoRemoved", data: { path: cards.path } });
+    expect(events[1]).toMatchObject({ data: { path: DEMO_WORKTREE_MAIN } });
+    expect((await backend.listRepos()).repos.some((r) => r.path === cards.path)).toBe(false);
   });
 });

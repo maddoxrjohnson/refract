@@ -78,3 +78,55 @@ describe("App's Refactor dialog", () => {
     await waitFor(() => expect(start.disabled).toBe(false), { timeout: 4000 });
   });
 });
+
+describe("App's worktrees", () => {
+  const MAIN = "/home/demo/projects/harbor-android";
+
+  async function zoomByWorktree() {
+    const backend = new TestBackend();
+    render(<App backend={backend} />);
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    // Search finds the main gem by a worktree's name.
+    for (const c of "wide-cards") await key(c);
+    await key("Enter");
+    const panel = await screen.findByRole("complementary", { name: "harbor-android details" });
+    return { backend, panel };
+  }
+
+  it("folds them into the main gem's panel and opens one as Enter would", async () => {
+    const { panel } = await zoomByWorktree();
+    const section = panel.querySelector('[aria-label="Worktrees"]')!;
+    expect(section.textContent).toContain("harbor-android-wide-cards");
+    expect(section.textContent).toContain("In v1.4.0 · Ready to remove");
+    expect(section.textContent).toContain("3 uncommitted changes");
+    fireEvent.click(screen.getByRole("button", { name: "Open harbor-android-wide-cards" }));
+    // It has a session to resume, so the picker opens for the worktree.
+    await screen.findByRole("dialog", { name: "Start an agent in harbor-android-wide-cards" });
+  });
+
+  it("keeps folded snapshots current through sessionChanged", async () => {
+    const { backend, panel } = await zoomByWorktree();
+    const search = (await backend.listRepos()).repos.find((r) => r.path === `${MAIN}-search`)!;
+    act(() =>
+      backend.send({
+        event: "sessionChanged",
+        data: {
+          repoPath: search.path,
+          session: { ...search.sessions[0], state: { kind: "live", detail: "waitingOnUser" }, resumeReason: null },
+          preselect: search.preselect,
+        },
+      }),
+    );
+    await waitFor(() => expect(panel.textContent).toContain("Agent waiting for you"));
+    // The main repo's status line counts it too.
+    expect(panel.querySelector(".rf-detail__header .rf-state")?.textContent).toContain("Waiting for you");
+  });
+
+  it("removes the ready one, which leaves the panel", async () => {
+    const { panel } = await zoomByWorktree();
+    fireEvent.click(screen.getByRole("button", { name: "Remove harbor-android-wide-cards…" }));
+    fireEvent.click(screen.getByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(panel.textContent).not.toContain("harbor-android-wide-cards"), { timeout: 3000 });
+    expect(panel.textContent).toContain("harbor-android-search");
+  });
+});

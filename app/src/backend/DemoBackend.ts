@@ -28,6 +28,7 @@ import type {
   SystemStats,
   TokenTotals,
   UsageSummary,
+  WorktreeInfo,
 } from "./types";
 import type {
   DeleteOutcome,
@@ -216,7 +217,7 @@ const SEEDS: Seed[] = [
 ];
 
 export function demoRepos(): RepoSnapshot[] {
-  return SEEDS.map((s, i) => {
+  const repos = SEEDS.map((s, i): RepoSnapshot => {
     const path = s.path ?? `/home/demo/projects/${s.name}`;
     const remote = s.host ? { host: s.host, owner: "demo-user", name: s.name } : null;
     const changedFiles = s.changedFiles ?? 0;
@@ -240,6 +241,93 @@ export function demoRepos(): RepoSnapshot[] {
       refactor: s.refactor ? seededRefactor(s.name) : null,
     };
   });
+  const main = repos.find((r) => r.path === DEMO_WORKTREE_MAIN);
+  return main ? [...repos, ...demoWorktrees(main)] : repos;
+}
+
+// Worktrees (.plans/worktrees-spec.md): two linked worktrees of harbor-android fold into
+// its gem. One is in a release and can be removed; the other has uncommitted changes.
+
+/** The demo repo that has linked worktrees. */
+export const DEMO_WORKTREE_MAIN = "/home/demo/projects/harbor-android";
+
+function worktreeInfo(extra: Partial<WorktreeInfo>): WorktreeInfo {
+  return {
+    locked: false,
+    operation: null,
+    untrackedChecked: true,
+    onlyHere: 0,
+    merged: null,
+    release: null,
+    ignored: [],
+    status: { kind: "pushed" },
+    removable: true,
+    ...extra,
+  };
+}
+
+function demoWorktrees(main: RepoSnapshot): RepoSnapshot[] {
+  const linked = (name: string, branch: string, extra: Partial<RepoSnapshot>): RepoSnapshot => ({
+    ...main,
+    path: `${main.path}-${name}`,
+    name: `${main.name}-${name}`,
+    branch,
+    ahead: 0,
+    behind: 0,
+    changedFiles: 0,
+    dirtyPaths: [],
+    mass: 0.2,
+    sessions: [],
+    preselect: { kind: "noPicker" },
+    refactor: null,
+    worktreeOf: main.path,
+    ...extra,
+  });
+  return [
+    linked("wide-cards", "wide-cards", {
+      lastCommit: { summary: "Wider cards on tablets", time: now() - 2 * 24 * HOUR, sha: demoSha(70) },
+      sessions: [
+        session("5f0c2a1e-0000-4000-8000-0000000000d1", { kind: "finished", detail: "completed" }, 26 * HOUR, "Should I tag v1.4.0?", 88_000, false, "askedQuestion"),
+      ],
+      preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-0000000000d1" },
+      worktree: worktreeInfo({
+        merged: "main",
+        release: "v1.4.0",
+        ignored: [".gradle/", "build/", "local.properties"],
+        status: { kind: "release", tag: "v1.4.0" },
+      }),
+    }),
+    linked("search", "search", {
+      changedFiles: 3,
+      dirtyPaths: ["app/src/main/Search.kt", "app/src/main/SearchView.kt", "notes.md"],
+      lastCommit: { summary: "Search screen scaffold", time: now() - 5 * HOUR, sha: demoSha(71) },
+      sessions: [
+        session("5f0c2a1e-0000-4000-8000-0000000000d2", { kind: "finished", detail: "completed" }, 4 * HOUR, "The search screen lists results; filters come next.", 64_000, false, "uncommittedChanges"),
+      ],
+      preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-0000000000d2" },
+      worktree: worktreeInfo({ onlyHere: 2, status: { kind: "changes", count: 3 }, removable: false }),
+    }),
+  ];
+}
+
+/** The helper's refusal for a worktree that is not removable, in its words. */
+function worktreeRefusal(repo: RepoSnapshot): string | null {
+  const info = repo.worktree;
+  if (!repo.worktreeOf || !info) return "Not a linked worktree.";
+  if (repo.sessions.some((s) => s.state.kind === "live")) return "An agent is running in this worktree.";
+  if (info.removable) return null;
+  switch (info.status.kind) {
+    case "locked":
+      return "This worktree is locked.";
+    case "operation":
+      return "A rebase, merge or similar is in progress in this worktree.";
+    case "changes":
+      return "This worktree has uncommitted changes.";
+    case "onlyHere":
+      return "Some commits are only on this computer.";
+    default:
+      return "Worktrees on Windows drives can't be removed from Refract yet.";
+  }
 }
 
 /** An invented abbreviated commit id. */
@@ -921,6 +1009,18 @@ export class DemoBackend implements Backend {
   setZoomed(path: string | null): Promise<void> {
     this.zoomed = path;
     return Promise.resolve();
+  }
+
+  /** Removes a demo worktree as the helper does: `repoRemoved` for it, then `repoChanged` for its main repo. */
+  async removeWorktree(path: string): Promise<void> {
+    await sleep(600);
+    const repo = this.repos.find((r) => r.path === path);
+    const refusal = repo ? worktreeRefusal(repo) : "Not a linked worktree.";
+    if (refusal || !repo?.worktreeOf) throw { kind: "worktree", message: `Cannot remove the worktree: ${refusal}` };
+    this.repos = this.repos.filter((r) => r.path !== path);
+    this.emit({ event: "repoRemoved", data: { path } });
+    const main = this.repos.find((r) => r.path === repo.worktreeOf);
+    if (main) this.emit({ event: "repoChanged", data: main });
   }
 
   /** Shows the pretend terminal of the refactor's window. */

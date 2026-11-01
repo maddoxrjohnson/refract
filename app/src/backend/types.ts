@@ -160,6 +160,45 @@ export interface RefactorNotice {
 
 /** The helper's error code for a refused or failed refactor request. */
 export const REFACTOR_FAILED = 8;
+/** The helper's error code for a refused `removeWorktree`; the message names the rule. */
+export const WORKTREE_REFUSED = 9;
+
+/**
+ * The git part of a linked worktree's status: the first matching row of the worktrees
+ * spec §4 rows 3-10. The app puts the agent rows 1-2 on top.
+ */
+export type WorktreeStatus =
+  | { kind: "locked" }
+  | { kind: "operation"; op: GitOperation }
+  /** Uncommitted changes, untracked files included where they are listed. */
+  | { kind: "changes"; count: number }
+  /** On a Windows drive with no changes seen, but untracked files unknown. */
+  | { kind: "unchecked" }
+  /** Commits only on this computer; `count` 100 means "100+". */
+  | { kind: "onlyHere"; count: number }
+  | { kind: "release"; tag: string }
+  | { kind: "merged"; branch: string }
+  /** Every commit is on a remote, though not merged. */
+  | { kind: "pushed" };
+
+/** What a linked worktree holds that removing it could lose, from refract-core's `WorktreeInfo`. */
+export interface WorktreeInfo {
+  locked: boolean;
+  operation: GitOperation | null;
+  /** False on a Windows drive, where untracked files aren't listed. */
+  untrackedChecked: boolean;
+  /** Commits on HEAD not on any remote-tracking ref, capped at 100. */
+  onlyHere: number;
+  /** The default branch's name when HEAD is its ancestor. */
+  merged: string | null;
+  /** The oldest tag containing HEAD. */
+  release: string | null;
+  /** Top-level ignored entries relative to the worktree (directories end in `/`), at most 9. */
+  ignored: string[];
+  status: WorktreeStatus;
+  /** Rows 8-10 and not on a Windows drive; the app also needs no live session in it. */
+  removable: boolean;
+}
 
 export interface RepoSnapshot {
   path: string;
@@ -181,6 +220,13 @@ export interface RepoSnapshot {
   preselect: Preselect;
   /** The repo's refactor, while it has one; missing from older helpers. */
   refactor?: RefactorInfo | null;
+  /**
+   * For a linked worktree: its main working tree's path, whether or not that repo is
+   * known. Missing for main checkouts, worktrees of bare repos and refactor worktrees.
+   */
+  worktreeOf?: string;
+  /** Facts for a linked worktree, set exactly when `worktreeOf` is. */
+  worktree?: WorktreeInfo;
 }
 
 export interface RepoList {

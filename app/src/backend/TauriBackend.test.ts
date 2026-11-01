@@ -257,6 +257,22 @@ describe("TauriBackend", () => {
     ]);
   });
 
+  it("removes a worktree through its command and passes on a refusal", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const refused = { kind: "worktree", message: "This worktree has uncommitted changes." };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "remove_worktree" && (args as { path: string }).path.endsWith("search")) throw refused;
+    });
+    const backend = new TauriBackend();
+    await backend.removeWorktree("/home/dev/projects/reef-maps-wide-cards");
+    await expect(backend.removeWorktree("/home/dev/projects/reef-maps-search")).rejects.toEqual(refused);
+    expect(calls).toEqual([
+      { cmd: "remove_worktree", args: { path: "/home/dev/projects/reef-maps-wide-cards" } },
+      { cmd: "remove_worktree", args: { path: "/home/dev/projects/reef-maps-search" } },
+    ]);
+  });
+
   it("asks about the hook and usage through their commands", async () => {
     const calls: Array<{ cmd: string; args: unknown }> = [];
     const info: HookInfo = {

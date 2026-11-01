@@ -3,7 +3,8 @@ import type { RemoteList, RemoteRef, RemoteRepo, RepoSnapshot, Settings } from "
 // Which projects appear (spec §5): local repos from the helper merged with remote repos
 // from GitHub and GitLab. A remote repo with a local clone shows as the local gem; one
 // without shows as a dimmed gem whose path is its project key, so the scene, layout and
-// navigation, which all key gems by path, work unchanged.
+// navigation, which all key gems by path, work unchanged. A linked worktree folds into
+// its main repo's gem while that repo is shown (worktrees spec §3).
 
 /** The key of a remote repo: `remote:<host>/<owner>/<name>`, lower case. */
 export function remoteKey(ref: RemoteRef): string {
@@ -61,12 +62,19 @@ export interface Projects {
   remotes: Map<string, RemoteRepo>;
   /** Paths (project keys) of the gems that are not cloned. */
   remoteOnly: Set<string>;
+  /**
+   * Linked worktrees folded into their main repo's gem, by the main repo's path, by
+   * name. They are not in `repos`.
+   */
+  worktrees: Map<string, RepoSnapshot[]>;
 }
 
 /**
  * Merges local repos with the remote listing. Local and remote match when host, owner and
  * name agree, ignoring case. Forks and archived repos are left out only when remote-only;
- * hidden keys apply to every gem (a local repo by its path or its remote's key).
+ * hidden keys apply to every gem (a local repo by its path or its remote's key). A local
+ * repo whose `worktreeOf` is a shown local repo's path folds into that gem; with its main
+ * repo hidden or unknown it stays a gem of its own.
  */
 export function mergeProjects(
   local: RepoSnapshot[],
@@ -83,14 +91,28 @@ export function mergeProjects(
   const repos: RepoSnapshot[] = [];
   const remotes = new Map<string, RemoteRepo>();
   const cloned = new Set<string>();
+  const shown: RepoSnapshot[] = [];
   for (const repo of local) {
     const key = repo.remote ? remoteKey(repo.remote) : null;
     if (key) cloned.add(key);
     if (hidden.has(repo.path) || (key && hidden.has(key))) continue;
+    shown.push(repo);
+  }
+  const shownPaths = new Set(shown.map((r) => r.path));
+  const worktrees = new Map<string, RepoSnapshot[]>();
+  for (const repo of shown) {
+    const main = repo.worktreeOf;
+    if (main && main !== repo.path && shownPaths.has(main)) {
+      const list = worktrees.get(main);
+      if (list) list.push(repo);
+      else worktrees.set(main, [repo]);
+      continue;
+    }
     repos.push(repo);
-    const match = key ? byKey.get(key) : undefined;
+    const match = repo.remote ? byKey.get(remoteKey(repo.remote)) : undefined;
     if (match) remotes.set(repo.path, match);
   }
+  for (const list of worktrees.values()) list.sort((a, b) => a.name.localeCompare(b.name));
 
   const remoteOnly = new Set<string>();
   for (const [key, r] of byKey) {
@@ -101,7 +123,7 @@ export function mergeProjects(
     remotes.set(key, r);
     remoteOnly.add(key);
   }
-  return { repos, remotes, remoteOnly };
+  return { repos, remotes, remoteOnly, worktrees };
 }
 
 /** A hidden key for a person: `owner/name · host` for remote keys, the path otherwise. */

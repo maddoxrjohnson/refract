@@ -32,6 +32,7 @@ import { createQualityController } from "./quality/controller";
 import type { QualityLevel, QualitySetting } from "./quality/tiers";
 import { NOTICE_TEXT } from "./refactors";
 import { initialRepoState, repoReducer } from "./repoState";
+import { worktreeView } from "./worktrees";
 import { rememberedTheme, useThemeMode } from "./theme";
 import { layoutGems } from "./scene/layout";
 import { SceneBoundary } from "./scene/SceneBoundary";
@@ -43,6 +44,7 @@ import { MoveDialog } from "./ui/MoveDialog";
 import { MoveSection } from "./ui/MoveSection";
 import { HookOffer, loadHookOfferDismissed, saveHookOfferDismissed } from "./ui/HookOffer";
 import {
+  findRepo,
   initialNavState,
   matchingPaths,
   navigate,
@@ -60,6 +62,7 @@ import { SettingsPanel } from "./ui/SettingsPanel";
 import { describeError, StatusToast, type LaunchProgress } from "./ui/StatusToast";
 import { SystemWidget } from "./ui/SystemWidget";
 import { UsageWidget } from "./ui/UsageWidget";
+import { WorktreesSection } from "./ui/WorktreesSection";
 import { DEFAULT_PRICES } from "./usage/cost";
 
 // The scene (three.js and its effects, most of the bundle) loads in its own chunk, so the
@@ -343,7 +346,8 @@ export function App({ backend }: { backend: Backend }) {
       if (launching.current) return;
       launching.current = true;
       setLaunchBusy(true);
-      const repoName = repos.get(path)?.name ?? path;
+      // A worktree folded into a gem is launched by its own path.
+      const repoName = (repos.get(path) ?? localRepos.get(path))?.name ?? path;
       setLaunch({ repoName, step: "starting" });
       start()
         .then(
@@ -355,7 +359,7 @@ export function App({ backend }: { backend: Backend }) {
           setLaunchBusy(false);
         });
     },
-    [repos],
+    [repos, localRepos],
   );
   const startLaunch = useCallback(
     (path: string, mode: LaunchMode) => runLaunch(path, () => backend.launch(path, mode)),
@@ -453,8 +457,13 @@ export function App({ backend }: { backend: Backend }) {
   // state without re-subscribing, and effects run outside the state update.
   const [nav, setNav] = useState<NavState>(initialNavState);
   const navRef = useRef(nav);
-  const ctxRef = useRef<NavContext>({ repos, positions, remoteOnly: projects.remoteOnly });
-  ctxRef.current = { repos, positions, remoteOnly: projects.remoteOnly };
+  const ctxRef = useRef<NavContext>({
+    repos,
+    positions,
+    remoteOnly: projects.remoteOnly,
+    worktrees: projects.worktrees,
+  });
+  ctxRef.current = { repos, positions, remoteOnly: projects.remoteOnly, worktrees: projects.worktrees };
   const runEffects = useRef<(effects: NavEffect[]) => void>(() => {});
   runEffects.current = (effects) => {
     for (const e of effects) {
@@ -516,11 +525,15 @@ export function App({ backend }: { backend: Backend }) {
   const onSelect = useCallback((path: string) => send({ type: "select", path }), [send]);
   const onBackgroundClick = useCallback(() => send({ type: "backgroundClick" }), [send]);
 
-  const matches = useMemo(() => matchingPaths(repoList, nav.filter), [repoList, nav.filter]);
+  const matches = useMemo(
+    () => matchingPaths(repoList, nav.filter, projects.worktrees),
+    [repoList, nav.filter, projects.worktrees],
+  );
   const focusedRepo = nav.focused ? repos.get(nav.focused) : undefined;
   const focusNotCloned = !!focusedRepo && projects.remoteOnly.has(focusedRepo.path);
   const focusMigration = focusedRepo ? moves.state.get(focusedRepo.path) : undefined;
   const focusMove = focusMigration ? stepText(focusMigration.phase) : null;
+  const focusWorktrees = focusedRepo ? projects.worktrees.get(focusedRepo.path) : undefined;
   const focusLabel = useMemo(
     () =>
       focusedRepo && (
@@ -529,21 +542,29 @@ export function App({ backend }: { backend: Backend }) {
           notCloned={focusNotCloned}
           windowsDrive={!focusNotCloned && isWindowsDrive(focusedRepo.path)}
           move={focusMove}
+          worktrees={focusWorktrees}
         />
       ),
-    [focusedRepo, focusNotCloned, focusMove],
+    [focusedRepo, focusNotCloned, focusMove, focusWorktrees],
   );
-  // The Windows-drive marker and the Move to WSL ring, on cloned gems only.
+  // The Windows-drive marker, the Move to WSL ring and the worktree count, on cloned gems only.
   const marks = useMemo(() => {
     const out = new Map<string, ReactNode>();
     for (const repo of repoList) {
       if (projects.remoteOnly.has(repo.path)) continue;
       const migration = moves.state.get(repo.path);
       const windows = isWindowsDrive(repo.path);
-      if (windows || migration) out.set(repo.path, <GemMark windows={windows} migration={migration} />);
+      const folded = projects.worktrees.get(repo.path);
+      const checkouts = folded && {
+        count: folded.length,
+        removable: folded.some((w) => worktreeView(w)?.removable),
+      };
+      if (windows || migration || checkouts) {
+        out.set(repo.path, <GemMark windows={windows} migration={migration} checkouts={checkouts} />);
+      }
     }
     return out;
-  }, [repoList, projects.remoteOnly, moves.state]);
+  }, [repoList, projects.remoteOnly, projects.worktrees, moves.state]);
   const zoomedRepo = nav.zoomed ? repos.get(nav.zoomed) : undefined;
   const refactorNotices = useRefactorNotices(backend, nav.zoomed);
   const notice = refactorNotices.notice;
@@ -558,7 +579,8 @@ export function App({ backend }: { backend: Backend }) {
     zoomedRemote ??
     (origin && (origin.host === "github.com" || origin.host === gitlabHost) ? origin : null);
   const details = useRemoteDetails(backend, detailsRef, visible);
-  const pickerRepo = nav.picker ? repos.get(nav.picker.path) : undefined;
+  const pickerRepo = nav.picker ? findRepo(ctxRef.current, nav.picker.path) : undefined;
+  const zoomedWorktrees = zoomedRepo ? projects.worktrees.get(zoomedRepo.path) : undefined;
   const now = Date.now();
   const showOffer =
     !offerDismissed &&
@@ -589,6 +611,7 @@ export function App({ backend }: { backend: Backend }) {
           <Scene
             repos={repoList}
             remoteOnly={projects.remoteOnly}
+            worktrees={projects.worktrees}
             visible={visible}
             quality={quality.level}
             theme={themeMode}
@@ -625,6 +648,18 @@ export function App({ backend }: { backend: Backend }) {
           remoteOnly={zoomedRemoteOnly}
           details={details.state}
           onRefreshDetails={details.refresh}
+          worktrees={zoomedWorktrees}
+          worktreeSection={
+            !zoomedRemoteOnly &&
+            zoomedWorktrees && (
+              <WorktreesSection
+                worktrees={zoomedWorktrees}
+                now={now}
+                onOpen={(path) => send({ type: "launch", path })}
+                onRemove={(path) => backend.removeWorktree(path)}
+              />
+            )
+          }
           refactor={
             !zoomedRemoteOnly && (
               <RefactorSection

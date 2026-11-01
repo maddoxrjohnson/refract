@@ -193,6 +193,11 @@ export class TauriBackend implements Backend {
     return invoke<void>("set_zoomed", { path });
   }
 
+  /** Rejects with `CommandError`, as merge and discard do. */
+  removeWorktree(path: string): Promise<void> {
+    return invoke<void>("remove_worktree", { path });
+  }
+
   // The hook and usage commands reject with `AgentRequestError`, as `agent_request` does.
 
   hookInfo(): Promise<HookInfo> {

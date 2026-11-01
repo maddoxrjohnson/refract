@@ -1,4 +1,11 @@
-import type { MigrationReport, RefactorInfo, RepoSnapshot, ResumeReason, SessionInfo } from "../backend/types";
+import type {
+  MigrationReport,
+  RefactorInfo,
+  RepoSnapshot,
+  ResumeReason,
+  SessionInfo,
+  WorktreeInfo,
+} from "../backend/types";
 
 // Fixtures for the overlay tests. Invented names only.
 
@@ -47,6 +54,39 @@ export function testRepo(extra: Partial<RepoSnapshot> = {}): RepoSnapshot {
     preselect: { kind: "noPicker" },
     ...extra,
   };
+}
+
+/** A linked worktree's facts: clean and pushed, so it can be removed. */
+export function testWorktreeInfo(extra: Partial<WorktreeInfo> = {}): WorktreeInfo {
+  return {
+    locked: false,
+    operation: null,
+    untrackedChecked: true,
+    onlyHere: 0,
+    merged: null,
+    release: null,
+    ignored: [],
+    status: { kind: "pushed" },
+    removable: true,
+    ...extra,
+  };
+}
+
+/** A linked worktree of the test repo, `tidepool-<name>` on branch `<name>`. */
+export function testWorktree(
+  name: string,
+  info: Partial<WorktreeInfo> = {},
+  extra: Partial<RepoSnapshot> = {},
+): RepoSnapshot {
+  const main = testRepo();
+  return testRepo({
+    path: `${main.path}-${name}`,
+    name: `${main.name}-${name}`,
+    branch: name,
+    worktreeOf: main.path,
+    worktree: testWorktreeInfo(info),
+    ...extra,
+  });
 }
 
 /** A repo on a Windows drive, and where Move to WSL puts it. */

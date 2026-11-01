@@ -12,13 +12,25 @@ export interface RepoStatus {
   waiting: boolean;
 }
 
-export function repoStatus(repo: RepoSnapshot): RepoStatus {
+/**
+ * `worktrees` are the linked worktrees folded into the repo's gem: an agent working or
+ * waiting in one shows on the main stone too (worktrees spec §3). Their changes and
+ * interrupted sessions stay in their own rows of the panel.
+ */
+export function repoStatus(repo: RepoSnapshot, worktrees: readonly RepoSnapshot[] = []): RepoStatus {
   let interrupted = false;
   let working = false;
   let waiting = false;
   for (const s of repo.sessions) {
     if (s.state.kind === "interrupted") interrupted = true;
     else if (s.state.kind === "live") {
+      if (s.state.detail === "working") working = true;
+      else if (s.state.detail === "waitingOnUser") waiting = true;
+    }
+  }
+  for (const wt of worktrees) {
+    for (const s of wt.sessions) {
+      if (s.state.kind !== "live") continue;
       if (s.state.detail === "working") working = true;
       else if (s.state.detail === "waitingOnUser") waiting = true;
     }

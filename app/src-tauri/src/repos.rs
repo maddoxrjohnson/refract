@@ -2,7 +2,8 @@
 //! a folder outside the helper's roots. The helper does the work (`cloneRepo`,
 //! `addRepo`) and reports the repo with `repoChanged`; these commands only ask it.
 //! Merging and discarding a repo's refactor go the same way (`mergeRefactor`,
-//! `discardRefactor`); starting one is a launch (see `launch.rs`).
+//! `discardRefactor`), as does removing a linked worktree (`removeWorktree`); starting
+//! a refactor is a launch (see `launch.rs`).
 
 use std::time::Duration;
 
@@ -19,9 +20,9 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(11 * 60);
 /// How long `add_repo` waits: git runs once and the roots are searched again, which is
 /// slow under `/mnt/`.
 const ADD_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long `merge_refactor` and `discard_refactor` wait: the helper runs them on a
-/// worker, and a rebase, or removing a worktree that holds installed dependencies, can
-/// take a while.
+/// How long `merge_refactor`, `discard_refactor` and `remove_worktree` wait: the helper
+/// runs them on a worker, and a rebase, or removing a worktree that holds installed
+/// dependencies, can take a while.
 const REFACTOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// The parts of the interface's `RemoteRepo` a clone needs; the rest is ignored.
@@ -52,6 +53,8 @@ pub enum RepoErrorKind {
     NotARepo,
     /// The helper refused or failed to merge or discard a refactor.
     Refactor,
+    /// The helper refused to remove a worktree; the message names why.
+    Worktree,
     /// A merge or discard is still running in the helper after the wait.
     Pending,
     /// The helper failed, is not running or did not answer.
@@ -78,6 +81,7 @@ impl RepoError {
                     code::CLONE_FAILED => RepoErrorKind::Clone,
                     code::REPO_NOT_FOUND => RepoErrorKind::NotARepo,
                     code::REFACTOR_FAILED => RepoErrorKind::Refactor,
+                    code::WORKTREE_REFUSED => RepoErrorKind::Worktree,
                     _ => RepoErrorKind::Agent,
                 };
                 RepoError::new(kind, format!("{doing}: {message}"))
@@ -171,6 +175,18 @@ pub async fn discard_refactor(app: AppHandle, path: String) -> Result<(), RepoEr
     }
 }
 
+/// Removes the linked worktree at `path` with `git worktree remove`, keeping its branch.
+/// The helper refuses, saying why, when anything in it could be lost.
+#[tauri::command]
+pub async fn remove_worktree(app: AppHandle, path: String) -> Result<(), RepoError> {
+    match request(app, Method::RemoveWorktree { path }, REFACTOR_TIMEOUT).await? {
+        Ok(Reply::Done) => Ok(()),
+        Ok(other) => Err(RepoError::unexpected("removeWorktree", &other)),
+        Err(RequestError::Timeout) => Err(RepoError::still_running()),
+        Err(err) => Err(RepoError::agent("Cannot remove the worktree", err)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -247,6 +263,18 @@ mod tests {
             serde_json::to_value(RepoError::agent("x", agent(code::REFACTOR_FAILED))).unwrap()
                 ["kind"],
             json!("refactor")
+        );
+        assert_eq!(
+            serde_json::to_value(RepoError::agent(
+                "Cannot remove the worktree",
+                RequestError::Agent {
+                    code: code::WORKTREE_REFUSED,
+                    message: "This worktree has uncommitted changes.".into(),
+                }
+            ))
+            .unwrap(),
+            json!({"kind": "worktree",
+                "message": "Cannot remove the worktree: This worktree has uncommitted changes."})
         );
         let timeout = RepoError::agent("x", RequestError::Timeout);
         assert_eq!(

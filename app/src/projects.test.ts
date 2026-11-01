@@ -9,7 +9,7 @@ import {
   remoteKey,
   remoteMass,
 } from "./projects";
-import { testRepo } from "./ui/testRepo";
+import { testRepo, testWorktree } from "./ui/testRepo";
 
 const SETTINGS: Settings = {
   gitlabUrl: null,
@@ -138,6 +138,41 @@ describe("mergeProjects", () => {
       repos: [local],
       remotes: new Map(),
       remoteOnly: new Set(),
+      worktrees: new Map(),
+    });
+  });
+
+  describe("worktrees", () => {
+    const main = testRepo();
+    const search = testWorktree("search");
+    const cards = testWorktree("cards");
+
+    it("fold into their shown main repo's gem, by name", () => {
+      const { repos, worktrees, remotes } = mergeProjects(
+        [search, main, cards],
+        list(remote("tidepool")),
+        SETTINGS,
+      );
+      expect(repos).toEqual([main]);
+      expect(worktrees).toEqual(new Map([[main.path, [cards, search]]]));
+      expect([...remotes.keys()]).toEqual([main.path]);
+    });
+
+    it("stay gems of their own when the main repo is absent or hidden", () => {
+      expect(mergeProjects([search], null, SETTINGS).repos).toEqual([search]);
+      // Hidden by path: the worktree, with its own path, still shows.
+      const hidden = mergeProjects([main, search], null, { ...SETTINGS, hidden: [main.path] });
+      expect(hidden.repos).toEqual([search]);
+      expect(hidden.worktrees.size).toBe(0);
+    });
+
+    it("hidden by their own path are left out", () => {
+      const { repos, worktrees } = mergeProjects([main, search, cards], null, {
+        ...SETTINGS,
+        hidden: [search.path],
+      });
+      expect(repos).toEqual([main]);
+      expect(worktrees.get(main.path)).toEqual([cards]);
     });
   });
 });

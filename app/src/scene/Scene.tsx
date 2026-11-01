@@ -54,6 +54,8 @@ export interface SceneProps {
   reducedMotion: boolean;
   /** Paths of gems that are not cloned; they draw stippled. */
   remoteOnly: ReadonlySet<string>;
+  /** Linked worktrees folded into a gem, by its path: their agents show on its stone. */
+  worktrees?: ReadonlyMap<string, readonly RepoSnapshot[]>;
   /** Filter result; `null` is no filter. Gems outside it fade towards the paper. */
   matches: ReadonlySet<string> | null;
   /** Path of the gem that lifts, grows a little and shows `focusLabel`. */
@@ -513,7 +515,7 @@ interface Leaving {
 }
 
 function SceneContents(props: ContentsProps) {
-  const { repos, remoteOnly, quality, theme, reducedMotion, matches, focused, zoomed, focusLabel, visible, marks } =
+  const { repos, remoteOnly, worktrees, quality, theme, reducedMotion, matches, focused, zoomed, focusLabel, visible, marks } =
     props;
   const tier = TIERS[quality];
   const gl = useThree((s) => s.gl);
@@ -678,7 +680,7 @@ function SceneContents(props: ContentsProps) {
   const markKeys = marks ? [...marks.keys()].join("\n") : "";
   useEffect(() => {
     ticker.request(tier.fpsCap, loop.current.lastStart);
-  }, [ticker, tier, repos, leaving, remoteOnly, theme, reducedMotion, matches, focused, zoomed, hasLabel, markKeys, visible]);
+  }, [ticker, tier, repos, leaving, remoteOnly, worktrees, theme, reducedMotion, matches, focused, zoomed, hasLabel, markKeys, visible]);
 
   useEffect(() => {
     const el = gl.domElement;
@@ -901,7 +903,7 @@ function SceneContents(props: ContentsProps) {
   }, 1);
 
   const gemFor = (repo: RepoSnapshot, p: GemPosition, gone: boolean) => {
-    const st = repoStatus(repo);
+    const st = repoStatus(repo, worktrees?.get(repo.path));
     return (
       <Gem
         key={repo.path}

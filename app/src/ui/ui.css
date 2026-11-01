@@ -1057,6 +1057,44 @@
   stroke-width: 0.8;
 }
 
+/* The count of linked worktrees folded into the gem, at its lower right; a dot in the
+   accent when one of them can be removed. */
+.rf-checkout-mark {
+  position: absolute;
+  left: calc(var(--r, 20px) * 0.62);
+  top: calc(var(--r, 20px) * 0.5);
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 5px 0 4px;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 15px;
+  font-variant-numeric: tabular-nums;
+  color: var(--fg);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  white-space: nowrap;
+}
+
+.rf-checkout-mark svg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.1;
+}
+
+.rf-checkout-mark--removable::after {
+  content: "";
+  position: absolute;
+  right: -2px;
+  top: -2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+}
+
 /* A thin ring just outside the stone; it fills as the move goes on. */
 .rf-move-ring {
   position: absolute;
@@ -2078,4 +2116,95 @@ body:has(.rf-toast) .rf-demo-badge {
   .rf-term__cursor {
     animation: none;
   }
+}
+
+/* Worktrees: the panel section (.plans/worktrees-spec.md §4) */
+
+.rf-worktrees__list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.rf-worktree {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.rf-worktree + .rf-worktree {
+  padding-top: 12px;
+  border-top: 1px dashed var(--line);
+}
+
+.rf-worktree__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  min-width: 0;
+}
+
+.rf-worktree__name {
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.rf-worktree__branch {
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.rf-worktree__status {
+  margin: 0;
+}
+
+/* Red only when an agent there needs you, as the status line does. */
+.rf-worktree__status--attention {
+  color: var(--accent);
+}
+
+.rf-worktree__status--keep,
+.rf-worktree__status--working {
+  color: var(--fg);
+}
+
+.rf-worktree__ready {
+  color: var(--muted);
+}
+
+/* One line of what the agent last said; the title holds the rest. */
+.rf-worktree__said {
+  display: flex;
+  gap: 0.35em;
+  min-width: 0;
+  margin: 0;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.rf-worktree__quote {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding-left: 8px;
+  border-left: 2px solid color-mix(in srgb, var(--fg) 35%, transparent);
+}
+
+.rf-worktree__said .rf-muted {
+  flex: none;
+}
+
+.rf-worktree .rf-row {
+  margin-top: 2px;
+}
+
+/* Compact, as the rows are a list; the confirm's buttons keep their width too. */
+.rf-worktree .rf-row > .rf-button {
+  flex: none;
+  min-width: 88px;
 }
