@@ -1,6 +1,6 @@
 //! The agent's picture of every repo, and the events that keep the app in step with it.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -20,6 +20,7 @@ use crate::git::{self, HeadInfo, Status};
 use crate::procs::{self, ClaudeProcess, LiveProcess};
 use crate::scan;
 use crate::sessions::SessionReader;
+use crate::subagents;
 
 /// Sessions active this recently keep their repo on the liveness timer.
 pub const RECENT_ACTIVITY: TimeDelta = TimeDelta::minutes(10);
@@ -66,6 +67,8 @@ pub struct RepoState {
     pub live: HashMap<String, Option<LiveProcess>>,
     /// Status hook statuses of this repo's sessions, by session id.
     pub hooks: HashMap<String, HookReport>,
+    /// Background subagents running, by live session id; sessions with none are left out.
+    pub background: HashMap<String, u32>,
     pub snapshot: RepoSnapshot,
     /// What the repo was on disk when it was first read.
     pub id: Option<scan::RepoId>,
@@ -78,7 +81,13 @@ impl RepoState {
     /// built earlier can be stale even when nothing on disk moved; call this before
     /// answering `listRepos` or `getRepo`.
     pub fn refresh_preselect(&mut self, now: DateTime<Utc>) -> bool {
-        let candidates = candidates(&self.snapshot.path, &self.sessions, &self.live, &self.hooks);
+        let candidates = candidates(
+            &self.snapshot.path,
+            &self.sessions,
+            &self.live,
+            &self.hooks,
+            &self.background,
+        );
         let fresh = preselect(&candidates, &repo_facts(&self.status, &self.head), now);
         if fresh == self.snapshot.preselect {
             return false;
@@ -245,14 +254,19 @@ impl Agent {
         if what.sessions {
             self.procs = procs::scan();
         }
-        let (sessions, live) = if what.sessions {
+        let (sessions, live, background) = if what.sessions {
             let sessions = self.reader.read_repo(&path_str(path));
             let live = live_set(&self.procs, path, &sessions);
-            (sessions, live)
+            let background = self.background_for(&live);
+            (sessions, live, background)
         } else {
-            (old.sessions.clone(), old.live.clone())
+            (
+                old.sessions.clone(),
+                old.live.clone(),
+                old.background.clone(),
+            )
         };
-        self.store(path.to_owned(), status, head, sessions, live);
+        self.store(path.to_owned(), status, head, sessions, live, background);
         let moved = if what.head {
             self.update_masses()
         } else {
@@ -359,13 +373,14 @@ impl Agent {
         for path in stale {
             let repo = &self.repos[&path];
             let old = repo.snapshot.clone();
-            let (status, head, sessions, live) = (
+            let (status, head, sessions, live, background) = (
                 repo.status.clone(),
                 repo.head.clone(),
                 repo.sessions.clone(),
                 repo.live.clone(),
+                repo.background.clone(),
             );
-            self.store(path.clone(), status, head, sessions, live);
+            self.store(path.clone(), status, head, sessions, live, background);
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
         events
@@ -410,16 +425,75 @@ impl Agent {
                 repo.head.clone(),
                 repo.sessions.clone(),
             );
-            self.store(path.clone(), status, head, sessions, live);
+            let background = self.background_for(&live);
+            self.store(path.clone(), status, head, sessions, live, background);
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
         events
     }
 
+    /// Counts the background subagents of live sessions again, of those in `only` or of
+    /// every live session, and returns events for the sessions whose state changed.
+    pub fn refresh_background(&mut self, only: Option<&HashSet<String>>) -> Vec<Event> {
+        let wanted = |id: &String| only.is_none_or(|ids| ids.contains(id));
+        let stale: Vec<(PathBuf, HashMap<String, u32>)> = self
+            .repos
+            .iter()
+            .filter(|(_, r)| r.live.keys().any(wanted))
+            .filter_map(|(p, r)| {
+                let background = self.background_for(&r.live);
+                (background != r.background).then(|| (p.clone(), background))
+            })
+            .collect();
+        let mut events = Vec::new();
+        for (path, background) in stale {
+            let repo = &self.repos[&path];
+            let old = repo.snapshot.clone();
+            let (status, head, sessions, live) = (
+                repo.status.clone(),
+                repo.head.clone(),
+                repo.sessions.clone(),
+                repo.live.clone(),
+            );
+            self.store(path.clone(), status, head, sessions, live, background);
+            events.extend(diff(&old, &self.repos[&path].snapshot));
+        }
+        events
+    }
+
+    /// Every live session's id and the directory beside its transcript, whose
+    /// `subagents` tree says which background agents it runs.
+    pub fn live_session_dirs(&self) -> Vec<(String, PathBuf)> {
+        let mut dirs: Vec<(String, PathBuf)> = self
+            .repos
+            .values()
+            .flat_map(|r| r.live.keys())
+            .filter_map(|id| Some((id.clone(), self.reader.session_dir(id)?)))
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+
+    /// Background subagents running for each session in `live` (see
+    /// [`crate::subagents`]), counting only those started since its process did when
+    /// that is known. Sessions with none are left out.
+    fn background_for(&self, live: &HashMap<String, Option<LiveProcess>>) -> HashMap<String, u32> {
+        live.iter()
+            .filter_map(|(id, process)| {
+                let dir = subagents::dir(&self.reader.session_dir(id)?);
+                let since = process.as_ref().and_then(|p| p.started);
+                let count = subagents::count_running(&dir, since);
+                (count > 0).then(|| (id.clone(), count))
+            })
+            .collect()
+    }
+
     fn insert(&mut self, path: PathBuf, status: Status, head: HeadInfo) {
         let sessions = self.reader.read_repo(&path_str(&path));
         let live = live_set(&self.procs, &path, &sessions);
-        self.store(path, status, head, sessions, live);
+        let background = self.background_for(&live);
+        self.store(path, status, head, sessions, live, background);
     }
 
     fn store(
@@ -429,13 +503,22 @@ impl Agent {
         head: HeadInfo,
         sessions: Vec<SessionSummary>,
         live: HashMap<String, Option<LiveProcess>>,
+        background: HashMap<String, u32>,
     ) {
         let old = self.repos.get(&path);
         let mass = old.map_or(0.0, |r| r.snapshot.mass);
         let id = old.map_or_else(|| scan::repo_id(&path), |r| r.id);
         let hooks = hooks_for(&self.hooks, &sessions);
-        let mut snapshot =
-            build_snapshot(&path, &status, &head, &sessions, &live, &hooks, Utc::now());
+        let mut snapshot = build_snapshot(
+            &path,
+            &status,
+            &head,
+            &sessions,
+            &live,
+            &hooks,
+            &background,
+            Utc::now(),
+        );
         snapshot.mass = mass;
         snapshot.refactor = self.refactors.get(&path).cloned();
         self.repos.insert(
@@ -446,6 +529,7 @@ impl Agent {
                 sessions,
                 live,
                 hooks,
+                background,
                 snapshot,
                 id,
             },
@@ -613,7 +697,9 @@ fn hooks_for(
 }
 
 /// Builds a snapshot with mass 0; the caller fills in mass across repos. `hooks` holds
-/// status hook statuses by session id.
+/// status hook statuses by session id, and `background` the number of background
+/// subagents running by live session id.
+#[allow(clippy::too_many_arguments)]
 pub fn build_snapshot(
     path: &Path,
     status: &Status,
@@ -621,6 +707,7 @@ pub fn build_snapshot(
     sessions: &[SessionSummary],
     live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
+    background: &HashMap<String, u32>,
     now: DateTime<Utc>,
 ) -> RepoSnapshot {
     let root = path_str(path);
@@ -630,7 +717,7 @@ pub fn build_snapshot(
         .map(|p| format!("{}/{p}", root.trim_end_matches('/')))
         .collect();
     // Reasons and preselect come from the same candidates and facts, so they agree.
-    let candidates = candidates(&root, sessions, live, hooks);
+    let candidates = candidates(&root, sessions, live, hooks, background);
     let facts = repo_facts(status, head);
     let reasons = resume_reasons(&candidates, &facts);
     let preselect = preselect(&candidates, &facts, now);
@@ -678,13 +765,19 @@ fn session_states(
     sessions: &[SessionSummary],
     live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
+    background: &HashMap<String, u32>,
 ) -> Vec<SessionState> {
     sessions
         .iter()
         .map(|s| {
             let id = s.session_id.as_ref();
             let is_live = id.is_some_and(|id| live.contains_key(id));
-            classify_report(s, is_live, id.and_then(|id| hooks.get(id).copied()))
+            classify_report(
+                s,
+                is_live,
+                id.and_then(|id| hooks.get(id).copied()),
+                id.and_then(|id| background.get(id).copied()).unwrap_or(0),
+            )
         })
         .collect()
 }
@@ -695,8 +788,9 @@ fn candidates<'a>(
     sessions: &'a [SessionSummary],
     live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
+    background: &HashMap<String, u32>,
 ) -> Vec<Candidate<'a>> {
-    let states = session_states(sessions, live, hooks);
+    let states = session_states(sessions, live, hooks, background);
     sessions
         .iter()
         .zip(states)
@@ -789,8 +883,9 @@ pub fn path_str(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use refract_core::classify::{FinishKind, LiveState};
+    use refract_core::classify::{FinishKind, HookStatus, LiveState};
     use refract_core::preselect::Preselect;
+    use std::fs;
 
     fn session(id: &str, state: SessionState) -> SessionInfo {
         SessionInfo {
@@ -810,6 +905,7 @@ mod tests {
             &Status::default(),
             &HeadInfo::default(),
             &[],
+            &HashMap::new(),
             &HashMap::new(),
             &HashMap::new(),
             Utc::now(),
@@ -846,6 +942,7 @@ mod tests {
             &HeadInfo::default(),
             &sessions,
             &live,
+            &HashMap::new(),
             &HashMap::new(),
             Utc::now(),
         );
@@ -918,5 +1015,72 @@ mod tests {
             blocked: None,
         });
         assert!(matches!(diff(&old, &new)[..], [Event::RepoChanged(_)]));
+    }
+
+    #[test]
+    fn a_background_agent_starting_or_finishing_reclassifies_its_live_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = PathBuf::from("/home/dev/projects/tidepool-api");
+        let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
+        let project = tmp.path().join("-home-dev-projects-tidepool-api");
+        fs::create_dir_all(&project).unwrap();
+        let line = format!(
+            "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\",\
+             \"timestamp\":\"2026-11-01T09:00:00Z\",\"message\":{{\"role\":\"user\",\
+             \"content\":\"chart the tides\"}}}}\n",
+            repo.display()
+        );
+        fs::write(project.join(format!("{id}.jsonl")), line).unwrap();
+        let mut agent = Agent::new(Config {
+            roots: vec![],
+            extra: vec![],
+            hidden: vec![],
+            depth: 1,
+            claude_projects: tmp.path().to_owned(),
+            limits_file: tmp.path().join("usage-state.json"),
+        });
+        let sessions = agent.reader.read_repo(&path_str(&repo));
+        assert_eq!(sessions.len(), 1);
+        let live: HashMap<String, Option<LiveProcess>> = [(
+            id.to_owned(),
+            Some(LiveProcess {
+                pid: 812,
+                started: Some(Utc::now() - TimeDelta::minutes(1)),
+                refract_folder: None,
+            }),
+        )]
+        .into();
+        let finished = HookReport {
+            status: HookStatus::Finished,
+            at: None,
+        };
+        agent.hooks.insert(id.to_owned(), finished);
+        let (status, head) = (Status::default(), HeadInfo::default());
+        agent.store(repo.clone(), status, head, sessions, live, HashMap::new());
+        let state = |agent: &Agent| agent.repos[&repo].snapshot.sessions[0].state;
+        assert_eq!(state(&agent), SessionState::Live(LiveState::Idle));
+        let session_dir = project.join(id);
+        assert_eq!(
+            agent.live_session_dirs(),
+            [(id.to_owned(), session_dir.clone())]
+        );
+
+        let meta = subagents::dir(&session_dir).join("agent-a1.meta.json");
+        fs::create_dir_all(meta.parent().unwrap()).unwrap();
+        let running = r#"{"agentType":"implementer","requestShape":"background"}"#;
+        fs::write(&meta, running).unwrap();
+        let ids: HashSet<String> = [id.to_owned()].into();
+        let changed = |events: &[Event]| match events {
+            [Event::SessionChanged(change)] => change.session.state,
+            other => panic!("unexpected {other:?}"),
+        };
+        let events = agent.refresh_background(Some(&ids));
+        assert_eq!(changed(&events), SessionState::Live(LiveState::Working));
+        assert!(agent.refresh_background(None).is_empty());
+
+        let done = r#"{"agentType":"implementer","requestShape":"background","finished":true}"#;
+        fs::write(&meta, done).unwrap();
+        let events = agent.refresh_background(Some(&ids));
+        assert_eq!(changed(&events), SessionState::Live(LiveState::Idle));
     }
 }

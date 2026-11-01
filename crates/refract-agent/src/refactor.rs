@@ -1366,10 +1366,15 @@ fn look(
             summary.as_ref().unwrap_or(&SessionSummary::default()),
             ours,
             hook,
+            0,
         )
     });
-    let finished =
-        |s: &SessionSummary| matches!(classify_report(s, false, None), SessionState::Finished(_));
+    let finished = |s: &SessionSummary| {
+        matches!(
+            classify_report(s, false, None, 0),
+            SessionState::Finished(_)
+        )
+    };
     let idle = others == 0
         && match state {
             Some(SessionState::Live(LiveState::Idle)) => true,

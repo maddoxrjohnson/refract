@@ -15,7 +15,10 @@
 //! directory the repo search walks (for repos appearing or vanishing), the directory and
 //! git directory of each repo the search found but git could not read yet (for it
 //! becoming readable; the server also tries such a repo again on a timer, see
-//! [`crate::server::RETRY_DELAYS`]), and the status hook's directory of status files.
+//! [`crate::server::RETRY_DELAYS`]), the status hook's directory of status files, and
+//! for each live session its directory beside the transcript and every directory of
+//! its `subagents` tree, for background agents starting and finishing (see
+//! [`crate::subagents`]).
 //!
 //! Re-watching a repo only adds and removes the directories that differ, so events
 //! already queued for unchanged watches still map to their repo. When the kernel drops a
@@ -70,6 +73,11 @@ pub enum Target {
     UnreadRepo(PathBuf),
     /// The status hook's directory of `<session id>.json` files.
     HookDir,
+    /// The directory beside a live session's transcript, by session id, for its
+    /// `subagents` directory appearing.
+    SessionDir(String),
+    /// A directory of a live session's `subagents` tree, by session id.
+    Subagents(String),
 }
 
 impl Target {
@@ -92,6 +100,9 @@ pub enum Change {
     Sessions(String),
     /// This status hook file was written or removed.
     Hook(String),
+    /// A subagent of this live session started or finished, or its `subagents` tree
+    /// grew a directory.
+    Background(String),
     /// A project directory appeared.
     NewProjectDir(String),
     /// Something changed in a repo git could not read; it may be readable now.
@@ -313,6 +324,39 @@ impl Watcher {
         self.add(dir, mask, Target::HookDir);
     }
 
+    /// Watches each live session's directory (`sessions` holds its id and the directory
+    /// beside its transcript) and every directory of its `subagents` tree, replacing the
+    /// previous set.
+    ///
+    /// Returns true when it watched a directory that was not watched before. What changed
+    /// there before the watch was not seen, so the caller counts the agents again.
+    pub fn watch_subagents(&mut self, sessions: &[(String, PathBuf)]) -> bool {
+        let session_mask = WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::ONLYDIR;
+        let mask = WatchMask::CLOSE_WRITE
+            | WatchMask::CREATE
+            | WatchMask::DELETE
+            | WatchMask::MOVED_FROM
+            | WatchMask::MOVED_TO
+            | WatchMask::ONLYDIR;
+        let mut wanted = Vec::new();
+        for (id, dir) in sessions {
+            wanted.push((dir.clone(), session_mask, Target::SessionDir(id.clone())));
+            let mut dirs = Vec::new();
+            collect_dirs(
+                &crate::subagents::dir(dir),
+                &mut dirs,
+                crate::subagents::MAX_DIRS,
+            );
+            for sub in dirs {
+                wanted.push((sub, mask, Target::Subagents(id.clone())));
+            }
+        }
+        self.sync(
+            |t| matches!(t, Target::SessionDir(_) | Target::Subagents(_)),
+            wanted,
+        )
+    }
+
     /// Number of inotify watches held.
     pub fn len(&self) -> usize {
         self.targets.len()
@@ -531,6 +575,14 @@ pub fn change_for(
         Target::HookDir => name
             .filter(|n| n.ends_with(".json") && !n.starts_with('.'))
             .map(|n| Change::Hook(n.to_owned())),
+        Target::SessionDir(id) => (name? == "subagents").then(|| Change::Background(id.clone())),
+        // Transcripts beside the meta files are written often and say nothing here. A new
+        // directory (a workflow run) needs watching and may already hold meta files.
+        Target::Subagents(id) => {
+            let new_dir = mask.contains(EventMask::ISDIR)
+                && mask.intersects(EventMask::CREATE | EventMask::MOVED_TO);
+            (new_dir || name?.ends_with(".meta.json")).then(|| Change::Background(id.clone()))
+        }
     }
 }
 
@@ -732,6 +784,66 @@ mod tests {
             change_for(&Target::HookDir, EventMask::DELETE_SELF, None),
             None
         );
+    }
+
+    #[test]
+    fn subagent_events() {
+        let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
+        let background = Some(Change::Background(id.into()));
+        let session = Target::SessionDir(id.into());
+        let mkdir = EventMask::CREATE | EventMask::ISDIR;
+        assert_eq!(change(session.clone(), mkdir, "subagents"), background);
+        assert_eq!(change(session, mkdir, "tool-results"), None);
+        let tree = Target::Subagents(id.into());
+        assert_eq!(
+            change(tree.clone(), EventMask::CLOSE_WRITE, "agent-a1.meta.json"),
+            background
+        );
+        assert_eq!(
+            change(tree.clone(), EventMask::MOVED_TO, "agent-a1.meta.json"),
+            background
+        );
+        assert_eq!(
+            change(tree.clone(), EventMask::CLOSE_WRITE, "agent-a1.jsonl"),
+            None
+        );
+        assert_eq!(change(tree, mkdir, "workflows"), background);
+    }
+
+    #[test]
+    fn subagent_trees_of_live_sessions_are_watched_at_any_depth() {
+        let tmp = tempfile::tempdir().unwrap();
+        let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
+        let session = tmp.path().join(id);
+        fs::create_dir_all(&session).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = start(move |batch| tx.send(batch).is_ok()).unwrap();
+        let sessions = vec![(id.to_owned(), session.clone())];
+        assert!(watcher.watch_subagents(&sessions));
+        fn changes(watcher: &Watcher, rx: &std::sync::mpsc::Receiver<Vec<FsEvent>>) -> Vec<Change> {
+            fs_events(rx)
+                .iter()
+                .flat_map(|e| watcher.changes(e))
+                .collect()
+        }
+        let background = Change::Background(id.into());
+
+        let nested = session.join("subagents/workflows/run-kelp");
+        fs::create_dir_all(&nested).unwrap();
+        assert!(changes(&watcher, &rx).contains(&background));
+        // The tree grew: watching it again adds its new directories.
+        assert!(watcher.watch_subagents(&sessions));
+        assert_eq!(watcher.len(), 4);
+        fs::write(nested.join("agent-a1.jsonl"), "{}\n").unwrap();
+        assert!(changes(&watcher, &rx).is_empty());
+        fs::write(nested.join("agent-a1.meta.json"), "{}").unwrap();
+        // Created, then written: the server takes both as one.
+        let seen = changes(&watcher, &rx);
+        assert!(!seen.is_empty() && seen.iter().all(|c| *c == background));
+
+        // A session no longer live is no longer watched.
+        assert!(!watcher.watch_subagents(&[]));
+        assert!(watcher.is_empty());
     }
 
     fn fs_events(rx: &std::sync::mpsc::Receiver<Vec<FsEvent>>) -> Vec<FsEvent> {

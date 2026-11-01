@@ -154,6 +154,8 @@ struct Pending {
     rewatch: HashSet<PathBuf>,
     /// Status hook files written or removed.
     hook_files: HashSet<String>,
+    /// Live sessions whose background subagents may have started or finished.
+    background: HashSet<String>,
     /// Repos git could not read that changed.
     retry: HashSet<PathBuf>,
     rescan: bool,
@@ -180,6 +182,9 @@ impl Pending {
             }
             Change::Hook(name) => {
                 self.hook_files.insert(name);
+            }
+            Change::Background(id) => {
+                self.background.insert(id);
             }
             Change::Retry(path) => {
                 self.retry.insert(path);
@@ -323,6 +328,8 @@ struct Server<W: Write> {
     refactors: Refactors,
     /// When the refactors are next looked at, while there are any.
     next_refactor: Option<Instant>,
+    /// Live sessions and their directories, as last watched for background agents.
+    subagent_dirs: Vec<(String, PathBuf)>,
 }
 
 /// Runs the helper until `shutdown` or the end of `input`.
@@ -397,7 +404,8 @@ where
             server.flush()?;
         }
         if server.next_live.is_some_and(|d| d <= now) {
-            let events = server.agent.recheck_live(Utc::now());
+            let mut events = server.agent.recheck_live(Utc::now());
+            events.extend(server.watch_subagents(false));
             server.send_all(&events)?;
             server.next_live = None;
         }
@@ -558,6 +566,7 @@ impl<W: Write> Server<W> {
             migrations: HashMap::new(),
             refactors: Refactors::from_env(),
             next_refactor: None,
+            subagent_dirs: Vec::new(),
         }
     }
 
@@ -1028,7 +1037,10 @@ impl<W: Write> Server<W> {
             Some(SessionState::Live(LiveState::Working)) => false,
             // Without a status hook, the transcript says whether its last turn ended.
             Some(SessionState::Live(LiveState::Unknown)) => summary.is_some_and(|s| {
-                matches!(classify_report(s, false, None), SessionState::Finished(_))
+                matches!(
+                    classify_report(s, false, None, 0),
+                    SessionState::Finished(_)
+                )
             }),
             _ => {
                 let message = format!("session {} is not running", params.session_id);
@@ -1383,6 +1395,8 @@ impl<W: Write> Server<W> {
             }
         }
         if last {
+            let events = self.watch_subagents(true);
+            self.send_all(&events)?;
             self.send(&Event::LoadComplete)?;
         }
         self.schedule_live();
@@ -1454,6 +1468,28 @@ impl<W: Write> Server<W> {
     fn watch_hook_dir(&mut self) {
         if let Some(watcher) = &mut self.watcher {
             watcher.watch_hook_dir(&hook::status_dir());
+        }
+    }
+
+    /// Watches the `subagents` trees of live sessions, dropping those of sessions no
+    /// longer live, and returns events for sessions whose background agents changed
+    /// before their directories were watched. Unless `force`, it does nothing while the
+    /// live sessions are the same; after file changes it is forced, since a session's
+    /// directory or tree may have appeared or grown.
+    fn watch_subagents(&mut self, force: bool) -> Vec<Event> {
+        let Some(watcher) = &mut self.watcher else {
+            return Vec::new();
+        };
+        let dirs = self.agent.live_session_dirs();
+        if !force && dirs == self.subagent_dirs {
+            return Vec::new();
+        }
+        let added = watcher.watch_subagents(&dirs);
+        self.subagent_dirs = dirs;
+        if added {
+            self.agent.refresh_background(None)
+        } else {
+            Vec::new()
         }
     }
 
@@ -1610,6 +1646,12 @@ impl<W: Write> Server<W> {
         }
         for path in rewatch {
             self.watch_repo(&path);
+        }
+        if !pending.reload && !pending.background.is_empty() {
+            events.extend(self.agent.refresh_background(Some(&pending.background)));
+        }
+        if !loading {
+            events.extend(self.watch_subagents(true));
         }
         // A refactor's commits show as changes in its repo's git directory; its agent's
         // hook status as a status file.

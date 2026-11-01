@@ -128,6 +128,15 @@ impl SessionReader {
         out
     }
 
+    /// The directory beside the transcript of session `id` that holds its subagents and
+    /// tool results, from the transcripts read so far. It may not exist yet.
+    pub fn session_dir(&self, id: &str) -> Option<PathBuf> {
+        self.cache
+            .iter()
+            .find(|(_, c)| c.summary.session_id.as_deref() == Some(id))
+            .map(|(path, _)| path.with_extension(""))
+    }
+
     /// Drops cached summaries of transcripts in `dir`, for when it was removed.
     pub fn forget_dir(&mut self, dir: &Path) {
         self.cache.retain(|path, _| !path.starts_with(dir));

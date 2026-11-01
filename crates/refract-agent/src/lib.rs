@@ -16,6 +16,7 @@ pub mod server;
 pub mod sessions;
 pub mod setup;
 pub mod state;
+pub mod subagents;
 pub mod usage;
 pub mod watch;
 
