@@ -180,6 +180,8 @@ export type WorktreeStatus =
   | { kind: "onlyHereUnknown" }
   /** Another repo lies in the folder (a submodule, a nested worktree or repo, or a `.git` in an ignored folder). */
   | { kind: "holdsRepo" }
+  /** The ignored folders hold too many folders to check them all for another repo. */
+  | { kind: "tooBigToCheck" }
   | { kind: "release"; tag: string }
   | { kind: "merged"; branch: string }
   /** Every commit is on a remote, though not merged. */

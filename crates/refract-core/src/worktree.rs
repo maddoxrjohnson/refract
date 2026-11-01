@@ -32,14 +32,17 @@ pub struct WorktreeFacts {
     /// submodule, another worktree or known repo inside it, or a `.git` in an ignored
     /// folder.
     pub holds_repo: bool,
+    /// The ignored folders hold too many folders to check them all for a `.git`.
+    pub too_many_ignored: bool,
 }
 
 /// The first matching row of spec §4 rows 3-10, and whether the worktree can be removed
 /// as far as git goes: rows 8-10 (in a release, merged, or pushed), and not on a Windows
 /// drive. The app also needs no agent working or waiting there.
 ///
-/// Two rows come before rows 8-10 to keep them from being offered: commits that cannot
-/// be counted (and are not merged), and another repo in the folder. The helper only looks
+/// Three rows come before rows 8-10 to keep them from being offered: commits that cannot
+/// be counted (and are not merged), another repo in the folder, and ignored folders too
+/// big to check for one. The helper only looks
 /// for repos in ignored folders when nothing earlier matched, so that row comes last.
 pub fn derive_worktree_status(f: &WorktreeFacts) -> (WorktreeStatus, bool) {
     let status = if f.locked {
@@ -58,6 +61,8 @@ pub fn derive_worktree_status(f: &WorktreeFacts) -> (WorktreeStatus, bool) {
         }
     } else if f.holds_repo {
         WorktreeStatus::HoldsRepo
+    } else if f.too_many_ignored {
+        WorktreeStatus::TooBigToCheck
     } else if let Some(tag) = &f.release {
         WorktreeStatus::Release { tag: tag.clone() }
     } else if let Some(branch) = &f.merged {
@@ -273,6 +278,14 @@ mod tests {
         assert_eq!(
             derive_worktree_status(&nested),
             (WorktreeStatus::HoldsRepo, false)
+        );
+        let too_big = WorktreeFacts {
+            too_many_ignored: true,
+            ..pushed()
+        };
+        assert_eq!(
+            derive_worktree_status(&too_big),
+            (WorktreeStatus::TooBigToCheck, false)
         );
         // Unpushed commits say more than a nested repo.
         let both = WorktreeFacts {

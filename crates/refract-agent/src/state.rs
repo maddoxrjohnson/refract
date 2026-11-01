@@ -257,7 +257,7 @@ impl Agent {
             }
         }
         if what.status || what.head {
-            git::finish_worktree(path, &mut status, &head);
+            git::finish_worktree_from(path, &mut status, &head, (&old.status, &old.head));
         }
         let old_snapshot = old.snapshot.clone();
         if what.sessions {

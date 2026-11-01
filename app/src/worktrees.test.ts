@@ -23,6 +23,7 @@ describe("worktree rows", () => {
       [{ kind: "onlyHere", count: 100 }, "100+ commits only on this computer"],
       [{ kind: "onlyHereUnknown" }, "Can't tell if its commits are pushed"],
       [{ kind: "holdsRepo" }, "Holds another repo"],
+      [{ kind: "tooBigToCheck" }, "Too many ignored files to check"],
       [{ kind: "release", tag: "v1.4.0" }, "In v1.4.0"],
       [{ kind: "merged", branch: "main" }, "Merged into main"],
       [{ kind: "pushed" }, "Pushed, not merged"],

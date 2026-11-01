@@ -42,12 +42,31 @@ pub struct Worktree {
     /// The main working tree's real path.
     pub main: PathBuf,
     /// The git part of its status read with the status, with `changes` from the status's
-    /// `paths`. The ref facts (`only_here`, `merged`, `release`) are left empty here: they
-    /// come from [`HeadInfo::worktree`] (see [`worktree_facts`]).
+    /// `paths`. The ref facts (`only_here`, `merged`, `release`) and the nested-repo facts
+    /// are left empty here: they come from [`HeadInfo::worktree`], `submodules` and
+    /// `nested` (see [`worktree_facts`]).
     pub facts: WorktreeFacts,
+    /// See [`has_submodules`].
+    pub submodules: bool,
     /// Top-level ignored entries, at most [`MAX_IGNORED`]. Read only once the worktree
     /// could be removed (see [`finish_worktree`]); empty otherwise and on a Windows drive.
     pub ignored: Vec<String>,
+    /// Whether an ignored folder holds a repo, read with `ignored`.
+    pub nested: Nested,
+}
+
+/// What a search of a worktree's ignored folders for a `.git` found (see
+/// [`nested_repo_in`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Nested {
+    /// No `.git`, or not searched.
+    #[default]
+    None,
+    /// A `.git`: another repo or worktree.
+    Repo,
+    /// An ignored folder held more than [`NESTED_REPO_BUDGET`] folders, so the search
+    /// could not tell.
+    TooMany,
 }
 
 /// The ref facts of a linked worktree (spec §4): refreshed when HEAD or refs move, not
@@ -65,13 +84,30 @@ pub struct WorktreeRefs {
 /// The most top-level ignored entries kept: 8 to show, and one more to say "and more".
 pub const MAX_IGNORED: usize = 9;
 
-/// How deep [`holds_repo_in`] looks inside each ignored folder for a `.git`: the folder
+/// How deep [`nested_repo_in`] looks inside each ignored folder for a `.git`: the folder
 /// itself is depth 0. `<ignored>/worktrees/<name>/.git` is found at depth 2.
 const NESTED_REPO_DEPTH: usize = 4;
 
-/// The most folders [`holds_repo_in`] reads before giving up and counting the worktree as
-/// holding a repo, so a huge ignored tree (`node_modules/`) costs a bounded walk.
+/// The most folders [`nested_repo_in`] reads in each ignored folder before giving up
+/// ([`Nested::TooMany`]), so a huge ignored tree costs a bounded walk.
 const NESTED_REPO_BUDGET: usize = 10_000;
+
+/// Build output and dependency folders [`nested_repo_in`] never enters, at any depth,
+/// an ignored folder of these names included. They are the huge trees that would use up
+/// the budget, and what tools put there is made again by the tools: a repo a package
+/// manager cloned into `node_modules/` holds no work of the user's. A worktree the user
+/// put there is still caught, as an entry of the repo's worktree list (and a known repo).
+const NOT_SEARCHED: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".next",
+    ".gradle",
+];
 
 /// Facts about HEAD: refreshed when HEAD or refs move.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -113,10 +149,11 @@ pub fn read_status(path: &Path) -> io::Result<Status> {
                 changes: status.paths.len() as u32,
                 untracked_checked: !windows,
                 windows_drive: windows,
-                holds_repo: has_submodules(path, &linked.git_dir),
                 ..WorktreeFacts::default()
             },
+            submodules: has_submodules(path, &linked.git_dir),
             ignored: Vec::new(),
+            nested: Nested::None,
         });
     }
     Ok(status)
@@ -157,6 +194,8 @@ pub fn worktree_facts(worktree: &Worktree, head: &HeadInfo) -> WorktreeFacts {
         facts.merged = refs.merged.clone();
         facts.release = refs.release.clone();
     }
+    facts.holds_repo = worktree.submodules || worktree.nested == Nested::Repo;
+    facts.too_many_ignored = worktree.nested == Nested::TooMany;
     facts
 }
 
@@ -169,6 +208,7 @@ pub fn finish_worktree(path: &Path, status: &mut Status, head: &HeadInfo) {
         return;
     };
     worktree.ignored.clear();
+    worktree.nested = Nested::None;
     if !derive_worktree_status(&worktree_facts(worktree, head)).1 {
         return;
     }
@@ -176,7 +216,39 @@ pub fn finish_worktree(path: &Path, status: &mut Status, head: &HeadInfo) {
         return;
     };
     worktree.ignored = top_level(&ignored);
-    worktree.facts.holds_repo = holds_repo_in(path, &ignored);
+    worktree.nested = nested_repo_in(path, &ignored);
+}
+
+/// Like [`finish_worktree`], but takes the result from `old` (the status and HEAD facts
+/// read before, already finished) when neither the status nor HEAD changed since. The
+/// ignored entries are a part of the status git leaves out, so files appearing in an
+/// ignored folder (a build) are not seen until the status or HEAD changes; the removal
+/// itself checks them again.
+pub fn finish_worktree_from(
+    path: &Path,
+    status: &mut Status,
+    head: &HeadInfo,
+    old: (&Status, &HeadInfo),
+) {
+    let (old_status, old_head) = old;
+    let same_status = old_status.branch == status.branch
+        && old_status.upstream == status.upstream
+        && old_status.ahead_behind == status.ahead_behind
+        && old_status.paths == status.paths
+        && old_status.origins == status.origins;
+    if let (Some(old_wt), Some(wt)) = (&old_status.worktree, status.worktree.as_mut()) {
+        let unchanged = same_status
+            && old_head == head
+            && old_wt.main == wt.main
+            && old_wt.facts == wt.facts
+            && old_wt.submodules == wt.submodules;
+        if unchanged {
+            wt.ignored = old_wt.ignored.clone();
+            wt.nested = old_wt.nested;
+            return;
+        }
+    }
+    finish_worktree(path, status, head);
 }
 
 /// Every ignored path in the worktree at `path`, as `git status --ignored` reports them:
@@ -204,35 +276,49 @@ pub fn has_submodules(path: &Path, git_dir: &Path) -> bool {
     git_dir.join("modules").is_dir() || std::fs::symlink_metadata(path.join(".gitmodules")).is_ok()
 }
 
-/// True when any folder in `ignored` (paths relative to `root`, folders ending in `/`)
-/// holds a `.git` (a repo or another worktree), looking [`NESTED_REPO_DEPTH`] levels
-/// deep without following symlinks. Also true when the walk reads more than
-/// [`NESTED_REPO_BUDGET`] folders, since then it cannot tell.
-pub fn holds_repo_in(root: &Path, ignored: &[String]) -> bool {
-    let mut budget = NESTED_REPO_BUDGET;
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = ignored
-        .iter()
-        .filter(|p| p.ends_with('/'))
-        .map(|p| (root.join(p.trim_end_matches('/')), 0))
-        .collect();
-    while let Some((dir, depth)) = queue.pop_front() {
-        if budget == 0 {
-            return true;
-        }
-        budget -= 1;
-        let Ok(entries) = std::fs::read_dir(&dir) else {
+/// Searches each folder in `ignored` (paths relative to `root`, folders ending in `/`)
+/// for a `.git` (a repo or another worktree), [`NESTED_REPO_DEPTH`] levels deep, without
+/// following symlinks or entering [`NOT_SEARCHED`] folders. Each ignored folder has its
+/// own budget of [`NESTED_REPO_BUDGET`] folders read; one that runs out gives
+/// [`Nested::TooMany`] unless another holds a `.git`.
+pub fn nested_repo_in(root: &Path, ignored: &[String]) -> Nested {
+    nested_repo_within(root, ignored, NESTED_REPO_BUDGET)
+}
+
+fn nested_repo_within(root: &Path, ignored: &[String], budget: usize) -> Nested {
+    let searched = |name: &std::ffi::OsStr| !NOT_SEARCHED.iter().any(|n| name == *n);
+    let mut outcome = Nested::None;
+    for top in ignored.iter().filter(|p| p.ends_with('/')) {
+        let top = root.join(top.trim_end_matches('/'));
+        if top.file_name().is_some_and(|n| !searched(n)) {
             continue;
-        };
-        for entry in entries.flatten() {
-            if entry.file_name() == ".git" {
-                return true;
+        }
+        let mut left = budget;
+        let mut queue = std::collections::VecDeque::from([(top, 0)]);
+        while let Some((dir, depth)) = queue.pop_front() {
+            if left == 0 {
+                outcome = Nested::TooMany;
+                break;
             }
-            if depth < NESTED_REPO_DEPTH && entry.file_type().is_ok_and(|t| t.is_dir()) {
-                queue.push_back((entry.path(), depth + 1));
+            left -= 1;
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                if name == ".git" {
+                    return Nested::Repo;
+                }
+                if depth < NESTED_REPO_DEPTH
+                    && searched(&name)
+                    && entry.file_type().is_ok_and(|t| t.is_dir())
+                {
+                    queue.push_back((entry.path(), depth + 1));
+                }
             }
         }
     }
-    false
+    outcome
 }
 
 /// The tracked files in the worktree at `path` whose changes git does not show: marked
@@ -678,6 +764,40 @@ mod tests {
         );
         assert_eq!(s.origins, ["src/old.rs"]);
         assert_eq!(s.ahead_behind, None);
+    }
+
+    #[test]
+    fn nested_repos_are_found_in_ignored_folders_but_not_in_build_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mkdir = |p: &str| std::fs::create_dir_all(root.join(p)).unwrap();
+        mkdir("node_modules/dep/.git");
+        mkdir("scratch/deep/build/vendored/.git");
+        mkdir("cache/a/b/c");
+        let ignored = |list: &[&str]| list.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // Build output and dependency folders are never entered, at any depth.
+        assert_eq!(
+            nested_repo_within(root, &ignored(&["node_modules/", "scratch/"]), 100),
+            Nested::None
+        );
+        mkdir("scratch/deep/inner/.git");
+        assert_eq!(
+            nested_repo_within(root, &ignored(&["scratch/"]), 100),
+            Nested::Repo
+        );
+        // Each ignored folder has its own budget; running out is its own outcome.
+        assert_eq!(
+            nested_repo_within(root, &ignored(&["cache/", "scratch/"]), 4),
+            Nested::Repo
+        );
+        assert_eq!(
+            nested_repo_within(root, &ignored(&["cache/"]), 3),
+            Nested::TooMany
+        );
+        assert_eq!(
+            nested_repo_within(root, &ignored(&["cache/", "cache.log"]), 4),
+            Nested::None
+        );
     }
 
     #[test]

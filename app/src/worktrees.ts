@@ -50,6 +50,8 @@ export function gitStatusLabel(status: WorktreeStatus): string {
       return "Can't tell if its commits are pushed";
     case "holdsRepo":
       return "Holds another repo";
+    case "tooBigToCheck":
+      return "Too many ignored files to check";
     case "release":
       return `In ${status.tag}`;
     case "merged":

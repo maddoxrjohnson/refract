@@ -902,6 +902,48 @@ fn records_survive_a_restart() {
 }
 
 #[test]
+fn a_refactor_worktree_is_adopted_into_the_main_checkout_not_a_linked_one() {
+    let env = Env::new();
+    let main = env.repo("refract-like");
+    // A linked worktree that sorts before its main repo.
+    let hotfix = env.root.join("hotfix");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "hotfix",
+            hotfix.to_str().unwrap(),
+        ],
+    );
+    let adopted = env.worktrees().join("refract-like-20200101-0000");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "refactor/20200101-0000",
+            adopted.to_str().unwrap(),
+        ],
+    );
+    commit_file(&adopted, "src/lib.rs", "pub fn tidy() {}\n", "Tidy up");
+
+    let mut agent = Agent::spawn(&env);
+    let found = agent.wait_state(&main, "ready");
+    assert_eq!(found["targetBranch"], "main");
+    assert_eq!(found["worktree"], adopted.to_str().unwrap());
+    assert_eq!(agent.repo(&hotfix)["refactor"], Value::Null);
+    let records = env.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["repo"], main.to_str().unwrap());
+    agent.shutdown();
+}
+
+#[test]
 fn reconcile_drops_records_without_worktrees_and_adopts_worktrees_without_records() {
     let env = Env::new();
     let repo = env.repo("tidepool-api");

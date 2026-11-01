@@ -231,10 +231,18 @@ fn check_nothing_nested(
     }
     let ignored = git::ignored_paths(real)
         .ok_or_else(|| refuse("Cannot list the worktree's ignored files."))?;
-    if git::holds_repo_in(real, &ignored) {
-        return Err(refuse(
-            "An ignored folder in this worktree holds another repo, or too many folders to check.",
-        ));
+    match git::nested_repo_in(real, &ignored) {
+        git::Nested::None => {}
+        git::Nested::Repo => {
+            return Err(refuse(
+                "An ignored folder in this worktree holds another repo.",
+            ))
+        }
+        git::Nested::TooMany => {
+            return Err(refuse(
+                "This worktree has too many ignored files to check for other repos.",
+            ))
+        }
     }
     Ok(())
 }

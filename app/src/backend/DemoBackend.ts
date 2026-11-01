@@ -330,6 +330,8 @@ function worktreeRefusal(repo: RepoSnapshot): string | null {
       return "Cannot tell whether this worktree's commits are pushed.";
     case "holdsRepo":
       return "Another worktree or repo is inside this worktree's folder.";
+    case "tooBigToCheck":
+      return "This worktree has too many ignored files to check for other repos.";
     default:
       return "Worktrees on Windows drives can't be removed from Refract yet.";
   }

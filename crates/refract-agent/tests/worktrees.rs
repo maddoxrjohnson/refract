@@ -398,7 +398,14 @@ fn worktrees_holding_another_repo_or_uncounted_commits_are_kept() {
     // A plain repo inside an ignored folder, which nothing else knows about.
     let holder = wt("holder");
     pushed_worktree(main, &holder, "holder");
-    init_repo(&holder.join("target/cache/vendored"));
+    commit_file(
+        &holder,
+        ".gitignore",
+        "*.log\ntarget/\nscratch/\n",
+        "Ignore scratch",
+    );
+    git(&holder, &["push", "-q", "origin", "holder"]);
+    init_repo(&holder.join("scratch/cache/vendored"));
 
     // A submodule, committed and pushed.
     let (sub_remote, _) = remote(&f.base, "harbor-icons");
@@ -449,6 +456,43 @@ fn worktrees_holding_another_repo_or_uncounted_commits_are_kept() {
         find(&repos, &inner).worktree_of.as_deref(),
         Some(main.to_str().unwrap())
     );
+}
+
+#[test]
+fn big_build_folders_are_not_searched_but_other_ignored_folders_are() {
+    let f = Fixture::new();
+    let main = &f.main;
+    let ignore = "*.log\ntarget/\nnode_modules/\nscratch/\n";
+
+    // More folders than the search reads in one ignored folder, and a package cloned
+    // with git, all in node_modules.
+    let modules = f.root.join("harbor-notes-modules");
+    pushed_worktree(main, &modules, "modules");
+    commit_file(&modules, ".gitignore", ignore, "Ignore dependencies");
+    git(&modules, &["push", "-q", "origin", "modules"]);
+    for i in 0..5_500 {
+        write(
+            &modules.join(format!("node_modules/pkg-{i}/lib/index.js")),
+            "export {};\n",
+        );
+    }
+    init_repo(&modules.join("node_modules/git-dep"));
+
+    // A plain repo deep in an ignored folder that is not build output.
+    let scratch = f.root.join("harbor-notes-scratch");
+    pushed_worktree(main, &scratch, "scratch");
+    commit_file(&scratch, ".gitignore", ignore, "Ignore scratch");
+    git(&scratch, &["push", "-q", "origin", "scratch"]);
+    init_repo(&scratch.join("scratch/experiments/vendored"));
+
+    let repos = f.load();
+    let modules_facts = info(&repos, &modules);
+    assert_eq!(modules_facts.status, WorktreeStatus::Pushed);
+    assert!(modules_facts.removable);
+    assert_eq!(modules_facts.ignored, ["node_modules/"]);
+    let scratch_facts = info(&repos, &scratch);
+    assert_eq!(scratch_facts.status, WorktreeStatus::HoldsRepo);
+    assert!(!scratch_facts.removable);
 }
 
 #[test]
@@ -808,7 +852,14 @@ fn remove_worktree_refuses_what_git_would_delete_unseen() {
 
     let holder = wt("holder");
     pushed_worktree(&main, &holder, "holder");
-    let vendored = holder.join("target/cache/vendored");
+    commit_file(
+        &holder,
+        ".gitignore",
+        "target/\nscratch/\n",
+        "Ignore scratch",
+    );
+    git(&holder, &["push", "-q", "origin", "holder"]);
+    let vendored = holder.join("scratch/cache/vendored");
     init_repo(&vendored);
 
     let (sub_remote, _) = remote(&base, "harbor-icons");
@@ -878,7 +929,7 @@ fn remove_worktree_refuses_what_git_would_delete_unseen() {
     );
     assert_eq!(
         helper.refusal(&holder),
-        "An ignored folder in this worktree holds another repo, or too many folders to check."
+        "An ignored folder in this worktree holds another repo."
     );
     assert_eq!(helper.refusal(&with_sub), "This worktree has submodules.");
     let hidden =

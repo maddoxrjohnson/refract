@@ -1142,6 +1142,13 @@ impl Refactors {
             let Ok(list) = worktrees(&repo) else {
                 continue;
             };
+            // Only into the main checkout (the list's first entry): adopted into a linked
+            // worktree, the refactor would target that worktree's branch and merge into the
+            // wrong checkout. While the main is not known nothing adopts it; the worktree is
+            // left as it is and adopted once the main repo is shown.
+            if !list.first().is_some_and(|main| same_dir(&main.path, &repo)) {
+                continue;
+            }
             let found = list.iter().skip(1).find(|w| {
                 w.branch
                     .as_deref()

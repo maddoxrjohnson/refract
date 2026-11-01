@@ -787,6 +787,8 @@ pub enum WorktreeStatus {
     /// Another repo lies in the folder (a submodule, a nested worktree or repo, or a
     /// `.git` in an ignored folder), so removing it could delete that repo's work.
     HoldsRepo,
+    /// The ignored folders hold too many folders to check them all for another repo.
+    TooBigToCheck,
     Release {
         tag: String,
     },
@@ -2029,6 +2031,10 @@ mod tests {
                 json!({"kind": "onlyHereUnknown"}),
             ),
             (WorktreeStatus::HoldsRepo, json!({"kind": "holdsRepo"})),
+            (
+                WorktreeStatus::TooBigToCheck,
+                json!({"kind": "tooBigToCheck"}),
+            ),
             (
                 WorktreeStatus::Release {
                     tag: "v0.13.3".into(),
