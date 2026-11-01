@@ -1123,6 +1123,31 @@ fn uncommitted_changes_in_the_worktree_block_the_merge() {
 }
 
 #[test]
+fn a_new_file_the_agent_left_unadded_blocks_the_merge() {
+    let env = Env::new();
+    let repo = env.repo("tidepool-api");
+    let mut agent = Agent::spawn(&env);
+    let refactor = ready(&mut agent, &repo, "src/main.rs", "fn main() { tidy() }\n");
+    let worktree = path(&refactor["worktree"]);
+    write(&worktree.join("src/tide.rs"), "pub fn tide() {}\n");
+    // Ignored files do not count.
+    write(&worktree.join(".git-info-ignored"), "");
+    let git_dir = PathBuf::from(git(&worktree, &["rev-parse", "--git-common-dir"]));
+    let git_dir = if git_dir.is_absolute() {
+        git_dir
+    } else {
+        worktree.join(git_dir)
+    };
+    write(&git_dir.join("info/exclude"), ".git-info-ignored\n");
+    let main = rev(&repo, "main");
+    let blocked = agent.request("mergeRefactor", json!({"path": repo}));
+    assert_blocked(&blocked, "worktreeDirty", json!(["src/tide.rs"]));
+    assert_eq!(rev(&repo, "main"), main);
+    assert!(worktree.join("src/tide.rs").is_file());
+    agent.shutdown();
+}
+
+#[test]
 fn a_worktree_off_its_branch_or_mid_rebase_is_left_alone() {
     let env = Env::new();
     let repo = env.repo("tidepool-api");
@@ -1212,7 +1237,8 @@ fn a_worktree_git_will_not_remove_after_a_merge_is_kept_until_discarded() {
     let worktree = path(&refactor["worktree"]);
     let branch = refactor["branch"].as_str().unwrap().to_owned();
     let head = rev(&worktree, "HEAD");
-    write(&worktree.join("scratch.txt"), "agent notes\n");
+    // A locked worktree is one `git worktree remove` refuses.
+    git(&repo, &["worktree", "lock", worktree.to_str().unwrap()]);
     let merged = agent.request("mergeRefactor", json!({"path": repo}));
     assert_eq!(merged["result"]["outcome"], "merged", "{merged}");
     assert_eq!(merged["result"]["commits"], 1);
@@ -1220,7 +1246,7 @@ fn a_worktree_git_will_not_remove_after_a_merge_is_kept_until_discarded() {
     assert_eq!(kept.len(), 1, "{merged}");
     assert!(kept[0].as_str().unwrap().starts_with("Kept the worktree"));
     assert_eq!(rev(&repo, "main"), head);
-    assert!(worktree.join("scratch.txt").is_file());
+    assert!(worktree.join("src/main.rs").is_file());
     assert!(branch_exists(&repo, &branch));
 
     let left = agent.wait_state(&repo, "nothingToDo");
@@ -1240,6 +1266,8 @@ fn a_worktree_git_will_not_remove_after_a_merge_is_kept_until_discarded() {
     let mut agent = Agent::spawn(&env);
     agent.wait_state(&repo, "nothingToDo");
     assert_eq!(env.records().len(), 1);
+    // Even `--force` keeps a locked worktree; once unlocked, Remove takes it.
+    git(&repo, &["worktree", "unlock", worktree.to_str().unwrap()]);
     let discarded = agent.request("discardRefactor", json!({"path": repo}));
     assert_eq!(discarded["result"], Value::Null, "{discarded}");
     assert!(!worktree.exists());

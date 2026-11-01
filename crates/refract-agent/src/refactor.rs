@@ -108,6 +108,8 @@ struct Entry {
     info: Option<RefactorInfo>,
     /// The sessions last seen live in the worktree, so their hook statuses refresh it.
     live_ids: Vec<String>,
+    /// Its agent was last seen waiting on the user (hook `waitingOnUser`).
+    waiting: bool,
 }
 
 /// Every refactor, by repo path.
@@ -168,7 +170,9 @@ enum Kind {
         focus: Option<String>,
         launch_dir: PathBuf,
     },
-    Merge(Record),
+    /// With the pids of the `claude` processes in the worktree when it was checked,
+    /// which were idle.
+    Merge(Record, Vec<u32>),
     Discard(Record),
 }
 
@@ -221,7 +225,7 @@ impl Job {
             Kind::Start { focus, launch_dir } => {
                 DoneKind::Started(self.start(focus.as_deref(), launch_dir).map(Box::new))
             }
-            Kind::Merge(record) => DoneKind::Merged(self.merge(record)),
+            Kind::Merge(record, idle) => DoneKind::Merged(self.merge(record, idle)),
             Kind::Discard(record) => DoneKind::Discarded(self.discard(record)),
         };
         Done {
@@ -338,7 +342,7 @@ impl Job {
     /// the target, then the clean-up. Anything that stops it before the fast-forward
     /// leaves the repo, the worktree and the branch as they were (a finished rebase
     /// aside).
-    fn merge(&self, record: &Record) -> Result<Merged, Fail> {
+    fn merge(&self, record: &Record, idle: &[u32]) -> Result<Merged, Fail> {
         let repo = &self.repo;
         let worktree = Path::new(&record.worktree);
         let blocked = |reason, files| Ok(Merged::Blocked { reason, files });
@@ -390,6 +394,10 @@ impl Job {
             if !clash.is_empty() {
                 return blocked(MergeBlockReason::DirtyOverlap, clash);
             }
+        }
+        // An agent that started in the worktree while the job waited would race it.
+        if newcomer(worktree, idle) {
+            return blocked(MergeBlockReason::Live, vec![]);
         }
         // The branch onto the target, in the worktree; undone on conflict.
         if !is_ancestor(repo, &target_ref, &branch_ref) {
@@ -505,6 +513,9 @@ impl Job {
             .map_err(|e| fail(format!("cannot list the repo's worktrees: {e}")))?
             .iter()
             .any(|w| same_dir(&w.path, &worktree));
+        if newcomer(&worktree, &[]) {
+            return Err(fail("The refactor's agent is still running."));
+        }
         if listed || fs::symlink_metadata(&worktree).is_ok() {
             check_safe(&self.worktrees_dir, repo, &worktree)?;
             let out = run_git(repo, &["worktree", "remove", "--force", &record.worktree])
@@ -537,8 +548,13 @@ impl Done {
     }
 }
 
+/// The git commands below work on git 2.25 and later (Ubuntu 20.04): newer settings
+/// are given as `-c` overrides, which older git ignores, rather than as flags, which
+/// it rejects.
+///
 /// The rebase of a merge, whatever the user's config says: no stash, no squash or
-/// fixup reordering, no other branches moved, no fork point, merges flattened.
+/// fixup reordering, no other branches moved (`rebase.updateRefs`, 2.38), no fork
+/// point, merges flattened (`rebase.rebaseMerges`, 2.42; flattening is the default).
 const REBASE: &[&str] = &[
     "-c",
     "rebase.autoStash=false",
@@ -554,12 +570,11 @@ const REBASE: &[&str] = &[
     "-q",
     "--no-autostash",
     "--no-autosquash",
-    "--no-update-refs",
     "--no-fork-point",
-    "--no-rebase-merges",
 ];
 
-/// The fast-forward of a checked-out target, whatever the user's config says.
+/// The fast-forward of a checked-out target, whatever the user's config says
+/// (`merge.autoStash` is 2.27; before that a merge never stashes).
 const MERGE: &[&str] = &[
     "-c",
     "merge.autoStash=false",
@@ -570,7 +585,6 @@ const MERGE: &[&str] = &[
     "merge",
     "-q",
     "--ff-only",
-    "--no-autostash",
     "--no-squash",
     "--no-verify-signatures",
     "--no-edit",
@@ -585,7 +599,6 @@ const FETCH: &[&str] = &[
     "-q",
     "--no-tags",
     "--no-recurse-submodules",
-    "--no-write-fetch-head",
     ".",
 ];
 
@@ -629,6 +642,7 @@ impl Refactors {
                 git_dir: None,
                 info: None,
                 live_ids: Vec::new(),
+                waiting: false,
             };
             entries.insert(repo, entry);
         }
@@ -654,7 +668,8 @@ impl Refactors {
     }
 
     /// True when the refactor of `repo` needs the fast poll: its repo is known, no job
-    /// runs for it, and its agent was just launched, works or waits on the user.
+    /// runs for it, and its agent was just launched, works, or waits on the user by its
+    /// hook (an idle open agent with nothing to show does not).
     fn active(&self, agent: &Agent, repo: &Path, entry: &Entry, now: DateTime<Utc>) -> bool {
         if agent.repo(repo).is_none() || self.busy.contains(repo) || entry.record.leftover {
             return false;
@@ -662,11 +677,10 @@ impl Refactors {
         let record = &entry.record;
         let launched = record.launched_at.unwrap_or(record.created_at);
         (!record.adopted && now - launched < self.grace)
-            || entry.info.as_ref().is_none_or(|i| {
-                matches!(
-                    i.state,
-                    RefactorState::Starting | RefactorState::Working | RefactorState::NeedsYou
-                )
+            || entry.info.as_ref().is_none_or(|i| match i.state {
+                RefactorState::Starting | RefactorState::Working => true,
+                RefactorState::NeedsYou => entry.waiting,
+                _ => false,
             })
     }
 
@@ -891,7 +905,8 @@ impl Refactors {
             return Ok(Step::Answer(Reply::RefactorMerge(outcome), Vec::new()));
         }
         let record = entry.record.clone();
-        Ok(Step::Run(self.job(repo, now, Kind::Merge(record))))
+        let idle = inside(&procs, &record.worktree);
+        Ok(Step::Run(self.job(repo, now, Kind::Merge(record, idle))))
     }
 
     /// Checks a discard of the refactor, and returns the job that deletes its worktree
@@ -932,10 +947,23 @@ impl Refactors {
                         git_dir: Some(started.git_dir),
                         info: None,
                         live_ids: Vec::new(),
+                        waiting: false,
                     },
                 );
                 let events = self.refresh(agent, Some(&[repo]), now);
                 Ok((Reply::Launch(started.ticket), events))
+            }
+            DoneKind::Merged(Ok(Merged::Blocked {
+                reason: MergeBlockReason::Live,
+                files,
+            })) => {
+                // Not stored: the agent's state shows it.
+                let outcome = MergeOutcome::Blocked {
+                    reason: MergeBlockReason::Live,
+                    files,
+                };
+                let events = self.refresh(agent, Some(std::slice::from_ref(&repo)), now);
+                Ok((Reply::RefactorMerge(outcome), events))
             }
             DoneKind::Merged(Ok(Merged::Blocked { reason, files })) => {
                 let (outcome, events) = self.blocked(agent, &repo, reason, files, now)?;
@@ -1118,6 +1146,7 @@ impl Refactors {
                 git_dir: None,
                 info: None,
                 live_ids: Vec::new(),
+                waiting: false,
             },
         );
     }
@@ -1215,6 +1244,22 @@ impl Refactors {
             let _ = fs::remove_file(self.records_dir.join(format!("{}.json", entry.id)));
         }
     }
+}
+
+/// The pids of the `claude` processes running in `worktree`.
+fn inside(procs: &[ClaudeProcess], worktree: &str) -> Vec<u32> {
+    procs
+        .iter()
+        .filter(|p| path_within(&p.cwd, worktree))
+        .map(|p| p.pid)
+        .collect()
+}
+
+/// True when a `claude` process other than `known` runs in `worktree` now.
+fn newcomer(worktree: &Path, known: &[u32]) -> bool {
+    inside(&procs::scan(), &path_str(worktree))
+        .iter()
+        .any(|pid| !known.contains(pid))
 }
 
 /// Refuses unless `worktree` really lies under `worktrees_dir` and the repo's `git
@@ -1356,6 +1401,7 @@ fn work_out(
     let (grace, quiet) = times;
     let look = look(entry, agent, procs, quiet, now);
     entry.live_ids = look.live_ids.clone();
+    entry.waiting = look.waiting;
     let record = &entry.record;
     let repo = Path::new(&record.repo);
     let worktree = Path::new(&record.worktree);
@@ -1709,7 +1755,8 @@ fn changed_files(repo: &Path, target: &str, branch: &str) -> Result<Vec<String>,
         .ok_or_else(|| fail("cannot list the files the refactor changed"))
 }
 
-/// Tracked files with changes in the worktree, both paths of a rename or copy.
+/// Files with changes in the worktree, both paths of a rename or copy, and untracked
+/// files that are not ignored.
 fn changed_in_worktree(worktree: &Path) -> Result<Vec<String>, Fail> {
     let out = read_git(
         worktree,
@@ -1717,7 +1764,7 @@ fn changed_in_worktree(worktree: &Path) -> Result<Vec<String>, Fail> {
             "status",
             "--porcelain",
             "-z",
-            "--untracked-files=no",
+            "--untracked-files=all",
             "--ignore-submodules=dirty",
         ],
     )
