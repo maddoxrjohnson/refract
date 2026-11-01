@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type { LiveState, WorktreeInfo } from "./backend/types";
 import { repoStatus } from "./repoStatus";
-import { testRepo, testSession, testWorktree } from "./ui/testRepo";
+import { testRefactor, testRepo, testSession, testWorktree } from "./ui/testRepo";
 import { gitStatusLabel, ignoredList, worktreeAgent, worktreeView } from "./worktrees";
 
 const live = (id: string, detail: LiveState) => testSession(id, { kind: "live", detail }, 0.1);
@@ -21,6 +21,8 @@ describe("worktree rows", () => {
       [{ kind: "onlyHere", count: 2 }, "2 commits only on this computer"],
       [{ kind: "onlyHere", count: 1 }, "1 commit only on this computer"],
       [{ kind: "onlyHere", count: 100 }, "100+ commits only on this computer"],
+      [{ kind: "onlyHereUnknown" }, "Can't tell if its commits are pushed"],
+      [{ kind: "holdsRepo" }, "Holds another repo"],
       [{ kind: "release", tag: "v1.4.0" }, "In v1.4.0"],
       [{ kind: "merged", branch: "main" }, "Merged into main"],
       [{ kind: "pushed" }, "Pushed, not merged"],
@@ -33,6 +35,14 @@ describe("worktree rows", () => {
     expect(view).toEqual({ label: "In v1.4.0", tone: "done", removable: true, agentOpen: false });
     const dirty = worktreeView(testWorktree("search", { status: { kind: "changes", count: 3 }, removable: false }));
     expect(dirty).toEqual({ label: "3 uncommitted changes", tone: "keep", removable: false, agentOpen: false });
+  });
+
+  it("hold back Remove from a worktree with a refactor, and say why", () => {
+    const refactored = testWorktree("cards", { status: { kind: "pushed" } }, { refactor: testRefactor() });
+    expect(worktreeView(refactored)).toEqual({ label: "Has a refactor", tone: "keep", removable: false, agentOpen: false });
+    // Something that could be lost still says so.
+    const dirty = testWorktree("search", { status: { kind: "changes", count: 3 }, removable: false }, { refactor: testRefactor() });
+    expect(worktreeView(dirty)?.label).toBe("3 uncommitted changes");
   });
 
   it("put the agent rows first", () => {

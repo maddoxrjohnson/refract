@@ -46,6 +46,10 @@ export function gitStatusLabel(status: WorktreeStatus): string {
       return status.count >= 100
         ? "100+ commits only on this computer"
         : plural(status.count, "commit only on this computer", "commits only on this computer");
+    case "onlyHereUnknown":
+      return "Can't tell if its commits are pushed";
+    case "holdsRepo":
+      return "Holds another repo";
     case "release":
       return `In ${status.tag}`;
     case "merged":
@@ -62,7 +66,7 @@ export interface WorktreeView {
   /** The status (spec §4), agent rows first. */
   label: string;
   tone: WorktreeTone;
-  /** Remove is offered: the helper says nothing can be lost and no agent is open there. */
+  /** Remove is offered: the helper says nothing can be lost, no agent is open there and it has no refactor. */
   removable: boolean;
   /** Nothing can be lost, but an agent is still open in the folder, which blocks Remove. */
   agentOpen: boolean;
@@ -77,6 +81,8 @@ export function worktreeView(repo: RepoSnapshot): WorktreeView | null {
   if (agent === "working") return { label: "Agent running", tone: "working", removable: false, agentOpen: false };
   // The helper refuses Remove while any session is live, idle ones too.
   const done = info.removable;
+  // Nor does it remove the repo a refactor was started from; say why Remove is missing.
+  if (done && repo.refactor) return { label: "Has a refactor", tone: "keep", removable: false, agentOpen: false };
   return {
     label: gitStatusLabel(info.status),
     tone: done ? "done" : "keep",

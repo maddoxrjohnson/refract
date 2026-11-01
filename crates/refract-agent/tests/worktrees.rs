@@ -50,6 +50,18 @@ fn add_worktree(main: &Path, dest: &Path, branch: &str) {
     );
 }
 
+/// Adds a worktree of `main` at `dest` on a new branch with one commit, pushed.
+fn pushed_worktree(main: &Path, dest: &Path, branch: &str) {
+    add_worktree(main, dest, branch);
+    commit_file(
+        dest,
+        &format!("src/{branch}.rs"),
+        "// work\n",
+        "Add the work",
+    );
+    git(dest, &["push", "-q", "origin", branch]);
+}
+
 fn branch_exists(repo: &Path, branch: &str) -> bool {
     git_ok(
         repo,
@@ -98,10 +110,14 @@ impl Fixture {
     }
 
     fn load(&self) -> Vec<RepoSnapshot> {
+        self.load_hiding(vec![])
+    }
+
+    fn load_hiding(&self, hidden: Vec<PathBuf>) -> Vec<RepoSnapshot> {
         let mut agent = Agent::new(Config {
             roots: vec![self.root.clone()],
             extra: vec![],
-            hidden: vec![],
+            hidden,
             depth: 3,
             claude_projects: self.projects.clone(),
             limits_file: self.projects.join("usage-state.json"),
@@ -364,6 +380,88 @@ fn worktrees_outside_the_roots_and_nested_ones_are_found() {
     std::fs::remove_dir_all(&outside).unwrap();
     let repos = f.load();
     assert!(!repos.iter().any(|r| r.path == outside.to_str().unwrap()));
+}
+
+#[test]
+fn worktrees_holding_another_repo_or_uncounted_commits_are_kept() {
+    let f = Fixture::new();
+    let main = &f.main;
+    let wt = |name: &str| f.root.join(format!("harbor-notes-{name}"));
+
+    // Another worktree, with work of its own, inside an ignored folder.
+    let outer = wt("outer");
+    pushed_worktree(main, &outer, "outer");
+    let inner = outer.join("target/inner");
+    add_worktree(main, &inner, "inner");
+    write(&inner.join("notes.txt"), "not committed\n");
+
+    // A plain repo inside an ignored folder, which nothing else knows about.
+    let holder = wt("holder");
+    pushed_worktree(main, &holder, "holder");
+    init_repo(&holder.join("target/cache/vendored"));
+
+    // A submodule, committed and pushed.
+    let (sub_remote, _) = remote(&f.base, "harbor-icons");
+    let with_sub = wt("with-sub");
+    pushed_worktree(main, &with_sub, "with-sub");
+    git(
+        &with_sub,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_remote.to_str().unwrap(),
+            "icons",
+        ],
+    );
+    git(&with_sub, &["commit", "-q", "-m", "Add the icons"]);
+    git(&with_sub, &["push", "-q", "origin", "with-sub"]);
+
+    // No commits yet, so git cannot count the unpushed ones.
+    let orphan = wt("orphan");
+    git(
+        main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--orphan",
+            "-b",
+            "orphan",
+            orphan.to_str().unwrap(),
+        ],
+    );
+
+    let repos = f.load();
+    for path in [&outer, &holder, &with_sub] {
+        let facts = info(&repos, path);
+        assert_eq!(facts.status, WorktreeStatus::HoldsRepo, "{path:?}");
+        assert!(!facts.removable, "{path:?}");
+        assert!(facts.ignored.is_empty(), "{path:?}");
+    }
+    let orphan_facts = info(&repos, &orphan);
+    assert_eq!(orphan_facts.status, WorktreeStatus::OnlyHereUnknown);
+    assert!(!orphan_facts.removable);
+    // The inner worktree is a worktree of its own.
+    assert_eq!(
+        find(&repos, &inner).worktree_of.as_deref(),
+        Some(main.to_str().unwrap())
+    );
+}
+
+#[test]
+fn hiding_a_repo_hides_the_worktrees_found_from_it() {
+    let f = Fixture::new();
+    let outside = f.base.join("elsewhere/harbor-notes-outside");
+    add_worktree(&f.main, &outside, "outside");
+    let nested = f.main.join(".claude/worktrees/wide-cards");
+    add_worktree(&f.main, &nested, "wide-cards");
+    assert_eq!(f.load().len(), 3);
+    let repos = f.load_hiding(vec![f.main.clone()]);
+    let paths: Vec<&str> = repos.iter().map(|r| r.path.as_str()).collect();
+    assert!(paths.is_empty(), "{paths:?}");
 }
 
 /// The built helper over stdio, with a temporary HOME.
@@ -677,5 +775,148 @@ fn remove_worktree_refuses_for_each_rule_and_removes_a_clean_pushed_one() {
     assert!(main_changed, "{:?}", helper.events);
     // Gone now, so a second removal is refused.
     assert_eq!(helper.refusal(&ready), "Not a linked worktree.");
+    helper.shutdown();
+}
+
+#[test]
+fn remove_worktree_refuses_what_git_would_delete_unseen() {
+    hermetic_git();
+    let tmp = tempfile::tempdir().unwrap();
+    let base = tmp.path().canonicalize().unwrap();
+    let home = base.join("home");
+    let root = home.join("projects");
+    let config = base.join("agent.toml");
+    write(
+        &config,
+        &format!("roots = [{:?}]\ndepth = 3\n", root.to_str().unwrap()),
+    );
+    std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+    let (bare, _seed) = remote(&base, "harbor-notes");
+    let main = root.join("harbor-notes");
+    clone(&bare, &main);
+    commit_file(&main, ".gitignore", "target/\n", "Ignore build output");
+    git(&main, &["push", "-q", "origin", "main"]);
+    // Git's own clean check in `worktree remove` would miss untracked files.
+    git(&main, &["config", "status.showUntrackedFiles", "no"]);
+    let wt = |name: &str| root.join(format!("harbor-notes-{name}"));
+
+    let outer = wt("outer");
+    pushed_worktree(&main, &outer, "outer");
+    let inner = outer.join("target/inner");
+    add_worktree(&main, &inner, "inner");
+    write(&inner.join("notes.txt"), "not committed\n");
+
+    let holder = wt("holder");
+    pushed_worktree(&main, &holder, "holder");
+    let vendored = holder.join("target/cache/vendored");
+    init_repo(&vendored);
+
+    let (sub_remote, _) = remote(&base, "harbor-icons");
+    let with_sub = wt("with-sub");
+    pushed_worktree(&main, &with_sub, "with-sub");
+    git(
+        &with_sub,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            sub_remote.to_str().unwrap(),
+            "icons",
+        ],
+    );
+    git(&with_sub, &["commit", "-q", "-m", "Add the icons"]);
+    git(&with_sub, &["push", "-q", "origin", "with-sub"]);
+
+    let skipped = wt("skipped");
+    pushed_worktree(&main, &skipped, "skipped");
+    git(&skipped, &["update-index", "--skip-worktree", "README.md"]);
+    write(&skipped.join("README.md"), "# edited\n");
+
+    let assumed = wt("assumed");
+    pushed_worktree(&main, &assumed, "assumed");
+    git(
+        &assumed,
+        &["update-index", "--assume-unchanged", "README.md"],
+    );
+    write(&assumed.join("README.md"), "# edited\n");
+
+    let untracked = wt("untracked");
+    pushed_worktree(&main, &untracked, "untracked");
+    write(&untracked.join("scratch.txt"), "untracked\n");
+
+    let orphan = wt("orphan");
+    git(
+        &main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--orphan",
+            "-b",
+            "orphan",
+            orphan.to_str().unwrap(),
+        ],
+    );
+
+    let refactored = wt("refactored");
+    pushed_worktree(&main, &refactored, "refactored");
+
+    let mut helper = Helper::spawn(&home, &config, &[]);
+    let untracked_snapshot = helper.request("getRepo", json!({"path": untracked}));
+    assert_eq!(
+        untracked_snapshot["result"]["worktree"]["status"],
+        json!({"kind": "changes", "count": 1})
+    );
+    let ticket = helper.request("startRefactor", json!({"path": refactored}));
+    assert!(ticket["result"]["requestId"].is_string(), "{ticket}");
+
+    assert_eq!(
+        helper.refusal(&outer),
+        "Another worktree or repo is inside this worktree's folder."
+    );
+    assert_eq!(
+        helper.refusal(&holder),
+        "An ignored folder in this worktree holds another repo, or too many folders to check."
+    );
+    assert_eq!(helper.refusal(&with_sub), "This worktree has submodules.");
+    let hidden =
+        "Some files are marked so git hides their changes (assume-unchanged or skip-worktree).";
+    assert_eq!(helper.refusal(&skipped), hidden);
+    assert_eq!(helper.refusal(&assumed), hidden);
+    assert_eq!(
+        helper.refusal(&untracked),
+        "This worktree has uncommitted changes."
+    );
+    assert_eq!(
+        helper.refusal(&orphan),
+        "Cannot tell whether this worktree's commits are pushed."
+    );
+    assert_eq!(
+        helper.refusal(&refactored),
+        "This worktree has a refactor; merge or discard it first."
+    );
+
+    // Nothing refused was changed.
+    assert!(inner.join("notes.txt").is_file());
+    assert!(vendored.join(".git").is_dir());
+    assert!(untracked.join("scratch.txt").is_file());
+    assert_eq!(
+        std::fs::read_to_string(skipped.join("README.md")).unwrap(),
+        "# edited\n"
+    );
+    for path in [
+        &outer,
+        &holder,
+        &with_sub,
+        &skipped,
+        &assumed,
+        &untracked,
+        &orphan,
+        &refactored,
+    ] {
+        assert!(path.join(".git").is_file(), "{path:?}");
+    }
     helper.shutdown();
 }

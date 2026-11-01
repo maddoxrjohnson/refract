@@ -21,17 +21,26 @@ pub struct WorktreeFacts {
     pub untracked_checked: bool,
     /// The worktree is on a Windows drive, where Refract does not remove worktrees yet.
     pub windows_drive: bool,
-    /// Commits on HEAD that no remote-tracking ref has, capped at [`MAX_ONLY_HERE`].
-    pub only_here: u32,
+    /// Commits on HEAD that no remote-tracking ref has, capped at [`MAX_ONLY_HERE`];
+    /// `None` when git cannot count them (no commits, or git failed).
+    pub only_here: Option<u32>,
     /// The default branch's name when HEAD is its ancestor.
     pub merged: Option<String>,
     /// The oldest tag containing HEAD.
     pub release: Option<String>,
+    /// Another repo lies in the folder, so removing it could delete that repo's work: a
+    /// submodule, another worktree or known repo inside it, or a `.git` in an ignored
+    /// folder.
+    pub holds_repo: bool,
 }
 
 /// The first matching row of spec §4 rows 3-10, and whether the worktree can be removed
 /// as far as git goes: rows 8-10 (in a release, merged, or pushed), and not on a Windows
 /// drive. The app also needs no agent working or waiting there.
+///
+/// Two rows come before rows 8-10 to keep them from being offered: commits that cannot
+/// be counted (and are not merged), and another repo in the folder. The helper only looks
+/// for repos in ignored folders when nothing earlier matched, so that row comes last.
 pub fn derive_worktree_status(f: &WorktreeFacts) -> (WorktreeStatus, bool) {
     let status = if f.locked {
         WorktreeStatus::Locked
@@ -41,10 +50,14 @@ pub fn derive_worktree_status(f: &WorktreeFacts) -> (WorktreeStatus, bool) {
         WorktreeStatus::Changes { count: f.changes }
     } else if !f.untracked_checked {
         WorktreeStatus::Unchecked
-    } else if f.only_here > 0 && f.merged.is_none() {
+    } else if f.only_here.is_none() && f.merged.is_none() {
+        WorktreeStatus::OnlyHereUnknown
+    } else if f.only_here.is_some_and(|n| n > 0) && f.merged.is_none() {
         WorktreeStatus::OnlyHere {
-            count: f.only_here.min(MAX_ONLY_HERE),
+            count: f.only_here.unwrap_or(0).min(MAX_ONLY_HERE),
         }
+    } else if f.holds_repo {
+        WorktreeStatus::HoldsRepo
     } else if let Some(tag) = &f.release {
         WorktreeStatus::Release { tag: tag.clone() }
     } else if let Some(branch) = &f.merged {
@@ -70,6 +83,7 @@ mod tests {
     fn pushed() -> WorktreeFacts {
         WorktreeFacts {
             untracked_checked: true,
+            only_here: Some(0),
             ..WorktreeFacts::default()
         }
     }
@@ -114,7 +128,7 @@ mod tests {
             ),
             (
                 WorktreeFacts {
-                    only_here: 2,
+                    only_here: Some(2),
                     ..pushed()
                 },
                 WorktreeStatus::OnlyHere { count: 2 },
@@ -159,7 +173,7 @@ mod tests {
             locked: true,
             operation: Some(GitOperation::Merge),
             changes: 4,
-            only_here: 7,
+            only_here: Some(7),
             ..pushed()
         };
         assert_eq!(derive_worktree_status(&all).0, WorktreeStatus::Locked);
@@ -198,7 +212,7 @@ mod tests {
     #[test]
     fn merged_commits_are_not_only_here() {
         let merged = WorktreeFacts {
-            only_here: 5,
+            only_here: Some(5),
             merged: Some("main".into()),
             ..pushed()
         };
@@ -213,7 +227,7 @@ mod tests {
         );
         // A tag containing unpushed, unmerged commits does not make them safe.
         let tagged = WorktreeFacts {
-            only_here: 5,
+            only_here: Some(5),
             release: Some("v1.0.0".into()),
             ..pushed()
         };
@@ -226,12 +240,48 @@ mod tests {
     #[test]
     fn only_here_is_capped() {
         let many = WorktreeFacts {
-            only_here: 250,
+            only_here: Some(250),
             ..pushed()
         };
         assert_eq!(
             derive_worktree_status(&many).0,
             WorktreeStatus::OnlyHere { count: 100 }
+        );
+    }
+
+    #[test]
+    fn uncounted_commits_and_nested_repos_are_kept() {
+        let uncounted = WorktreeFacts {
+            only_here: None,
+            ..pushed()
+        };
+        assert_eq!(
+            derive_worktree_status(&uncounted),
+            (WorktreeStatus::OnlyHereUnknown, false)
+        );
+        // Merged into the default branch is safe however many commits there are.
+        let merged = WorktreeFacts {
+            merged: Some("main".into()),
+            ..uncounted
+        };
+        assert!(derive_worktree_status(&merged).1);
+        let nested = WorktreeFacts {
+            holds_repo: true,
+            release: Some("v1.0.0".into()),
+            ..pushed()
+        };
+        assert_eq!(
+            derive_worktree_status(&nested),
+            (WorktreeStatus::HoldsRepo, false)
+        );
+        // Unpushed commits say more than a nested repo.
+        let both = WorktreeFacts {
+            only_here: Some(3),
+            ..nested
+        };
+        assert_eq!(
+            derive_worktree_status(&both).0,
+            WorktreeStatus::OnlyHere { count: 3 }
         );
     }
 

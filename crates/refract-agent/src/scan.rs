@@ -45,6 +45,9 @@ pub fn walk_roots(config: &Config) -> Walk {
             found.insert(extra.clone());
         }
     }
+    // Worktrees are found from the repos still shown: hiding a repo hides the worktrees
+    // folded into it rather than turning them into gems of their own.
+    found.retain(|repo| !config.hidden.contains(repo));
     add_linked_worktrees(&mut found);
     let repos = found
         .into_iter()
@@ -153,6 +156,9 @@ fn add_linked_worktrees(found: &mut BTreeSet<PathBuf>) {
 /// `common`, from each `worktrees/<name>/gitdir`, that exist, are repos, and are not
 /// Refract's refactor worktrees. Without a `worktrees` directory this is one failed
 /// `read_dir`.
+///
+/// Worktrees made by git for Windows are left out: their own `.git` file names a
+/// `C:/...` git directory, which Linux git cannot follow, so they would never load.
 pub fn linked_worktrees(common: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(common.join("worktrees")) else {
         return Vec::new();
@@ -168,12 +174,26 @@ pub fn linked_worktrees(common: &Path) -> Vec<PathBuf> {
         let Some(folder) = dot_git.parent().map(normalize) else {
             continue;
         };
-        if folder.is_dir() && is_repo(&folder) && !is_refactor_worktree(&folder) {
+        if folder.is_dir()
+            && is_repo(&folder)
+            && !is_refactor_worktree(&folder)
+            && !has_windows_gitdir(&folder)
+        {
             out.push(folder);
         }
     }
     out.sort();
     out
+}
+
+/// True when the `.git` file of the worktree at `folder` names its git directory by a
+/// Windows path (`C:/...`), as git for Windows writes it.
+fn has_windows_gitdir(folder: &Path) -> bool {
+    fs::read_to_string(folder.join(".git")).is_ok_and(|text| {
+        text.trim()
+            .strip_prefix("gitdir:")
+            .is_some_and(|dir| from_windows_path(dir.trim()) != Path::new(dir.trim()))
+    })
 }
 
 /// A Windows path git for Windows wrote (`C:/Users/...` or `C:\Users\...`) as WSL sees
@@ -444,6 +464,29 @@ mod tests {
             normalize(Path::new("/a/b/../c/./d")),
             PathBuf::from("/a/c/d")
         );
+    }
+
+    #[test]
+    fn worktrees_made_by_git_for_windows_are_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let common = tmp.path().join("main/.git");
+        for (name, gitdir) in [
+            ("linux", "{common}/worktrees/linux"),
+            ("windows", "C:/Users/dev/main/.git/worktrees/windows"),
+        ] {
+            let admin = common.join("worktrees").join(name);
+            let folder = tmp.path().join(name);
+            fs::create_dir_all(&admin).unwrap();
+            fs::create_dir_all(&folder).unwrap();
+            fs::write(
+                admin.join("gitdir"),
+                format!("{}\n", folder.join(".git").display()),
+            )
+            .unwrap();
+            let gitdir = gitdir.replace("{common}", &common.display().to_string());
+            fs::write(folder.join(".git"), format!("gitdir: {gitdir}\n")).unwrap();
+        }
+        assert_eq!(linked_worktrees(&common), [tmp.path().join("linux")]);
     }
 
     #[test]

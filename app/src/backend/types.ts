@@ -176,6 +176,10 @@ export type WorktreeStatus =
   | { kind: "unchecked" }
   /** Commits only on this computer; `count` 100 means "100+". */
   | { kind: "onlyHere"; count: number }
+  /** Git could not count the commits only on this computer, and HEAD is not merged. */
+  | { kind: "onlyHereUnknown" }
+  /** Another repo lies in the folder (a submodule, a nested worktree or repo, or a `.git` in an ignored folder). */
+  | { kind: "holdsRepo" }
   | { kind: "release"; tag: string }
   | { kind: "merged"; branch: string }
   /** Every commit is on a remote, though not merged. */
@@ -196,7 +200,7 @@ export interface WorktreeInfo {
   /** Top-level ignored entries relative to the worktree (directories end in `/`), at most 9. */
   ignored: string[];
   status: WorktreeStatus;
-  /** Rows 8-10 and not on a Windows drive; the app also needs no live session in it. */
+  /** Rows 8-10 and not on a Windows drive; the app also needs no live session and no refactor in it. */
   removable: boolean;
 }
 

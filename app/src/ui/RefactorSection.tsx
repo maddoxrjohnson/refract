@@ -1,4 +1,4 @@
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { MergeOutcome, RefactorInfo, RepoSnapshot } from "../backend/types";
 import { blockText, CHECK_LABELS, discardQuestion, refactorBlocker } from "../refactors";
 import { describeError } from "./StatusToast";
@@ -94,6 +94,16 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   const info = repo.refactor ?? null;
   const [busy, setBusy] = useState<"merge" | "discard" | null>(null);
   const [confirming, setConfirming] = useState(false);
+  // Opening or closing the confirm unmounts the focused button, so focus moves to Keep it
+  // on open and back to the Discard (or Remove) button on Keep it.
+  const keepRef = useRef<HTMLButtonElement>(null);
+  const discardRef = useRef<HTMLButtonElement>(null);
+  const focusNext = useRef<"keep" | "discard" | null>(null);
+  useEffect(() => {
+    const target = focusNext.current === "keep" ? keepRef.current : focusNext.current === "discard" ? discardRef.current : null;
+    focusNext.current = null;
+    target?.focus();
+  }, [confirming]);
   const [error, setError] = useState<{ text: string; pending: boolean } | null>(null);
   // Kept after the refactor is gone, until the panel closes or moves to another repo, or
   // another refactor appears.
@@ -241,11 +251,13 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   );
   const discardButton = (label: string) => (
     <button
+      ref={discardRef}
       type="button"
       className="rf-button rf-button--danger"
       disabled={live || busy !== null}
       title={live ? LIVE_TITLE : undefined}
       onClick={() => {
+        focusNext.current = "keep";
         setError(null);
         setConfirming(true);
       }}
@@ -383,7 +395,16 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
             <button type="button" className="rf-button rf-button--danger" disabled={live || busy !== null} onClick={discard}>
               {busy === "discard" ? "Discarding…" : commits > 0 ? "Discard" : "Remove"}
             </button>
-            <button type="button" className="rf-button" disabled={busy !== null} onClick={() => setConfirming(false)}>
+            <button
+              ref={keepRef}
+              type="button"
+              className="rf-button"
+              disabled={busy !== null}
+              onClick={() => {
+                focusNext.current = "discard";
+                setConfirming(false);
+              }}
+            >
               Keep it
             </button>
           </div>

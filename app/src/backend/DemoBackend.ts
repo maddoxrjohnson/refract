@@ -314,6 +314,7 @@ function demoWorktrees(main: RepoSnapshot): RepoSnapshot[] {
 function worktreeRefusal(repo: RepoSnapshot): string | null {
   const info = repo.worktree;
   if (!repo.worktreeOf || !info) return "Not a linked worktree.";
+  if (repo.refactor) return "This worktree has a refactor; merge or discard it first.";
   if (repo.sessions.some((s) => s.state.kind === "live")) return "An agent is running in this worktree.";
   if (info.removable) return null;
   switch (info.status.kind) {
@@ -325,6 +326,10 @@ function worktreeRefusal(repo: RepoSnapshot): string | null {
       return "This worktree has uncommitted changes.";
     case "onlyHere":
       return "Some commits are only on this computer.";
+    case "onlyHereUnknown":
+      return "Cannot tell whether this worktree's commits are pushed.";
+    case "holdsRepo":
+      return "Another worktree or repo is inside this worktree's folder.";
     default:
       return "Worktrees on Windows drives can't be removed from Refract yet.";
   }

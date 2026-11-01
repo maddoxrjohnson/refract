@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { RepoSnapshot } from "../backend/types";
-import { NOW, testSession, testWorktree } from "./testRepo";
+import { NOW, testRefactor, testSession, testWorktree } from "./testRepo";
 import { WorktreesSection, type WorktreesSectionProps } from "./WorktreesSection";
 
 afterEach(cleanup);
@@ -73,6 +73,23 @@ describe("WorktreesSection", () => {
     const asks = row("tidepool-asks");
     expect(asks.textContent).toContain("Agent waiting for you");
     expect(within(asks).queryByRole("button", { name: /Remove/ })).toBeNull();
+  });
+
+  it("offers no Remove for a worktree with a refactor, and says why", () => {
+    setup([testWorktree("cards", { status: { kind: "pushed" } }, { refactor: testRefactor() })]);
+    const cards = row("tidepool-cards");
+    expect(cards.textContent).toContain("Has a refactor");
+    expect(within(cards).queryByRole("button", { name: /Remove/ })).toBeNull();
+  });
+
+  it("moves focus into the confirm, and back to Remove… on Keep it", () => {
+    setup([released]);
+    const remove = screen.getByRole("button", { name: "Remove tidepool-wide-cards…" });
+    remove.focus();
+    fireEvent.click(remove);
+    expect(document.activeElement).toBe(within(screen.getByRole("group")).getByRole("button", { name: "Keep it" }));
+    fireEvent.click(document.activeElement!);
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove tidepool-wide-cards…" }));
   });
 
   it("opens a worktree as Enter does on its folder", () => {

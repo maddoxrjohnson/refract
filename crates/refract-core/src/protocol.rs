@@ -744,7 +744,7 @@ pub struct WorktreeInfo {
     /// Spec §4 rows 3-10.
     pub status: WorktreeStatus,
     /// Rows 8-10 and not on a Windows drive. The app ANDs this with "no agent working or
-    /// waiting".
+    /// waiting" and "no refactor".
     pub removable: bool,
 }
 
@@ -782,6 +782,11 @@ pub enum WorktreeStatus {
     OnlyHere {
         count: u32,
     },
+    /// Git could not count the commits only on this computer, and HEAD is not merged.
+    OnlyHereUnknown,
+    /// Another repo lies in the folder (a submodule, a nested worktree or repo, or a
+    /// `.git` in an ignored folder), so removing it could delete that repo's work.
+    HoldsRepo,
     Release {
         tag: String,
     },
@@ -2019,6 +2024,11 @@ mod tests {
                 WorktreeStatus::OnlyHere { count: 100 },
                 json!({"kind": "onlyHere", "count": 100}),
             ),
+            (
+                WorktreeStatus::OnlyHereUnknown,
+                json!({"kind": "onlyHereUnknown"}),
+            ),
+            (WorktreeStatus::HoldsRepo, json!({"kind": "holdsRepo"})),
             (
                 WorktreeStatus::Release {
                     tag: "v0.13.3".into(),

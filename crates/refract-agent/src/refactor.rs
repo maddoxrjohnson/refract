@@ -974,6 +974,12 @@ impl Refactors {
                 .values()
                 .map(|e| PathBuf::from(&e.record.worktree))
                 .collect(),
+            refactor_repos: self
+                .entries
+                .iter()
+                .flat_map(|(repo, e)| [repo.clone(), PathBuf::from(&e.record.repo)])
+                .collect(),
+            known_repos: agent.repo_paths().cloned().collect(),
             agent_live,
             refactor_dir: Some(self.worktrees_dir.clone()),
         };

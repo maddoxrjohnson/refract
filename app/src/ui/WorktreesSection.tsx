@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { RepoSnapshot, SessionInfo } from "../backend/types";
 import { ignoredList, worktreeView } from "../worktrees";
 import { firstLine, relativeTime } from "./format";
@@ -35,6 +35,16 @@ function WorktreeRow({ repo, now, onOpen, onRemove }: { repo: RepoSnapshot } & O
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<{ text: string; pending: boolean } | null>(null);
+  // Opening or closing the confirm unmounts the focused button, so focus moves to Keep it
+  // on open and back to Remove… on Keep it.
+  const keepRef = useRef<HTMLButtonElement>(null);
+  const removeRef = useRef<HTMLButtonElement>(null);
+  const focusNext = useRef<"keep" | "remove" | null>(null);
+  useEffect(() => {
+    const target = focusNext.current === "keep" ? keepRef.current : focusNext.current === "remove" ? removeRef.current : null;
+    focusNext.current = null;
+    target?.focus();
+  }, [confirming]);
   const view = worktreeView(repo);
   const said = lastMessage(repo);
   const line = said ? firstLine(said.lastAssistantText) : null;
@@ -105,10 +115,12 @@ function WorktreeRow({ repo, now, onOpen, onRemove }: { repo: RepoSnapshot } & O
               {busy ? "Removing…" : "Remove"}
             </button>
             <button
+              ref={keepRef}
               type="button"
               className="rf-button"
               disabled={busy}
               onClick={() => {
+                focusNext.current = "remove";
                 setConfirming(false);
                 setError(null);
               }}
@@ -124,10 +136,12 @@ function WorktreeRow({ repo, now, onOpen, onRemove }: { repo: RepoSnapshot } & O
           </button>
           {removable && (
             <button
+              ref={removeRef}
               type="button"
               className="rf-button"
               aria-label={`Remove ${repo.name}…`}
               onClick={() => {
+                focusNext.current = "keep";
                 setError(null);
                 setConfirming(true);
               }}

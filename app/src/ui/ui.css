@@ -1058,7 +1058,7 @@
 }
 
 /* The count of linked worktrees folded into the gem, at its lower right; a dot in the
-   accent when one of them can be removed. */
+   text colour when one of them can be removed (the accent means "waiting on you"). */
 .rf-checkout-mark {
   position: absolute;
   left: calc(var(--r, 20px) * 0.62);
@@ -1092,7 +1092,7 @@
   width: 6px;
   height: 6px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--fg);
 }
 
 /* A thin ring just outside the stone; it fills as the move goes on. */

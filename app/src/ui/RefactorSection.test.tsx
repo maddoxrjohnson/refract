@@ -134,6 +134,15 @@ describe("RefactorSection", () => {
     expect(props.onDiscard).toHaveBeenCalled();
   });
 
+  it("moves focus into the discard confirm, and back to Discard on Keep it", () => {
+    setup(withRefactor({ state: "ready" }));
+    button("Discard").focus();
+    fireEvent.click(button("Discard"));
+    expect(document.activeElement).toBe(button("Keep it"));
+    fireEvent.click(button("Keep it"));
+    expect(document.activeElement).toBe(button("Discard"));
+  });
+
   it("shows a blocked merge's files, Merge again, and Fix with Claude only for conflicts", () => {
     const blocked = (reason: "conflict" | "dirtyOverlap" | "worktreeDirty") =>
       withRefactor({ state: "mergeBlocked", blocked: { reason, files: ["src/sync.ts"] } });

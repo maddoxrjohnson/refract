@@ -14,7 +14,7 @@ use refract_core::protocol::{
 };
 use refract_core::sessions::{path_within, paths_match};
 use refract_core::transcript::SessionSummary;
-use refract_core::worktree::derive_worktree_status;
+use refract_core::worktree::{derive_worktree_status, WorktreeFacts};
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
@@ -206,6 +206,7 @@ impl Agent {
                 Err(e) => eprintln!("refract-agent: skipping {}: {e}", path.display()),
             }
         }
+        self.resolve_worktrees();
         self.update_masses();
         inserted
     }
@@ -254,6 +255,9 @@ impl Agent {
                 Ok(h) => head = h,
                 Err(e) => eprintln!("refract-agent: git in {}: {e}", path.display()),
             }
+        }
+        if what.status || what.head {
+            git::finish_worktree(path, &mut status, &head);
         }
         let old_snapshot = old.snapshot.clone();
         if what.sessions {
@@ -337,7 +341,12 @@ impl Agent {
                 }
             }
         }
-        let moved = self.update_masses();
+        let mut moved = self.update_masses();
+        if !inserted.is_empty() || !removed.is_empty() {
+            moved.extend(self.resolve_worktrees());
+            moved.sort();
+            moved.dedup();
+        }
         events.extend(self.repo_events(inserted.iter()));
         events.extend(self.repo_events(moved.iter().filter(|p| !inserted.contains(p))));
         removed.extend(replaced);
@@ -569,10 +578,7 @@ impl Agent {
         );
         snapshot.mass = mass;
         snapshot.refactor = self.refactors.get(&path).cloned();
-        if let Some(worktree) = &status.worktree {
-            snapshot.worktree_of = Some(path_str(&self.known_form(&worktree.main)));
-            snapshot.worktree = Some(worktree_info(worktree));
-        }
+        self.set_worktree(&path, &status, &head, &mut snapshot);
         self.repos.insert(
             path,
             RepoState {
@@ -586,6 +592,51 @@ impl Agent {
                 id,
             },
         );
+    }
+
+    /// Sets the worktree parts of `snapshot`, the snapshot of the repo at `path`, when it
+    /// is a linked worktree: its main repo as a known repo names it, and its facts, which
+    /// hold a repo also when another known repo lies inside it (spec §5 rule 5).
+    fn set_worktree(
+        &self,
+        path: &Path,
+        status: &Status,
+        head: &HeadInfo,
+        snapshot: &mut RepoSnapshot,
+    ) {
+        let Some(worktree) = &status.worktree else {
+            return;
+        };
+        let mut facts = git::worktree_facts(worktree, head);
+        facts.holds_repo |= self
+            .repos
+            .keys()
+            .any(|known| known != path && known.starts_with(path));
+        snapshot.worktree_of = Some(path_str(&self.known_form(&worktree.main)));
+        snapshot.worktree = Some(worktree_info(&facts, &worktree.ignored));
+    }
+
+    /// Sets the worktree parts of every snapshot again, once a batch of repos is in: a
+    /// worktree's main repo, or a repo inside it, may have come in after it. Returns the
+    /// repos whose snapshot changed.
+    fn resolve_worktrees(&mut self) -> Vec<PathBuf> {
+        let paths: Vec<PathBuf> = self
+            .repos
+            .iter()
+            .filter(|(_, r)| r.status.worktree.is_some())
+            .map(|(p, _)| p.clone())
+            .collect();
+        let mut changed = Vec::new();
+        for path in paths {
+            let repo = &self.repos[&path];
+            let mut snapshot = repo.snapshot.clone();
+            self.set_worktree(&path, &repo.status, &repo.head, &mut snapshot);
+            if snapshot != self.repos[&path].snapshot {
+                self.repos.get_mut(&path).expect("known repo").snapshot = snapshot;
+                changed.push(path);
+            }
+        }
+        changed
     }
 
     /// `path` as a known repo names it, when one is the same directory under another
@@ -687,10 +738,19 @@ pub fn read_git_with(path: &Path, concurrent: bool) -> GitResult {
             Some(status.and_then(|s| Ok((s, head?))))
         });
         if let Some(read) = read {
-            return read;
+            return read.map(|(s, h)| finish(path, s, h));
         }
     }
-    git::read_status(path).and_then(|s| Ok((s, git::read_head(path)?)))
+    git::read_status(path)
+        .and_then(|s| Ok((s, git::read_head(path)?)))
+        .map(|(s, h)| finish(path, s, h))
+}
+
+/// The status and HEAD facts with what a removable worktree needs read too (see
+/// [`git::finish_worktree`]).
+fn finish(path: &Path, mut status: Status, head: HeadInfo) -> (Status, HeadInfo) {
+    git::finish_worktree(path, &mut status, &head);
+    (status, head)
 }
 
 /// Reads every repo in `paths`, several at once.
@@ -844,17 +904,21 @@ pub fn build_snapshot(
 }
 
 /// The snapshot part of a linked worktree's facts, with its status worked out.
-fn worktree_info(worktree: &git::Worktree) -> WorktreeInfo {
-    let (status, removable) = derive_worktree_status(&worktree.facts);
-    let facts = &worktree.facts;
+fn worktree_info(facts: &WorktreeFacts, ignored: &[String]) -> WorktreeInfo {
+    let (status, removable) = derive_worktree_status(facts);
     WorktreeInfo {
         locked: facts.locked,
         operation: facts.operation,
         untracked_checked: facts.untracked_checked,
-        only_here: facts.only_here,
+        only_here: facts.only_here.unwrap_or(0),
         merged: facts.merged.clone(),
         release: facts.release.clone(),
-        ignored: worktree.ignored.clone(),
+        // Listed only while it could be removed, as the confirm is the only reader.
+        ignored: if removable {
+            ignored.to_vec()
+        } else {
+            Vec::new()
+        },
         status,
         removable,
     }

@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use refract_core::language::main_language;
 use refract_core::protocol::{GitOperation, LastCommit};
 use refract_core::sessions::is_windows_mount;
-use refract_core::worktree::{WorktreeFacts, MAX_ONLY_HERE};
+use refract_core::worktree::{derive_worktree_status, WorktreeFacts, MAX_ONLY_HERE};
 
 use crate::scan;
 
@@ -41,14 +41,37 @@ pub struct Status {
 pub struct Worktree {
     /// The main working tree's real path.
     pub main: PathBuf,
-    /// The git part of its status, with `changes` from the status's `paths`.
+    /// The git part of its status read with the status, with `changes` from the status's
+    /// `paths`. The ref facts (`only_here`, `merged`, `release`) are left empty here: they
+    /// come from [`HeadInfo::worktree`] (see [`worktree_facts`]).
     pub facts: WorktreeFacts,
-    /// Top-level ignored entries, at most [`MAX_IGNORED`]; empty on a Windows drive.
+    /// Top-level ignored entries, at most [`MAX_IGNORED`]. Read only once the worktree
+    /// could be removed (see [`finish_worktree`]); empty otherwise and on a Windows drive.
     pub ignored: Vec<String>,
+}
+
+/// The ref facts of a linked worktree (spec §4): refreshed when HEAD or refs move, not
+/// on every working-tree change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeRefs {
+    /// See [`WorktreeFacts::only_here`].
+    pub only_here: Option<u32>,
+    /// The default branch's name when HEAD is its ancestor.
+    pub merged: Option<String>,
+    /// The oldest tag containing HEAD.
+    pub release: Option<String>,
 }
 
 /// The most top-level ignored entries kept: 8 to show, and one more to say "and more".
 pub const MAX_IGNORED: usize = 9;
+
+/// How deep [`holds_repo_in`] looks inside each ignored folder for a `.git`: the folder
+/// itself is depth 0. `<ignored>/worktrees/<name>/.git` is found at depth 2.
+const NESTED_REPO_DEPTH: usize = 4;
+
+/// The most folders [`holds_repo_in`] reads before giving up and counting the worktree as
+/// holding a repo, so a huge ignored tree (`node_modules/`) costs a bounded walk.
+const NESTED_REPO_BUDGET: usize = 10_000;
 
 /// Facts about HEAD: refreshed when HEAD or refs move.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -63,6 +86,8 @@ pub struct HeadInfo {
     pub off_origin: u32,
     /// Directories that hold tracked files, relative to the root (`""` is the root).
     pub tracked_dirs: Vec<String>,
+    /// The ref facts of a linked worktree; `None` for every other repo.
+    pub worktree: Option<WorktreeRefs>,
 }
 
 /// Reads `git status`. Fails if git cannot run or `path` is not a repo.
@@ -79,7 +104,20 @@ pub fn read_status(path: &Path) -> io::Result<Status> {
     let out = git(path, &args)?.ok_or_else(|| io::Error::other("git status failed"))?;
     let mut status = parse_status(&out);
     if let Some(linked) = scan::linked(path) {
-        status.worktree = Some(read_worktree(path, &linked, status.paths.len()));
+        let windows = worktree_on_windows_drive(path);
+        status.worktree = Some(Worktree {
+            main: linked.main.clone(),
+            facts: WorktreeFacts {
+                locked: is_locked(&linked.git_dir),
+                operation: operation(&linked.git_dir),
+                changes: status.paths.len() as u32,
+                untracked_checked: !windows,
+                windows_drive: windows,
+                holds_repo: has_submodules(path, &linked.git_dir),
+                ..WorktreeFacts::default()
+            },
+            ignored: Vec::new(),
+        });
     }
     Ok(status)
 }
@@ -91,11 +129,9 @@ pub fn worktree_on_windows_drive(path: &Path) -> bool {
     on_windows_drive(path) || crate::state::under_test_slow_prefix(path)
 }
 
-/// Reads the facts of the linked worktree at `path` that has `changes` status entries.
-/// Only reads git: nothing touches the network. A fact git cannot give stays empty.
-fn read_worktree(path: &Path, linked: &scan::Linked, changes: usize) -> Worktree {
-    let windows = worktree_on_windows_drive(path);
-    let only_here = only_here(path).unwrap_or(0);
+/// Reads the ref facts of the linked worktree at `path` (spec §4). Only reads git:
+/// nothing touches the network. A fact git cannot give stays empty.
+fn read_worktree_refs(path: &Path) -> WorktreeRefs {
     let merged = default_branch(path).filter(|(_, full)| is_ancestor(path, "HEAD", full));
     let release = git(path, &["tag", "--contains", "HEAD", "--sort=creatordate"])
         .ok()
@@ -105,39 +141,116 @@ fn read_worktree(path: &Path, linked: &scan::Linked, changes: usize) -> Worktree
             text.lines().next().map(str::to_owned)
         })
         .filter(|t| !t.is_empty());
-    let ignored = if windows {
-        Vec::new()
-    } else {
-        git(
-            path,
-            &[
-                "status",
-                "--porcelain",
-                "-z",
-                "--ignored=traditional",
-                "--untracked-files=normal",
-                "--ignore-submodules=all",
-            ],
-        )
-        .ok()
-        .flatten()
-        .map(|out| parse_ignored(&out))
-        .unwrap_or_default()
-    };
-    Worktree {
-        main: linked.main.clone(),
-        facts: WorktreeFacts {
-            locked: is_locked(&linked.git_dir),
-            operation: operation(&linked.git_dir),
-            changes: changes as u32,
-            untracked_checked: !windows,
-            windows_drive: windows,
-            only_here,
-            merged: merged.map(|(name, _)| name),
-            release,
-        },
-        ignored,
+    WorktreeRefs {
+        only_here: only_here(path),
+        merged: merged.map(|(name, _)| name),
+        release,
     }
+}
+
+/// The facts of a linked worktree: those read with its status, and the ref facts read
+/// with HEAD (none when HEAD could not be read, so it is not offered for removal).
+pub fn worktree_facts(worktree: &Worktree, head: &HeadInfo) -> WorktreeFacts {
+    let mut facts = worktree.facts.clone();
+    if let Some(refs) = &head.worktree {
+        facts.only_here = refs.only_here;
+        facts.merged = refs.merged.clone();
+        facts.release = refs.release.clone();
+    }
+    facts
+}
+
+/// Reads what only a removable worktree needs, once its status and HEAD facts are read:
+/// the ignored entries the confirm lists, and whether an ignored folder holds a repo.
+/// Skipped (and the ignored entries left empty) while anything else keeps the worktree,
+/// so a worktree being worked in costs no extra git call per status refresh.
+pub fn finish_worktree(path: &Path, status: &mut Status, head: &HeadInfo) {
+    let Some(worktree) = status.worktree.as_mut() else {
+        return;
+    };
+    worktree.ignored.clear();
+    if !derive_worktree_status(&worktree_facts(worktree, head)).1 {
+        return;
+    }
+    let Some(ignored) = ignored_paths(path) else {
+        return;
+    };
+    worktree.ignored = top_level(&ignored);
+    worktree.facts.holds_repo = holds_repo_in(path, &ignored);
+}
+
+/// Every ignored path in the worktree at `path`, as `git status --ignored` reports them:
+/// a wholly ignored folder once, with a trailing `/`. `None` when git fails.
+pub fn ignored_paths(path: &Path) -> Option<Vec<String>> {
+    let out = git(
+        path,
+        &[
+            "status",
+            "--porcelain",
+            "-z",
+            "--ignored=traditional",
+            "--untracked-files=normal",
+            "--ignore-submodules=all",
+        ],
+    )
+    .ok()??;
+    Some(parse_ignored_paths(&out))
+}
+
+/// True when the worktree whose own git directory is `git_dir` has submodules, which
+/// `git worktree remove` refuses: `<git_dir>/modules` exists, or `.gitmodules` does
+/// (which also counts submodules not checked out, where git would not refuse).
+pub fn has_submodules(path: &Path, git_dir: &Path) -> bool {
+    git_dir.join("modules").is_dir() || std::fs::symlink_metadata(path.join(".gitmodules")).is_ok()
+}
+
+/// True when any folder in `ignored` (paths relative to `root`, folders ending in `/`)
+/// holds a `.git` (a repo or another worktree), looking [`NESTED_REPO_DEPTH`] levels
+/// deep without following symlinks. Also true when the walk reads more than
+/// [`NESTED_REPO_BUDGET`] folders, since then it cannot tell.
+pub fn holds_repo_in(root: &Path, ignored: &[String]) -> bool {
+    let mut budget = NESTED_REPO_BUDGET;
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = ignored
+        .iter()
+        .filter(|p| p.ends_with('/'))
+        .map(|p| (root.join(p.trim_end_matches('/')), 0))
+        .collect();
+    while let Some((dir, depth)) = queue.pop_front() {
+        if budget == 0 {
+            return true;
+        }
+        budget -= 1;
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.file_name() == ".git" {
+                return true;
+            }
+            if depth < NESTED_REPO_DEPTH && entry.file_type().is_ok_and(|t| t.is_dir()) {
+                queue.push_back((entry.path(), depth + 1));
+            }
+        }
+    }
+    false
+}
+
+/// The tracked files in the worktree at `path` whose changes git does not show: marked
+/// assume-unchanged (a lowercase tag in `git ls-files -v`), or skip-worktree (`S`) and
+/// present on disk, as a sparse checkout's files are not. `None` when git fails.
+pub fn hidden_edits(path: &Path) -> Option<Vec<String>> {
+    let out = git(path, &["ls-files", "-v", "-z"]).ok()??;
+    Some(
+        out.split(|&b| b == 0)
+            .filter_map(|record| {
+                let (&tag, rest) = record.split_first()?;
+                let file = String::from_utf8_lossy(rest.strip_prefix(b" ")?).into_owned();
+                let hidden = tag.is_ascii_lowercase()
+                    || (tag == b'S' && std::fs::symlink_metadata(path.join(&file)).is_ok());
+                hidden.then_some(file)
+            })
+            .collect(),
+    )
 }
 
 /// True when the worktree whose git directory is `git_dir` is locked.
@@ -202,19 +315,22 @@ pub fn is_ancestor(path: &Path, ancestor: &str, of: &str) -> bool {
     git(path, &["merge-base", "--is-ancestor", ancestor, of]).is_ok_and(|out| out.is_some())
 }
 
-/// The top-level ignored entries in `git status --porcelain -z --ignored`, in order,
-/// at most [`MAX_IGNORED`]. A directory, or a path inside one, is its first component
-/// with a trailing `/`.
-pub fn parse_ignored(out: &[u8]) -> Vec<String> {
+/// The ignored paths in `git status --porcelain -z --ignored`, in order.
+pub fn parse_ignored_paths(out: &[u8]) -> Vec<String> {
+    out.split(|&b| b == 0)
+        .filter_map(|record| record.strip_prefix(b"!! "))
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect()
+}
+
+/// The top-level entries of ignored paths, in order, at most [`MAX_IGNORED`]. A
+/// directory, or a path inside one, is its first component with a trailing `/`.
+pub fn top_level(paths: &[String]) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
-    for record in out.split(|&b| b == 0) {
-        let Some(path) = record.strip_prefix(b"!! ") else {
-            continue;
-        };
-        let path = String::from_utf8_lossy(path);
+    for path in paths {
         let top = match path.split_once('/') {
             Some((first, _)) => format!("{first}/"),
-            None => path.into_owned(),
+            None => path.clone(),
         };
         if !entries.contains(&top) {
             entries.push(top);
@@ -389,6 +505,7 @@ pub fn read_head_unless(path: &Path, cancel: &AtomicBool) -> io::Result<HeadInfo
         commits_30d,
         off_origin,
         tracked_dirs: dirs.into_iter().collect(),
+        worktree: scan::linked(path).map(|_| read_worktree_refs(path)),
     })
 }
 
@@ -573,10 +690,16 @@ mod tests {
             "!! sub/cache/",
             "!! a b.tmp",
         ]);
-        assert_eq!(parse_ignored(&out), [".env", "target/", "sub/", "a b.tmp"]);
+        assert_eq!(
+            top_level(&parse_ignored_paths(&out)),
+            [".env", "target/", "sub/", "a b.tmp"]
+        );
         let many: Vec<String> = (0..12).map(|i| format!("!! f{i}.log")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert_eq!(parse_ignored(&z(&many)).len(), MAX_IGNORED);
+        assert_eq!(
+            top_level(&parse_ignored_paths(&z(&many))).len(),
+            MAX_IGNORED
+        );
     }
 
     #[test]
