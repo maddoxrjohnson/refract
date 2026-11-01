@@ -199,14 +199,51 @@ describe("RefactorSection", () => {
     expect(section().textContent).not.toContain("Merged 2 commits");
   });
 
-  it("says a merge that outlasted the wait is still running, not that it failed", async () => {
-    const { section } = setup(withRefactor({ state: "ready" }), {
-      onMerge: vi.fn(() => Promise.reject({ kind: "pending", message: "Still running; the panel will update when it finishes." })),
+  const STILL = { kind: "pending", message: "Still running; the panel will update when it finishes." };
+
+  it("keeps a merge that outlasted the wait busy, then says it merged without a count", async () => {
+    const { props, view, section } = setup(withRefactor({ state: "ready" }), {
+      onMerge: vi.fn(() => Promise.reject(STILL)),
     });
     fireEvent.click(button("Merge into main"));
     await flush();
     expect(section().querySelector('[role="alert"]')).toBeNull();
     expect(section().textContent).toContain("Still running; the panel will update when it finishes.");
+    expect(button("Merging…")).toHaveProperty("disabled", true);
+    expect(button("Discard")).toHaveProperty("disabled", true);
+    // A snapshot with the same state changes nothing.
+    view.rerender(<RefactorSection {...props} repo={withRefactor({ state: "ready" })} />);
+    expect(button("Merging…")).toHaveProperty("disabled", true);
+    view.rerender(<RefactorSection {...props} repo={testRepo({ refactor: null })} />);
+    expect(section().textContent).toContain("Merged into main.");
+    expect(section().textContent).not.toContain("Still running");
+  });
+
+  it("frees the buttons when a pending merge ends blocked", async () => {
+    const { props, view, section } = setup(withRefactor({ state: "ready" }), {
+      onMerge: vi.fn(() => Promise.reject(STILL)),
+    });
+    fireEvent.click(button("Merge into main"));
+    await flush();
+    view.rerender(
+      <RefactorSection {...props} repo={withRefactor({ state: "mergeBlocked", blocked: { reason: "conflict", files: [] } })} />,
+    );
+    expect(button("Merge again")).toHaveProperty("disabled", false);
+    expect(section().textContent).not.toContain("Still running");
+  });
+
+  it("shows nothing merged after a pending discard ends", async () => {
+    const { props, view, section } = setup(withRefactor({ state: "ready" }), {
+      onDiscard: vi.fn(() => Promise.reject(STILL)),
+    });
+    fireEvent.click(button("Discard"));
+    fireEvent.click(screen.getByRole("group", { name: "Confirm discard" }).querySelector("button")!);
+    await flush();
+    expect(button("Discarding…")).toHaveProperty("disabled", true);
+    view.rerender(<RefactorSection {...props} repo={testRepo({ refactor: null })} />);
+    expect(section().textContent).not.toContain("Merged");
+    expect(section().textContent).not.toContain("Still running");
+    expect(button(/Refactor…/)).toHaveProperty("disabled", false);
   });
 
   it("waits with Refactor and Resume while another launch runs", () => {

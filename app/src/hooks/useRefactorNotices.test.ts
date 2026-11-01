@@ -45,7 +45,12 @@ describe("useRefactorNotices", () => {
     send({ path: PATH, repoName: "tidepool", alert: "finished" });
     rerender({ zoomed: PATH });
     expect(result.current.notice).toBeNull();
+    // One that crossed the zoom on its way is dropped too.
     send({ path: PATH, repoName: "tidepool", alert: "finished" });
+    expect(result.current.notice).toBeNull();
+    rerender({ zoomed: null });
+    send({ path: PATH, repoName: "tidepool", alert: "finished" });
+    expect(result.current.notice?.alert).toBe("finished");
     act(() => result.current.dismiss());
     expect(result.current.notice).toBeNull();
   });

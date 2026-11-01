@@ -97,14 +97,46 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   const [error, setError] = useState<{ text: string; pending: boolean } | null>(null);
   // Kept after the refactor is gone, until the panel closes or moves to another repo, or
   // another refactor appears.
-  const [merged, setMerged] = useState<{ commits: number; target: string; kept: string[]; worktree: string } | null>(
-    null,
-  );
+  // `commits` is null when the merge outlasted its wait, so its outcome never came.
+  const [merged, setMerged] = useState<{
+    commits: number | null;
+    target: string;
+    kept: string[];
+    worktree: string;
+  } | null>(null);
+  // A merge or discard still running in the helper after the wait: the buttons stay busy
+  // until the refactor's state or worktree moves on.
+  const [pending, setPending] = useState<{
+    kind: "merge" | "discard";
+    state: RefactorInfo["state"];
+    worktree: string;
+    target: string;
+  } | null>(null);
   const worktree = info?.worktree ?? null;
+  const state = info?.state ?? null;
   useEffect(() => {
     if (worktree !== null) setMerged((m) => (m && m.worktree !== worktree ? null : m));
   }, [worktree]);
-  const fail = (err: unknown) => setError({ text: describeError(err), pending: isPending(err) });
+  useEffect(() => {
+    if (!pending || (pending.state === state && pending.worktree === worktree)) return;
+    // Gone after a merge that outlasted its wait: it went in, with an unknown count.
+    if (worktree === null && pending.kind === "merge") {
+      setMerged({ commits: null, target: pending.target, kept: [], worktree: pending.worktree });
+    }
+    setPending(null);
+    setBusy(null);
+    setError(null);
+  }, [pending, state, worktree]);
+  /** `kind`'s request failed, or is still running when the error says so. */
+  const fail = (kind: "merge" | "discard") => (err: unknown) => {
+    const still = isPending(err);
+    setError({ text: describeError(err), pending: still });
+    if (still && info) {
+      setPending({ kind, state: info.state, worktree: info.worktree, target: info.targetBranch });
+    } else {
+      setBusy(null);
+    }
+  };
   // A blocked merge whose reason the state doesn't show (the agent was still running).
   const [stopped, setStopped] = useState<string | null>(null);
 
@@ -121,18 +153,20 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
         } else if (outcome.reason === "live") {
           setStopped(blockText(outcome, target));
         }
+        setBusy(null);
       })
-      .catch(fail)
-      .finally(() => setBusy(null));
+      .catch(fail("merge"));
   };
 
   const discard = () => {
     setBusy("discard");
     setError(null);
     onDiscard()
-      .then(() => setConfirming(false))
-      .catch(fail)
-      .finally(() => setBusy(null));
+      .then(() => {
+        setConfirming(false);
+        setBusy(null);
+      })
+      .catch(fail("discard"));
   };
 
   const errorLine =
@@ -149,7 +183,8 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   const mergedBanner = merged && (
     <div className="rf-refactor__merged" role="status">
       <p className="rf-ok">
-        Merged {plural(merged.commits, "commit", "commits")} into <span className="rf-mono">{merged.target}</span>.
+        Merged {merged.commits === null ? "" : `${plural(merged.commits, "commit", "commits")} `}into{" "}
+        <span className="rf-mono">{merged.target}</span>.
       </p>
       {merged.kept.map((line) => (
         <p key={line} className="rf-hint">

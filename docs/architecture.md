@@ -505,11 +505,11 @@ The agent writes `refract-refactor.json` into the worktree's own git directory (
 ### Alerts
 
 There are two: the plan is ready (the refactor enters `needsYou` for the first time) and the refactor is ready (it enters `ready`). Both need the status hook to know when the agent waits. The Windows app decides each from the helper's `repoChanged` events (`app/src-tauri/src/alerts.rs`), so a hidden window, whose WebView2 is suspended, still gets them. How it is shown follows the window:
-- window hidden: a Windows toast;
-- window shown and the repo not zoomed: a notice in the interface (the `refactor://notice` event);
-- window shown and the repo zoomed: nothing, since the panel shows it.
+- window hidden, minimized or not focused (behind VS Code, say): a Windows toast;
+- window in front (shown and focused) and the repo not zoomed: a notice in the interface (the `refactor://notice` event);
+- window in front and the repo zoomed: nothing, since the panel shows it.
 
-Each alert comes once per refactor. A refactor first seen by the app is not announced (it may have been there before the app started), and neither is a state it has already passed. A resume re-arms the "ready" alert.
+Each alert comes once per refactor, which the app tells apart by worktree and creation time (a snapshot that briefly lacks the refactor, as in the helper's first load, forgets nothing). A refactor first seen by the app is not announced (it may have been there before the app started). One first seen in any state but `starting` counts as past its plan, so a later `needsYou` is taken for a question and not announced. The "ready" alert is re-armed when the refactor is interrupted and when it is resumed from Refract.
 
 ### In the interface
 

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { Backend } from "../backend/Backend";
 import type { RefactorNotice } from "../backend/types";
 
@@ -13,7 +13,16 @@ export const NOTICE_MS = 8000;
 export function useRefactorNotices(backend: Backend, zoomed: string | null) {
   const [notice, setNotice] = useState<RefactorNotice | null>(null);
 
-  useEffect(() => backend.onRefactorNotice(setNotice), [backend]);
+  // The zoomed repo's panel shows its own changes, even if a notice was already on its way.
+  const zoomedRef = useRef(zoomed);
+  zoomedRef.current = zoomed;
+  useEffect(
+    () =>
+      backend.onRefactorNotice((n) => {
+        if (n.path !== zoomedRef.current) setNotice(n);
+      }),
+    [backend],
+  );
 
   useEffect(() => {
     backend.setZoomed(zoomed).catch((err: unknown) => console.warn("setZoomed failed", err));

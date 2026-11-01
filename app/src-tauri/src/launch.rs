@@ -334,7 +334,7 @@ pub async fn open_refactor(app: AppHandle, path: String) -> Result<(), LaunchErr
     tauri::async_runtime::spawn_blocking(move || {
         let agent = app.state::<Agent>();
         let result = match agent.request(Method::GetRepo { path: path.clone() }, PREPARE_TIMEOUT) {
-            Ok(Reply::Repo(repo)) => refactor_folder(&repo),
+            Ok(Reply::Repo(repo)) => refactor_folder(&repo, crate::alerts::loaded()),
             Ok(other) => Err(LaunchError::new(
                 LaunchErrorKind::Agent,
                 format!("The helper sent an unexpected answer to getRepo: {other:?}"),
@@ -361,18 +361,23 @@ pub async fn open_refactor(app: AppHandle, path: String) -> Result<(), LaunchErr
 
 /// The `code --folder-uri` of `repo`'s refactor worktree: a WSL folder under the
 /// refactor worktrees folder, or an error.
-fn refactor_folder(repo: &RepoSnapshot) -> Result<String, LaunchError> {
+fn refactor_folder(repo: &RepoSnapshot, loaded: bool) -> Result<String, LaunchError> {
     let Some(info) = &repo.refactor else {
-        return Err(LaunchError::new(
-            LaunchErrorKind::Agent,
-            format!("{} has no refactor any more.", repo.name),
-        ));
+        // During the helper's first load a repo comes before its refactor does.
+        let message = if loaded {
+            format!("{} has no refactor any more.", repo.name)
+        } else {
+            "Refract is still loading; try again in a moment.".to_owned()
+        };
+        return Err(LaunchError::new(LaunchErrorKind::Agent, message));
     };
     let uri = &info.folder_uri;
     let in_worktrees = uri
         .strip_prefix("vscode-remote://wsl+")
         .and_then(|rest| rest.split_once('/'))
-        .is_some_and(|(_, path)| path.contains("/.refract-worktrees/") && !path.contains("/../"));
+        .is_some_and(|(_, path)| {
+            path.contains("/.refract-worktrees/") && !path.split('/').any(|seg| seg == "..")
+        });
     if !in_worktrees {
         return Err(LaunchError::new(
             LaunchErrorKind::Agent,
@@ -802,17 +807,22 @@ mod tests {
             .unwrap()
         };
         let good = "vscode-remote://wsl+Ubuntu/home/dev/projects/.refract-worktrees/reef-maps-20261031-1405";
-        assert_eq!(refactor_folder(&repo(Some(good))).unwrap(), good);
+        assert_eq!(refactor_folder(&repo(Some(good)), true).unwrap(), good);
         for bad in [
             "vscode-remote://wsl+Ubuntu/home/dev/projects/reef-maps",
             "file:///home/dev/projects/.refract-worktrees/reef-maps",
             "vscode-remote://wsl+Ubuntu/home/dev/projects/.refract-worktrees/../reef-maps",
+            "vscode-remote://wsl+Ubuntu/home/dev/projects/.refract-worktrees/x/..",
         ] {
-            assert!(refactor_folder(&repo(Some(bad))).is_err(), "{bad}");
+            assert!(refactor_folder(&repo(Some(bad)), true).is_err(), "{bad}");
         }
         assert_eq!(
-            refactor_folder(&repo(None)).unwrap_err().message,
+            refactor_folder(&repo(None), true).unwrap_err().message,
             "reef-maps has no refactor any more."
+        );
+        assert_eq!(
+            refactor_folder(&repo(None), false).unwrap_err().message,
+            "Refract is still loading; try again in a moment."
         );
     }
 

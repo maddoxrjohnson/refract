@@ -125,6 +125,15 @@ pub fn window_visible(app: &AppHandle) -> bool {
         .is_some_and(|w| w.is_visible().unwrap_or(false) && !w.is_minimized().unwrap_or(false))
 }
 
+/// Whether the main window is shown, not minimized and focused: in front of the user,
+/// not behind VS Code.
+pub fn window_in_front(app: &AppHandle) -> bool {
+    window_visible(app)
+        && app
+            .get_webview_window(MAIN)
+            .is_some_and(|w| w.is_focused().unwrap_or(false))
+}
+
 /// The visibility last reported to the interface. The window starts hidden.
 static REPORTED: AtomicBool = AtomicBool::new(false);
 

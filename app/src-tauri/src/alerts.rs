@@ -1,11 +1,15 @@
 //! Alerts for refactors (refactor spec §2, §4): one when the plan is first ready for
 //! approval and one when the refactor finishes. One state machine decides each alert
 //! from the helper's `repoChanged` events; it then goes to the interface as a
-//! [`NOTICE_EVENT`] while the window shows (unless the repo is the zoomed one, whose
-//! panel shows it), or as a Windows toast while it is hidden (WebView2 is suspended then).
+//! [`NOTICE_EVENT`] while the window is in front (shown and focused; unless the repo is
+//! the zoomed one, whose panel shows it), or as a Windows toast otherwise: hidden
+//! (WebView2 is suspended then), minimized, or behind another window such as VS Code.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
+
+use refract_client::AgentStatus;
 
 use refract_core::protocol::{Event, RefactorInfo, RefactorState, RepoSnapshot};
 use serde::Serialize;
@@ -75,7 +79,8 @@ pub struct Tracker {
 impl Tracker {
     /// Records `repo`'s refactor and returns the alert its change calls for. A refactor
     /// seen for the first time never alerts: it may have been there since before the app
-    /// started. A new one first shows as starting, so nothing is lost.
+    /// started. A new one first shows as starting, so nothing is lost; one first seen in
+    /// any later state may be past its plan, so a later `needsYou` is a question.
     pub fn observe(&mut self, repo: &RepoSnapshot) -> Option<Alert> {
         let Some(info) = &repo.refactor else {
             self.current.remove(&repo.path);
@@ -90,7 +95,7 @@ impl Tracker {
                 key,
                 Told {
                     state,
-                    plan: !matches!(state, Starting | Working),
+                    plan: state != Starting,
                     finished: matches!(state, Ready | NothingToDo | MergeBlocked),
                 },
             );
@@ -144,9 +149,10 @@ impl Tracker {
         self.zoomed = path;
     }
 
-    /// Where an alert for the repo at `path` goes, with the window `visible` or not.
-    pub fn route(&self, path: &str, visible: bool) -> Delivery {
-        if !visible {
+    /// Where an alert for the repo at `path` goes, with the window `in_front` (shown,
+    /// not minimized and focused) or not.
+    pub fn route(&self, path: &str, in_front: bool) -> Delivery {
+        if !in_front {
             Delivery::Toast
         } else if self.zoomed.as_deref() == Some(path) {
             Delivery::Panel
@@ -172,6 +178,21 @@ pub fn text(alert: Alert, name: &str) -> (String, &'static str) {
 
 static TRACKER: Mutex<Option<Tracker>> = Mutex::new(None);
 
+/// The helper finished its first load, refactors included: a repo without one has none.
+static LOADED: AtomicBool = AtomicBool::new(false);
+
+/// Whether the helper has sent every repo with its refactor since it (re)started.
+pub fn loaded() -> bool {
+    LOADED.load(Ordering::SeqCst)
+}
+
+/// Called with every helper status: a restarted helper loads again.
+pub fn on_helper_status(status: &AgentStatus) {
+    if *status != AgentStatus::Running {
+        LOADED.store(false, Ordering::SeqCst);
+    }
+}
+
 fn with_tracker<T>(f: impl FnOnce(&mut Tracker) -> T) -> T {
     let mut tracker = TRACKER.lock().unwrap_or_else(PoisonError::into_inner);
     f(tracker.get_or_insert_with(Tracker::default))
@@ -189,13 +210,17 @@ pub fn on_resume(path: &str) {
 
 /// Called with every helper event before it is forwarded to the interface.
 pub fn on_helper_event(app: &AppHandle, event: &Event) {
-    let Event::RepoChanged(repo) = event else {
-        return;
+    if let Event::LoadComplete = event {
+        LOADED.store(true, Ordering::SeqCst);
+    }
+    let repo = match event {
+        Event::RepoChanged(repo) => repo,
+        _ => return,
     };
-    let visible = crate::window::window_visible(app);
+    let in_front = crate::window::window_in_front(app);
     let Some((alert, delivery)) = with_tracker(|t| {
         t.observe(repo)
-            .map(|alert| (alert, t.route(&repo.path, visible)))
+            .map(|alert| (alert, t.route(&repo.path, in_front)))
     }) else {
         return;
     };
@@ -369,18 +394,16 @@ mod tests {
             MergeBlocked,
         ] {
             let mut t = Tracker::default();
-            let alerts = run(
-                &mut t,
-                &[Some((A, state)), Some((A, NeedsYou)), Some((A, Ready))],
-            );
-            assert_eq!(alerts[0], None, "{state:?}");
-            // Seen while working, the plan may still come; seen later, it has been.
-            assert_eq!(
-                alerts[1].is_some(),
-                state == Working,
-                "{state:?}: {alerts:?}"
-            );
+            let alerts = run(&mut t, &[Some((A, state)), Some((A, NeedsYou))]);
+            // Seen past starting, it may be past its plan: a later needsYou is a question.
+            assert_eq!(alerts, vec![None, None], "{state:?}");
         }
+        // Seen while working, its finish is still news.
+        let mut t = Tracker::default();
+        assert_eq!(
+            run(&mut t, &[Some((A, Working)), Some((A, Ready))]),
+            vec![None, Some(Alert::Finished)]
+        );
     }
 
     #[test]
@@ -441,12 +464,14 @@ mod tests {
 
     #[test]
     fn alerts_go_to_the_panel_the_interface_or_windows() {
+        // Hidden, minimized or behind another window: a Windows toast.
         let mut t = Tracker::default();
         assert_eq!(t.route(PATH, false), Delivery::Toast);
         assert_eq!(t.route(PATH, true), Delivery::Notice);
         t.set_zoomed(Some(PATH.into()));
         assert_eq!(t.route(PATH, true), Delivery::Panel);
         assert_eq!(t.route("/home/dev/projects/other", true), Delivery::Notice);
+        // Zoomed but behind VS Code: the panel isn't seen either.
         assert_eq!(t.route(PATH, false), Delivery::Toast);
     }
 
