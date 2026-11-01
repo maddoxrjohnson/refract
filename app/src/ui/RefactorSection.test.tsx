@@ -50,7 +50,7 @@ describe("RefactorSection", () => {
       const { props, section, view } = setup(withRefactor({ state, live: true, commits: [] }));
       if (state === "needsYou") expect(section().textContent).toContain("approve its plan");
       fireEvent.click(button(/Go to the refactor/));
-      expect(props.onOpen).toHaveBeenCalledWith(props.repo.refactor);
+      expect(props.onOpen).toHaveBeenCalled();
       expect(screen.queryByRole("button", { name: /Discard/ })).toBeNull();
       view.unmount();
     }
@@ -161,5 +161,59 @@ describe("RefactorSection", () => {
     expect(section().textContent).toContain("The code is already tidy.");
     fireEvent.click(button("Remove"));
     expect(screen.getByText("Remove the refactor's worktree and branch?")).toBeTruthy();
+  });
+  it("with Claude still open after a conflict: Go to the refactor, and why Fix and Discard wait", () => {
+    const { section } = setup(
+      withRefactor({ state: "mergeBlocked", live: true, blocked: { reason: "conflict", files: ["src/sync.ts"] } }),
+    );
+    expect(section().textContent).toContain("Claude is still open in the refactor window; close it to fix or discard.");
+    expect(button(/Go to the refactor/)).toBeTruthy();
+    for (const name of ["Fix with Claude", "Discard"]) {
+      expect(button(name)).toHaveProperty("disabled", true);
+      expect(button(name).getAttribute("title")).toContain("Close it first");
+    }
+    expect(button("Merge again")).toHaveProperty("disabled", false);
+  });
+
+  it("with Claude still open and nothing to do: Go to the refactor, Remove waits", () => {
+    const { section } = setup(withRefactor({ state: "nothingToDo", live: true, commits: [] }));
+    expect(section().textContent).toContain("close it to fix or discard");
+    expect(button(/Go to the refactor/)).toBeTruthy();
+    expect(button("Remove")).toHaveProperty("disabled", true);
+  });
+
+  it("keeps the merged line over a leftover copy, and drops it for a new refactor", async () => {
+    const { props, view, section } = setup(withRefactor({ state: "ready" }));
+    fireEvent.click(button("Merge into main"));
+    await flush();
+    const leftover = testRepo({
+      refactor: testRefactor({ state: "nothingToDo", commits: [], summary: "Merged; the worktree could not be removed: in use" }),
+    });
+    view.rerender(<RefactorSection {...props} repo={leftover} />);
+    expect(section().textContent).toContain("Merged 2 commits into main.");
+    expect(section().textContent).toContain("leftover copy");
+    expect(section().textContent).not.toContain("found nothing");
+    expect(button("Remove")).toBeTruthy();
+    const next = testRepo({ refactor: testRefactor({ state: "starting", worktree: "/home/demo/projects/.refract-worktrees/tidepool-20261031-1610" }) });
+    view.rerender(<RefactorSection {...props} repo={next} />);
+    expect(section().textContent).not.toContain("Merged 2 commits");
+  });
+
+  it("says a merge that outlasted the wait is still running, not that it failed", async () => {
+    const { section } = setup(withRefactor({ state: "ready" }), {
+      onMerge: vi.fn(() => Promise.reject({ kind: "pending", message: "Still running; the panel will update when it finishes." })),
+    });
+    fireEvent.click(button("Merge into main"));
+    await flush();
+    expect(section().querySelector('[role="alert"]')).toBeNull();
+    expect(section().textContent).toContain("Still running; the panel will update when it finishes.");
+  });
+
+  it("waits with Refactor and Resume while another launch runs", () => {
+    const first = setup(testRepo(), { launching: true });
+    expect(button(/Refactor…/)).toHaveProperty("disabled", true);
+    first.view.unmount();
+    setup(withRefactor({ state: "interrupted", commits: [] }), { launching: true });
+    expect(button("Resume refactor")).toHaveProperty("disabled", true);
   });
 });

@@ -17,6 +17,7 @@ import type {
   LaunchTicket,
   MergeOutcome,
   MigratePreflight,
+  RefactorNotice,
   MigrateSnapshotProgress,
   PendingMigration,
   CancelOutcome,
@@ -43,6 +44,7 @@ export const EVENTS = {
   gpu: "system://gpu",
   stats: "system://stats",
   migrateSnapshot: "migrate://snapshot",
+  refactorNotice: "refactor://notice",
 } as const;
 
 /**
@@ -179,8 +181,16 @@ export class TauriBackend implements Backend {
     return invoke<void>("discard_refactor", { path });
   }
 
-  openRefactor(folderUri: string): Promise<void> {
-    return invoke<void>("open_refactor", { folderUri });
+  openRefactor(path: string): Promise<void> {
+    return invoke<void>("open_refactor", { path });
+  }
+
+  onRefactorNotice(cb: (notice: RefactorNotice) => void): Unsubscribe {
+    return subscribe<RefactorNotice>(EVENTS.refactorNotice, (e) => cb(e.payload));
+  }
+
+  setZoomed(path: string | null): Promise<void> {
+    return invoke<void>("set_zoomed", { path });
   }
 
   // The hook and usage commands reject with `AgentRequestError`, as `agent_request` does.

@@ -462,6 +462,13 @@ describe("Alt+R", () => {
     }
   });
 
+  it("matches the physical R key on other layouts", () => {
+    const r = run([{ type: "select", path: "/p/plain" }, { type: "key", key: { key: "к", code: "KeyR", alt: true } }], initialNavState, c);
+    expect(r.effects).toEqual([{ kind: "refactorDialog", path: "/p/plain" }]);
+    const t = run([{ type: "select", path: "/p/plain" }, { type: "key", key: { key: "r", code: "KeyT", alt: true } }], initialNavState, c);
+    expect(t.handled).toBe(false);
+  });
+
   it("goes to the refactor once the repo has one", () => {
     expect(altR("/p/busy").effects).toEqual([{ kind: "openRefactor", path: "/p/busy" }]);
   });

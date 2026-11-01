@@ -108,6 +108,16 @@ describe("TauriBackend", () => {
     expect(usages).toEqual([{ totalPercent: 42.5, ownPercent: 7 }]);
   });
 
+  it("delivers refactor notices from the Rust side", async () => {
+    mockIPC(() => undefined, { shouldMockEvents: true });
+    const notices: unknown[] = [];
+    new TauriBackend().onRefactorNotice((n) => notices.push(n));
+    await settle();
+    const notice = { path: "/home/dev/projects/reef-maps", repoName: "reef-maps", alert: "planReady" };
+    await emit(EVENTS.refactorNotice, notice);
+    expect(notices).toEqual([notice]);
+  });
+
   it("delivers events until unsubscribed", async () => {
     mockIPC(() => undefined, { shouldMockEvents: true });
     const backend = new TauriBackend();
@@ -232,14 +242,18 @@ describe("TauriBackend", () => {
     await backend.resumeRefactor(path, true);
     expect(await backend.mergeRefactor(path)).toEqual({ outcome: "merged", commits: 2 });
     await expect(backend.discardRefactor(path)).rejects.toMatchObject({ kind: "refactor" });
-    await backend.openRefactor(ticket.folderUri);
+    await backend.openRefactor(path);
+    await backend.setZoomed(path);
+    await backend.setZoomed(null);
     expect(calls).toEqual([
       { cmd: "start_refactor", args: { path, focus: null } },
       { cmd: "start_refactor", args: { path, focus: "the parser" } },
       { cmd: "resume_refactor", args: { path, fix: true } },
       { cmd: "merge_refactor", args: { path } },
       { cmd: "discard_refactor", args: { path } },
-      { cmd: "open_refactor", args: { folderUri: ticket.folderUri } },
+      { cmd: "open_refactor", args: { path } },
+      { cmd: "set_zoomed", args: { path } },
+      { cmd: "set_zoomed", args: { path: null } },
     ]);
   });
 

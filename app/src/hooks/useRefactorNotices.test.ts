@@ -1,59 +1,52 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { RefactorState, RepoSnapshot } from "../backend/types";
-import { testRefactor, testRepo } from "../ui/testRepo";
-import { NOTICE_MS, QUIET_AFTER_SHOW_MS, useRefactorNotices } from "./useRefactorNotices";
+import type { Backend } from "../backend/Backend";
+import type { RefactorNotice } from "../backend/types";
+import { NOTICE_MS, useRefactorNotices } from "./useRefactorNotices";
 
 afterEach(() => vi.useRealTimers());
 
 const PATH = "/home/demo/projects/tidepool";
-const OTHER = "/home/demo/projects/quill";
 
-function repos(state: RefactorState | null): Map<string, RepoSnapshot> {
-  const repo = testRepo({ refactor: state ? testRefactor({ state }) : null });
-  return new Map([[repo.path, repo]]);
-}
-
-function setup(visible = true, zoomed: string | null = OTHER) {
-  vi.useFakeTimers();
-  const hook = renderHook(
-    (p: { repos: Map<string, RepoSnapshot>; visible: boolean; zoomed: string | null }) =>
-      useRefactorNotices(p.repos, p.visible, p.zoomed),
-    { initialProps: { repos: repos("working"), visible, zoomed } },
-  );
-  act(() => vi.advanceTimersByTime(QUIET_AFTER_SHOW_MS));
-  return hook;
+function fakeBackend() {
+  let send: ((n: RefactorNotice) => void) | null = null;
+  const setZoomed = vi.fn(() => Promise.resolve());
+  const backend = {
+    onRefactorNotice: (cb: (n: RefactorNotice) => void) => {
+      send = cb;
+      return () => (send = null);
+    },
+    setZoomed,
+  } as unknown as Backend;
+  return { backend, setZoomed, send: (n: RefactorNotice) => act(() => send?.(n)) };
 }
 
 describe("useRefactorNotices", () => {
-  it("tells a plan that is ready once, for a repo that isn't zoomed, then fades", () => {
-    const { result, rerender } = setup();
-    rerender({ repos: repos("needsYou"), visible: true, zoomed: OTHER });
-    expect(result.current.notice).toEqual({ path: PATH, repoName: "tidepool", alert: "planReady" });
-    act(() => result.current.dismiss());
-    rerender({ repos: repos("needsYou"), visible: true, zoomed: OTHER });
-    expect(result.current.notice).toBeNull();
-    rerender({ repos: repos("ready"), visible: true, zoomed: OTHER });
-    expect(result.current.notice?.alert).toBe("finished");
+  it("tells the Rust side the zoomed repo and shows what it sends until it fades", () => {
+    vi.useFakeTimers();
+    const { backend, setZoomed, send } = fakeBackend();
+    const { result, rerender } = renderHook((p: { zoomed: string | null }) => useRefactorNotices(backend, p.zoomed), {
+      initialProps: { zoomed: null as string | null },
+    });
+    expect(setZoomed).toHaveBeenLastCalledWith(null);
+    rerender({ zoomed: "/home/demo/projects/quill" });
+    expect(setZoomed).toHaveBeenLastCalledWith("/home/demo/projects/quill");
+    send({ path: PATH, repoName: "tidepool", alert: "planReady" });
+    expect(result.current.notice?.alert).toBe("planReady");
     act(() => vi.advanceTimersByTime(NOTICE_MS));
     expect(result.current.notice).toBeNull();
   });
 
-  it("stays quiet for the zoomed repo, and clears when its repo is zoomed", () => {
-    const { result, rerender } = setup(true, PATH);
-    rerender({ repos: repos("needsYou"), visible: true, zoomed: PATH });
+  it("clears a notice when its repo is zoomed, and on dismiss", () => {
+    const { backend, send } = fakeBackend();
+    const { result, rerender } = renderHook((p: { zoomed: string | null }) => useRefactorNotices(backend, p.zoomed), {
+      initialProps: { zoomed: null as string | null },
+    });
+    send({ path: PATH, repoName: "tidepool", alert: "finished" });
+    rerender({ zoomed: PATH });
     expect(result.current.notice).toBeNull();
-    rerender({ repos: repos("ready"), visible: true, zoomed: OTHER });
-    expect(result.current.notice?.alert).toBe("finished");
-    rerender({ repos: repos("ready"), visible: true, zoomed: PATH });
-    expect(result.current.notice).toBeNull();
-  });
-
-  it("stays quiet while hidden and just after showing, when Windows has told it", () => {
-    const { result, rerender } = setup(false);
-    rerender({ repos: repos("needsYou"), visible: false, zoomed: OTHER });
-    rerender({ repos: repos("needsYou"), visible: true, zoomed: OTHER });
-    rerender({ repos: repos("ready"), visible: true, zoomed: OTHER });
+    send({ path: PATH, repoName: "tidepool", alert: "finished" });
+    act(() => result.current.dismiss());
     expect(result.current.notice).toBeNull();
   });
 });

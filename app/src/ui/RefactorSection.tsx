@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import type { MergeOutcome, RefactorInfo, RepoSnapshot } from "../backend/types";
 import { blockText, CHECK_LABELS, discardQuestion, refactorBlocker } from "../refactors";
 import { describeError } from "./StatusToast";
@@ -9,18 +9,26 @@ export interface RefactorSectionProps {
   /** Opens the Refactor dialog. */
   onStart(): void;
   /** Opens or raises the worktree's VS Code window: Go to the refactor, Review in VS Code. */
-  onOpen(info: RefactorInfo): void;
+  onOpen(): void;
   /** Resume refactor, or with `fix` Fix with Claude after a conflict. Runs as a launch. */
   onResume(fix: boolean): void;
   /** Rejects with the helper's reason. */
   onMerge(): Promise<MergeOutcome>;
   onDiscard(): Promise<void>;
-  /** A launch is under way, so Resume would wait behind it. */
+  /** A launch or clone is under way, so Refactor and Resume would wait behind it. */
   launching?: boolean;
 }
 
 function plural(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
+}
+
+/** Why Fix with Claude and Discard wait while the agent runs. */
+const LIVE_TITLE = "Claude is still open in the refactor window. Close it first.";
+
+/** A merge or discard that outlasted the wait; the helper carries on. */
+function isPending(err: unknown): boolean {
+  return typeof err === "object" && err !== null && (err as { kind?: unknown }).kind === "pending";
 }
 
 const ALT_R = (
@@ -86,9 +94,17 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   const info = repo.refactor ?? null;
   const [busy, setBusy] = useState<"merge" | "discard" | null>(null);
   const [confirming, setConfirming] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Kept after the refactor is gone, until the panel closes or moves to another repo.
-  const [merged, setMerged] = useState<{ commits: number; target: string; kept: string[] } | null>(null);
+  const [error, setError] = useState<{ text: string; pending: boolean } | null>(null);
+  // Kept after the refactor is gone, until the panel closes or moves to another repo, or
+  // another refactor appears.
+  const [merged, setMerged] = useState<{ commits: number; target: string; kept: string[]; worktree: string } | null>(
+    null,
+  );
+  const worktree = info?.worktree ?? null;
+  useEffect(() => {
+    if (worktree !== null) setMerged((m) => (m && m.worktree !== worktree ? null : m));
+  }, [worktree]);
+  const fail = (err: unknown) => setError({ text: describeError(err), pending: isPending(err) });
   // A blocked merge whose reason the state doesn't show (the agent was still running).
   const [stopped, setStopped] = useState<string | null>(null);
 
@@ -101,12 +117,12 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
     onMerge()
       .then((outcome) => {
         if (outcome.outcome === "merged") {
-          setMerged({ commits: outcome.commits, target, kept: outcome.kept ?? [] });
+          setMerged({ commits: outcome.commits, target, kept: outcome.kept ?? [], worktree: info.worktree });
         } else if (outcome.reason === "live") {
           setStopped(blockText(outcome, target));
         }
       })
-      .catch((err: unknown) => setError(describeError(err)))
+      .catch(fail)
       .finally(() => setBusy(null));
   };
 
@@ -115,14 +131,32 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
     setError(null);
     onDiscard()
       .then(() => setConfirming(false))
-      .catch((err: unknown) => setError(describeError(err)))
+      .catch(fail)
       .finally(() => setBusy(null));
   };
 
-  const errorLine = error && (
-    <p className="rf-error" role="alert">
-      {error}
-    </p>
+  const errorLine =
+    error &&
+    (error.pending ? (
+      <p className="rf-hint" role="status">
+        {error.text}
+      </p>
+    ) : (
+      <p className="rf-error" role="alert">
+        {error.text}
+      </p>
+    ));
+  const mergedBanner = merged && (
+    <div className="rf-refactor__merged" role="status">
+      <p className="rf-ok">
+        Merged {plural(merged.commits, "commit", "commits")} into <span className="rf-mono">{merged.target}</span>.
+      </p>
+      {merged.kept.map((line) => (
+        <p key={line} className="rf-hint">
+          {line}
+        </p>
+      ))}
+    </div>
   );
 
   if (!info) {
@@ -130,18 +164,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
     return (
       <section className="rf-section" aria-label="Refactor">
         <h3 className="rf-section__label">Refactor</h3>
-        {merged && (
-          <div className="rf-refactor__merged" role="status">
-            <p className="rf-ok">
-              Merged {plural(merged.commits, "commit", "commits")} into <span className="rf-mono">{merged.target}</span>.
-            </p>
-            {merged.kept.map((line) => (
-              <p key={line} className="rf-hint">
-                {line}
-              </p>
-            ))}
-          </div>
-        )}
+        {mergedBanner}
         {!merged && (
           <p className="rf-hint">
             {blocker ?? "Claude proposes up to 3 refactors in a copy of the repo, then commits each one for you to review."}
@@ -151,7 +174,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
           type="button"
           className="rf-button"
           aria-haspopup="dialog"
-          disabled={blocker !== null}
+          disabled={blocker !== null || launching}
           onClick={onStart}
         >
           <span>Refactor…</span>
@@ -165,7 +188,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   const live = info.live;
   const commits = info.commits.length;
   const goTo = (
-    <button type="button" className="rf-button" onClick={() => onOpen(info)}>
+    <button type="button" className="rf-button" onClick={onOpen}>
       <span>Go to the refactor</span>
       {ALT_R}
     </button>
@@ -175,6 +198,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
       type="button"
       className={`rf-button${fix ? " rf-button--accent" : ""}`}
       disabled={live || launching || busy !== null}
+      title={live ? LIVE_TITLE : undefined}
       onClick={() => onResume(fix)}
     >
       {label}
@@ -185,7 +209,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
       type="button"
       className="rf-button rf-button--danger"
       disabled={live || busy !== null}
-      title={live ? "The refactor agent is still running." : undefined}
+      title={live ? LIVE_TITLE : undefined}
       onClick={() => {
         setError(null);
         setConfirming(true);
@@ -200,6 +224,10 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
     </button>
   );
 
+  // An idle agent left open is the normal end of a run; say what it holds up.
+  const stillOpen = live && (
+    <p className="rf-refactor__line rf-muted">Claude is still open in the refactor window; close it to fix or discard.</p>
+  );
   let body: ReactNode;
   let actions: ReactNode;
   switch (info.state) {
@@ -248,7 +276,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
       actions = (
         <>
           {mergeButton(`Merge into ${info.targetBranch}`)}
-          <button type="button" className="rf-button" onClick={() => onOpen(info)}>
+          <button type="button" className="rf-button" onClick={onOpen}>
             <span>Review in VS Code</span>
             {ALT_R}
           </button>
@@ -260,11 +288,19 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
     case "nothingToDo":
       body = (
         <>
-          <p className="rf-refactor__line">Claude found nothing worth refactoring.</p>
+          <p className="rf-refactor__line">
+            {merged ? "The refactor's leftover copy is still here; Remove deletes it." : "Claude found nothing worth refactoring."}
+          </p>
           {info.summary && <p className="rf-quote rf-refactor__summary">{info.summary}</p>}
+          {stillOpen}
         </>
       );
-      actions = discardButton("Remove");
+      actions = (
+        <>
+          {live && goTo}
+          {discardButton("Remove")}
+        </>
+      );
       break;
     case "mergeBlocked": {
       const block = info.blocked;
@@ -281,13 +317,14 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
             </ul>
           )}
           <Results info={info} />
+          {stillOpen}
         </>
       );
       actions = (
         <>
           {mergeButton("Merge again")}
           {block?.reason === "conflict" && resume(true, "Fix with Claude")}
-          {(block?.reason === "worktreeDirty" || block?.reason === "worktreeBusy") && goTo}
+          {(live || block?.reason === "worktreeDirty" || block?.reason === "worktreeBusy") && goTo}
           {discardButton("Discard")}
         </>
       );
@@ -298,6 +335,7 @@ export function RefactorSection({ repo, onStart, onOpen, onResume, onMerge, onDi
   return (
     <section className="rf-section rf-refactor" aria-label="Refactor" aria-busy={busy !== null}>
       <h3 className="rf-section__label">Refactor</h3>
+      {mergedBanner}
       {body}
       {stopped && <p className="rf-refactor__line rf-refactor__attention">{stopped}</p>}
       {confirming ? (

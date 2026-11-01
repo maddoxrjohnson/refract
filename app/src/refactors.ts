@@ -2,7 +2,7 @@ import type {
   CheckOutcome,
   MergeBlock,
   RefactorInfo,
-  RefactorState,
+  RefactorNotice,
   RepoSnapshot,
 } from "./backend/types";
 
@@ -79,9 +79,9 @@ export function blockText(block: Pick<MergeBlock, "reason">, target: string): st
     case "targetBusy":
       return `${target} is checked out or being rebased in another worktree. Finish there, then merge again.`;
     case "worktreeBusy":
-      return "The refactor's worktree is off its branch or mid-rebase. Sort it out there, then merge again.";
+      return "The refactor's copy is in the middle of a rebase or merge, or not on its branch (after a crash, say). Finish or abort it in the refactor window (git rebase --abort), or Discard.";
     case "worktreeDirty":
-      return "The refactor's worktree has uncommitted changes. Commit or drop them there, then merge again.";
+      return "The refactor's copy has uncommitted changes, which can include new files Claude didn't add. Commit or remove them in the refactor window, then merge again.";
     case "targetRewound":
       return `${target} no longer contains the commit the refactor started from, so it can't be merged.`;
   }
@@ -94,75 +94,8 @@ export function discardQuestion(commits: number): string {
     : "Remove the refactor's worktree and branch?";
 }
 
-// Toasts (spec §4): entering needsYou the first time (the plan) and entering ready, once
-// per transition. The same rules as app/src-tauri/src/alerts.rs, which toasts while the
-// window is hidden.
-
-/** What was last seen of one repo's refactor. */
-export interface RefactorSeen {
-  /** Tells one refactor from the next; `null` while the repo has none. */
-  worktree: string | null;
-  state: RefactorState | null;
-  /** The plan toast was shown for this refactor, or it was first seen past planning. */
-  planTold: boolean;
-}
-
-export type RefactorAlert = "planReady" | "finished";
-
-/**
- * What `next` is after `prev` (`undefined` the first time the repo is seen), and the toast
- * the change calls for. A first sighting never toasts.
- */
-export function stepRefactor(
-  prev: RefactorSeen | undefined,
-  next: RefactorInfo | null | undefined,
-): [RefactorSeen, RefactorAlert | null] {
-  const worktree = next?.worktree ?? null;
-  const state = next?.state ?? null;
-  if (!prev) {
-    const planTold = state !== null && state !== "starting" && state !== "working";
-    return [{ worktree, state, planTold }, null];
-  }
-  const same = prev.worktree !== null && prev.worktree === worktree;
-  const before = same ? prev.state : null;
-  let planTold = same && prev.planTold;
-  let alert: RefactorAlert | null = null;
-  if (state === "needsYou" && before !== state && !planTold) {
-    planTold = true;
-    alert = "planReady";
-  } else if (state === "ready" && before !== null && before !== "ready" && before !== "mergeBlocked") {
-    alert = "finished";
-  }
-  return [{ worktree, state, planTold }, alert];
-}
-
-export interface RefactorNotice {
-  path: string;
-  repoName: string;
-  alert: RefactorAlert;
-}
-
-/**
- * Steps every repo in `repos` from `seen` (updated in place; repos that are gone are
- * forgotten) and returns the toasts the changes call for.
- */
-export function trackRefactors(
-  seen: Map<string, RefactorSeen>,
-  repos: Iterable<RepoSnapshot>,
-): RefactorNotice[] {
-  const out: RefactorNotice[] = [];
-  const present = new Set<string>();
-  for (const repo of repos) {
-    present.add(repo.path);
-    const [next, alert] = stepRefactor(seen.get(repo.path), repo.refactor);
-    seen.set(repo.path, next);
-    if (alert) out.push({ path: repo.path, repoName: repo.name, alert });
-  }
-  for (const path of [...seen.keys()]) if (!present.has(path)) seen.delete(path);
-  return out;
-}
-
-export const NOTICE_TEXT: Record<RefactorAlert, string> = {
+// The toast's text for an alert the Rust side sent (app/src-tauri/src/alerts.rs decides them).
+export const NOTICE_TEXT: Record<RefactorNotice["alert"], string> = {
   planReady: "refactor plan is ready for you",
   finished: "refactor is ready to review",
 };

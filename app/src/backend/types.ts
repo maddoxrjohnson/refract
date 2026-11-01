@@ -151,6 +151,13 @@ export type MergeOutcome =
   /** Nothing changed; the refactor stays. */
   | { outcome: "blocked"; reason: MergeBlockReason; files: string[] };
 
+/** A refactor alert for the interface's toast, sent as `refactor://notice`. */
+export interface RefactorNotice {
+  path: string;
+  repoName: string;
+  alert: "planReady" | "finished";
+}
+
 /** The helper's error code for a refused or failed refactor request. */
 export const REFACTOR_FAILED = 8;
 

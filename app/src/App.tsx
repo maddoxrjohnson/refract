@@ -14,7 +14,6 @@ import type {
   AgentStatus,
   LaunchMode,
   LaunchTicket,
-  RefactorInfo,
   RemoteList,
   RemoteRef,
   RepoSnapshot,
@@ -372,6 +371,7 @@ export function App({ backend }: { backend: Backend }) {
       const gem = repos.get(key);
       if (launching.current || !remote || !gem) return;
       launching.current = true;
+      setLaunchBusy(true);
       const repoName = remote.name;
       setLaunch({ repoName, step: "cloning" });
       backend
@@ -387,6 +387,7 @@ export function App({ backend }: { backend: Backend }) {
         )
         .finally(() => {
           launching.current = false;
+          setLaunchBusy(false);
         });
     },
     [backend, projects, repos],
@@ -435,14 +436,18 @@ export function App({ backend }: { backend: Backend }) {
 
   // The Refactor dialog, by repo path; window keys stay with it while it is open.
   const [refactorFor, setRefactorFor] = useState<string | null>(null);
+  // Set where the dialog renders, so keys go back to the scene whenever it is not shown.
   const refactorOpenRef = useRef(false);
-  refactorOpenRef.current = refactorFor !== null;
   const closeRefactor = useCallback(() => {
     setRefactorFor(null);
     (document.activeElement as HTMLElement | null)?.blur();
   }, []);
-  const openRefactor = (info: RefactorInfo) =>
-    backend.openRefactor(info.folderUri).catch((err: unknown) => setOpenError(describeError(err)));
+  const openRefactor = (path: string) =>
+    backend.openRefactor(path).catch((err: unknown) => setOpenError(describeError(err)));
+  // A repo that goes away (removed, or moved to WSL) takes its dialog with it.
+  useEffect(() => {
+    if (refactorFor && !repos.has(refactorFor)) setRefactorFor(null);
+  }, [refactorFor, repos]);
 
   // Navigation is a pure state machine; the ref lets window listeners read the latest
   // state without re-subscribing, and effects run outside the state update.
@@ -455,10 +460,8 @@ export function App({ backend }: { backend: Backend }) {
     for (const e of effects) {
       if (e.kind === "clone") startClone(e.key);
       else if (e.kind === "refactorDialog") setRefactorFor(e.path);
-      else if (e.kind === "openRefactor") {
-        const info = repos.get(e.path)?.refactor;
-        if (info) void openRefactor(info);
-      } else startLaunch(e.path, e.mode);
+      else if (e.kind === "openRefactor") void openRefactor(e.path);
+      else startLaunch(e.path, e.mode);
     }
   };
   const send = useCallback((input: NavInput) => {
@@ -478,7 +481,15 @@ export function App({ backend }: { backend: Backend }) {
     const onKey = (ev: KeyboardEvent) => {
       if (ev.key === "Enter" && ev.repeat) return;
       // The Move to WSL and Refactor dialogs handle their own keys, Escape included.
-      if (moveOpenRef.current || refactorOpenRef.current) return;
+      if (moveOpenRef.current) return;
+      if (refactorOpenRef.current) {
+        // Escape from outside the dialog (it handles its own) still closes it.
+        if (ev.key === "Escape") {
+          ev.preventDefault();
+          closeRefactor();
+        }
+        return;
+      }
       if (settingsOpenRef.current) {
         // Escape from outside the dialog (the dialog handles its own) still closes it.
         if (ev.key === "Escape") {
@@ -493,13 +504,13 @@ export function App({ backend }: { backend: Backend }) {
       if (ev.key === "Enter" && target?.closest("button")) return;
       const handled = send({
         type: "key",
-        key: { key: ev.key, ctrl: ev.ctrlKey, meta: ev.metaKey, alt: ev.altKey },
+        key: { key: ev.key, code: ev.code, ctrl: ev.ctrlKey, meta: ev.metaKey, alt: ev.altKey },
       });
       if (handled) ev.preventDefault();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [send, closeSettings]);
+  }, [send, closeSettings, closeRefactor]);
 
   const onPointerFocus = useCallback((path: string | null) => send({ type: "pointerFocus", path }), [send]);
   const onSelect = useCallback((path: string) => send({ type: "select", path }), [send]);
@@ -534,9 +545,10 @@ export function App({ backend }: { backend: Backend }) {
     return out;
   }, [repoList, projects.remoteOnly, moves.state]);
   const zoomedRepo = nav.zoomed ? repos.get(nav.zoomed) : undefined;
-  const refactorNotices = useRefactorNotices(localRepos, visible, nav.zoomed);
+  const refactorNotices = useRefactorNotices(backend, nav.zoomed);
   const notice = refactorNotices.notice;
-  const refactorRepo = refactorFor ? repos.get(refactorFor) : undefined;
+  const refactorRepo = refactorFor && !moveSource ? repos.get(refactorFor) : undefined;
+  refactorOpenRef.current = refactorRepo !== undefined;
   const zoomedRemote = zoomedRepo ? (projects.remotes.get(zoomedRepo.path) ?? null) : null;
   const zoomedRemoteOnly = !!zoomedRepo && projects.remoteOnly.has(zoomedRepo.path);
   // Details come from the listed remote, or from a local origin on a host Refract asks.
@@ -623,7 +635,7 @@ export function App({ backend }: { backend: Backend }) {
                   if (nav.picker) send({ type: "pickerClose" });
                   setRefactorFor(zoomedRepo.path);
                 }}
-                onOpen={openRefactor}
+                onOpen={() => void openRefactor(zoomedRepo.path)}
                 onResume={(fix) =>
                   runLaunch(zoomedRepo.path, () => backend.resumeRefactor(zoomedRepo.path, fix))
                 }
@@ -663,13 +675,15 @@ export function App({ backend }: { backend: Backend }) {
           }}
         />
       )}
-      {refactorRepo && !moveSource && (
+      {refactorRepo && (
         <RefactorDialog
           repo={refactorRepo}
           hook={hook}
+          busy={launchBusy}
           onClose={closeRefactor}
           onConfirm={(focus) => {
             const path = refactorRepo.path;
+            if (launching.current) return;
             closeRefactor();
             runLaunch(path, () => backend.startRefactor(path, focus || undefined));
           }}

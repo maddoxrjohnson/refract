@@ -8,7 +8,7 @@ use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use refract_client::RequestError;
-use refract_core::protocol::{code, LaunchMode, LaunchTicket, Method, Reply};
+use refract_core::protocol::{code, LaunchMode, LaunchTicket, Method, Reply, RepoSnapshot};
 use refract_launch::setup::{
     ensure_profile, windows_code_commit, CliCommand, CodeCli, RunOutput, Runner, WindowCloser,
     WindowMatch,
@@ -322,17 +322,31 @@ pub async fn resume_refactor(
         path: path.clone(),
         fix,
     };
+    crate::alerts::on_resume(&path);
     launch_with(app, path, method, REFACTOR_TIMEOUT).await
 }
 
-/// Opens (or raises) the VS Code window on a refactor's worktree, `folder_uri` from its
-/// `RefactorInfo`, in the Refract profile. Asks the helper nothing and starts no agent.
+/// Opens (or raises) the VS Code window on the worktree of the refactor of the repo at
+/// `path`, in the Refract profile. The folder comes from the helper's latest snapshot,
+/// never from the interface; no agent starts.
 #[tauri::command]
-pub async fn open_refactor(folder_uri: String) -> Result<(), LaunchError> {
+pub async fn open_refactor(app: AppHandle, path: String) -> Result<(), LaunchError> {
     tauri::async_runtime::spawn_blocking(move || {
-        let result = open_folder_uri(&code_cli()?, &folder_uri);
+        let agent = app.state::<Agent>();
+        let result = match agent.request(Method::GetRepo { path: path.clone() }, PREPARE_TIMEOUT) {
+            Ok(Reply::Repo(repo)) => refactor_folder(&repo),
+            Ok(other) => Err(LaunchError::new(
+                LaunchErrorKind::Agent,
+                format!("The helper sent an unexpected answer to getRepo: {other:?}"),
+            )),
+            Err(err) => Err(LaunchError::agent("Cannot find the refactor", err)),
+        }
+        .and_then(|folder_uri| open_folder_uri(&code_cli()?, &folder_uri));
         if let Err(err) = &result {
-            eprintln!("refract: opening {folder_uri} failed: {}", err.message);
+            eprintln!(
+                "refract: opening the refactor of {path} failed: {}",
+                err.message
+            );
         }
         result
     })
@@ -343,6 +357,29 @@ pub async fn open_refactor(folder_uri: String) -> Result<(), LaunchError> {
             format!("The launch task failed: {err}"),
         )
     })?
+}
+
+/// The `code --folder-uri` of `repo`'s refactor worktree: a WSL folder under the
+/// refactor worktrees folder, or an error.
+fn refactor_folder(repo: &RepoSnapshot) -> Result<String, LaunchError> {
+    let Some(info) = &repo.refactor else {
+        return Err(LaunchError::new(
+            LaunchErrorKind::Agent,
+            format!("{} has no refactor any more.", repo.name),
+        ));
+    };
+    let uri = &info.folder_uri;
+    let in_worktrees = uri
+        .strip_prefix("vscode-remote://wsl+")
+        .and_then(|rest| rest.split_once('/'))
+        .is_some_and(|(_, path)| path.contains("/.refract-worktrees/") && !path.contains("/../"));
+    if !in_worktrees {
+        return Err(LaunchError::new(
+            LaunchErrorKind::Agent,
+            format!("The refactor's folder is not a refactor worktree: {uri}"),
+        ));
+    }
+    Ok(uri.clone())
 }
 
 /// Runs [`run`] for `method` off the main thread, one launch at a time.
@@ -740,6 +777,42 @@ mod tests {
         assert_eq!(
             err.message,
             "Cannot prepare the launch: the helper answered with error -32602: bad"
+        );
+    }
+
+    #[test]
+    fn only_a_refactor_worktree_is_opened() {
+        let repo = |uri: Option<&str>| -> RepoSnapshot {
+            let refactor = uri.map(|uri| {
+                serde_json::json!({
+                    "state": "ready", "worktree": "/w", "folderUri": uri,
+                    "branch": "refactor/x", "targetBranch": "main", "baseCommit": "0",
+                    "sessionId": "", "createdAt": "2026-10-31T14:05:00Z", "live": false,
+                    "commits": [], "filesChanged": 0, "insertions": 0, "deletions": 0,
+                    "checks": null, "summary": null, "blocked": null
+                })
+            });
+            serde_json::from_value(serde_json::json!({
+                "path": "/home/dev/projects/reef-maps", "name": "reef-maps", "originUrl": null,
+                "remote": null, "branch": "main", "ahead": null, "behind": null,
+                "changedFiles": 0, "dirtyPaths": [], "lastCommit": null, "language": null,
+                "trackedBytes": 0, "commits30d": 0, "mass": 0.5, "sessions": [],
+                "preselect": {"kind": "noPicker"}, "refactor": refactor
+            }))
+            .unwrap()
+        };
+        let good = "vscode-remote://wsl+Ubuntu/home/dev/projects/.refract-worktrees/reef-maps-20261031-1405";
+        assert_eq!(refactor_folder(&repo(Some(good))).unwrap(), good);
+        for bad in [
+            "vscode-remote://wsl+Ubuntu/home/dev/projects/reef-maps",
+            "file:///home/dev/projects/.refract-worktrees/reef-maps",
+            "vscode-remote://wsl+Ubuntu/home/dev/projects/.refract-worktrees/../reef-maps",
+        ] {
+            assert!(refactor_folder(&repo(Some(bad))).is_err(), "{bad}");
+        }
+        assert_eq!(
+            refactor_folder(&repo(None)).unwrap_err().message,
+            "reef-maps has no refactor any more."
         );
     }
 

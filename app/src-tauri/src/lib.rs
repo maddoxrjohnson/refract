@@ -90,6 +90,7 @@ pub fn run() {
             launch::start_refactor,
             launch::resume_refactor,
             launch::open_refactor,
+            alerts::set_zoomed,
             migrate::migrate_preflight,
             migrate::migrate_start,
             migrate::migrate_cancel_snapshot,

@@ -11,6 +11,7 @@ import type {
   LaunchTicket,
   MergeOutcome,
   ModelUsage,
+  RefactorNotice,
   PlanLimits,
   Preselect,
   RemoteDetails,
@@ -578,6 +579,8 @@ export class DemoBackend implements Backend {
   private moveOutcome: DemoMoveOutcome;
   // Refactors: the pending step of each repo's simulated run, by path.
   private refactorTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private noticeListeners = new Set<(notice: RefactorNotice) => void>();
+  private zoomed: string | null = null;
 
   /**
    * `moveOutcome` is what Delete original first says; by default the original goes to the
@@ -820,9 +823,15 @@ export class DemoBackend implements Backend {
     this.refactorTimers.set(
       path,
       setTimeout(() => {
-        this.setRefactor(path, (info, repo) =>
+        const before = this.repos.find((r) => r.path === path)?.refactor?.state;
+        const repo = this.setRefactor(path, (info, repo) =>
           state === "ready" ? finishedRefactor(info, repo.language) : { ...info, state, live: true, blocked: null },
         );
+        // As the Rust side does: the plan and the finish, told outside the zoomed repo.
+        const alert = state === "needsYou" ? "planReady" : state === "ready" ? "finished" : null;
+        if (repo && alert && before !== state && path !== this.zoomed) {
+          for (const cb of this.noticeListeners) cb({ path, repoName: repo.name, alert });
+        }
         this.runRefactor(path, rest);
       }, afterMs),
     );
@@ -904,9 +913,19 @@ export class DemoBackend implements Backend {
     this.updateRepo(path, (r) => ({ ...r, refactor: null }));
   }
 
+  onRefactorNotice(cb: (notice: RefactorNotice) => void): Unsubscribe {
+    this.noticeListeners.add(cb);
+    return () => this.noticeListeners.delete(cb);
+  }
+
+  setZoomed(path: string | null): Promise<void> {
+    this.zoomed = path;
+    return Promise.resolve();
+  }
+
   /** Shows the pretend terminal of the refactor's window. */
-  openRefactor(folderUri: string): Promise<void> {
-    const repo = this.repos.find((r) => r.refactor?.folderUri === folderUri);
+  openRefactor(path: string): Promise<void> {
+    const repo = this.repos.find((r) => r.path === path);
     if (repo?.refactor) {
       this.demoRefactorLaunch(repo.path, { kind: "focus", sessionId: repo.refactor.sessionId }, repo.refactor.sessionId);
     }

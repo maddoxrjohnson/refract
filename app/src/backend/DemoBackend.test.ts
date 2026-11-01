@@ -160,8 +160,11 @@ describe("DemoBackend's refactors", () => {
     expect(ticket.folderUri).toContain("/home/demo/projects/.refract-worktrees/dotfiles-");
     expect(launches).toEqual(["new:true"]);
     await expect(settle(backend.startRefactor(DOTFILES))).rejects.toMatchObject({ message: "This repo already has a refactor." });
+    const notices: string[] = [];
+    backend.onRefactorNotice((n) => notices.push(`${n.repoName}:${n.alert}`));
     await vi.advanceTimersByTimeAsync(20_000);
     expect(states).toEqual(["starting", "working", "needsYou", "working", "ready"]);
+    expect(notices).toEqual(["dotfiles:planReady", "dotfiles:finished"]);
     const repo = await backend.getRepo(DOTFILES);
     expect(repo.refactor).toMatchObject({ live: false, filesChanged: 7, summary: expect.any(String) });
     expect(repo.refactor!.checks!.map((c) => c.command)).toEqual(["shellcheck *.sh"]);
@@ -176,6 +179,9 @@ describe("DemoBackend's refactors", () => {
   it("refuses to discard while live, discards the seeded one, and blocks a merge over a clashing file", async () => {
     vi.useFakeTimers();
     const backend = new DemoBackend();
+    const notices: unknown[] = [];
+    backend.onRefactorNotice((n) => notices.push(n));
+    await backend.setZoomed("/home/demo/projects/ledger-sync");
     await settle(backend.startRefactor("/home/demo/projects/ledger-sync"));
     await vi.advanceTimersByTimeAsync(1500);
     await expect(settle(backend.discardRefactor("/home/demo/projects/ledger-sync"))).rejects.toMatchObject({ kind: "refactor" });
@@ -186,6 +192,8 @@ describe("DemoBackend's refactors", () => {
       files: ["src/file-1.txt"],
     });
     expect((await backend.getRepo("/home/demo/projects/ledger-sync")).refactor?.state).toBe("mergeBlocked");
+    // The zoomed repo's panel shows its own changes.
+    expect(notices).toEqual([]);
 
     await settle(backend.discardRefactor(SWEEP));
     expect((await backend.getRepo(SWEEP)).refactor).toBeNull();
@@ -196,8 +204,7 @@ describe("DemoBackend's refactors", () => {
     const backend = new DemoBackend();
     const modes: string[] = [];
     backend.onDemoLaunch((l) => modes.push(l.mode.kind));
-    const info = (await backend.getRepo(SWEEP)).refactor!;
-    await backend.openRefactor(info.folderUri);
+    await backend.openRefactor(SWEEP);
     await settle(backend.resumeRefactor(SWEEP, false));
     expect((await backend.getRepo(SWEEP)).refactor).toMatchObject({ state: "working", live: true });
     await vi.advanceTimersByTimeAsync(5000);

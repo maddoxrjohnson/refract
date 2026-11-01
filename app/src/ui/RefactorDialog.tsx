@@ -11,6 +11,8 @@ export interface RefactorDialogProps {
   hook: HookControls;
   /** Starts the refactor with the "Focus on…" line, empty for none. */
   onConfirm(focus: string): void;
+  /** Another launch or clone is under way: Start waits for it. */
+  busy?: boolean;
   onClose(): void;
 }
 
@@ -22,7 +24,7 @@ export const FOCUS_MAX = 200;
  * and, without the status hook, that its alerts need the hook. Enter starts, Escape
  * cancels; window keys stay with the dialog while it is open.
  */
-export function RefactorDialog({ repo, hook, onConfirm, onClose }: RefactorDialogProps) {
+export function RefactorDialog({ repo, hook, onConfirm, onClose, busy = false }: RefactorDialogProps) {
   const base = useId();
   const titleId = `${base}-title`;
   const noteId = `${base}-note`;
@@ -37,7 +39,7 @@ export function RefactorDialog({ repo, hook, onConfirm, onClose }: RefactorDialo
 
   const submit = (ev: FormEvent) => {
     ev.preventDefault();
-    onConfirm(focus.trim());
+    if (!busy) onConfirm(focus.trim());
   };
 
   const onKeyDown = (ev: KeyboardEvent<HTMLFormElement>) => {
@@ -109,7 +111,12 @@ export function RefactorDialog({ repo, hook, onConfirm, onClose }: RefactorDialo
         <button type="button" className="rf-button rf-button--ghost" onClick={onClose}>
           Cancel <kbd className="rf-kbd">Esc</kbd>
         </button>
-        <button type="submit" className="rf-button rf-button--primary">
+        <button
+          type="submit"
+          className="rf-button rf-button--primary"
+          disabled={busy}
+          title={busy ? "Another launch is under way." : undefined}
+        >
           <span>Start refactor</span>
           <kbd className="rf-kbd" aria-hidden="true">
             Enter

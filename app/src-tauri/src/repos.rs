@@ -52,6 +52,8 @@ pub enum RepoErrorKind {
     NotARepo,
     /// The helper refused or failed to merge or discard a refactor.
     Refactor,
+    /// A merge or discard is still running in the helper after the wait.
+    Pending,
     /// The helper failed, is not running or did not answer.
     Agent,
     /// The command's task itself failed.
@@ -82,6 +84,15 @@ impl RepoError {
             }
             err => RepoError::new(RepoErrorKind::Agent, format!("{doing}: {err}")),
         }
+    }
+
+    /// A merge or discard that outlasted its wait: the helper's worker carries on, and the
+    /// snapshot it sends when done updates the panel.
+    fn still_running() -> RepoError {
+        RepoError::new(
+            RepoErrorKind::Pending,
+            "Still running; the panel will update when it finishes.",
+        )
     }
 
     fn unexpected(method: &str, reply: &Reply) -> RepoError {
@@ -143,6 +154,7 @@ pub async fn merge_refactor(app: AppHandle, path: String) -> Result<MergeOutcome
     match request(app, Method::MergeRefactor { path }, REFACTOR_TIMEOUT).await? {
         Ok(Reply::RefactorMerge(outcome)) => Ok(outcome),
         Ok(other) => Err(RepoError::unexpected("mergeRefactor", &other)),
+        Err(RequestError::Timeout) => Err(RepoError::still_running()),
         Err(err) => Err(RepoError::agent("Cannot merge the refactor", err)),
     }
 }
@@ -154,6 +166,7 @@ pub async fn discard_refactor(app: AppHandle, path: String) -> Result<(), RepoEr
     match request(app, Method::DiscardRefactor { path }, REFACTOR_TIMEOUT).await? {
         Ok(Reply::Done) => Ok(()),
         Ok(other) => Err(RepoError::unexpected("discardRefactor", &other)),
+        Err(RequestError::Timeout) => Err(RepoError::still_running()),
         Err(err) => Err(RepoError::agent("Cannot discard the refactor", err)),
     }
 }
@@ -241,5 +254,10 @@ mod tests {
             json!("agent")
         );
         assert_eq!(timeout.message, "x: the helper did not answer in time");
+        assert_eq!(
+            serde_json::to_value(RepoError::still_running()).unwrap(),
+            json!({"kind": "pending",
+                "message": "Still running; the panel will update when it finishes."})
+        );
     }
 }

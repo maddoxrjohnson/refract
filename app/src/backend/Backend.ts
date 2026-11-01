@@ -24,6 +24,7 @@ import type {
   LaunchStep,
   LaunchTicket,
   MergeOutcome,
+  RefactorNotice,
   RepoList,
   RepoSnapshot,
 } from "./types";
@@ -89,8 +90,18 @@ export interface Backend {
   mergeRefactor(path: string): Promise<MergeOutcome>;
   /** Deletes the worktree and branch; refused while the agent runs. Rejects with a `CommandError`. */
   discardRefactor(path: string): Promise<void>;
-  /** Opens or raises the VS Code window on a refactor's worktree. Rejects with a `LaunchError`. */
-  openRefactor(folderUri: string): Promise<void>;
+  /**
+   * Opens or raises the VS Code window on the worktree of the repo's refactor; the folder
+   * is looked up from the helper, not passed in. Rejects with a `LaunchError`.
+   */
+  openRefactor(path: string): Promise<void>;
+  /**
+   * A refactor's plan is ready or it finished, in a repo other than the zoomed one, while
+   * the window shows. The Rust side decides each one (and toasts in Windows while hidden).
+   */
+  onRefactorNotice(cb: (notice: RefactorNotice) => void): Unsubscribe;
+  /** Tells the Rust side the zoomed repo, whose alerts its panel shows instead. */
+  setZoomed(path: string | null): Promise<void>;
 
   /** Whether the status hook is installed, and what installing would change. */
   hookInfo(): Promise<HookInfo>;

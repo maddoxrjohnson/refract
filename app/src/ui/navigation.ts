@@ -44,6 +44,8 @@ export const initialNavState: NavState = {
 /** A key press, reduced to what navigation needs. */
 export interface NavKey {
   key: string;
+  /** The physical key (`KeyboardEvent.code`), for shortcuts on any layout. */
+  code?: string;
   ctrl?: boolean;
   meta?: boolean;
   alt?: boolean;
@@ -302,7 +304,9 @@ function refactorKey(state: NavState, ctx: NavContext): NavResult {
 }
 
 function onKey(state: NavState, k: NavKey, ctx: NavContext): NavResult {
-  if (k.alt && !k.ctrl && !k.meta && k.key.toLowerCase() === "r") return refactorKey(state, ctx);
+  // By physical key, so Alt+R works on non-Latin layouts too.
+  const isR = k.code ? k.code === "KeyR" : k.key.toLowerCase() === "r";
+  if (k.alt && !k.ctrl && !k.meta && isR) return refactorKey(state, ctx);
   if (k.ctrl || k.meta || k.alt) return unhandled(state);
   if (state.picker) return pickerKey(state, state.picker, k.key);
 

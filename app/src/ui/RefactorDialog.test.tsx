@@ -78,4 +78,12 @@ describe("RefactorDialog", () => {
     await act(async () => {});
     expect(screen.getByRole("alert").textContent).toBe("denied (-32603)");
   });
+  it("waits to start while another launch runs", () => {
+    const onConfirm = vi.fn();
+    render(<RefactorDialog repo={testRepo()} hook={hook(true)} onConfirm={onConfirm} onClose={vi.fn()} busy />);
+    const start = screen.getByRole("button", { name: /Start refactor/ });
+    expect(start).toHaveProperty("disabled", true);
+    fireEvent.submit(screen.getByRole("textbox", { name: /Focus on/ }));
+    expect(onConfirm).not.toHaveBeenCalled();
+  });
 });
