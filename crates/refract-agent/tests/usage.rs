@@ -148,14 +148,13 @@ fn usage_is_summed_and_follows_writes() {
         &session,
         &response(&repo, "msg_3", now - TimeDelta::days(8), 9_000, 1),
     );
-    // Outside any repo: a subagent transcript from yesterday.
+    // Outside any repo: a subagent transcript from yesterday. 24 h ago can still be today
+    // on a 25-hour day (clocks going back), so also keep it an hour before local midnight.
     let scratch = tmp.path().join("scratch");
     let subagent = project_dir(&projects, &scratch)
         .join("6d4e0000-0000-4000-8000-000000000002/subagents/agent-a1.jsonl");
-    append(
-        &subagent,
-        &response(&scratch, "msg_4", now - TimeDelta::days(1), 1_000, 2),
-    );
+    let yesterday = (now - TimeDelta::days(1)).min(today_start - TimeDelta::hours(1));
+    append(&subagent, &response(&scratch, "msg_4", yesterday, 1_000, 2));
 
     let mut agent = Agent::spawn(&home, &config);
     // Let the repo list load so usage can be split by repo.
