@@ -111,6 +111,9 @@ pub enum Method {
     /// Token use added up from Claude Code's transcripts: answered with a
     /// [`UsageSummary`].
     Usage,
+    /// CPU and memory as Linux sees them, and the helper's own share: answered with a
+    /// [`LinuxStats`].
+    SystemStats,
     /// Whether the status hook is installed: answered with a [`HookInfo`].
     HookInfo,
     /// Installs the status hook (spec §6.2): answered with a [`HookInfo`].
@@ -267,6 +270,7 @@ pub enum Reply {
     ServerSetup(ServerSetup),
     Hook(HookInfo),
     Usage(UsageSummary),
+    SystemStats(LinuxStats),
     /// The result of `migrate`.
     Migration(MigrationTicket),
     /// The result of `migrateRecheck`.
@@ -353,6 +357,36 @@ pub struct LaunchTicket {
     pub session_id: String,
     /// What to pass to `code --folder-uri`.
     pub folder_uri: String,
+}
+
+/// The result of `systemStats`: CPU and memory from Linux's point of view. CPU
+/// figures are shares of all Linux CPUs (0–100) since the previous call, and `None`
+/// on the first call, which only primes the counters, on a call less than a second after
+/// the last reading, and when `/proc` could not be read.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxStats {
+    /// Busy share of `/proc/stat`'s `cpu` line.
+    pub cpu_percent: Option<f64>,
+    /// Linux CPUs (`cpuN` lines of `/proc/stat`).
+    pub cpu_count: u32,
+    pub mem_total_bytes: u64,
+    /// What programs use: `MemTotal - MemFree` less the file cache.
+    pub mem_used_bytes: u64,
+    /// File cache Linux can give back: `Buffers + Cached + SReclaimable - Shmem`.
+    pub mem_cache_bytes: u64,
+    /// The helper and its live descendants.
+    pub own: LinuxOwnStats,
+}
+
+/// The helper's own share in [`LinuxStats`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinuxOwnStats {
+    /// CPU time since the previous call, as a share of all Linux CPUs.
+    pub cpu_percent: Option<f64>,
+    /// Resident memory (`VmRSS`).
+    pub mem_bytes: u64,
 }
 
 /// The result of `hookInfo`, `installHook` and `uninstallHook`.
@@ -1209,8 +1243,8 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateBeginDelete"
         | "migrateResync" | "stopAgent" | "startRefactor" | "resumeRefactor" | "mergeRefactor"
         | "discardRefactor" | "removeWorktree" | "checkWorktree" | "pruneWorktree" => true,
-        "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
-        | "shutdown" | "migratePending" => false,
+        "ping" | "listRepos" | "usage" | "systemStats" | "hookInfo" | "installHook"
+        | "uninstallHook" | "shutdown" | "migratePending" => false,
         _ => {
             return Err(fail(
                 Some(id),
@@ -1910,6 +1944,15 @@ mod tests {
                 by_repo: vec![],
                 ..usage()
             }),
+            Reply::SystemStats(linux_stats()),
+            Reply::SystemStats(LinuxStats {
+                cpu_percent: None,
+                own: LinuxOwnStats {
+                    cpu_percent: None,
+                    mem_bytes: 0,
+                },
+                ..linux_stats()
+            }),
             Reply::Migration(MigrationTicket { id: "m-1".into() }),
             Reply::Recheck(Recheck::default()),
             Reply::BeginDelete(BeginDelete {
@@ -2042,6 +2085,53 @@ mod tests {
         .unwrap();
         assert_eq!(old.by_model, ModelWindows::default());
         assert_eq!(old.limits, None);
+    }
+
+    fn linux_stats() -> LinuxStats {
+        LinuxStats {
+            cpu_percent: Some(12.5),
+            cpu_count: 8,
+            mem_total_bytes: 8_000_000_000,
+            mem_used_bytes: 1_500_000_000,
+            mem_cache_bytes: 4_000_000_000,
+            own: LinuxOwnStats {
+                cpu_percent: Some(0.25),
+                mem_bytes: 41_000_000,
+            },
+        }
+    }
+
+    #[test]
+    fn system_stats_round_trips() {
+        let request = parse_request(r#"{"id":17,"method":"systemStats","params":{}}"#).unwrap();
+        assert_eq!(request.method, Method::SystemStats);
+        assert_eq!(
+            round_trip(&request),
+            json!({"id": 17, "method": "systemStats"})
+        );
+        assert_eq!(
+            round_trip(&Response::ok(17, Reply::SystemStats(linux_stats()))),
+            json!({"id": 17, "result": {
+                "cpuPercent": 12.5,
+                "cpuCount": 8,
+                "memTotalBytes": 8_000_000_000u64,
+                "memUsedBytes": 1_500_000_000u64,
+                "memCacheBytes": 4_000_000_000u64,
+                "own": {"cpuPercent": 0.25, "memBytes": 41_000_000}}})
+        );
+        // The first call's CPU figures are sent as null, not left out.
+        let first = LinuxStats {
+            cpu_percent: None,
+            own: LinuxOwnStats {
+                cpu_percent: None,
+                mem_bytes: 41_000_000,
+            },
+            ..linux_stats()
+        };
+        let value = round_trip(&Response::ok(18, Reply::SystemStats(first)));
+        assert_eq!(value["result"]["cpuPercent"], Value::Null);
+        assert_eq!(value["result"]["own"]["cpuPercent"], Value::Null);
+        assert!(value["result"].get("cpuPercent").is_some());
     }
 
     #[test]

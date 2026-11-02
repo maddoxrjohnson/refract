@@ -17,6 +17,7 @@ pub mod sessions;
 pub mod setup;
 pub mod state;
 pub mod subagents;
+pub mod sysstats;
 pub mod usage;
 pub mod watch;
 pub mod worktree;

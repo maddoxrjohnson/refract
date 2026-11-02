@@ -55,6 +55,7 @@ use crate::repos;
 use crate::scan;
 use crate::setup;
 use crate::state::{self, path_str, Agent, GitResult, Refresh};
+use crate::sysstats;
 use crate::usage::Usage;
 use crate::watch::{self, Change, FsEvent, Watcher};
 
@@ -326,6 +327,8 @@ struct Server<W: Write> {
     usage: Usage,
     /// Plan limits from the status line's file, added to each `usage` answer.
     limits: LimitsFile,
+    /// The last `systemStats` reading, which the next one is compared with.
+    system_stats: sysstats::Sampler,
     /// Migrations running or waiting for `migrateFinish`, by id.
     migrations: HashMap<String, migrate::Handle>,
     /// Every repo's refactor (see [`crate::refactor`]).
@@ -574,6 +577,7 @@ impl<W: Write> Server<W> {
             unread: HashMap::new(),
             usage,
             limits,
+            system_stats: sysstats::Sampler::default(),
             migrations: HashMap::new(),
             refactors: Refactors::from_env(),
             next_refactor: None,
@@ -696,6 +700,8 @@ impl<W: Write> Server<W> {
                 summary.limits = self.limits.read().map(Box::new);
                 Response::ok(id, Reply::Usage(summary))
             }
+            // Only `/proc`, which is in memory: quick enough to answer in line.
+            Method::SystemStats => Response::ok(id, Reply::SystemStats(self.system_stats.sample())),
             Method::HookInfo => hook_response(id, hook::info(&hook::Paths::from_env())),
             Method::InstallHook | Method::UninstallHook => {
                 let paths = hook::Paths::from_env();

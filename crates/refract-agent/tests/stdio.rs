@@ -1416,3 +1416,45 @@ fn background_work_keeps_a_live_session_whose_turn_ended_working() {
     );
     agent.event(state_is("idle"));
 }
+
+#[test]
+fn system_stats_primes_then_reports_linux_figures() {
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let config = tmp.path().join("agent.toml");
+    write(&config, "roots = []\n");
+    let mut agent = Agent::spawn(&home, &config);
+
+    agent.send(json!({"id": 1, "method": "systemStats"}));
+    let first = agent.response();
+    assert_eq!(first["id"], 1);
+    let stats = &first["result"];
+    assert_eq!(stats["cpuPercent"], Value::Null);
+    assert_eq!(stats["own"]["cpuPercent"], Value::Null);
+    assert!(stats["cpuCount"].as_u64().unwrap() >= 1);
+    let total = stats["memTotalBytes"].as_u64().unwrap();
+    assert!(total > 0);
+    assert!(stats["memUsedBytes"].as_u64().unwrap() <= total);
+    assert!(stats["memCacheBytes"].as_u64().unwrap() <= total);
+    assert!(stats["own"]["memBytes"].as_u64().unwrap() > 0);
+
+    // Within a second of the last reading: still no CPU figures.
+    agent.send(json!({"id": 2, "method": "systemStats", "params": {}}));
+    let soon = agent.response();
+    assert_eq!(soon["result"]["cpuPercent"], Value::Null);
+    assert_eq!(soon["result"]["own"]["cpuPercent"], Value::Null);
+
+    std::thread::sleep(Duration::from_millis(1100));
+    agent.send(json!({"id": 4, "method": "systemStats"}));
+    let second = agent.response();
+    for share in [
+        &second["result"]["cpuPercent"],
+        &second["result"]["own"]["cpuPercent"],
+    ] {
+        let share = share.as_f64().expect("a number after the first call");
+        assert!((0.0..=100.0).contains(&share), "{share}");
+    }
+    agent.send(json!({"id": 3, "method": "shutdown"}));
+    assert_eq!(agent.response()["id"], 3);
+    agent.child.wait().unwrap();
+}
