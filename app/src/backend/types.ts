@@ -160,7 +160,7 @@ export interface RefactorNotice {
 
 /** The helper's error code for a refused or failed refactor request. */
 export const REFACTOR_FAILED = 8;
-/** The helper's error code for a refused `removeWorktree`; the message names the rule. */
+/** The helper's error code for a refused `removeWorktree`, `checkWorktree` or `pruneWorktree`; the message names the rule. */
 export const WORKTREE_REFUSED = 9;
 
 /**
@@ -204,6 +204,43 @@ export interface WorktreeInfo {
   status: WorktreeStatus;
   /** Rows 8-10 and not on a Windows drive; the app also needs no live session and no refactor in it. */
   removable: boolean;
+  /**
+   * On a Windows drive with untracked files unknown, and the rest of the facts would give
+   * rows 8-10: `checkWorktree` can read the files and say. Missing from older helpers.
+   */
+  checkable?: boolean;
+}
+
+/** `checkWorktree`'s answer: the status with untracked and ignored files read (worktrees spec §10.1). */
+export interface WorktreeCheck {
+  status: WorktreeStatus;
+  removable: boolean;
+  /** Top-level ignored entries, as `WorktreeInfo.ignored`. */
+  ignored: string[];
+}
+
+/** Why a worktree entry whose folder is gone can or can't be cleaned up (worktrees spec §10.2, m1-m6). */
+export type MissingWorktreeStatus =
+  | { kind: "locked" }
+  /** The path is on a Windows drive that isn't mounted. */
+  | { kind: "driveNotAttached" }
+  /** A repo Refract knows uses the entry's admin dir: the folder moved to `to`. */
+  | { kind: "moved"; to: string }
+  /** The entry has refs of its own, such as bisect refs. */
+  | { kind: "ownRefs" }
+  /** Detached, and no branch, tag or remote ref holds its HEAD. */
+  | { kind: "commitsOnlyHere" }
+  | { kind: "gone" };
+
+/** A linked worktree git still lists whose folder is gone. */
+export interface MissingWorktree {
+  /** The path as `git worktree list` gives it. */
+  path: string;
+  /** Short branch name; missing when detached. */
+  branch?: string;
+  status: MissingWorktreeStatus;
+  /** Status `gone`: Clean up is offered. */
+  cleanable: boolean;
 }
 
 export interface RepoSnapshot {
@@ -233,6 +270,8 @@ export interface RepoSnapshot {
   worktreeOf?: string;
   /** Facts for a linked worktree, set exactly when `worktreeOf` is. */
   worktree?: WorktreeInfo;
+  /** A main repo's worktree entries whose folders are gone; missing when there are none. */
+  missingWorktrees?: MissingWorktree[];
 }
 
 export interface RepoList {
@@ -253,7 +292,18 @@ export type AgentEvent =
   /** A Move to WSL migration moved on. */
   | { event: "migrateProgress"; data: MigrateProgress }
   /** A migration finished its checks and waits for an answer; also re-sent after a restart. */
-  | { event: "migrateReady"; data: { id: string; report: MigrationReport } };
+  | { event: "migrateReady"; data: { id: string; report: MigrationReport } }
+  /** A `removeWorktree` or `pruneWorktree` job finished, after its other events. */
+  | { event: "worktreeJobDone"; data: WorktreeJobDone };
+
+/**
+ * How a worktree job ended: `path` as the app sent it (for a prune, the missing entry's),
+ * and `error` on a refusal or a half-removal, left out on success.
+ */
+export interface WorktreeJobDone {
+  path: string;
+  error?: string;
+}
 
 /** How to start the agent, from refract-core's `LaunchMode`. */
 export type LaunchMode =

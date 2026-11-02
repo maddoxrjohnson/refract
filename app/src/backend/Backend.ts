@@ -27,6 +27,7 @@ import type {
   RefactorNotice,
   RepoList,
   RepoSnapshot,
+  WorktreeCheck,
 } from "./types";
 import type { ThemeSetting } from "../theme";
 
@@ -107,9 +108,24 @@ export interface Backend {
    * Removes the linked worktree at `path` (its snapshot's path) with `git worktree remove`,
    * keeping its branch. The helper checks again that nothing can be lost; on success the
    * worktree goes with `repoRemoved` and its main repo gets a `repoChanged`. Rejects with
-   * a `CommandError` whose message says why it was refused.
+   * a `CommandError` whose message says why it was refused. `ignored` is the ignored list
+   * the confirm showed (up to 9 entries); the helper refuses when others appeared since.
+   * Each job ends with a `worktreeJobDone`, also after the request has timed out.
    */
-  removeWorktree(path: string): Promise<void>;
+  removeWorktree(path: string, ignored?: string[]): Promise<void>;
+  /**
+   * Reads the untracked and ignored files of the linked worktree at `path` (slow on a
+   * Windows drive) and says its status as if they were always read. Changes nothing.
+   * Rejects with a `CommandError`, as `removeWorktree` does.
+   */
+  checkWorktree(path: string): Promise<WorktreeCheck>;
+  /**
+   * Drops git's entry for a worktree whose folder is gone (`path` as listed in the main
+   * repo `repo`'s `missingWorktrees`), keeping its branch. On success the main repo gets a
+   * `repoChanged` without the entry. Rejects with a `CommandError` saying why it was refused.
+   * Ends with a `worktreeJobDone` for `path`, as `removeWorktree` does.
+   */
+  pruneWorktree(repo: string, path: string): Promise<void>;
 
   /** Whether the status hook is installed, and what installing would change. */
   hookInfo(): Promise<HookInfo>;

@@ -125,6 +125,7 @@ export function repoReducer(state: RepoState, action: RepoAction): RepoState {
         }
         case "migrateProgress":
         case "migrateReady":
+        case "worktreeJobDone":
           return state;
       }
     }

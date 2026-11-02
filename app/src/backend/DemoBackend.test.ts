@@ -1,6 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { canDelete } from "../migrations";
-import { DEMO_WINDOWS_REPO, DEMO_WORKTREE_MAIN, DemoBackend, demoHookDiff, demoRepos } from "./DemoBackend";
+import {
+  DEMO_WINDOWS_REPO,
+  DEMO_WINDOWS_WORKTREE,
+  DEMO_WORKTREE_MAIN,
+  DemoBackend,
+  demoHookDiff,
+  demoRepos,
+} from "./DemoBackend";
 import type { AgentEvent, MigrateError, MigrateSnapshotProgress } from "./types";
 
 afterEach(() => vi.useRealTimers());
@@ -214,10 +221,12 @@ describe("DemoBackend's refactors", () => {
 });
 
 describe("DemoBackend's worktrees", () => {
-  it("seeds two linked worktrees of one repo, one ready to remove", () => {
+  it("seeds three linked worktrees of one repo, one ready to remove and one to check", () => {
     const linked = demoRepos().filter((r) => r.worktreeOf);
-    expect(linked.map((r) => r.worktreeOf)).toEqual([DEMO_WORKTREE_MAIN, DEMO_WORKTREE_MAIN]);
-    const [cards, search] = linked;
+    expect(linked.map((r) => r.worktreeOf)).toEqual([DEMO_WORKTREE_MAIN, DEMO_WORKTREE_MAIN, DEMO_WORKTREE_MAIN]);
+    const [cards, search, tablet] = linked;
+    expect(tablet.path).toBe(DEMO_WINDOWS_WORKTREE);
+    expect(tablet.worktree).toMatchObject({ status: { kind: "unchecked" }, removable: false, checkable: true });
     expect(cards.worktree).toMatchObject({ status: { kind: "release", tag: "v1.4.0" }, removable: true });
     expect(cards.sessions[0].lastAssistantText).toBe("Should I tag v1.4.0?");
     expect(search.worktree).toMatchObject({ status: { kind: "changes", count: 3 }, removable: false });
@@ -234,11 +243,77 @@ describe("DemoBackend's worktrees", () => {
       message: "Cannot remove the worktree: This worktree has uncommitted changes.",
     });
     await expect(settle(backend.removeWorktree(DEMO_WORKTREE_MAIN))).rejects.toMatchObject({ kind: "worktree" });
-    expect(events).toEqual([]);
-    await settle(backend.removeWorktree(cards.path));
-    expect(events.map((e) => e.event)).toEqual(["repoRemoved", "repoChanged"]);
+    // Each job ends with `worktreeJobDone`, a refused one with the reason.
+    expect(events).toEqual([
+      {
+        event: "worktreeJobDone",
+        data: { path: search.path, error: "Cannot remove the worktree: This worktree has uncommitted changes." },
+      },
+      { event: "worktreeJobDone", data: { path: DEMO_WORKTREE_MAIN, error: "Cannot remove the worktree: Not a linked worktree." } },
+    ]);
+    events.length = 0;
+    await settle(backend.removeWorktree(cards.path, cards.worktree!.ignored));
+    expect(events.map((e) => e.event)).toEqual(["repoRemoved", "repoChanged", "worktreeJobDone"]);
     expect(events[0]).toEqual({ event: "repoRemoved", data: { path: cards.path } });
     expect(events[1]).toMatchObject({ data: { path: DEMO_WORKTREE_MAIN } });
+    expect(events[2]).toEqual({ event: "worktreeJobDone", data: { path: cards.path } });
     expect((await backend.listRepos()).repos.some((r) => r.path === cards.path)).toBe(false);
+  });
+
+  it("checks the Windows-drive worktree slowly, refuses a Remove that missed a new ignored file, then removes it", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    const events: AgentEvent[] = [];
+    backend.onAgentEvent((e) => events.push(e));
+    let done = false;
+    const check = backend.checkWorktree(DEMO_WINDOWS_WORKTREE).finally(() => (done = true));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(done).toBe(false);
+    await expect(settle(check)).resolves.toEqual({ status: { kind: "pushed" }, removable: true, ignored: ["node_modules/"] });
+    await expect(settle(backend.checkWorktree(DEMO_WORKTREE_MAIN))).rejects.toMatchObject({ kind: "worktree" });
+    expect(events).toEqual([]);
+    // A program on Windows wrote `.env` after the check, so the confirm's list misses it.
+    const refusal = "Cannot remove the worktree: New ignored files appeared since you confirmed (.env). Check again.";
+    await expect(settle(backend.removeWorktree(DEMO_WINDOWS_WORKTREE, ["node_modules/"]))).rejects.toEqual({
+      kind: "worktree",
+      message: refusal,
+    });
+    expect(events).toEqual([{ event: "worktreeJobDone", data: { path: DEMO_WINDOWS_WORKTREE, error: refusal } }]);
+    events.length = 0;
+    const again = await settle(backend.checkWorktree(DEMO_WINDOWS_WORKTREE));
+    expect(again.ignored).toEqual(["node_modules/", ".env"]);
+    await settle(backend.removeWorktree(DEMO_WINDOWS_WORKTREE, again.ignored));
+    expect(events.map((e) => e.event)).toEqual(["repoRemoved", "repoChanged", "worktreeJobDone"]);
+    expect(events[0]).toEqual({ event: "repoRemoved", data: { path: DEMO_WINDOWS_WORKTREE } });
+  });
+
+  it("lists a missing worktree under its repo and cleans it up, keeping the others", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    const events: AgentEvent[] = [];
+    backend.onAgentEvent((e) => events.push(e));
+    const main = await backend.getRepo(DEMO_WORKTREE_MAIN);
+    expect(main.missingWorktrees).toEqual([
+      { path: "/home/demo/projects/harbor-android-offline", branch: "offline-maps", status: { kind: "gone" }, cleanable: true },
+    ]);
+    expect(demoRepos().filter((r) => r.missingWorktrees).map((r) => r.path)).toEqual([DEMO_WORKTREE_MAIN]);
+    await expect(settle(backend.pruneWorktree(DEMO_WORKTREE_MAIN, "/home/demo/projects/elsewhere"))).rejects.toMatchObject({
+      kind: "worktree",
+    });
+    expect(events).toEqual([
+      {
+        event: "worktreeJobDone",
+        data: { path: "/home/demo/projects/elsewhere", error: "Cannot clean up the worktree: Git does not list it as missing." },
+      },
+    ]);
+    events.length = 0;
+    await settle(backend.pruneWorktree(DEMO_WORKTREE_MAIN, "/home/demo/projects/harbor-android-offline"));
+    expect(events.map((e) => e.event)).toEqual(["repoChanged", "worktreeJobDone"]);
+    expect(events[1]).toEqual({ event: "worktreeJobDone", data: { path: "/home/demo/projects/harbor-android-offline" } });
+    const next = (events[0] as Extract<AgentEvent, { event: "repoChanged" }>).data;
+    expect(next.path).toBe(DEMO_WORKTREE_MAIN);
+    expect(next.missingWorktrees).toBeUndefined();
+    expect((await backend.getRepo(DEMO_WORKTREE_MAIN)).missingWorktrees).toBeUndefined();
+    expect((await backend.listRepos()).repos.filter((r) => r.worktreeOf)).toHaveLength(3);
   });
 });

@@ -28,6 +28,8 @@ import type {
   SystemStats,
   TokenTotals,
   UsageSummary,
+  MissingWorktree,
+  WorktreeCheck,
   WorktreeInfo,
 } from "./types";
 import type {
@@ -242,14 +244,37 @@ export function demoRepos(): RepoSnapshot[] {
     };
   });
   const main = repos.find((r) => r.path === DEMO_WORKTREE_MAIN);
-  return main ? [...repos, ...demoWorktrees(main)] : repos;
+  if (!main) return repos;
+  const withMissing: RepoSnapshot = { ...main, missingWorktrees: [DEMO_MISSING_WORKTREE] };
+  return [...repos.map((r) => (r === main ? withMissing : r)), ...demoWorktrees(main)];
 }
 
-// Worktrees (.plans/worktrees-spec.md): two linked worktrees of harbor-android fold into
-// its gem. One is in a release and can be removed; the other has uncommitted changes.
+// Worktrees (.plans/worktrees-spec.md): three linked worktrees of harbor-android fold into
+// its gem. One is in a release and can be removed; one has uncommitted changes; one is on
+// a Windows drive, where Check… reads its files first (§10.1). Git also still lists one
+// whose folder is gone, which can be cleaned up (§10.2). On the Windows drive a program
+// writes an ignored `.env` just after the first check, so the first Remove is refused
+// until Check again lists it.
 
 /** The demo repo that has linked worktrees. */
 export const DEMO_WORKTREE_MAIN = "/home/demo/projects/harbor-android";
+/** The demo worktree on a Windows drive. */
+export const DEMO_WINDOWS_WORKTREE = "/mnt/c/Users/demo/source/harbor-android-tablet";
+
+const DEMO_MISSING_WORKTREE: MissingWorktree = {
+  path: "/home/demo/projects/harbor-android-offline",
+  branch: "offline-maps",
+  status: { kind: "gone" },
+  cleanable: true,
+};
+
+/** What `checkWorktree` finds on a Windows-drive worktree once its files are read. */
+const DEMO_WORKTREE_CHECKS: Record<string, WorktreeCheck> = {
+  [DEMO_WINDOWS_WORKTREE]: { status: { kind: "pushed" }, removable: true, ignored: ["node_modules/"] },
+};
+
+/** The ignored file that appears on the Windows-drive worktree after its first check. */
+const DEMO_LATE_IGNORED = ".env";
 
 function worktreeInfo(extra: Partial<WorktreeInfo>): WorktreeInfo {
   return {
@@ -307,6 +332,16 @@ function demoWorktrees(main: RepoSnapshot): RepoSnapshot[] {
       preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-0000000000d2" },
       worktree: worktreeInfo({ onlyHere: 2, status: { kind: "changes", count: 3 }, removable: false }),
     }),
+    linked("tablet", "tablet-layout", {
+      path: DEMO_WINDOWS_WORKTREE,
+      lastCommit: { summary: "Two-pane layout on tablets", time: now() - 3 * 24 * HOUR, sha: demoSha(72) },
+      worktree: worktreeInfo({
+        untrackedChecked: false,
+        status: { kind: "unchecked" },
+        removable: false,
+        checkable: true,
+      }),
+    }),
   ];
 }
 
@@ -316,7 +351,8 @@ function worktreeRefusal(repo: RepoSnapshot): string | null {
   if (!repo.worktreeOf || !info) return "Not a linked worktree.";
   if (repo.refactor) return "This worktree has a refactor; merge or discard it first.";
   if (repo.sessions.some((s) => s.state.kind === "live")) return "An agent is running in this worktree.";
-  if (info.removable) return null;
+  // On a Windows drive the helper reads the files at removal; the demo's would pass.
+  if (info.removable || info.checkable) return null;
   switch (info.status.kind) {
     case "locked":
       return "This worktree is locked.";
@@ -333,7 +369,7 @@ function worktreeRefusal(repo: RepoSnapshot): string | null {
     case "tooBigToCheck":
       return "This worktree has too many ignored files to check for other repos.";
     default:
-      return "Worktrees on Windows drives can't be removed from Refract yet.";
+      return "This worktree's untracked files could not be checked.";
   }
 }
 
@@ -676,6 +712,8 @@ export class DemoBackend implements Backend {
   private refactorTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private noticeListeners = new Set<(notice: RefactorNotice) => void>();
   private zoomed: string | null = null;
+  /** Worktrees whose ignored files changed since the demo began, by path. */
+  private worktreeIgnored = new Map<string, string[]>();
 
   /**
    * `moveOutcome` is what Delete original first says; by default the original goes to the
@@ -1018,16 +1056,65 @@ export class DemoBackend implements Backend {
     return Promise.resolve();
   }
 
-  /** Removes a demo worktree as the helper does: `repoRemoved` for it, then `repoChanged` for its main repo. */
-  async removeWorktree(path: string): Promise<void> {
+  /**
+   * Removes a demo worktree as the helper does: `repoRemoved` for it, then `repoChanged`
+   * for its main repo, then `worktreeJobDone`. Refused, as the helper is, when an ignored
+   * file appeared that `ignored` (what the confirm showed) does not list.
+   */
+  async removeWorktree(path: string, ignored?: string[]): Promise<void> {
     await sleep(600);
     const repo = this.repos.find((r) => r.path === path);
-    const refusal = repo ? worktreeRefusal(repo) : "Not a linked worktree.";
-    if (refusal || !repo?.worktreeOf) throw { kind: "worktree", message: `Cannot remove the worktree: ${refusal}` };
+    let refusal = repo ? worktreeRefusal(repo) : "Not a linked worktree.";
+    const now = this.worktreeIgnored.get(path) ?? repo?.worktree?.ignored ?? [];
+    const appeared = ignored ? now.filter((f) => !ignored.includes(f)) : [];
+    if (!refusal && appeared.length > 0) {
+      refusal = `New ignored files appeared since you confirmed (${appeared.join(", ")}). Check again.`;
+    }
+    if (refusal || !repo?.worktreeOf) {
+      const message = `Cannot remove the worktree: ${refusal}`;
+      this.emit({ event: "worktreeJobDone", data: { path, error: message } });
+      throw { kind: "worktree", message };
+    }
     this.repos = this.repos.filter((r) => r.path !== path);
     this.emit({ event: "repoRemoved", data: { path } });
     const main = this.repos.find((r) => r.path === repo.worktreeOf);
     if (main) this.emit({ event: "repoChanged", data: main });
+    this.emit({ event: "worktreeJobDone", data: { path } });
+  }
+
+  /** Reads a demo worktree's files, slowly, as the helper does on a Windows drive. */
+  async checkWorktree(path: string): Promise<WorktreeCheck> {
+    await sleep(1200);
+    const info = this.repos.find((r) => r.path === path && r.worktreeOf)?.worktree;
+    if (!info) throw { kind: "worktree", message: "Cannot check the worktree: Not a linked worktree." };
+    const found = DEMO_WORKTREE_CHECKS[path] ?? { status: info.status, removable: info.removable, ignored: info.ignored };
+    const ignored = this.worktreeIgnored.get(path);
+    // A Windows program writes one more ignored file just after the first check.
+    if (path === DEMO_WINDOWS_WORKTREE && !ignored) this.worktreeIgnored.set(path, [...found.ignored, DEMO_LATE_IGNORED]);
+    return { ...found, ignored: ignored ?? found.ignored };
+  }
+
+  /**
+   * Drops a missing worktree's entry as the helper does: `repoChanged` for its main repo
+   * without it, then `worktreeJobDone`.
+   */
+  async pruneWorktree(repo: string, path: string): Promise<void> {
+    await sleep(600);
+    const main = this.repos.find((r) => r.path === repo && !r.worktreeOf);
+    const entry = main?.missingWorktrees?.find((m) => m.path === path);
+    let refusal: string | null = null;
+    if (!main || !entry) refusal = "Git does not list it as missing.";
+    else if (!entry.cleanable) refusal = "Git's record of it is still needed.";
+    if (refusal || !main || !entry) {
+      const message = `Cannot clean up the worktree: ${refusal}`;
+      this.emit({ event: "worktreeJobDone", data: { path, error: message } });
+      throw { kind: "worktree", message };
+    }
+    const rest = main.missingWorktrees!.filter((m) => m !== entry);
+    const next: RepoSnapshot = { ...main, missingWorktrees: rest.length > 0 ? rest : undefined };
+    this.repos = this.repos.map((r) => (r === main ? next : r));
+    this.emit({ event: "repoChanged", data: next });
+    this.emit({ event: "worktreeJobDone", data: { path } });
   }
 
   /** Shows the pretend terminal of the refactor's window. */

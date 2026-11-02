@@ -68,6 +68,7 @@ export function testWorktreeInfo(extra: Partial<WorktreeInfo> = {}): WorktreeInf
     ignored: [],
     status: { kind: "pushed" },
     removable: true,
+    checkable: false,
     ...extra,
   };
 }

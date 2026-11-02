@@ -190,7 +190,7 @@ test("a refactor runs from the dialog to a merge, and another is discarded", asy
 
 test("linked worktrees fold into their repo's gem, and the ready one is removed", async ({ page }) => {
   const mark = page.locator(".rf-checkout-mark");
-  await expect(mark).toHaveAttribute("data-count", "2");
+  await expect(mark).toHaveAttribute("data-count", "3");
   await expect(mark).toHaveClass(/rf-checkout-mark--removable/);
   // Search finds the main gem by a worktree's branch.
   await page.keyboard.type("wide-cards");
@@ -211,8 +211,53 @@ test("linked worktrees fold into their repo's gem, and the ready one is removed"
   await confirm.getByRole("button", { name: "Remove" }).click();
   await expect(cards).toHaveCount(0);
   await expect(search).toBeVisible();
-  await expect(mark).toHaveAttribute("data-count", "1");
+  await expect(mark).toHaveAttribute("data-count", "2");
   await expect(mark).not.toHaveClass(/rf-checkout-mark--removable/);
+});
+
+test("a Windows-drive worktree is checked, then removed, and a missing one cleaned up", async ({ page }) => {
+  const mark = page.locator(".rf-checkout-mark");
+  await page.keyboard.type("tablet-layout");
+  await expect(page.locator(".rf-focus-label__name")).toHaveText("harbor-android");
+  await page.keyboard.press("Enter");
+  const panel = page.getByRole("complementary", { name: "harbor-android details" });
+  const section = panel.getByRole("region", { name: "Worktrees" });
+  const tablet = section.getByRole("listitem", { name: "harbor-android-tablet" });
+  await expect(tablet).toContainText("Changes not checked (Windows drive)");
+  await expect(tablet.getByRole("button", { name: /Remove/ })).toHaveCount(0);
+  const check = tablet.getByRole("button", { name: "Check harbor-android-tablet…" });
+  await check.click();
+  await expect(check).toBeDisabled();
+  await expect(tablet.getByRole("status")).toHaveText("Checking files on the Windows drive…");
+  const confirm = tablet.getByRole("group", { name: "Confirm removing harbor-android-tablet" });
+  await expect(confirm).toBeVisible();
+  await expect(tablet).toContainText("Pushed, not merged · Ready to remove");
+  await expect(confirm.getByRole("list", { name: "Ignored files" })).toHaveText("node_modules/");
+  // A program on Windows wrote .env after the check, so the helper refuses until it is listed.
+  await confirm.getByRole("button", { name: "Remove" }).click();
+  await expect(tablet.getByRole("alert")).toHaveText(
+    "Cannot remove the worktree: New ignored files appeared since you confirmed (.env). Check again.",
+  );
+  await expect(tablet).toContainText("Changes not checked (Windows drive)");
+  await expect(confirm).toHaveCount(0);
+  await check.click();
+  await expect(tablet.getByRole("alert")).toHaveCount(0);
+  await expect(confirm.getByRole("list", { name: "Ignored files" })).toHaveText("node_modules/.env");
+  await confirm.getByRole("button", { name: "Remove" }).click();
+  await expect(tablet).toHaveCount(0);
+  await expect(mark).toHaveAttribute("data-count", "2");
+
+  // The folder of harbor-android-offline is gone; git's entry for it can go.
+  const offline = section.getByRole("listitem", { name: "harbor-android-offline" });
+  await expect(offline).toContainText("/home/demo/projects/harbor-android-offline");
+  await expect(offline).toContainText("Folder is gone");
+  await offline.getByRole("button", { name: "Clean up harbor-android-offline…" }).click();
+  const forget = offline.getByRole("group", { name: "Confirm cleaning up harbor-android-offline" });
+  await expect(forget).toContainText("Forget this worktree? Only git's record of it goes; branch offline-maps stays.");
+  await forget.getByRole("button", { name: "Clean up" }).click();
+  await expect(offline).toHaveCount(0);
+  await expect(section.getByRole("listitem", { name: "harbor-android-wide-cards" })).toBeVisible();
+  await expect(mark).toHaveAttribute("data-count", "2");
 });
 
 test("the settings panel opens and closes", async ({ page }) => {

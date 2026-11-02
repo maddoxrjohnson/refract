@@ -32,6 +32,7 @@ import type {
   SystemStats,
   UsageSummary,
   VsCodeWindow,
+  WorktreeCheck,
 } from "./types";
 import { NO_FORCE } from "./types";
 
@@ -194,8 +195,18 @@ export class TauriBackend implements Backend {
   }
 
   /** Rejects with `CommandError`, as merge and discard do. */
-  removeWorktree(path: string): Promise<void> {
-    return invoke<void>("remove_worktree", { path });
+  removeWorktree(path: string, ignored?: string[]): Promise<void> {
+    return invoke<void>("remove_worktree", { path, ignored });
+  }
+
+  /** Rejects with `CommandError`, as `removeWorktree` does. */
+  checkWorktree(path: string): Promise<WorktreeCheck> {
+    return invoke<WorktreeCheck>("check_worktree", { path });
+  }
+
+  /** Rejects with `CommandError`, as `removeWorktree` does. */
+  pruneWorktree(repo: string, path: string): Promise<void> {
+    return invoke<void>("prune_worktree", { repo, path });
   }
 
   // The hook and usage commands reject with `AgentRequestError`, as `agent_request` does.

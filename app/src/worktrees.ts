@@ -1,4 +1,4 @@
-import type { GitOperation, RepoSnapshot, WorktreeStatus } from "./backend/types";
+import type { GitOperation, MissingWorktreeStatus, RepoSnapshot, WorktreeCheck, WorktreeStatus } from "./backend/types";
 
 // Linked worktrees folded into their main repo's gem (.plans/worktrees-spec.md §4): what
 // a worktree's row says, and whether it can be removed. The helper decides the git rows
@@ -72,25 +72,56 @@ export interface WorktreeView {
   removable: boolean;
   /** Nothing can be lost, but an agent is still open in the folder, which blocks Remove. */
   agentOpen: boolean;
+  /**
+   * Check… is offered: on a Windows drive, only the unread files could keep it (spec §10.1).
+   * It stays after an answer, as Check again: edits from Windows bring no new snapshot.
+   */
+  checkable: boolean;
 }
 
-/** What a folded worktree's row shows; `null` without the helper's facts. */
-export function worktreeView(repo: RepoSnapshot): WorktreeView | null {
+/**
+ * What a folded worktree's row shows; `null` without the helper's facts. `check` is a
+ * `checkWorktree` answer for the current snapshot, which stands in for its git status.
+ */
+export function worktreeView(repo: RepoSnapshot, check?: WorktreeCheck | null): WorktreeView | null {
   const info = repo.worktree;
   if (!info) return null;
   const agent = worktreeAgent(repo);
-  if (agent === "waiting") return { label: "Agent waiting for you", tone: "attention", removable: false, agentOpen: false };
-  if (agent === "working") return { label: "Agent running", tone: "working", removable: false, agentOpen: false };
+  const none = { removable: false, agentOpen: false, checkable: false };
+  if (agent === "waiting") return { label: "Agent waiting for you", tone: "attention", ...none };
+  if (agent === "working") return { label: "Agent running", tone: "working", ...none };
+  const status = check ? check.status : info.status;
   // The helper refuses Remove while any session is live, idle ones too.
-  const done = info.removable;
+  const done = check ? check.removable : info.removable;
+  // A check could make it removable, so the same rules hold Check… back.
+  const checkable = info.checkable ?? false;
   // Nor does it remove the repo a refactor was started from; say why Remove is missing.
-  if (done && repo.refactor) return { label: "Has a refactor", tone: "keep", removable: false, agentOpen: false };
+  if ((done || checkable) && repo.refactor) return { label: "Has a refactor", tone: "keep", ...none };
   return {
-    label: gitStatusLabel(info.status),
+    label: gitStatusLabel(status),
     tone: done ? "done" : "keep",
     removable: done && agent === null,
-    agentOpen: done && agent === "open",
+    agentOpen: (done || checkable) && agent === "open",
+    checkable: checkable && agent === null,
   };
+}
+
+/** A missing-folder entry's words (spec §10.2, m1-m6). */
+export function missingWorktreeLabel(status: MissingWorktreeStatus): string {
+  switch (status.kind) {
+    case "locked":
+      return "Folder is gone · Locked";
+    case "driveNotAttached":
+      return "Folder is gone · Drive not attached";
+    case "moved":
+      return `Moved to ${status.to}`;
+    case "ownRefs":
+      return "Folder is gone · Has its own refs";
+    case "commitsOnlyHere":
+      return "Folder is gone · Its commits would be lost";
+    case "gone":
+      return "Folder is gone";
+  }
 }
 
 /**

@@ -265,11 +265,32 @@ describe("TauriBackend", () => {
       if (cmd === "remove_worktree" && (args as { path: string }).path.endsWith("search")) throw refused;
     });
     const backend = new TauriBackend();
-    await backend.removeWorktree("/home/dev/projects/reef-maps-wide-cards");
+    await backend.removeWorktree("/home/dev/projects/reef-maps-wide-cards", [".env", "build/"]);
     await expect(backend.removeWorktree("/home/dev/projects/reef-maps-search")).rejects.toEqual(refused);
     expect(calls).toEqual([
-      { cmd: "remove_worktree", args: { path: "/home/dev/projects/reef-maps-wide-cards" } },
+      { cmd: "remove_worktree", args: { path: "/home/dev/projects/reef-maps-wide-cards", ignored: [".env", "build/"] } },
       { cmd: "remove_worktree", args: { path: "/home/dev/projects/reef-maps-search" } },
+    ]);
+  });
+
+  it("checks a worktree and cleans up a missing one through their commands, passing on refusals", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const check = { status: { kind: "pushed" }, removable: true, ignored: ["node_modules/"] };
+    const refused = { kind: "worktree", message: "Cannot clean up the worktree: The folder is back." };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      if (cmd === "check_worktree") return check;
+      if (cmd === "prune_worktree" && (args as { path: string }).path.endsWith("back")) throw refused;
+    });
+    const backend = new TauriBackend();
+    const main = "/home/dev/projects/reef-maps";
+    await expect(backend.checkWorktree("/mnt/c/Users/dev/reef-maps-tablet")).resolves.toEqual(check);
+    await backend.pruneWorktree(main, "/home/dev/projects/reef-maps-offline");
+    await expect(backend.pruneWorktree(main, "/home/dev/projects/reef-maps-back")).rejects.toEqual(refused);
+    expect(calls).toEqual([
+      { cmd: "check_worktree", args: { path: "/mnt/c/Users/dev/reef-maps-tablet" } },
+      { cmd: "prune_worktree", args: { repo: main, path: "/home/dev/projects/reef-maps-offline" } },
+      { cmd: "prune_worktree", args: { repo: main, path: "/home/dev/projects/reef-maps-back" } },
     ]);
   });
 

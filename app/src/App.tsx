@@ -20,6 +20,7 @@ import type {
   Settings,
   SystemStats,
   UsageSummary,
+  WorktreeJobDone,
 } from "./backend/types";
 import { useHook } from "./hooks/useHook";
 import { useMigrations } from "./hooks/useMigrations";
@@ -247,6 +248,22 @@ export function App({ backend }: { backend: Backend }) {
   }, [backend, running, shown, relist]);
 
   useEffect(() => backend.onAgentEvent((event) => dispatch({ type: "event", event })), [backend]);
+  // The Worktrees section hears its remove and prune jobs end, also past their requests' wait.
+  const onWorktreeJobDone = useCallback(
+    (cb: (done: WorktreeJobDone) => void) =>
+      backend.onAgentEvent((event) => {
+        if (event.event === "worktreeJobDone") cb(event.data);
+      }),
+    [backend],
+  );
+  // A helper that stops or restarts drops its jobs, so none of them ends with that event.
+  const onHelperGone = useCallback(
+    (cb: () => void) =>
+      backend.onAgentStatus((s) => {
+        if (s.state !== "running") cb();
+      }),
+    [backend],
+  );
   // Move to WSL (spec §2): pending reports are asked for again on each show.
   const moves = useMigrations(backend, running, shown);
 
@@ -650,13 +667,18 @@ export function App({ backend }: { backend: Backend }) {
           onRefreshDetails={details.refresh}
           worktrees={zoomedWorktrees}
           worktreeSection={
-            !zoomedRemoteOnly &&
-            zoomedWorktrees && (
+            !zoomedRemoteOnly && (
               <WorktreesSection
-                worktrees={zoomedWorktrees}
+                key={zoomedRepo.path}
+                worktrees={zoomedWorktrees ?? []}
                 now={now}
                 onOpen={(path) => send({ type: "launch", path })}
-                onRemove={(path) => backend.removeWorktree(path)}
+                onRemove={(path, ignored) => backend.removeWorktree(path, ignored)}
+                onCheck={(path) => backend.checkWorktree(path)}
+                missing={zoomedRepo.missingWorktrees}
+                onPrune={(path) => backend.pruneWorktree(zoomedRepo.path, path)}
+                onJobDone={onWorktreeJobDone}
+                onHelperGone={onHelperGone}
               />
             )
           }
