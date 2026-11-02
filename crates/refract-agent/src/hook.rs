@@ -455,10 +455,11 @@ fn read_status(path: &Path) -> Option<HookReport> {
         .read_to_end(&mut bytes)
         .ok()?;
     let file = hook::parse_status_file(&bytes)?;
-    Some(HookReport {
-        status: file.status,
-        at: file.at,
-    })
+    let mut report = HookReport::new(file.status, file.at);
+    for (slot, pid) in report.pids.iter_mut().zip(file.pids) {
+        *slot = pid;
+    }
+    Some(report)
 }
 
 #[cfg(test)]
@@ -564,7 +565,7 @@ mod tests {
         fs::write(dir.join(format!(".{ID}.42.tmp")), r#"{"status":"ended"}"#).unwrap();
         fs::write(dir.join("notes.json"), r#"{"status":"ended"}"#).unwrap();
         let mut statuses = read_statuses(dir);
-        let report = |status, at| HookReport { status, at };
+        let report = HookReport::new;
         assert_eq!(
             statuses,
             HashMap::from([(ID.to_owned(), report(HookStatus::Working, Some(17)))])
@@ -573,6 +574,18 @@ mod tests {
         fs::write(dir.join(&name), r#"{"status":"waitingOnUser"}"#).unwrap();
         update_statuses(dir, &mut statuses, [&name]);
         assert_eq!(statuses[ID], report(HookStatus::WaitingOnUser, None));
+        // Pids are kept, the first four only.
+        fs::write(
+            dir.join(&name),
+            r#"{"status":"working","at":18,"pids":[812,640,600,500,1]}"#,
+        )
+        .unwrap();
+        update_statuses(dir, &mut statuses, [&name]);
+        assert_eq!(statuses[ID].pids, [812, 640, 600, 500]);
+        assert_eq!(
+            statuses[ID].pids().collect::<Vec<_>>(),
+            [812, 640, 600, 500]
+        );
         fs::remove_file(dir.join(&name)).unwrap();
         update_statuses(dir, &mut statuses, [&name]);
         assert!(statuses.is_empty());

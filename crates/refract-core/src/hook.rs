@@ -105,7 +105,8 @@ pub fn command(script: &str, status: HookStatus, status_dir: &str) -> String {
 }
 
 /// What one status file says:
-/// `{"status":"working","event":"UserPromptSubmit","at":1773489600}`.
+/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600]}`.
+/// Files from scripts before `pids` was added have none.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StatusFile {
     pub status: HookStatus,
@@ -115,6 +116,10 @@ pub struct StatusFile {
     /// When, in Unix seconds.
     #[serde(default)]
     pub at: Option<i64>,
+    /// The pids of the script's ancestors, nearest first; the `claude` process that ran
+    /// the hook is among them.
+    #[serde(default)]
+    pub pids: Vec<u32>,
 }
 
 /// Parses a status file. `None` when it is not one (empty, cut short, unknown status).
@@ -410,6 +415,16 @@ mod tests {
         assert_eq!(file.status, HookStatus::WaitingOnUser);
         assert_eq!(file.event.as_deref(), Some("Notification"));
         assert_eq!(file.at, Some(17));
+        assert!(file.pids.is_empty());
+        let file = parse_status_file(
+            br#"{"status":"working","event":"PostToolUse","at":1793661784,"pids":[123,122,100,1]}"#,
+        )
+        .unwrap();
+        assert_eq!(file.status, HookStatus::Working);
+        assert_eq!(file.at, Some(1_793_661_784));
+        assert_eq!(file.pids, [123, 122, 100, 1]);
+        let empty = parse_status_file(br#"{"status":"finished","at":5,"pids":[]}"#).unwrap();
+        assert!(empty.pids.is_empty());
         assert_eq!(
             parse_status_file(b"{\"status\":\"ended\"}\n")
                 .unwrap()

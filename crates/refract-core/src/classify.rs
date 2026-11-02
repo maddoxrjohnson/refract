@@ -15,11 +15,33 @@ pub enum HookStatus {
     Ended,
 }
 
-/// A status hook report: the status and when the script wrote it, in Unix seconds.
+/// The most pids a [`HookReport`] keeps.
+pub const HOOK_PIDS: usize = 4;
+
+/// A status hook report: the status, when the script wrote it, in Unix seconds, and
+/// the pids of the script's ancestors, nearest first (0 for none), one of which is the
+/// `claude` process that ran the hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HookReport {
     pub status: HookStatus,
     pub at: Option<i64>,
+    pub pids: [u32; HOOK_PIDS],
+}
+
+impl HookReport {
+    /// A report without pids, as an install from before they were recorded writes.
+    pub fn new(status: HookStatus, at: Option<i64>) -> Self {
+        HookReport {
+            status,
+            at,
+            pids: [0; HOOK_PIDS],
+        }
+    }
+
+    /// The recorded pids, nearest ancestor first.
+    pub fn pids(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pids.iter().copied().filter(|&pid| pid != 0)
+    }
 }
 
 /// What a running session is doing.
@@ -85,7 +107,7 @@ pub fn classify(summary: &SessionSummary, live: bool, hook: Option<HookStatus>) 
     classify_report(
         summary,
         live,
-        hook.map(|status| HookReport { status, at: None }),
+        hook.map(|status| HookReport::new(status, None)),
         0,
     )
 }
@@ -156,7 +178,7 @@ mod tests {
             last_timestamp: Utc.timestamp_opt(at + 5, 0).single(),
             ..SessionSummary::default()
         };
-        let report = |status, at| Some(HookReport { status, at });
+        let report = |status, at| Some(HookReport::new(status, at));
         for status in [HookStatus::Working, HookStatus::WaitingOnUser] {
             assert_eq!(
                 classify_report(&summary, true, report(status, Some(at)), 0),
@@ -190,12 +212,7 @@ mod tests {
     #[test]
     fn running_background_agents_keep_an_idle_live_session_working() {
         let at = 1_773_489_600;
-        let report = |status| {
-            Some(HookReport {
-                status,
-                at: Some(at),
-            })
-        };
+        let report = |status| Some(HookReport::new(status, Some(at)));
         let done = SessionSummary {
             tail: Some(Tail::AssistantReply),
             ..SessionSummary::default()

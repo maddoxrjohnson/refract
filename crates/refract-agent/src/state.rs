@@ -1325,10 +1325,7 @@ mod tests {
             }),
         )]
         .into();
-        let finished = HookReport {
-            status: HookStatus::Finished,
-            at: None,
-        };
+        let finished = HookReport::new(HookStatus::Finished, None);
         agent.hooks.insert(id.to_owned(), finished);
         let (status, head) = (Status::default(), HeadInfo::default());
         agent.store(repo.clone(), status, head, sessions, live, HashMap::new());

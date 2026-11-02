@@ -266,6 +266,8 @@ fn install_run_and_uninstall_the_status_hook() {
         assert_eq!(written["status"], status);
         assert_eq!(written["event"], event);
         assert!(written["at"].as_i64().unwrap() > 1_700_000_000);
+        let pids = written["pids"].as_array().unwrap();
+        assert!(!pids.is_empty() && pids.iter().all(|p| p.as_u64().is_some_and(|p| p > 1)));
         agent.event(event, |e| {
             e["event"] == "sessionChanged"
                 && e["data"]["session"]["id"] == SESSION_ID
@@ -352,6 +354,58 @@ fn install_run_and_uninstall_the_status_hook() {
     claude_proc.wait().unwrap();
     assert_eq!(agent.request(7, "shutdown")["result"], Value::Null);
     assert!(agent.child.wait().unwrap().success());
+}
+
+#[test]
+fn the_script_records_the_pids_of_its_ancestors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("sessions");
+    let script: PathBuf = [env!("CARGO_MANIFEST_DIR"), "src", "status-hook.sh"]
+        .iter()
+        .collect();
+    // Shaped like the installed command, so the script is not the shell's last command
+    // and runs as its child.
+    let command = format!(
+        "[ -f '{0}' ] && sh '{0}' working '{1}' || cat >/dev/null; exit 0",
+        script.display(),
+        dir.display()
+    );
+    let mut child = Command::new("sh")
+        .args(["-c", &command])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let shell = child.id();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin
+        .write_all(&hook_input("PostToolUse", tmp.path()))
+        .unwrap();
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+    let text = std::fs::read_to_string(dir.join(format!("{SESSION_ID}.json"))).unwrap();
+    let list = text.split("\"pids\":[").nth(1).unwrap().split(']').next();
+    let list = list.unwrap();
+    assert!(
+        list.chars().all(|c| c.is_ascii_digit() || c == ','),
+        "{text}"
+    );
+    let written: Value = serde_json::from_str(&text).unwrap();
+    let pids: Vec<u64> = written["pids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_u64().unwrap())
+        .collect();
+    // The shell that ran the command, then this test, which started it.
+    assert_eq!(
+        pids[..2],
+        [u64::from(shell), u64::from(std::process::id())],
+        "{text}"
+    );
+    assert!(pids.len() <= 4 && pids.iter().all(|&p| p > 1), "{text}");
 }
 
 #[test]
