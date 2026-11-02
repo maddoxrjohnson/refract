@@ -74,7 +74,7 @@ Shown next to the zoomed gem:
 
 There are two small paper widgets in the corners of the scene. Both update about every 2 seconds, and only while the window is visible.
 
-- **System:** CPU, memory and GPU use, plus Refract's own share, so you can see that Refract is cheap to run.
+- **System:** CPU, memory and GPU use, plus Refract's own share, so you can see that Refract is cheap to run. Each bar is split into WSL and Windows, so when memory runs short you can tell which side holds it; WSL's memory is the VM's working set, with the part that is Linux file cache shaded lighter (see `.plans/system-split-spec.md`). Refract's share counts the helper inside WSL too.
 - **Claude usage:** tokens used today, in the last 7 days and in a rolling 5-hour window, and how many agents are running now. Hovering shows a per-repo breakdown. The numbers are added up from Claude Code's local session files, so they cost nothing to collect. An optional cost estimate uses a pricing table you can edit. Plan-limit percentages are shown only if Claude Code exposes them through an official local source. Refract never guesses them.
 
 ### 3.6 Graphics quality
