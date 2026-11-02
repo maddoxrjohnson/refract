@@ -340,7 +340,8 @@ describe("TauriBackend", () => {
       memUsedBytes: 8e9,
       memTotalBytes: 32e9,
       gpuPercent: 30,
-      own: { cpuPercent: 0.4, memBytes: 1.2e8, gpuPercent: 1.5 },
+      wsl: { cpuPercent: 4, memBytes: 5e9, memProgramBytes: 1.5e9, memCacheBytes: 3.5e9, gpuPercent: null },
+      own: { cpuPercent: 0.4, memBytes: 1.2e8, gpuPercent: 1.5, wslCpuPercent: 0.1, wslMemBytes: 4e7 },
     };
     const seen: SystemStats[] = [];
     const stop = new TauriBackend().onSystemStats((s) => seen.push(s));

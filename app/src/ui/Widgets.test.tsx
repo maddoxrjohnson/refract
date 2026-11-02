@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CostEstimate, ModelUsage, SystemStats, UsageSummary } from "../backend/types";
-import { SystemWidget } from "./SystemWidget";
+import { SystemWidget, layoutBar } from "./SystemWidget";
 import { UsageWidget, totalTokens } from "./UsageWidget";
 
 afterEach(cleanup);
@@ -12,7 +12,15 @@ const STATS: SystemStats = {
   memUsedBytes: 13.4 * GB,
   memTotalBytes: 32 * GB,
   gpuPercent: 18,
-  own: { cpuPercent: 0.6, memBytes: 210 * 1024 ** 2, gpuPercent: 1.5 },
+  wsl: null,
+  own: { cpuPercent: 0.6, memBytes: 210 * 1024 ** 2, gpuPercent: 1.5, wslCpuPercent: 0, wslMemBytes: 0 },
+};
+
+/** The same machine with WSL's share: 12% CPU, a 5.5 GB VM of which 4 GB is cache. */
+const WSL_STATS: SystemStats = {
+  ...STATS,
+  wsl: { cpuPercent: 12, memBytes: 5.5 * GB, memProgramBytes: 1.5 * GB, memCacheBytes: 4 * GB, gpuPercent: 1 },
+  own: { cpuPercent: 3, memBytes: 410 * 1024 ** 2, gpuPercent: 2, wslCpuPercent: 0.4, wslMemBytes: 40 * 1024 ** 2 },
 };
 
 const t = (input: number, output: number, cacheRead: number, cacheWrite: number) => ({
@@ -47,6 +55,80 @@ describe("SystemWidget", () => {
     expect(screen.getByRole("region", { name: "System" }).textContent).toContain(
       "Refract 0.6% CPU · 210 MB · 1.5% GPU",
     );
+  });
+
+  it("looks as before the split with no WSL figures", () => {
+    const { container } = render(<SystemWidget stats={STATS} away={false} />);
+    expect(container.querySelector(".rf-meter__wsl")).toBeNull();
+    expect(container.querySelector(".rf-widget__legend")).toBeNull();
+    expect(screen.getByRole("region", { name: "System" }).textContent).not.toContain("WSL");
+    expect(container.querySelectorAll(".rf-meter__own")).toHaveLength(3);
+  });
+
+  it("splits the bars into WSL and Windows and lists WSL's share", () => {
+    const { container } = render(<SystemWidget stats={WSL_STATS} away={false} />);
+    expect(screen.getByRole("meter", { name: "CPU" }).getAttribute("aria-valuetext")).toBe("24%, WSL 12%");
+    expect(screen.getByRole("meter", { name: "Memory" }).getAttribute("aria-valuetext")).toBe(
+      "13.4 GB, WSL 5.5 GB (4 GB cache)",
+    );
+    expect(screen.getByRole("meter", { name: "GPU" }).getAttribute("aria-valuetext")).toBe("18%, WSL 1%");
+    const text = screen.getByRole("region", { name: "System" }).textContent;
+    expect(text).toContain("WSLcacheWindowsRefract");
+    expect(text).toContain("WSL 12% CPU · 5.5 GB · 1% GPU");
+    // Refract's line is both sides together.
+    expect(text).toContain("Refract 3% CPU · 410 MB · 2% GPU");
+    expect(container.querySelectorAll(".rf-meter__wsl")).toHaveLength(3);
+    expect(container.querySelectorAll(".rf-meter__gap")).toHaveLength(3);
+    // Only memory has a striped part, after what programs use.
+    expect(container.querySelectorAll(".rf-meter__wsl-cache")).toHaveLength(1);
+    const memory = screen.getByRole("meter", { name: "Memory" });
+    const cache = memory.querySelector<HTMLElement>(".rf-meter__wsl-cache")!;
+    expect(parseFloat(cache.style.width)).toBeCloseTo((4 / 32) * 100);
+    expect(parseFloat(cache.style.left)).toBeCloseTo((1.5 / 32) * 100);
+    // The label sits on its own line whatever the digits; the Refract swatch waits for
+    // short windows.
+    expect(container.querySelectorAll(".rf-widget__line-label")).toHaveLength(2);
+    expect(container.querySelectorAll(".rf-widget__swatch--short")).toHaveLength(1);
+  });
+
+  it("leaves GPU whole when WSL has no GPU figure", () => {
+    render(<SystemWidget stats={{ ...WSL_STATS, wsl: { ...WSL_STATS.wsl!, gpuPercent: null } }} away={false} />);
+    const gpu = screen.getByRole("meter", { name: "GPU" });
+    expect(gpu.getAttribute("aria-valuetext")).toBe("18%");
+    expect(gpu.querySelector(".rf-meter__wsl")).toBeNull();
+    const text = screen.getByRole("region", { name: "System" }).textContent;
+    expect(text).toContain("WSL 12% CPU · 5.5 GB");
+    expect(text).not.toContain("5.5 GB ·");
+  });
+
+  it("lays out a bar WSL first, with Refract's mark at the start of each part", () => {
+    expect(layoutBar({ total: 40, own: 5 })).toEqual({ fill: [0, 40], own: [0, 5] });
+    // Programs solid from the start; the rest of WSL's part (cache, and anything beyond
+    // programs and cache) striped after it; a gap where Windows' part starts.
+    expect(layoutBar({ total: 40, own: 5, wsl: 10, wslOwn: 1, wslPrograms: 3 })).toEqual({
+      fill: [0, 40],
+      wsl: [0, 10],
+      wslCache: [3, 7],
+      wslOwn: [0, 1],
+      own: [10, 4],
+      gap: 10,
+    });
+    // CPU and GPU have no striped part.
+    expect(layoutBar({ total: 40, own: 5, wsl: 10 }).wslCache).toBeUndefined();
+    // Each piece stays inside its part and the bar; no gap with no Windows part.
+    expect(layoutBar({ total: 40, own: 50, wsl: 60, wslOwn: 80, wslPrograms: 90 })).toEqual({
+      fill: [0, 40],
+      wsl: [0, 40],
+      wslCache: [40, 0],
+      wslOwn: [0, 40],
+      own: [40, 0],
+    });
+    expect(layoutBar({ total: Number.NaN, own: 1, wsl: 1 })).toEqual({
+      fill: [0, 0],
+      wsl: [0, 0],
+      wslOwn: [0, 0],
+      own: [0, 0],
+    });
   });
 
   it("waits for the first reading and hides while away", () => {

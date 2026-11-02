@@ -20,6 +20,10 @@
   --panel: rgb(238 240 228 / 0.86);
   /* Hover and selected rows, meter tracks. */
   --wash: rgb(31 74 61 / 0.07);
+  /* The system widget's WSL segment: what Linux programs use, and its fainter, striped file cache
+     (system-split spec §3). Apart from the ink of Refract's mark and the Windows fill. */
+  --wsl: #4a7f9e;
+  --wsl-cache: #c6d7dc;
   --shadow: 0 6px 20px rgb(0 0 0 / 0.06);
   --sans: "IBM Plex Sans", system-ui, "Segoe UI", sans-serif;
   --mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", monospace;
@@ -38,6 +42,8 @@
   --line: rgb(216 199 143 / 0.17);
   --panel: rgb(14 23 19 / 0.86);
   --wash: rgb(216 199 143 / 0.08);
+  --wsl: #3d7a99;
+  --wsl-cache: #1b313a;
   --shadow: none;
 }
 
@@ -53,6 +59,8 @@
     --line: rgb(216 199 143 / 0.17);
     --panel: rgb(14 23 19 / 0.86);
     --wash: rgb(216 199 143 / 0.08);
+    --wsl: #3d7a99;
+    --wsl-cache: #1b313a;
     --shadow: none;
   }
 }
@@ -1509,18 +1517,51 @@
 }
 
 .rf-meter__fill,
+.rf-meter__wsl,
+.rf-meter__wsl-cache,
 .rf-meter__own {
   position: absolute;
   inset: 0 auto 0 0;
   border-radius: 3px;
-  transition: width 600ms var(--ease-out);
+  transition:
+    left 600ms var(--ease-out),
+    width 600ms var(--ease-out);
 }
 
+/* The machine's use; with WSL drawn over its start, the Windows part. */
 .rf-meter__fill {
   background: color-mix(in srgb, var(--fg) 32%, transparent);
 }
 
-/* Refract's share, from the start of the bar. */
+/* WSL's part, from the start of the bar, square where Windows' part follows it. */
+.rf-meter__wsl {
+  border-radius: 3px 0 0 3px;
+  background: var(--wsl);
+}
+
+/* The end of WSL's part that Windows can get back: Linux's file cache and memory it has
+   freed but not handed back yet. Striped, so it differs from the Windows fill by pattern
+   as well as colour. */
+.rf-meter__wsl-cache,
+.rf-widget__swatch.rf-widget__swatch--cache {
+  border-radius: 0;
+  background: repeating-linear-gradient(
+    135deg,
+    var(--wsl) 0 1.5px,
+    var(--wsl-cache) 1.5px 4px
+  );
+}
+
+/* Panel showing through between WSL's part and Windows'. */
+.rf-meter__gap {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 1px;
+  background: var(--panel);
+  transition: left 600ms var(--ease-out);
+}
+
+/* Refract's share, from the start of the bar or of each part. */
 .rf-meter__own {
   background: var(--fg);
 }
@@ -1545,6 +1586,50 @@
   height: 8px;
   border-radius: 2px;
   background: var(--fg);
+}
+
+/* With WSL figures: a legend for the split bars above a line each for WSL and Refract. */
+.rf-widget__legend {
+  display: flex;
+  gap: 0 8px;
+  margin: 8px 0 2px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.rf-widget__legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.rf-widget__swatch--wsl {
+  background: var(--wsl);
+}
+
+.rf-widget__swatch--windows {
+  background: color-mix(in srgb, var(--fg) 32%, transparent);
+}
+
+/* The label on a line of its own and the figures on the next, whatever their digits,
+   so the widget keeps its height as they change. */
+.rf-widget__own--line {
+  margin: 2px 0 0;
+}
+
+.rf-widget__line-label {
+  display: flex;
+  flex-basis: 100%;
+  align-items: center;
+  gap: 6px;
+}
+
+.rf-widget__own--line .rf-mono {
+  white-space: nowrap;
+}
+
+.rf-widget__swatch--short {
+  display: none;
 }
 
 .rf-usage__totals {
@@ -1668,6 +1753,32 @@
   background: var(--accent);
 }
 
+/* How much taller the system widget is with its WSL legend and line (system-split spec
+   §3), which the usage widget's breakdown below leaves room for. */
+:root {
+  --rf-system-extra: 0px;
+}
+
+:root:has(.rf-widget--wsl) {
+  --rf-system-extra: 52px;
+}
+
+/* Too short for that room: the bars stay split, without the legend and WSL line. */
+@media (max-height: 539px) {
+  :root:has(.rf-widget--wsl) {
+    --rf-system-extra: 0px;
+  }
+
+  .rf-widget--wsl .rf-widget__legend,
+  .rf-widget--wsl .rf-widget__own--wsl {
+    display: none;
+  }
+
+  .rf-widget--wsl .rf-widget__swatch--short {
+    display: block;
+  }
+}
+
 /* The 7-day breakdown grows the widget upward, short of the system widget. */
 .rf-usage__repos {
   margin: 0 0 10px;
@@ -1680,18 +1791,18 @@
   list-style: none;
   margin: 0;
   padding: 0;
-  max-height: min(220px, max(40px, calc(100vh - 360px)));
+  max-height: min(220px, max(40px, calc(100vh - 360px - var(--rf-system-extra))));
   overflow-y: auto;
 }
 
 /* The plan limits take about 80px (100px with their "as of" line) below the list, so the
    list gives that room back to stay clear of the system widget on short windows. */
 .rf-widget--limits .rf-usage__repos ul {
-  max-height: min(220px, max(18px, calc(100vh - 440px)));
+  max-height: min(220px, max(18px, calc(100vh - 440px - var(--rf-system-extra))));
 }
 
 .rf-widget--limits-stale .rf-usage__repos ul {
-  max-height: min(220px, max(18px, calc(100vh - 460px)));
+  max-height: min(220px, max(18px, calc(100vh - 460px - var(--rf-system-extra))));
 }
 
 .rf-usage__repos li {
@@ -1801,6 +1912,9 @@
   .rf-quality__option span,
   .rf-segmented__option span,
   .rf-meter__fill,
+  .rf-meter__wsl,
+  .rf-meter__wsl-cache,
+  .rf-meter__gap,
   .rf-meter__own,
   .rf-limit__fill,
   .rf-move-bar__fill,

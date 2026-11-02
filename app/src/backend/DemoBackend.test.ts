@@ -8,7 +8,7 @@ import {
   demoHookDiff,
   demoRepos,
 } from "./DemoBackend";
-import type { AgentEvent, MigrateError, MigrateSnapshotProgress } from "./types";
+import type { AgentEvent, MigrateError, MigrateSnapshotProgress, SystemStats } from "./types";
 
 afterEach(() => vi.useRealTimers());
 
@@ -35,6 +35,31 @@ describe("demo repos", () => {
       if (pre.kind !== "resume") continue;
       expect(r.sessions.find((s) => s.id === pre.sessionId)?.resumeReason, r.name).toBeTruthy();
     }
+  });
+});
+
+describe("DemoBackend's system stats", () => {
+  it("split off a WSL share that fits inside the machine's, or none in the no-WSL mode", () => {
+    vi.useFakeTimers();
+    const seen: SystemStats[] = [];
+    const stop = new DemoBackend().onSystemStats((s) => seen.push(s));
+    for (let i = 0; i < 40; i++) vi.advanceTimersByTime(7_000);
+    stop();
+    expect(seen.length).toBeGreaterThan(40);
+    for (const s of seen) {
+      const wsl = s.wsl!;
+      expect(wsl.cpuPercent).toBeLessThanOrEqual(s.cpuPercent);
+      expect(wsl.memBytes).toBe(wsl.memProgramBytes + wsl.memCacheBytes);
+      expect(wsl.memBytes).toBeLessThan(s.memUsedBytes);
+      expect(wsl.gpuPercent).not.toBeNull();
+      expect(s.own.wslCpuPercent).toBeLessThan(s.own.cpuPercent);
+      expect(s.own.wslMemBytes).toBeLessThan(s.own.memBytes);
+    }
+
+    const without: SystemStats[] = [];
+    new DemoBackend({ wsl: false }).onSystemStats((s) => without.push(s))();
+    expect(without[0].wsl).toBeNull();
+    expect(without[0].own).toMatchObject({ wslCpuPercent: 0, wslMemBytes: 0 });
   });
 });
 

@@ -604,16 +604,41 @@ const GB = 1024 ** 3;
 const wave = (t: number, periodS: number, phase = 0) =>
   0.5 + 0.5 * Math.sin((2 * Math.PI * t) / periodS + phase);
 
-function demoStats(t: number): SystemStats {
-  return {
-    cpuPercent: 14 + 22 * wave(t, 47) + 6 * wave(t, 7, 1),
+/** The machine, with WSL's share of it unless `wsl` is false (as with an older helper). */
+function demoStats(t: number, wsl: boolean): SystemStats {
+  const cpuPercent = 14 + 22 * wave(t, 47) + 6 * wave(t, 7, 1);
+  const windowsOwn = {
+    cpuPercent: 0.4 + 0.6 * wave(t, 11, 2),
+    memBytes: (0.21 + 0.02 * wave(t, 23)) * GB,
+    gpuPercent: 1.2 + 1.5 * wave(t, 13, 1),
+  };
+  const machine = {
+    cpuPercent,
     memUsedBytes: (13.2 + 1.6 * wave(t, 90, 2)) * GB,
     memTotalBytes: 32 * GB,
     gpuPercent: 9 + 18 * wave(t, 31, 0.5),
+  };
+  if (!wsl) return { ...machine, wsl: null, own: { ...windowsOwn, wslCpuPercent: 0, wslMemBytes: 0 } };
+  // A VM holding 5.5 GB or so, most of it file cache, as on a machine that has built a
+  // few repos.
+  const memProgramBytes = (1.5 + 0.3 * wave(t, 60, 1)) * GB;
+  const memCacheBytes = (3.8 + 0.2 * wave(t, 120)) * GB;
+  const helper = { cpuPercent: 0.1 + 0.2 * wave(t, 9, 1), memBytes: (0.04 + 0.01 * wave(t, 17)) * GB };
+  return {
+    ...machine,
+    wsl: {
+      cpuPercent: cpuPercent * (0.3 + 0.1 * wave(t, 29)),
+      memBytes: memProgramBytes + memCacheBytes,
+      memProgramBytes,
+      memCacheBytes,
+      gpuPercent: 0.6 + 0.8 * wave(t, 19, 2),
+    },
     own: {
-      cpuPercent: 0.4 + 0.6 * wave(t, 11, 2),
-      memBytes: (0.21 + 0.02 * wave(t, 23)) * GB,
-      gpuPercent: 1.2 + 1.5 * wave(t, 13, 1),
+      cpuPercent: windowsOwn.cpuPercent + helper.cpuPercent,
+      memBytes: windowsOwn.memBytes + helper.memBytes,
+      gpuPercent: windowsOwn.gpuPercent,
+      wslCpuPercent: helper.cpuPercent,
+      wslMemBytes: helper.memBytes,
     },
   };
 }
@@ -708,6 +733,8 @@ export class DemoBackend implements Backend {
   private moveCount = 0;
   private moveWindows: VsCodeWindow[] = [{ id: 4242, title: "marigold-site - Visual Studio Code" }];
   private moveOutcome: DemoMoveOutcome;
+  /** Whether the system stats have WSL figures. */
+  private wsl: boolean;
   // Refactors: the pending step of each repo's simulated run, by path.
   private refactorTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private noticeListeners = new Set<(notice: RefactorNotice) => void>();
@@ -719,17 +746,23 @@ export class DemoBackend implements Backend {
    * `moveOutcome` is what Delete original first says; by default the original goes to the
    * Recycle Bin. The page's `?move=wontfit` asks for the permanent-delete question instead,
    * and `?move=unfinished` stops the first delete halfway, as a file in use would.
+   * `wsl: false`, or the page's `?wsl=off`, leaves WSL's figures out of the system stats,
+   * as a helper without `systemStats` does.
    */
-  constructor(options: { moveOutcome?: DemoMoveOutcome } = {}) {
+  constructor(options: { moveOutcome?: DemoMoveOutcome; wsl?: boolean } = {}) {
     let fromPage: DemoMoveOutcome | undefined;
+    let wslFromPage = true;
     try {
-      const move = new URLSearchParams(globalThis.location?.search ?? "").get("move");
+      const params = new URLSearchParams(globalThis.location?.search ?? "");
+      const move = params.get("move");
       if (move === "wontfit") fromPage = "wontFit";
       else if (move === "unfinished") fromPage = "unfinished";
+      wslFromPage = params.get("wsl") !== "off";
     } catch {
       // No page address: the default.
     }
     this.moveOutcome = options.moveOutcome ?? fromPage ?? "deleted";
+    this.wsl = options.wsl ?? wslFromPage;
   }
 
   private emit(event: AgentEvent) {
@@ -1172,7 +1205,7 @@ export class DemoBackend implements Backend {
   }
 
   onSystemStats(cb: (stats: SystemStats) => void): Unsubscribe {
-    const tick = () => cb(demoStats((Date.now() - this.started) / 1000));
+    const tick = () => cb(demoStats((Date.now() - this.started) / 1000, this.wsl));
     tick();
     const timer = setInterval(tick, 2000);
     return () => clearInterval(timer);

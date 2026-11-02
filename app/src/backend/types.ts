@@ -532,8 +532,29 @@ export interface SystemStats {
   memTotalBytes: number;
   /** Busiest GPU engine, as in GpuUsage. */
   gpuPercent: number;
-  /** Refract's own share: the app, its WebView2 processes and the helper's wsl.exe. */
-  own: { cpuPercent: number; memBytes: number; gpuPercent: number };
+  /** WSL's part of the figures above; null when the helper gave no reading. */
+  wsl: WslShare | null;
+  /**
+   * Refract's own share: the app, its WebView2 processes and the helper's wsl.exe on
+   * Windows, plus the helper and its children inside WSL. `cpuPercent` and `memBytes`
+   * are the two together; `wslCpuPercent` and `wslMemBytes` are the WSL part (0 with no
+   * WSL reading).
+   */
+  own: { cpuPercent: number; memBytes: number; gpuPercent: number; wslCpuPercent: number; wslMemBytes: number };
+}
+
+/** WSL's part of SystemStats, on Windows' scale (.plans/system-split-spec.md §4). */
+export interface WslShare {
+  /** Of all Windows CPUs, 0 to 100, no more than the machine's total. */
+  cpuPercent: number;
+  /** The WSL VM's working set. */
+  memBytes: number;
+  /** The part of `memBytes` Linux programs use. */
+  memProgramBytes: number;
+  /** The part that is Linux file cache, which Linux can give back. */
+  memCacheBytes: number;
+  /** null when the GPU counters credit nothing to the VM. */
+  gpuPercent: number | null;
 }
 
 // Move to WSL (.plans/wsl-migration-spec.md). The commands are documented in

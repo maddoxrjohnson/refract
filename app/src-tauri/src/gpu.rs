@@ -104,6 +104,16 @@ pub fn usage(samples: &[(String, f64)], own: &HashSet<u32>) -> GpuUsage {
     }
 }
 
+/// One process's use from a reading of the counter, added up as in [`usage`]: `None`
+/// when no instance in the reading belongs to `pid`, which is how a process that has
+/// never touched the GPU looks. Used for the WSL VM's process (`vmmemWSL`).
+pub fn process_percent(samples: &[(String, f64)], pid: u32) -> Option<f64> {
+    let pairs = || samples.iter().map(|(name, value)| (name.as_str(), *value));
+    pairs()
+        .any(|(name, _)| parse_instance(name).is_some_and(|e| e.pid == pid))
+        .then(|| busiest_engine(pairs(), |p| p == pid))
+}
+
 /// `root` and every process descended from it, from `(pid, parent pid)` pairs. WebView2
 /// runs its browser process as a child of the app and its GPU and renderer processes
 /// as children of that. A parent id can be stale (Windows reuses ids), so a process
@@ -190,11 +200,18 @@ mod sampler {
                     query.collect();
                 }
                 let mut sampler = stats::Sampler::new(&processes());
+                // Primes the helper's counters too, so the first tick has WSL's CPU use.
+                // Without the sampler there are no stats to add WSL's figures to.
+                let mut linux = stats::LinuxSource::default();
+                if sampler.is_some() {
+                    linux.read(&app);
+                }
                 loop {
                     match stopped.recv_timeout(INTERVAL) {
                         Err(RecvTimeoutError::Timeout) => {}
                         _ => return,
                     }
+                    let wsl = sampler.as_ref().and_then(|_| linux.read(&app));
                     let samples = query.as_ref().and_then(Query::read);
                     let processes = processes();
                     if let Some(samples) = &samples {
@@ -206,7 +223,8 @@ mod sampler {
                         }
                     }
                     if let Some(sampler) = &mut sampler {
-                        let stats = sampler.sample(&processes, samples.as_deref().unwrap_or(&[]));
+                        let stats =
+                            sampler.sample(&processes, samples.as_deref().unwrap_or(&[]), wsl);
                         if let Err(err) = app.emit(STATS_EVENT, stats) {
                             eprintln!("refract: emitting {STATS_EVENT}: {err}");
                         }
@@ -459,6 +477,22 @@ mod tests {
             serde_json::to_value(usage(&items, &own)).unwrap(),
             serde_json::json!({"totalPercent": 70.0, "ownPercent": 20.0})
         );
+    }
+
+    #[test]
+    fn process_percent_is_null_without_an_instance() {
+        let items = vec![
+            (name(10, A, 0, "3D"), 12.0),
+            (name(77, A, 0, "3D"), 6.0),
+            (name(77, A, 1, "3D"), 3.0),
+            (name(77, A, 2, "Copy"), 4.0),
+            (name(78, A, 0, "3D"), 0.0),
+        ];
+        assert_eq!(process_percent(&items, 77), Some(9.0));
+        // An instance at 0 % is a figure; no instance at all is none.
+        assert_eq!(process_percent(&items, 78), Some(0.0));
+        assert_eq!(process_percent(&items, 99), None);
+        assert_eq!(process_percent(&[], 77), None);
     }
 
     #[test]

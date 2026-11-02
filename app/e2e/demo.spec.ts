@@ -342,6 +342,45 @@ test.describe("Banknote colours at 1280×760", () => {
   }
 });
 
+test("the system widget splits its bars into WSL and Windows", async ({ page }) => {
+  const widget = page.getByRole("region", { name: "System" });
+  await expect(widget.getByRole("meter", { name: "Memory" })).toHaveAttribute(
+    "aria-valuetext",
+    /^[\d.]+ GB, WSL [\d.]+ GB \([\d.]+ GB cache\)$/,
+  );
+  await expect(widget.getByRole("meter", { name: "CPU" })).toHaveAttribute("aria-valuetext", /^[\d.]+%, WSL [\d.]+%$/);
+  await expect(widget.locator(".rf-widget__legend")).toHaveText("WSLcacheWindowsRefract");
+  await expect(widget).toContainText(/WSL [\d.]+% CPU · [\d.]+ GB · [\d.]+% GPU/);
+  await expect(widget).toContainText(/Refract [\d.]+% CPU · \d+ MB · [\d.]+% GPU/);
+  await expect(widget.locator(".rf-meter__wsl")).toHaveCount(3);
+  // The legend and lines stay inside the widget.
+  const fits = await widget.evaluate((el) => {
+    const box = el.getBoundingClientRect();
+    return [...el.querySelectorAll(".rf-widget__legend, .rf-widget__own")].every((row) => {
+      const r = row.getBoundingClientRect();
+      return r.left >= box.left && r.right <= box.right && row.scrollWidth <= row.clientWidth;
+    });
+  });
+  expect(fits).toBe(true);
+  // The same height as the figures change, within the room the usage widget leaves.
+  const heights = new Set<number>();
+  for (let i = 0; i < 3; i++) {
+    heights.add(Math.round((await widget.boundingBox())!.height));
+    await page.waitForTimeout(2100);
+  }
+  expect([...heights]).toHaveLength(1);
+  expect([...heights][0]).toBeLessThanOrEqual(198);
+});
+
+test("without WSL figures the system widget looks as before the split", async ({ page }) => {
+  await page.goto("./?wsl=off");
+  const widget = page.getByRole("region", { name: "System" });
+  await expect(widget.getByRole("meter", { name: "Memory" })).toHaveAttribute("aria-valuetext", /^[\d.]+ GB$/);
+  await expect(widget).toContainText(/Refract [\d.]+% CPU/);
+  await expect(widget).not.toContainText("WSL");
+  await expect(widget.locator(".rf-meter__wsl, .rf-widget__legend")).toHaveCount(0);
+});
+
 test.describe("at 1280×800", () => {
   test.use({ viewport: { width: 1280, height: 800 } });
 
@@ -533,7 +572,27 @@ test.describe("at 1280×480", () => {
     await widget.focus();
     await expect(widget.getByRole("list")).toBeVisible();
     const usage = (await widget.boundingBox())!;
-    const system = (await page.getByRole("region", { name: "System" }).boundingBox())!;
+    const systemWidget = page.getByRole("region", { name: "System" });
+    const system = (await systemWidget.boundingBox())!;
+    expect(usage.y).toBeGreaterThanOrEqual(system.y + system.height + 4);
+    // Too short for the legend and WSL line; the Refract line keeps its swatch.
+    await expect(systemWidget.locator(".rf-widget__legend")).toBeHidden();
+    await expect(systemWidget.locator(".rf-widget__swatch--short")).toBeVisible();
+  });
+});
+
+test.describe("at 1280×560", () => {
+  test.use({ viewport: { width: 1280, height: 560 } });
+
+  test("the usage widget's breakdown stays clear of the system widget with its WSL line", async ({ page }) => {
+    const widget = page.getByRole("region", { name: "Claude usage" });
+    await expect(widget.getByRole("meter", { name: "Weekly limit" })).toBeVisible();
+    const systemWidget = page.getByRole("region", { name: "System" });
+    await expect(systemWidget.locator(".rf-widget__legend")).toBeVisible();
+    await widget.focus();
+    await expect(widget.getByRole("list")).toBeVisible();
+    const usage = (await widget.boundingBox())!;
+    const system = (await systemWidget.boundingBox())!;
     expect(usage.y).toBeGreaterThanOrEqual(system.y + system.height + 4);
   });
 });

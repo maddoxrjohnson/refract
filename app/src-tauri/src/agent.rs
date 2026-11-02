@@ -474,6 +474,7 @@ pub fn start(app: &AppHandle) {
                 ClientEvent::Status(status) => {
                     crate::migrate::on_helper_status(&handle, &status);
                     crate::alerts::on_helper_status(&status);
+                    crate::stats::on_helper_status(&status);
                     handle.emit(STATUS_EVENT, status)
                 }
                 ClientEvent::Event(event) => {
