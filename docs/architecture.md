@@ -178,11 +178,22 @@ Claude Code writes one JSON-lines file per conversation under `~/.claude/project
 
 | State | How it is known |
 |---|---|
-| Live | A `claude` process is running with that session id, or in that working directory (read from `/proc`) |
+| Live | A `claude` process is running that session (read from `/proc`; see [Which process runs a session](#which-process-runs-a-session)) |
 | Working / waiting on you / idle | Live, plus the [status hook's](#the-status-hook) most recent report. Without the hook a live session has no detail |
-| Focusable | Live, the process running it is known for certain, and its environment (`/proc/<pid>/environ`) has `REFRACT_FOLDER` equal to the repo path, so it runs in a terminal of the Refract window on exactly this folder, which the picker can go to. Sent as `focusable` on each session. The process is known when it names the session id, or when it is the only process in the repo naming none; a session matched to one of several such processes is live but not focusable |
+| Focusable | Live, the process running it is known for certain, and its environment (`/proc/<pid>/environ`) has `REFRACT_FOLDER` equal to the repo path, so it runs in a terminal of the Refract window on exactly this folder, which the picker can go to. Sent as `focusable` on each session. The process is known when the status hook's pids lead to it, when it names the session id, when it is the only process in the repo naming none, or when it moved from the session it names to a newer one (below); a session matched to one of several processes naming none is live but not focusable |
 | Finished | Not live, and the last entry is a complete assistant reply (or a user interrupt) |
 | Interrupted | Not live, and the last entry is an unanswered user message, a tool call without a result, tool results the assistant never answered, or an API error |
+
+### Which process runs a session
+
+A `claude` process's command line names a session only when started with `--resume <id>` or `--session-id <id>`, and it keeps naming it after `/clear` or `/resume` switches the process to another session. So the helper (`procs::live_sessions`) decides which session each process runs in this order:
+
+1. **The status hook's pids.** Each status file lists the pids of the hook script's ancestors, one of which is the `claude` process that ran it. A report's process is the first of them that is a running `claude` process, in any directory, started no later than 2 s after the report (so a pid reused since does not count). A process runs the session of the latest report leading to it; at the same second a report that is not `ended` wins (`/clear` ends one session and starts the next at once), then the greater session id. That session is live with that process, and the process's command line no longer counts.
+2. **The id it names.** A process the hook did not place runs the session it names, if that session is on disk.
+3. **No id.** Each process in the repo naming no id takes the most recent session not yet claimed whose transcript was written at or after the process started; later-started processes choose first. The process is known only when it is the only one naming no id in the repo.
+4. **Without hook pids** (no hook, or one installed before pids were recorded): a process in the repo naming session X moves to the newest unclaimed session Y whose transcript starts at or after the process started and was written after X's, unless Y's hook report leads to another process. X then stays live only if another process names it. This needs the process's start time and no unplaced process naming no id in the repo.
+
+A refactor's agent, `stopAgent` and focus launches use the same answer.
 
 Only the start and the end of each file are read, and results are cached until inotify reports a change.
 
@@ -405,6 +416,8 @@ The diff that "Show what changes" displays is computed by the helper with a smal
 | The script | `~/.local/share/refract/status-hook.sh` | `XDG_DATA_HOME` |
 | Status files | `~/.local/state/refract/sessions/<session id>.json` | `XDG_STATE_HOME` |
 | Backup | `~/.local/state/refract/settings.backup.json` (or `settings.backup.missing`) | `XDG_STATE_HOME` |
+
+A status file is one line: `{"status":"working","event":"PostToolUse","at":1793661784,"pids":[123,122,100,1]}`. `at` is Unix seconds. `pids` are the script's ancestors from its parent up, at most four and above pid 1, read from `/proc/<pid>/stat`; Claude Code runs the command through a shell, so the `claude` process that ran the hook is among them (see [Which process runs a session](#which-process-runs-a-session)). Files from a script before `pids` was added have none and still parse; the changed script makes such an install show "Needs update".
 
 A relative `XDG_*` value is ignored. The helper watches the status directory with inotify and updates the affected session when a file is written or removed. Status files do not pile up: at startup, then hourly, the helper deletes `ended` files and the script's leftover temporary files older than 10 minutes. An ended session classifies the same as one with no report, so that changes nothing the interface shows. Full reads of the directory (startup, reload, install) also delete any status file untouched for seven days; a live session that quiet then shows as unknown until its next event.
 
