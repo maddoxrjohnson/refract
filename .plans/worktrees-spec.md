@@ -179,29 +179,70 @@ snapshot never reads them there (row 6, "Changes not checked"). v1.1 reads them 
 when the user asks.
 
 - **core:** `derive_worktree_status` also returns `checkable`: on a Windows drive, untracked files not
-  listed, and the status the same facts would get with `untracked_checked = true` is row 8-10 (holds_repo /
-  too_many_ignored are unknown there and left false). `removable` stays false on a Windows drive.
+  listed, not made by Git for Windows (the snapshot reads the same `.git`/admin `gitdir` test as rule 3,
+  on Windows drives only), and the status the same facts would get with `untracked_checked = true` is
+  row 8-10 (holds_repo / too_many_ignored are unknown there and left false). `removable` stays false on
+  a Windows drive. With untracked files not listed, a blocker already known from the refs (Can't tell if
+  its commits are pushed, N only here) comes before row 6 "Changes not checked", so the row names what
+  really keeps it; `checkable` stays false then. Locked, operation and changes still come first.
 - **protocol:** `WorktreeInfo.checkable: bool` (serde default false). New method
   `checkWorktree { path }` → `WorktreeCheck { status: WorktreeStatus, removable: bool, ignored: string[] }`.
   It reads the facts the way a Linux-side worktree gets them (untracked listed, ignored entries up to
-  `MAX_IGNORED`, nested-repo search) on any drive, and derives with `windows_drive = false`. Read-only;
-  runs on the helper's job worker (one job per repo, like `removeWorktree`). Refused with
-  `WORKTREE_REFUSED` for a non-linked path or a refactor worktree. Tauri command `check_worktree`, same
-  5-minute timeout as `remove_worktree`.
+  `MAX_IGNORED`, nested-repo search) on any drive, and derives with `windows_drive = false`. Edits git
+  hides (assume-unchanged, skip-worktree) count as changes, and `core.fsmonitor=false` is passed to its
+  status. Read-only. Refused with `WORKTREE_REFUSED` as the removal would be: a non-linked path, one made
+  by Git for Windows, a refactor worktree, a prunable one. Tauri command `check_worktree`, same 5-minute
+  timeout as `remove_worktree`.
+- **threads:** each `checkWorktree` runs on a thread of its own, so a minutes-long check on a Windows
+  drive holds up no other repo's jobs; the per-main-repo busy set still keeps it from overlapping another
+  job of the same main repo. `removeWorktree` and `pruneWorktree` stay on the shared job worker: the busy
+  set is keyed per main repo, but refactor jobs are keyed by the repo they were started from (which may
+  be a linked worktree of the same main repo), and a removal's "has a refactor" rule reads the refactor
+  records when it is asked for, so a start still in flight is only kept apart from it by the single
+  worker.
+- **removeWorktree { path, ignored?: string[] }.** `ignored` is the list of top-level ignored entries the
+  confirm showed (the snapshot's or the check's). When it has fewer than `MAX_IGNORED` (9) entries, the
+  helper refuses if the top-level ignored set it reads at execution has an entry not in it: "New ignored
+  files appeared since you confirmed (<up to 3, then "and more">). Check again." on a Windows drive, and
+  "… Review the list and remove again." elsewhere. With 9 or more entries (the confirm said "and more") or
+  when absent (an older app), nothing is compared. Tauri `remove_worktree(path, ignored?)` passes it
+  through. The snapshot keeps its ignored list while the status and HEAD are unchanged, so after this
+  refusal off a Windows drive the helper reads the worktree again with its ignored entries re-read and
+  sends its `repoChanged` (after the answer, before `worktreeJobDone`), and the next confirm lists them.
+- **Order in removeWorktree.** Rules 3, 1, 2, prunable and "has a refactor" first; then the cheap rules
+  (locked, operation, rule 6, rule 7) with HEAD recorded (`rev-parse HEAD`), so a worktree in use is
+  refused at once; then the slow ones (hidden edits, the untracked status, then nested repos and the
+  `ignored` comparison last, so ignored files made while the status runs are still seen); then the cheap
+  rules again right before `git worktree remove`, with HEAD unchanged
+  ("This worktree's HEAD moved while it was being checked. Check again."). Rule 6 uses the recorded
+  commit. Rule 3 is checked before the request is queued too, so a worktree whose `.git` holds a Windows
+  path gets the Git for Windows message, not "Not a linked worktree". The rule-5 status, the
+  ignored listing and `git worktree remove` run with `-c core.fsmonitor=false` (an fsmonitor misses Windows writes on drvfs).
 - **removeWorktree rule 3 becomes:** refuse when the worktree's `.git` file or its admin `gitdir` file
   holds a Windows path (`X:/` or `X:\`), i.e. Git for Windows made or repaired it: "This worktree was made
   by Git for Windows; remove it from Windows." Otherwise a Windows-drive worktree goes through every other
   rule unchanged (the full untracked status runs, slowly, at execution time).
 - **Half-removed on Windows.** A Windows program holding a file open makes `git worktree remove` fail
   partway; git still drops the admin dir. After any failed `worktree remove` the helper re-reads the
-  worktree list. If the entry is gone, the worktree is dropped (`repoRemoved`, main repo `repoChanged`) and
-  the refusal says: "Git removed the worktree, but a Windows program had files open, so some are still in
-  <path>. Close it and delete the folder." Nothing is retried or deleted by Refract.
+  worktree list. If the entry is gone, the worktree is dropped (`repoRemoved`, main repo `repoChanged`; its
+  watches go too) and on a Windows drive the refusal says: "Git removed the worktree, but a Windows program
+  had files open, so some are still in <path>. Close it and delete the folder." Elsewhere: "Git removed the
+  worktree but could not delete all of its files, so some are still in <path> (<git's first stderr line>).
+  Delete the folder." Nothing is retried or deleted by Refract.
+- **Event `worktreeJobDone`.** Every `removeWorktree` and `pruneWorktree` job ends with
+  `{"event":"worktreeJobDone","data":{"path":"…","error":"…"}}`, `error` left out on success and set to the
+  refusal's message when refused or half-removed. `path` is the path the app sent (for prune, the entry's
+  path). It is sent after the answer and the answer's other events (half-removed ones included), so an app
+  whose request timed out still learns the outcome. Requests refused before a job is queued (busy, not a
+  linked worktree, not a known main checkout) are answered at once and get no event.
 - **app:** a row with `checkable` (and no agent, no refactor) shows **Check…** where Remove… would be.
   Click → "Checking files on the Windows drive…" (button disabled) → the check's result replaces the row's
   label until that worktree's next snapshot. If `removable`, the usual confirm opens with the check's
-  `ignored` list; Remove then calls `removeWorktree` as today. A refused check shows its message like a
-  refused Remove.
+  `ignored` list; Remove then calls `removeWorktree` with that list. A refused check shows its message like a
+  refused Remove. As built: "Check again" stays offered while a result shows; a refused Remove clears the
+  result. Remove/prune refusals (half-removed included) are notices kept by the Worktrees section, keyed by
+  path, so they outlive the row; a timed-out request stays pending until `worktreeJobDone`. Notices live in
+  the zoomed repo's panel, so zooming out drops them.
 
 ### 10.2 Missing-folder entries
 
@@ -210,7 +251,11 @@ branch stays checked out there, so `git switch <branch>` elsewhere fails). v1.1 
 their main repo and offers **Clean up**, which drops only git's bookkeeping.
 
 Facts (main repo, read with its ref facts and whenever a tracked worktree is dropped): each non-main entry of
-`git worktree list --porcelain` marked `prunable`, minus refactor worktrees (§3). Per entry: `path`,
+`git worktree list --porcelain` marked `prunable` (or locked) whose path gives `NotFound` on
+`symlink_metadata` (any other error, such as EACCES on a parent or a dead network mount, is not "gone" and
+the entry is not listed), minus refactor worktrees (§3). The m5 ref walk is skipped when m1, m2 or m4
+already holds, and its answer is kept per commit until the refs move. m3 compares only with known linked
+worktrees. Per entry: `path`,
 `branch` (short name, or none when detached), `locked`, and the derived status.
 
 Status, first match wins:
@@ -218,7 +263,7 @@ Status, first match wins:
 | # | Condition | Label | Clean up |
 |---|---|---|---|
 | m1 | `locked` | Folder is gone · Locked | no |
-| m2 | path under `/mnt/` and no mount other than `/`, `/mnt`, `/mnt/wsl` holds it (by `/proc/mounts`) | Folder is gone · Drive not attached | no |
+| m2 | path under `/mnt/`, `/media/` or `/run/media/`, and no mount holds it other than `/` and the bare parent dirs `/mnt`, `/mnt/wsl`, `/media`, `/run`, `/run/media`, `/run/media/<user>` (by `/proc/mounts`; unreadable → counts as not attached) | Folder is gone · Drive not attached | no |
 | m3 | a repo Refract knows has this entry's admin dir as its git dir (the folder was moved) | Moved to `<path>` (hint: run `git worktree repair` there) | no |
 | m4 | the entry has its own refs (anything under `<admin>/refs/`, e.g. bisect or `refs/worktree/*`) | Folder is gone · Has its own refs | no |
 | m5 | detached, and no branch, tag or remote ref contains its HEAD (`for-each-ref --contains <head> --count=1` prints nothing) | Folder is gone · Its commits would be lost | no |
@@ -234,10 +279,13 @@ Status, first match wins:
   1. `repo` is a known non-bare main repo and `path` is a non-main, `prunable` entry of its
      `git worktree list --porcelain`, matched by the listed path.
   2. Not a refactor worktree (refactor dir or a refactor record).
-  3. `path` does not exist (`symlink_metadata` fails). If it reappeared: "The folder is back."
+  3. `path` does not exist: `symlink_metadata` fails with `NotFound`. If it reappeared: "The folder is
+     back." Any other error: "Can't tell whether the folder is there: <error>."
   4. m1-m5 all false.
-  5. Runs `git -C <repo> worktree remove <path>` (no `--force`; on a missing folder git only deletes the
-     admin dir, checked on git 2.43). Never `worktree prune` (it drops every entry at once), never `rm`.
+  5. Checks rule 3 again immediately before, then runs `git -c status.showUntrackedFiles=normal -c
+     core.fsmonitor=false -C <repo> worktree remove <path>` (no `--force`; on a missing folder git only
+     deletes the admin dir, checked on git 2.43). Never `worktree prune` (it drops every entry at once),
+     never `rm`. Ends with `worktreeJobDone` (§10.1).
   6. Never deletes, moves or resets the branch. One job per repo, shared with the other git jobs.
   On success the main repo's snapshot is sent again without the entry.
 - **app:** the Worktrees section appears when a repo has folded worktrees or missing entries. Missing rows
@@ -257,6 +305,12 @@ Status, first match wins:
   succeeds on a clean slow-prefix worktree and refuses one with a Windows `gitdir`; missing entries listed
   for a deleted folder; `pruneWorktree` refuses locked, moved, own refs, detached-only, folder back, refactor,
   and succeeds keeping the branch.
+- v1.1 review fixes: core, a known blocker before "Changes not checked" and Git-for-Windows never
+  checkable; the m2 rule for `/media` and `/run/media`; helper, an unreadable parent (mode 000) is not
+  gone in the listing or in prune, HEAD moved between the checks refuses (unit, real git), the `ignored`
+  comparison (unit and helper), `worktreeJobDone` after success and refusal of both jobs and none for a
+  request-time refusal, `checkWorktree` counting a skip-worktree edit and refusing a Windows-`gitdir`
+  worktree whose snapshot is not checkable; protocol shapes of the event and the `ignored` param.
 - app (Vitest): Check… flow (busy, result label, confirm with check's ignored, refusal); missing rows,
   labels, Clean up confirm and call.
 - e2e (demo): Check → Remove on the `/mnt` worktree; Clean up on the missing entry.

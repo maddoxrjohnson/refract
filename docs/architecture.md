@@ -104,7 +104,9 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `resumeRefactor` | `{path, fix?}` | a launch ticket | Resumes the refactor's agent; with `fix`, asks it to rebase the branch onto the target after a conflict. Error `8` while the agent runs |
 | `mergeRefactor` | `{path}` | `{outcome: "merged", commits, kept?}` or `{outcome: "blocked", reason, files}` | Rebases the branch onto its target if needed, fast-forwards the target, removes the worktree and branch. A refusal that leaves everything as it was is `blocked`, not an error. Nothing is pushed |
 | `discardRefactor` | `{path}` | `null` | Deletes the refactor's worktree and branch. Error `8` while the agent runs |
-| `removeWorktree` | `{path}` | `null` | Removes a linked worktree's folder with `git worktree remove` (never `--force`) and keeps its branch, after re-checking that nothing can be lost ([Worktrees](#worktrees)). Error `9` names the rule that refused |
+| `removeWorktree` | `{path, ignored?}` | `null` | Removes a linked worktree's folder with `git worktree remove` (never `--force`) and keeps its branch, after re-checking that nothing can be lost ([Worktrees](#worktrees)). `ignored` is the list the confirm showed; new ignored entries refuse. Error `9` names the rule that refused; the job ends with `worktreeJobDone` |
+| `checkWorktree` | `{path}` | `{status, removable, ignored}` | Reads a worktree's untracked and ignored files once, on any drive: how a Windows-drive worktree is checked before Remove ([Worktrees](#worktrees)). Read-only. Error `9` as for `removeWorktree` |
+| `pruneWorktree` | `{repo, path}` | `null` | Forgets a worktree entry whose folder is gone (`git worktree remove` on the missing path, never `prune`), keeping its branch. Error `9` names the rule that refused; ends with `worktreeJobDone` |
 
 ### Events
 
@@ -121,9 +123,9 @@ Usage totals are not pushed. The app asks for them with `usage`.
 
 ### Errors
 
-Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working, `8` a refactor request was refused or failed (see [Refactor](#refactor)), `9` `removeWorktree` refused (see [Worktrees](#worktrees)).
+Errors follow JSON-RPC where a code fits: `-32700` bad JSON, `-32600` not a request, `-32601` unknown method, `-32602` bad params, `-32603` internal. Refract adds `1` repo not found (or a launch path that is not a directory), `2` server setup failed, `3` clone failed, `4` status hook failed, `5` the agent a focus launch names is no longer running in the Refract window on that folder (or, for `stopAgent`, the session is not running or its process is not certain), `6` a migration could not start or the migration named is unknown or not at that step, `7` `stopAgent` named a session that is working, `8` a refactor request was refused or failed (see [Refactor](#refactor)), `9` `removeWorktree`, `checkWorktree` or `pruneWorktree` refused (see [Worktrees](#worktrees)).
 
-A repo snapshot (`listRepos`, `getRepo`, `repoChanged`) carries two fields added with the refactor, both optional on the wire so older peers still parse it: `refactor`, the repo's [`RefactorInfo`](#refactor) while it has one, and `lastCommit.sha`, the abbreviated id of its newest commit, which the Refactor dialog shows as "Starts from a1b2c3d". `LaunchMode` gained `planMode` on `new` and `prompt` on `resume`. None of this changed `PROTOCOL_VERSION`. The worktrees work added two more optional fields, set only on a linked worktree's snapshot: `worktreeOf`, the path of its main working tree, and `worktree`, its facts and status (`WorktreeInfo`, see [Worktrees](#worktrees)).
+A repo snapshot (`listRepos`, `getRepo`, `repoChanged`) carries two fields added with the refactor, both optional on the wire so older peers still parse it: `refactor`, the repo's [`RefactorInfo`](#refactor) while it has one, and `lastCommit.sha`, the abbreviated id of its newest commit, which the Refactor dialog shows as "Starts from a1b2c3d". `LaunchMode` gained `planMode` on `new` and `prompt` on `resume`. None of this changed `PROTOCOL_VERSION`. The worktrees work added two more optional fields, set only on a linked worktree's snapshot: `worktreeOf`, the path of its main working tree, and `worktree`, its facts and status (`WorktreeInfo`, see [Worktrees](#worktrees)). v1.1 added `worktree.checkable` and, on a main repo's snapshot, `missingWorktrees` (left out when empty), plus the event `worktreeJobDone {path, error?}`, sent when a `removeWorktree` or `pruneWorktree` job ends so an app whose request timed out still learns the outcome.
 
 ### Rules of the line protocol
 
@@ -524,7 +526,7 @@ A linked git worktree (a folder whose `.git` is a file pointing into another rep
 
 The helper keeps each linked worktree as a repo of its own: it has its own status, watches, sessions, status-hook state and launch, exactly like any repo. Besides the ones the root search finds, the helper reads each known repo's `<git dir>/worktrees/*/gitdir` and tracks those folders too, so worktrees outside the roots and worktrees nested inside the main folder (which the search never enters) are found. Hidden repos are left out before this, so hiding a repo hides its worktrees. Refract's own refactor worktrees under `~/projects/.refract-worktrees` are never tracked this way; they belong to [Refactor](#refactor). Worktrees made by Windows git (a `C:/…` gitdir) are skipped, because Linux git can't read them. A session whose folder is inside several known repos belongs to the deepest one.
 
-Each linked worktree's snapshot carries `worktreeOf`, the path of its main working tree, and `worktree` (`WorktreeInfo`): `locked`, `operation` (a rebase, merge, cherry-pick, revert or bisect in progress), `untrackedChecked` (false on Windows drives), `onlyHere` (commits on HEAD that no remote-tracking ref has, capped at 100), `merged` (the default branch, when HEAD is its ancestor: `origin/HEAD`'s target, else local `main`, else `master`), `release` (the oldest tag containing HEAD), `ignored` (top-level ignored entries, only when it could be removed), `status` and `removable`. The ref facts are read with HEAD, not on every status refresh, and the ignored listing is reused while HEAD and the status are unchanged. The common dir's `refs/tags` is watched for linked worktrees, so a fetched release tag shows without another change.
+Each linked worktree's snapshot carries `worktreeOf`, the path of its main working tree, and `worktree` (`WorktreeInfo`): `locked`, `operation` (a rebase, merge, cherry-pick, revert or bisect in progress), `untrackedChecked` (false on Windows drives), `onlyHere` (commits on HEAD that no remote-tracking ref has, capped at 100), `merged` (the default branch, when HEAD is its ancestor: `origin/HEAD`'s target, else local `main`, else `master`), `release` (the oldest tag containing HEAD), `ignored` (top-level ignored entries, only when it could be removed), `status`, `removable` and `checkable` (on a Windows drive, everything but the untracked files says it could be removed). The ref facts are read with HEAD, not on every status refresh, and the ignored listing is reused while HEAD and the status are unchanged. The common dir's `refs/tags` is watched for linked worktrees, so a fetched release tag shows without another change.
 
 ### In the interface
 
@@ -539,7 +541,7 @@ The panel's **Worktrees** section lists each one with its folder, branch, status
 | Locked | `git worktree lock` | no |
 | Mid-rebase, Mid-merge, Mid-cherry-pick, Mid-revert, Bisecting | an operation is in progress | no |
 | N uncommitted changes | tracked or untracked changes | no |
-| Changes not checked (Windows drive) | on `/mnt`, untracked files aren't listed | no |
+| Changes not checked (Windows drive) | on `/mnt`, untracked files aren't listed (a blocker already known from the refs, like commits only here, shows instead) | Check… |
 | Holds another repo | another worktree, a repo, a submodule, or a `.git` in an ignored folder lies inside it | no |
 | Too many ignored files to check | the nested-repo search ran out of budget | no |
 | Can't tell if its commits are pushed | git couldn't count them | no |
@@ -548,7 +550,7 @@ The panel's **Worktrees** section lists each one with its folder, branch, status
 | Merged into `<branch>` | HEAD is an ancestor of the default branch | yes |
 | Pushed, not merged | everything is on a remote | yes |
 
-The last three add "Ready to remove", except on Windows drives, where Remove isn't offered yet. A live agent in the folder, even an idle one, hides Remove and the row says to close it first; a worktree with its own refactor says "Has a refactor". The confirm names the folder, says the branch stays, and lists the ignored entries that will be deleted with it.
+The last three add "Ready to remove". On a Windows drive, listing untracked and ignored files can take minutes, so the snapshot never does; a worktree there that is otherwise ready offers **Check…** (`checkWorktree`), which reads them once and shows the result in the row ("Check again" re-reads it). When it is removable the usual confirm opens with the check's ignored list. Worktrees made by Git for Windows (a Windows path in `.git` or the admin `gitdir`) are never checkable or removable from Linux. A live agent in the folder, even an idle one, hides Remove and the row says to close it first; a worktree with its own refactor says "Has a refactor". The confirm names the folder, says the branch stays, and lists the ignored entries that will be deleted with it.
 
 ### Remove and the safety rules
 
@@ -556,14 +558,30 @@ The last three add "Ready to remove", except on Windows drives, where Remove isn
 
 1. the path is a non-main entry of the main repo's `git worktree list` (found from the path's own common dir);
 2. it is not a Refract refactor worktree, and no refactor record names it as its worktree or its repo;
-3. it is not on a Windows drive;
+3. it was not made by Git for Windows (a Windows path in its `.git` file or admin `gitdir`);
 4. it is not locked or prunable and no operation is in progress;
 5. HEAD has no commits that only this computer has, or is merged into the default branch;
 6. no session there is live and no `claude` process has its working directory inside the folder;
 7. nothing is nested inside it: no other worktree or known repo, no submodule, no `.git` in an ignored folder (searched up to 4 levels with a budget per folder; build and dependency folders such as `node_modules` and `target` aren't searched, so a plain repo kept inside one isn't seen), and no edits hidden by `--skip-worktree` or `--assume-unchanged`;
-8. `git status --porcelain --untracked-files=all` prints nothing.
+8. `git status --porcelain --untracked-files=all` prints nothing;
+9. when the app sent `ignored` with fewer than 9 entries, no top-level ignored entry exists that the confirm didn't show.
 
-It then runs `git -c status.showUntrackedFiles=normal worktree remove <path>`, so git's own clean check can't be turned off by config, never with `--force` and never `rm`. The branch is never touched. It shares the per-repo job queue with refactor merges and discards. On success the worktree's `repoRemoved` and the main repo's `repoChanged` follow. Rule 6 only sees agents whose process runs inside the folder; an agent that started in the main repo and works in a nested worktree isn't seen, though rules 7 and 8 still protect its files.
+The cheap rules (4-6) run first, with HEAD recorded, so a worktree in use is refused at once; then the slow ones (minutes on a Windows drive): the hidden edits of 7, then 8, then the nested repos of 7, and 9 last, so ignored files made while the status runs are still seen; then the cheap rules again with HEAD unchanged, right before git. It then runs `git -c status.showUntrackedFiles=normal -c core.fsmonitor=false worktree remove <path>`, so git's own clean check can't be turned off by config, never with `--force` and never `rm`. The branch is never touched. It shares the job worker with refactor starts, merges and discards, so a slow removal on a Windows drive holds up those jobs for other repos too (`checkWorktree` runs on a thread of its own). On success the worktree's `repoRemoved` and the main repo's `repoChanged` follow. If git fails partway (on a Windows drive, usually a Windows program holding a file open) it has still dropped the worktree's entry: the helper drops the worktree, and the refusal says which folder still holds files to delete by hand. Refract neither retries nor deletes anything itself. The panel keeps that message (and any refusal) as a notice in the Worktrees section after the row goes. The snapshot keeps a worktree's ignored list while its status and HEAD are unchanged, so when rule 9 refuses off a Windows drive the helper reads the list again and sends the worktree's `repoChanged` before `worktreeJobDone`, and the next confirm shows the new entries (on a Windows drive the refusal asks for another check). Rule 6 only sees agents whose process runs inside the folder; an agent that started in the main repo and works in a nested worktree isn't seen, though rules 7 and 8 still protect its files.
+
+### Missing folders
+
+A worktree whose folder was deleted stays in git's list (and keeps its branch checked out there, so the branch can't be switched to elsewhere). The main repo's snapshot lists these as `missingWorktrees` (`path`, `branch`, `status`, `cleanable`), read with its ref facts and when a tracked worktree is dropped. Only `NotFound` counts as gone: a folder that can't be looked at (permissions, a dead network mount) isn't listed. The panel shows them after the live rows, and **Clean up…** forgets one. The first matching status wins:
+
+| Status | When | Clean up |
+|---|---|---|
+| Folder is gone · Locked | `git worktree lock` | no |
+| Folder is gone · Drive not attached | under `/mnt/`, `/media/` or `/run/media/` with no mount of its own holding it | no |
+| Moved to `<path>` | a known worktree uses this entry's admin dir (run `git worktree repair` there) | no |
+| Folder is gone · Has its own refs | anything under the entry's `refs/` (a bisect, `refs/worktree/*`) | no |
+| Folder is gone · Its commits would be lost | detached (or its branch is gone) and no branch, tag or remote contains HEAD | no |
+| Folder is gone | otherwise | yes |
+
+`pruneWorktree` re-checks all of this when it runs, checks the folder is still gone right before git, and runs `git -c status.showUntrackedFiles=normal -c core.fsmonitor=false worktree remove <listed path>`: on a missing folder git deletes only that entry's admin dir. It never runs `git worktree prune`, which drops every entry at once, and never touches the branch. A moved folder is only recognised when Refract knows where it went.
 
 ## Usage and system stats
 
