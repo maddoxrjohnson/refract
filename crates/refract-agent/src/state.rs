@@ -19,7 +19,7 @@ use refract_core::worktree::{derive_missing_status, derive_worktree_status, Work
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
-use crate::procs::{self, ClaudeProcess, LiveProcess};
+use crate::procs::{self, ClaudeProcess, LiveProcess, SessionTimes};
 use crate::scan;
 use crate::sessions::SessionReader;
 use crate::subagents;
@@ -236,7 +236,7 @@ impl Agent {
     pub fn live_process(&mut self, path: &Path, id: &str) -> Option<LiveProcess> {
         self.procs = procs::scan();
         let sessions = self.read_sessions(path);
-        live_set(&self.procs, path, &sessions).remove(id)?
+        live_set(&self.procs, path, &sessions, &self.hooks).remove(id)?
     }
 
     /// All snapshots, sorted by path.
@@ -296,7 +296,7 @@ impl Agent {
         }
         let (sessions, live, background) = if what.sessions {
             let sessions = self.read_sessions(path);
-            let live = live_set(&self.procs, path, &sessions);
+            let live = live_set(&self.procs, path, &sessions, &self.hooks);
             let background = self.background_for(path, &live);
             (sessions, live, background)
         } else {
@@ -422,26 +422,34 @@ impl Agent {
     }
 
     /// Takes in the status hook's statuses and returns events for the sessions whose
-    /// state changed with them.
+    /// state changed with them. The pids in them say which session a process runs (see
+    /// [`procs::live_sessions`]), so which sessions are live is worked out again, from
+    /// the processes last scanned.
     pub fn set_hooks(&mut self, hooks: HashMap<String, HookReport>) -> Vec<Event> {
         self.hooks = hooks;
-        let stale: Vec<PathBuf> = self
+        let stale: Vec<(PathBuf, HashMap<String, Option<LiveProcess>>)> = self
             .repos
             .iter()
-            .filter(|(_, r)| hooks_for(&self.hooks, &r.sessions) != r.hooks)
-            .map(|(p, _)| p.clone())
+            .filter_map(|(p, r)| {
+                let live = live_set(&self.procs, p, &r.sessions, &self.hooks);
+                (hooks_for(&self.hooks, &r.sessions) != r.hooks || live != r.live)
+                    .then(|| (p.clone(), live))
+            })
             .collect();
         let mut events = Vec::new();
-        for path in stale {
+        for (path, live) in stale {
             let repo = &self.repos[&path];
             let old = repo.snapshot.clone();
-            let (status, head, sessions, live, background) = (
+            let (status, head, sessions) = (
                 repo.status.clone(),
                 repo.head.clone(),
                 repo.sessions.clone(),
-                repo.live.clone(),
-                repo.background.clone(),
             );
+            let background = if live == repo.live {
+                repo.background.clone()
+            } else {
+                self.background_for(&path, &live)
+            };
             self.store(path.clone(), status, head, sessions, live, background);
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
@@ -479,7 +487,7 @@ impl Agent {
         let mut events = Vec::new();
         for path in watched {
             let repo = &self.repos[&path];
-            let live = live_set(&self.procs, &path, &repo.sessions);
+            let live = live_set(&self.procs, &path, &repo.sessions, &self.hooks);
             if live == repo.live {
                 continue;
             }
@@ -596,7 +604,7 @@ impl Agent {
 
     fn insert(&mut self, path: PathBuf, status: Status, head: HeadInfo) {
         let sessions = self.read_sessions(&path);
-        let live = live_set(&self.procs, &path, &sessions);
+        let live = live_set(&self.procs, &path, &sessions, &self.hooks);
         let background = self.background_for(&path, &live);
         self.store(path, status, head, sessions, live, background);
     }
@@ -924,12 +932,23 @@ fn live_set(
     procs: &[ClaudeProcess],
     repo: &Path,
     sessions: &[SessionSummary],
+    hooks: &HashMap<String, HookReport>,
 ) -> HashMap<String, Option<LiveProcess>> {
-    let pairs: Vec<(&str, Option<DateTime<Utc>>)> = sessions
+    procs::live_sessions(procs, &path_str(repo), &session_times(sessions), hooks)
+}
+
+/// What [`procs::live_sessions`] needs of `sessions`.
+pub fn session_times(sessions: &[SessionSummary]) -> Vec<SessionTimes<'_>> {
+    sessions
         .iter()
-        .filter_map(|s| Some((s.session_id.as_deref()?, s.modified.or(s.last_timestamp))))
-        .collect();
-    procs::live_sessions(procs, &path_str(repo), &pairs)
+        .filter_map(|s| {
+            Some(SessionTimes {
+                id: s.session_id.as_deref()?,
+                modified: s.modified.or(s.last_timestamp),
+                first: s.first_timestamp,
+            })
+        })
+        .collect()
 }
 
 /// The statuses in `hooks` of `sessions`.
@@ -1354,5 +1373,67 @@ mod tests {
         fs::write(&meta, done).unwrap();
         let events = agent.refresh_background(Some(&ids));
         assert_eq!(changed(&events), SessionState::Live(LiveState::Idle));
+    }
+
+    #[test]
+    fn a_hook_report_with_pids_moves_a_resumed_process_to_its_new_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = PathBuf::from("/home/dev/projects/tidepool-api");
+        let (old, new) = (
+            "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11",
+            "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c12",
+        );
+        let project = tmp.path().join("-home-dev-projects-tidepool-api");
+        fs::create_dir_all(&project).unwrap();
+        for (id, hour) in [(old, "09"), (new, "10")] {
+            let line = format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{}\",\
+                 \"timestamp\":\"2026-11-01T{hour}:00:00Z\",\"message\":{{\"role\":\"user\",\
+                 \"content\":\"chart the tides\"}}}}\n",
+                repo.display()
+            );
+            fs::write(project.join(format!("{id}.jsonl")), line).unwrap();
+        }
+        let mut agent = Agent::new(Config {
+            roots: vec![],
+            extra: vec![],
+            hidden: vec![],
+            depth: 1,
+            claude_projects: tmp.path().to_owned(),
+            limits_file: tmp.path().join("usage-state.json"),
+        });
+        // `claude --resume <old>`, then /clear; its start time is not known, so nothing
+        // but the hook can move it.
+        agent.procs = vec![ClaudeProcess {
+            pid: 812,
+            cwd: path_str(&repo),
+            session_id: Some(old.to_owned()),
+            started: None,
+            refract_folder: None,
+        }];
+        let sessions = agent.reader.read_repo(&path_str(&repo));
+        let live = live_set(&agent.procs, &repo, &sessions, &agent.hooks);
+        let (status, head) = (Status::default(), HeadInfo::default());
+        agent.store(repo.clone(), status, head, sessions, live, HashMap::new());
+        let live_ids = |agent: &Agent| {
+            let mut ids: Vec<String> = agent.repos[&repo].live.keys().cloned().collect();
+            ids.sort();
+            ids
+        };
+        assert_eq!(live_ids(&agent), [old]);
+
+        let mut working = HookReport::new(HookStatus::Working, Some(Utc::now().timestamp()));
+        working.pids[..2].copy_from_slice(&[900, 812]);
+        let events = agent.set_hooks([(new.to_owned(), working)].into());
+        assert!(!events.is_empty());
+        assert_eq!(live_ids(&agent), [new]);
+        let states: HashMap<String, SessionState> = agent.repos[&repo]
+            .snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.id.clone(), s.state))
+            .collect();
+        assert_eq!(states[new], SessionState::Live(LiveState::Working));
+        assert!(!matches!(states[old], SessionState::Live(_)));
     }
 }

@@ -20,6 +20,7 @@ use std::io::Read;
 use std::path::Path;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use refract_core::classify::{HookReport, HookStatus};
 use refract_core::sessions::paths_match;
 
 /// Subcommands of `claude` that are not interactive sessions.
@@ -297,57 +298,191 @@ pub fn scan() -> Vec<ClaudeProcess> {
         .collect()
 }
 
-/// Decides which of a working directory's sessions are live, and which process runs
-/// each when that is certain.
-///
-/// A session is live when a process names its id. Each process in `cwd` that names no
-/// id is matched to the most recent session no other process claimed and that was
-/// written at or after the process started, so a fresh session with no transcript yet
-/// claims nothing. Later-started processes choose first, since fewer sessions fit them.
-/// A process whose start time is unknown may take any session. A process naming an id
-/// that is not on disk yet (a fresh `--session-id`) marks nothing. `sessions` holds
-/// (id, when its transcript was last written) pairs.
-///
-/// The process is known for certain when it names the session id (of two naming the
-/// same id, the first listed is kept), or when it is the only process in `cwd` naming
-/// no id. A session matched to one of several such processes is live with no process:
-/// the match decides liveness well enough, but not which terminal it runs in.
-pub fn live_sessions(
+/// What [`live_sessions`] needs to know of one session's transcript.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionTimes<'a> {
+    pub id: &'a str,
+    /// When its transcript was last written.
+    pub modified: Option<DateTime<Utc>>,
+    /// Its transcript's first timestamp.
+    pub first: Option<DateTime<Utc>>,
+}
+
+/// How long after a status hook report the process it names may have started and still
+/// be the one that ran the hook. Start times and report times are whole seconds apart
+/// at best.
+const HOOK_START_SLACK: TimeDelta = TimeDelta::seconds(2);
+
+/// The process in `procs` that ran the hook writing `report`: the first of its pids
+/// that is a running `claude` process started no later than the report (give or take
+/// [`HOOK_START_SLACK`]), so a pid reused since does not count. `None` for a report
+/// without pids or a time.
+fn hook_process(procs: &[ClaudeProcess], report: &HookReport) -> Option<usize> {
+    let latest = DateTime::from_timestamp(report.at?, 0)?.checked_add_signed(HOOK_START_SLACK)?;
+    report.pids().find_map(|pid| {
+        procs
+            .iter()
+            .position(|p| p.pid == pid && p.started.is_none_or(|s| s <= latest))
+    })
+}
+
+/// The session each process in `procs` runs by the status hook: of the reports in
+/// `hooks` (by session id, from any directory) whose pids lead to the process (see
+/// [`hook_process`]), the latest; at the same second a report that is not `ended` wins
+/// (`/clear` ends one session and starts the next at once), then the greater session
+/// id. Keyed by index in `procs`. Processes no report leads to are left out.
+fn hook_runs<'a>(
     procs: &[ClaudeProcess],
+    hooks: &'a HashMap<String, HookReport>,
+) -> HashMap<usize, &'a str> {
+    let mut runs: HashMap<usize, (i64, bool, &str)> = HashMap::new();
+    for (id, report) in hooks {
+        let Some(i) = hook_process(procs, report) else {
+            continue;
+        };
+        let key = (
+            report.at.unwrap_or_default(),
+            report.status != HookStatus::Ended,
+            id.as_str(),
+        );
+        runs.entry(i)
+            .and_modify(|best| *best = (*best).max(key))
+            .or_insert(key);
+    }
+    runs.into_iter().map(|(i, (_, _, id))| (i, id)).collect()
+}
+
+/// The session each process runs by the status hook (see [`live_sessions`], step 1),
+/// by pid. A process listed here runs that session whatever its command line names.
+pub fn hook_sessions(
+    procs: &[ClaudeProcess],
+    hooks: &HashMap<String, HookReport>,
+) -> HashMap<u32, String> {
+    hook_runs(procs, hooks)
+        .into_iter()
+        .map(|(i, id)| (procs[i].pid, id.to_owned()))
+        .collect()
+}
+
+/// Decides which of a working directory's sessions are live, and which process runs
+/// each when that is certain. `procs` are all running `claude` processes, `sessions`
+/// the transcripts in `cwd`, and `hooks` every status hook report by session id.
+///
+/// A process keeps the id on its command line (`--resume X`, `--session-id X`) after
+/// `/clear` or `/resume Y` switches it to another session, so the status hook's pids
+/// come first. In order:
+///
+/// 1. Hook reports. A report's process is the first of its pids that is a running
+///    `claude` process, in any directory, started no later than 2 s after the report
+///    (an older pid reused since does not count). A process runs the session of the
+///    latest report leading to it, across all directories; at the same second a report
+///    that is not `ended` wins, then the greater session id. When that session is in
+///    `sessions`, it is live with that process. Earlier reports leading to the same
+///    process make nothing live through it, and the process is done with: its command
+///    line no longer counts, and the steps below skip it.
+/// 2. A process naming an id in `sessions` makes it live with that process (of two
+///    naming the same id, the first listed is kept). A fresh `--session-id` not on disk
+///    yet marks nothing.
+/// 3. Each process in `cwd` that names no id is matched to the most recent session not
+///    yet claimed that was written at or after the process started, so a fresh session
+///    with no transcript yet claims nothing. Later-started processes choose first,
+///    since fewer sessions fit them, and one whose start time is unknown may take any
+///    session. The process is certain only when it is the only such process in `cwd`;
+///    a session matched to one of several is live with no process: the match decides
+///    liveness well enough, but not which terminal it runs in.
+/// 4. Without a hook report to go by (no hook, or one installed before pids were
+///    recorded), a process P in `cwd` named session X in `sessions` moves to the
+///    newest session Y that is still unclaimed, whose transcript starts at or after P
+///    started and was written after X's, and whose hook report, if any, leads to no
+///    other process. Then Y is live with P, and X stays live only if another process
+///    names it. This needs P's start time, and no process in `cwd` naming no id left
+///    after step 1, since that one could be running Y.
+pub fn live_sessions<'a>(
+    procs: &'a [ClaudeProcess],
     cwd: &str,
-    sessions: &[(&str, Option<DateTime<Utc>>)],
+    sessions: &[SessionTimes],
+    hooks: &HashMap<String, HookReport>,
 ) -> HashMap<String, Option<LiveProcess>> {
-    let known: HashSet<&str> = sessions.iter().map(|(id, _)| *id).collect();
+    let known: HashSet<&str> = sessions.iter().map(|s| s.id).collect();
     let mut live: HashMap<String, Option<LiveProcess>> = HashMap::new();
-    for process in procs {
-        if let Some(id) = process
-            .session_id
-            .as_deref()
-            .filter(|id| known.contains(id))
-        {
+    // Step 1.
+    let runs = hook_runs(procs, hooks);
+    for (&i, &id) in &runs {
+        if known.contains(id) {
+            live.insert(id.to_owned(), Some(live_process(&procs[i])));
+        }
+    }
+    let open: Vec<(usize, &ClaudeProcess)> = procs
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !runs.contains_key(i))
+        .collect();
+    let named_in = |p: &'a ClaudeProcess| p.session_id.as_deref().filter(|id| known.contains(id));
+    // Step 2.
+    for (_, process) in &open {
+        if let Some(id) = named_in(process) {
             live.entry(id.to_owned())
                 .or_insert_with(|| Some(live_process(process)));
         }
     }
-    let mut unnamed: Vec<&ClaudeProcess> = procs
+    // Step 3.
+    let mut unnamed: Vec<&ClaudeProcess> = open
         .iter()
+        .map(|(_, p)| *p)
         .filter(|p| p.session_id.is_none() && paths_match(&p.cwd, cwd))
         .collect();
     let certain = unnamed.len() == 1;
     // `None` sorts first, so reversed the unknown start times come last.
     unnamed.sort_by_key(|p| std::cmp::Reverse(p.started));
-    let mut recent: Vec<_> = sessions.iter().collect();
-    recent.sort_by_key(|s| std::cmp::Reverse(s.1));
-    for process in unnamed {
-        let claim = recent.iter().find(|(id, written)| {
-            !live.contains_key(*id)
+    let mut recent: Vec<&SessionTimes> = sessions.iter().collect();
+    recent.sort_by_key(|s| std::cmp::Reverse(s.modified));
+    for process in &unnamed {
+        let claim = recent.iter().find(|s| {
+            !live.contains_key(s.id)
                 && process
                     .started
-                    .is_none_or(|started| written.is_some_and(|w| w >= started))
+                    .is_none_or(|started| s.modified.is_some_and(|w| w >= started))
         });
-        if let Some((id, _)) = claim {
-            live.insert((*id).to_owned(), certain.then(|| live_process(process)));
+        if let Some(s) = claim {
+            live.insert(s.id.to_owned(), certain.then(|| live_process(process)));
         }
+    }
+    // Step 4.
+    if !unnamed.is_empty() {
+        return live;
+    }
+    let mut moved: Vec<(usize, &str)> = Vec::new();
+    for &(i, process) in &open {
+        let (Some(x), Some(started)) = (named_in(process), process.started) else {
+            continue;
+        };
+        if !paths_match(&process.cwd, cwd) {
+            continue;
+        }
+        let x_written = sessions.iter().find(|s| s.id == x).and_then(|s| s.modified);
+        let next = recent.iter().find(|y| {
+            !live.contains_key(y.id)
+                && y.first.is_some_and(|first| first >= started)
+                && y.modified.is_some_and(|w| Some(w) > x_written)
+                && hooks
+                    .get(y.id)
+                    .and_then(|r| hook_process(procs, r))
+                    .is_none_or(|j| j == i)
+        });
+        if let Some(y) = next {
+            live.insert(y.id.to_owned(), Some(live_process(process)));
+            moved.push((i, x));
+        }
+    }
+    let gone: HashSet<usize> = moved.iter().map(|(i, _)| *i).collect();
+    for (_, x) in moved {
+        let stays = open
+            .iter()
+            .find(|(j, p)| !gone.contains(j) && named_in(p) == Some(x));
+        match stays {
+            Some((_, p)) => live.insert(x.to_owned(), Some(live_process(p))),
+            None => live.remove(x),
+        };
     }
     live
 }
@@ -492,10 +627,228 @@ mod tests {
         v
     }
 
+    /// Sessions from (id, last written) pairs, with no first timestamp.
+    fn times<'a>(pairs: &[(&'a str, Option<DateTime<Utc>>)]) -> Vec<SessionTimes<'a>> {
+        pairs
+            .iter()
+            .map(|&(id, modified)| SessionTimes {
+                id,
+                modified,
+                first: None,
+            })
+            .collect()
+    }
+
+    fn without_hooks(
+        procs: &[ClaudeProcess],
+        cwd: &str,
+        pairs: &[(&str, Option<DateTime<Utc>>)],
+    ) -> HashMap<String, Option<LiveProcess>> {
+        live_sessions(procs, cwd, &times(pairs), &HashMap::new())
+    }
+
+    /// A status hook report written at `hour` by a hook whose ancestors are `pids`.
+    fn report(status: HookStatus, hour: u32, pids: &[u32]) -> HookReport {
+        let mut report = HookReport::new(status, at(hour).map(|t| t.timestamp()));
+        report.pids[..pids.len()].copy_from_slice(pids);
+        report
+    }
+
+    fn hooks(reports: &[(&str, HookReport)]) -> HashMap<String, HookReport> {
+        reports
+            .iter()
+            .map(|(id, r)| ((*id).to_owned(), *r))
+            .collect()
+    }
+
+    fn pid_of(live: &HashMap<String, Option<LiveProcess>>, id: &str) -> Option<u32> {
+        live.get(id)?.as_ref().map(|p| p.pid)
+    }
+
+    /// `claude --resume <id>` as pid `pid`, started at `hour`, in `cwd`.
+    fn resumed(cwd: &str, pid: u32, id: &str, hour: u32) -> ClaudeProcess {
+        ClaudeProcess {
+            pid,
+            session_id: Some(id.into()),
+            ..started_at(cwd, hour)
+        }
+    }
+
+    const ELSEWHERE: &str = "/home/dev/projects/aurora-notes";
+    const ID3: &str = "3f6c1a52-0000-4000-8000-000000000003";
+
+    #[test]
+    fn clear_in_a_resumed_process_moves_it_to_the_session_its_hook_names() {
+        // `claude --resume ID`, then /clear: ID ends and ID2 starts in the same process,
+        // whose shell (900, 901) ran the hooks.
+        let sessions = times(&[(ID, at(1)), (ID2, at(5))]);
+        let procs = [resumed(REPO, 812, ID, 0)];
+        let reports = hooks(&[
+            (ID, report(HookStatus::Ended, 2, &[900, 812, 640])),
+            (ID2, report(HookStatus::Working, 3, &[901, 812, 640])),
+        ]);
+        let live = live_sessions(&procs, REPO, &sessions, &reports);
+        assert_eq!(sorted(live.clone()), [ID2]);
+        assert_eq!(pid_of(&live, ID2), Some(812));
+        // At the same second the session that ended loses, whichever id is greater.
+        let reports = hooks(&[
+            (ID2, report(HookStatus::Ended, 2, &[900, 812])),
+            (ID, report(HookStatus::Finished, 2, &[901, 812])),
+        ]);
+        let procs = [resumed(REPO, 812, ID2, 0)];
+        let live = live_sessions(&procs, REPO, &sessions, &reports);
+        assert_eq!(sorted(live.clone()), [ID]);
+        assert_eq!(pid_of(&live, ID), Some(812));
+    }
+
+    #[test]
+    fn a_hook_pid_of_a_process_started_after_the_report_is_ignored() {
+        // Pid 812 was reused by a process started at 5, after the report at 3.
+        let sessions = times(&[(ID, at(1)), (ID2, at(4))]);
+        let procs = [resumed(REPO, 812, ID, 5)];
+        let reports = hooks(&[(ID2, report(HookStatus::Working, 3, &[812]))]);
+        let live = live_sessions(&procs, REPO, &sessions, &reports);
+        assert_eq!(sorted(live.clone()), [ID]);
+        assert_eq!(pid_of(&live, ID), Some(812));
+        // Started within 2 s of the report still counts; the first matching pid wins.
+        let mut close = resumed(REPO, 812, ID, 3);
+        close.started = close.started.map(|t| t + TimeDelta::seconds(2));
+        let reports = hooks(&[(ID2, report(HookStatus::Working, 3, &[901, 812, 1]))]);
+        let live = live_sessions(&[close], REPO, &sessions, &reports);
+        assert_eq!(sorted(live.clone()), [ID2]);
+        assert_eq!(pid_of(&live, ID2), Some(812));
+    }
+
+    #[test]
+    fn of_two_reports_leading_to_one_process_only_the_newest_is_live() {
+        let sessions = times(&[(ID, at(1)), (ID2, at(5))]);
+        let procs = [ClaudeProcess {
+            pid: 812,
+            ..started_at(REPO, 0)
+        }];
+        let reports = hooks(&[
+            (ID, report(HookStatus::Working, 4, &[900, 812])),
+            (ID2, report(HookStatus::Finished, 3, &[901, 812])),
+        ]);
+        let live = live_sessions(&procs, REPO, &sessions, &reports);
+        // Without the hook the unnamed process would have taken ID2, the most recent.
+        assert_eq!(sorted(live.clone()), [ID]);
+        assert_eq!(pid_of(&live, ID), Some(812));
+    }
+
+    #[test]
+    fn a_newer_report_from_another_directory_takes_the_process() {
+        // The process runs in another directory; its newest report is for a session
+        // there, so this directory's session is not live through it.
+        let sessions = times(&[(ID, at(1))]);
+        let procs = [ClaudeProcess {
+            pid: 700,
+            ..started_at(ELSEWHERE, 0)
+        }];
+        let older = (ID, report(HookStatus::Working, 2, &[900, 700]));
+        let newer = (ID3, report(HookStatus::Working, 4, &[901, 700]));
+        let live = live_sessions(&procs, REPO, &sessions, &hooks(&[older, newer]));
+        assert!(live.is_empty());
+        // Alone, the report makes the session live with that process, wherever it runs.
+        let live = live_sessions(&procs, REPO, &sessions, &hooks(&[older]));
+        assert_eq!(pid_of(&live, ID), Some(700));
+    }
+
+    #[test]
+    fn a_process_the_hook_placed_is_not_matched_again() {
+        // The process named ID2 by its hook neither keeps its command-line id nor takes
+        // a session as an unnamed process; the other unnamed process is then certain.
+        let sessions = times(&[(ID, at(1)), (ID2, at(5)), (ID3, at(6))]);
+        let procs = [
+            resumed(REPO, 812, ID, 0),
+            ClaudeProcess {
+                pid: 907,
+                ..started_at(REPO, 0)
+            },
+        ];
+        let reports = hooks(&[(ID2, report(HookStatus::Working, 5, &[812]))]);
+        let live = live_sessions(&procs, REPO, &sessions, &reports);
+        assert_eq!(sorted(live.clone()), [ID2, ID3]);
+        assert_eq!(pid_of(&live, ID2), Some(812));
+        assert_eq!(pid_of(&live, ID3), Some(907));
+    }
+
+    /// A session last written at `written` whose transcript starts at `first`.
+    fn timed(id: &str, first: u32, written: u32) -> SessionTimes<'_> {
+        SessionTimes {
+            id,
+            modified: at(written),
+            first: at(first),
+        }
+    }
+
+    #[test]
+    fn without_hook_pids_a_named_process_moves_to_a_newer_session_it_started() {
+        // `claude --resume ID` started at 2, then /clear started ID2 at 4.
+        let sessions = [timed(ID, 0, 3), timed(ID2, 4, 5)];
+        let procs = [resumed(REPO, 812, ID, 2)];
+        let live = live_sessions(&procs, REPO, &sessions, &HashMap::new());
+        assert_eq!(sorted(live.clone()), [ID2]);
+        assert_eq!(pid_of(&live, ID2), Some(812));
+        // Reports without pids (an older install) change nothing.
+        let old = hooks(&[(ID2, report(HookStatus::Working, 5, &[]))]);
+        assert_eq!(live_sessions(&procs, REPO, &sessions, &old), live);
+        // The newest such session is taken.
+        let sessions = [timed(ID, 0, 3), timed(ID2, 4, 5), timed(ID3, 4, 6)];
+        let live = live_sessions(&procs, REPO, &sessions, &HashMap::new());
+        assert_eq!(sorted(live.clone()), [ID3]);
+        // ID stays live while another process names it.
+        let both = [resumed(REPO, 812, ID, 2), resumed(REPO, 813, ID, 1)];
+        let live = live_sessions(&both, REPO, &sessions, &HashMap::new());
+        assert_eq!(pid_of(&live, ID3), Some(812));
+        assert_eq!(pid_of(&live, ID2), Some(813));
+        assert!(!live.contains_key(ID));
+        let other = [resumed(REPO, 812, ID, 2), resumed(ELSEWHERE, 813, ID, 1)];
+        let live = live_sessions(&other, REPO, &sessions, &HashMap::new());
+        assert_eq!(pid_of(&live, ID3), Some(812));
+        assert_eq!(pid_of(&live, ID), Some(813));
+    }
+
+    #[test]
+    fn the_fallback_is_refused_when_it_could_be_wrong() {
+        let procs = [resumed(REPO, 812, ID, 2)];
+        let check = |procs: &[ClaudeProcess], sessions: &[SessionTimes], reports| {
+            let live = live_sessions(procs, REPO, sessions, &reports);
+            assert!(!live.contains_key(ID2), "{live:?}");
+            assert_eq!(pid_of(&live, ID), Some(812));
+        };
+        // An unnamed process in the directory could be running ID2.
+        let unnamed = ClaudeProcess {
+            pid: 907,
+            ..started_at(REPO, 6)
+        };
+        let sessions = [timed(ID, 0, 3), timed(ID2, 4, 5)];
+        check(&[procs[0].clone(), unnamed], &sessions, HashMap::new());
+        // ID2 started before the process did.
+        check(&procs, &[timed(ID, 0, 3), timed(ID2, 1, 5)], HashMap::new());
+        // ID2 was last written before ID.
+        check(&procs, &[timed(ID, 0, 6), timed(ID2, 4, 5)], HashMap::new());
+        // ID2's hook leads to another running process.
+        let other = ClaudeProcess {
+            pid: 950,
+            ..started_at(ELSEWHERE, 0)
+        };
+        let reports = hooks(&[(ID2, report(HookStatus::Working, 5, &[950]))]);
+        let live = live_sessions(&[procs[0].clone(), other], REPO, &sessions, &reports);
+        assert_eq!(pid_of(&live, ID2), Some(950));
+        assert_eq!(pid_of(&live, ID), Some(812));
+        // The process's start time is not known.
+        let unknown = [ClaudeProcess {
+            started: None,
+            ..procs[0].clone()
+        }];
+        check(&unknown, &sessions, HashMap::new());
+    }
+
     #[test]
     fn named_process_marks_its_session_only() {
         let sessions = [(ID, at(1)), (ID2, at(5))];
-        let live = live_sessions(&[proc(REPO, Some(ID))], REPO, &sessions);
+        let live = without_hooks(&[proc(REPO, Some(ID))], REPO, &sessions);
         assert_eq!(sorted(live), [ID]);
     }
 
@@ -503,44 +856,44 @@ mod tests {
     fn unnamed_process_marks_most_recent_session_in_its_cwd() {
         let sessions = [(ID, at(1)), (ID2, at(5))];
         assert_eq!(
-            sorted(live_sessions(&[proc(REPO, None)], REPO, &sessions)),
+            sorted(without_hooks(&[proc(REPO, None)], REPO, &sessions)),
             [ID2]
         );
         let elsewhere = proc("/home/dev/projects/aurora-notes", None);
-        assert!(live_sessions(&[elsewhere], REPO, &sessions).is_empty());
+        assert!(without_hooks(&[elsewhere], REPO, &sessions).is_empty());
     }
 
     #[test]
     fn unnamed_processes_skip_sessions_already_claimed() {
         let sessions = [(ID, at(1)), (ID2, at(5))];
         let procs = [proc(REPO, Some(ID2)), proc(REPO, None)];
-        assert_eq!(sorted(live_sessions(&procs, REPO, &sessions)), [ID, ID2]);
+        assert_eq!(sorted(without_hooks(&procs, REPO, &sessions)), [ID, ID2]);
     }
 
     #[test]
     fn new_session_not_on_disk_yet_marks_nothing() {
         let sessions = [(ID, at(1))];
         let fresh = "3f6c1a52-0000-4000-8000-0000000000ff";
-        assert!(live_sessions(&[proc(REPO, Some(fresh))], REPO, &sessions).is_empty());
+        assert!(without_hooks(&[proc(REPO, Some(fresh))], REPO, &sessions).is_empty());
     }
 
     #[test]
     fn no_processes_means_nothing_live() {
-        assert!(live_sessions(&[], REPO, &[(ID, at(1))]).is_empty());
+        assert!(without_hooks(&[], REPO, &[(ID, at(1))]).is_empty());
     }
 
     #[test]
     fn unnamed_process_ignores_sessions_written_before_it_started() {
         // A fresh session with no transcript yet must not claim an old one.
         let sessions = [(ID, at(1)), (ID2, at(5))];
-        assert!(live_sessions(&[started_at(REPO, 6)], REPO, &sessions).is_empty());
+        assert!(without_hooks(&[started_at(REPO, 6)], REPO, &sessions).is_empty());
         assert_eq!(
-            sorted(live_sessions(&[started_at(REPO, 4)], REPO, &sessions)),
+            sorted(without_hooks(&[started_at(REPO, 4)], REPO, &sessions)),
             [ID2]
         );
         // Written at the very second it started still counts.
         assert_eq!(
-            sorted(live_sessions(&[started_at(REPO, 5)], REPO, &sessions)),
+            sorted(without_hooks(&[started_at(REPO, 5)], REPO, &sessions)),
             [ID2]
         );
     }
@@ -550,7 +903,7 @@ mod tests {
         // The process started at 4 can only own ID2; the one started at 0 takes ID.
         let sessions = [(ID, at(1)), (ID2, at(5))];
         let procs = [started_at(REPO, 0), started_at(REPO, 4)];
-        assert_eq!(sorted(live_sessions(&procs, REPO, &sessions)), [ID, ID2]);
+        assert_eq!(sorted(without_hooks(&procs, REPO, &sessions)), [ID, ID2]);
     }
 
     #[test]
@@ -569,7 +922,7 @@ mod tests {
             pid: 907,
             ..proc(REPO, None)
         };
-        let live = live_sessions(&[named, unnamed], REPO, &sessions);
+        let live = without_hooks(&[named, unnamed], REPO, &sessions);
         assert_eq!(
             live[ID],
             Some(LiveProcess {
@@ -595,7 +948,7 @@ mod tests {
                 ..started_at(REPO, 4)
             },
         ];
-        let live = live_sessions(&procs, REPO, &sessions);
+        let live = without_hooks(&procs, REPO, &sessions);
         assert_eq!(sorted(live.clone()), [ID, ID2]);
         assert_eq!(live[ID], None);
         assert_eq!(live[ID2], None);
@@ -611,7 +964,7 @@ mod tests {
                 ..proc(REPO, None)
             },
         ];
-        let live = live_sessions(&procs, REPO, &sessions);
+        let live = without_hooks(&procs, REPO, &sessions);
         assert_eq!(live[ID].as_ref().map(|p| p.pid), Some(812));
         assert_eq!(live[ID2].as_ref().map(|p| p.pid), Some(907));
     }
@@ -626,7 +979,7 @@ mod tests {
             },
             proc("/home/dev/projects/aurora-notes", None),
         ];
-        let live = live_sessions(&procs, REPO, &sessions);
+        let live = without_hooks(&procs, REPO, &sessions);
         assert_eq!(live[ID].as_ref().map(|p| p.pid), Some(812));
     }
 

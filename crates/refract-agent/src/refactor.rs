@@ -12,7 +12,7 @@
 //! a worktree is only deleted when its real path is under the worktrees directory and
 //! the repo's `git worktree list` names it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::unix::fs::DirBuilderExt;
@@ -1476,6 +1476,16 @@ impl Refactors {
     }
 }
 
+/// The session process `p` runs: the one its hook last reported (after `/clear` or
+/// `/resume` it no longer runs the one it names), or else the one it names. `by_hook`
+/// is [`procs::hook_sessions`].
+fn runs_session<'a>(by_hook: &'a HashMap<u32, String>, p: &'a ClaudeProcess) -> Option<&'a str> {
+    by_hook
+        .get(&p.pid)
+        .map(String::as_str)
+        .or(p.session_id.as_deref())
+}
+
 /// The pids of the `claude` processes running in `worktree`.
 fn inside(procs: &[ClaudeProcess], worktree: &str) -> Vec<u32> {
     procs
@@ -1552,13 +1562,12 @@ fn look(
     let id = entry.record.session_id.as_str();
     let worktree = entry.record.worktree.as_str();
     let sessions = agent.reader_mut().read_repo(worktree);
-    let pairs: Vec<(&str, Option<DateTime<Utc>>)> = sessions
-        .iter()
-        .filter_map(|s| Some((s.session_id.as_deref()?, s.modified.or(s.last_timestamp))))
-        .collect();
-    let claimed = procs::live_sessions(procs, worktree, &pairs);
+    let times = crate::state::session_times(&sessions);
+    let claimed = procs::live_sessions(procs, worktree, &times, agent.hooks());
+    let by_hook = procs::hook_sessions(procs, agent.hooks());
+    let runs = |p| runs_session(&by_hook, p);
     // A fresh `--session-id` process has no transcript yet, but names the session.
-    let named = !id.is_empty() && procs.iter().any(|p| p.session_id.as_deref() == Some(id));
+    let named = !id.is_empty() && procs.iter().any(|p| runs(p) == Some(id));
     let ours = !id.is_empty() && (named || claimed.contains_key(id));
     // Any other `claude` in the worktree: what it does is not known, so it is busy.
     let inside: Vec<&ClaudeProcess> = procs
@@ -1567,14 +1576,14 @@ fn look(
         .collect();
     let mut others = inside
         .iter()
-        .filter(|p| id.is_empty() || p.session_id.as_deref() != Some(id))
+        .filter(|p| id.is_empty() || runs(p) != Some(id))
         .count();
     if ours && !named && others > 0 {
         // The recorded session runs in a process that names no session.
         others -= 1;
     }
     let mut live_ids: Vec<String> = claimed.keys().cloned().collect();
-    live_ids.extend(inside.iter().filter_map(|p| p.session_id.clone()));
+    live_ids.extend(inside.iter().filter_map(|p| runs(p).map(str::to_owned)));
     if ours {
         live_ids.push(id.to_owned());
     }
@@ -1595,7 +1604,7 @@ fn look(
     let background = if ours {
         let process = procs
             .iter()
-            .find(|p| p.session_id.as_deref() == Some(id))
+            .find(|p| runs(p) == Some(id))
             .map(|p| LiveProcess {
                 pid: p.pid,
                 started: p.started,
