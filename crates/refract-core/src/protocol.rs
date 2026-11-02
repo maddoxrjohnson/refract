@@ -60,9 +60,11 @@ pub mod code {
     /// repo with no refactor, was refused (its agent is running, its worktree is not one
     /// Refract made) or failed.
     pub const REFACTOR_FAILED: i32 = 8;
-    /// `removeWorktree` was refused: the path is not a linked worktree, or something in
-    /// it could be lost (see [`Method::RemoveWorktree`]). The message names the rule that
-    /// failed, in words for the app. Nothing was changed.
+    /// `removeWorktree`, `checkWorktree` or `pruneWorktree` was refused: the path is not
+    /// a linked worktree (or no missing entry of the repo), or something in it could be
+    /// lost (see [`Method::RemoveWorktree`] and [`Method::PruneWorktree`]). The message
+    /// names the rule that failed, in words for the app. Nothing was changed, except
+    /// where the message says git removed the worktree halfway.
     pub const WORKTREE_REFUSED: i32 = 9;
 }
 
@@ -188,11 +190,39 @@ pub enum Method {
     /// Removes the linked worktree at `path` (its snapshot's `path`) with `git worktree
     /// remove`, never forced, keeping its branch: answered with `null`. The helper checks
     /// again that nothing can be lost (clean, every commit on a remote or merged, no
-    /// agent running, not locked or mid-operation, not on a Windows drive, not a
+    /// agent running, not locked or mid-operation, not made by Git for Windows, not a
     /// refactor worktree) and otherwise refuses with [`code::WORKTREE_REFUSED`]. On
     /// success the worktree goes with [`Event::RepoRemoved`] and its main repo, when
-    /// known, gets a fresh [`Event::RepoChanged`].
-    RemoveWorktree { path: String },
+    /// known, gets a fresh [`Event::RepoChanged`]. When git fails partway but drops the
+    /// worktree anyway (a Windows program holding files open), the same events are sent
+    /// and the request is refused with a message saying so.
+    ///
+    /// `ignored` is the list of top-level ignored entries the confirm showed (from the
+    /// snapshot or a [`WorktreeCheck`]). With fewer than 9 entries the removal is refused
+    /// when the worktree now has an ignored entry not in it; with 9 or more (the confirm
+    /// said "and more"), or left out (an older app), nothing is compared. Every job of
+    /// this request ends with [`Event::WorktreeJobDone`].
+    RemoveWorktree {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ignored: Option<Vec<String>>,
+    },
+    /// Reads the linked worktree at `path` the way a worktree on a Linux drive is read,
+    /// untracked and ignored files included, whatever drive it is on: answered with a
+    /// [`WorktreeCheck`]. Read-only; for worktrees on Windows drives, whose snapshot
+    /// leaves untracked files unchecked ([`WorktreeInfo::checkable`]). Refused with
+    /// [`code::WORKTREE_REFUSED`] for a path that is no linked worktree, one made by Git
+    /// for Windows, a refactor worktree, or one git lists as prunable.
+    CheckWorktree { path: String },
+    /// Drops git's record of the missing worktree `path` (as
+    /// [`MissingWorktree::path`] lists it) of the main repo `repo` (its snapshot's
+    /// `path`) with `git worktree remove`, never forced, keeping its branch: answered
+    /// with `null`. The helper checks again that the folder is still gone and that
+    /// nothing would be lost (see [`MissingWorktreeStatus`]), and otherwise refuses with
+    /// [`code::WORKTREE_REFUSED`]. On success the main repo gets a fresh
+    /// [`Event::RepoChanged`]. Every job of this request ends with
+    /// [`Event::WorktreeJobDone`].
+    PruneWorktree { repo: String, path: String },
 }
 
 /// A request id: any JSON number or string, echoed back unchanged.
@@ -249,6 +279,8 @@ pub enum Reply {
     Cancelled(CancelOutcome),
     /// The result of `mergeRefactor`.
     RefactorMerge(MergeOutcome),
+    /// The result of `checkWorktree`.
+    WorktreeCheck(WorktreeCheck),
     /// A Linux path: the result of `cloneRepo`.
     Path(String),
     /// `null`, for methods with nothing to return.
@@ -652,6 +684,15 @@ pub enum Event {
     /// `migrateFinish`. Also sent again for a pending migration after the helper
     /// restarts.
     MigrateReady { id: String, report: Box<Report> },
+    /// A `removeWorktree` or `pruneWorktree` job finished: done, refused or half done.
+    /// `path` is the path the app sent (for `pruneWorktree`, the entry's path); `error`
+    /// is the refusal's message, left out on success. Sent after the answer and its
+    /// other events, so an app whose request timed out still learns the outcome.
+    WorktreeJobDone {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Data of a `sessionChanged` event.
@@ -719,6 +760,10 @@ pub struct RepoSnapshot {
     /// Facts for a linked worktree (set exactly when `worktree_of` is).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// For a main repo: its linked worktrees whose folder is gone but which git still
+    /// lists (spec §10.2), other than refactor worktrees. Left out when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing_worktrees: Vec<MissingWorktree>,
 }
 
 /// What a linked worktree holds that removing it could lose, and the status that
@@ -746,6 +791,63 @@ pub struct WorktreeInfo {
     /// Rows 8-10 and not on a Windows drive. The app ANDs this with "no agent working or
     /// waiting" and "no refactor".
     pub removable: bool,
+    /// On a Windows drive with untracked files not listed, where the same facts with them
+    /// listed would give rows 8-10, and not made by Git for Windows: `checkWorktree` can
+    /// tell whether it can be removed.
+    #[serde(default)]
+    pub checkable: bool,
+}
+
+/// The result of `checkWorktree`: the status of a linked worktree read with untracked
+/// and ignored files listed, as on a Linux drive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCheck {
+    /// Spec §4 rows 3-10, never `unchecked`.
+    pub status: WorktreeStatus,
+    /// Rows 8-10. The app ANDs this with "no agent working or waiting" and "no refactor".
+    pub removable: bool,
+    /// Top-level ignored entries, as in [`WorktreeInfo::ignored`]; empty unless
+    /// `removable`.
+    pub ignored: Vec<String>,
+}
+
+/// A linked worktree whose folder is gone while git still lists it (spec §10.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MissingWorktree {
+    /// Its path as `git worktree list` gives it; what `pruneWorktree` takes.
+    pub path: String,
+    /// The branch it had checked out, without `refs/heads/`; `None` when detached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    pub status: MissingWorktreeStatus,
+    /// `status` is `gone`: `pruneWorktree` drops only git's record of it.
+    pub cleanable: bool,
+}
+
+/// Why a missing worktree's record is kept, or `gone` when it can go: the first matching
+/// row m1-m6 of spec §10.2 (see [`crate::worktree::derive_missing_status`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum MissingWorktreeStatus {
+    /// `git worktree lock` was used on it.
+    Locked,
+    /// It was on a drive under `/mnt/` that is not mounted now.
+    DriveNotAttached,
+    /// The folder was moved to `to`, a repo Refract knows; `git worktree repair` there
+    /// fixes git's record.
+    Moved { to: String },
+    /// It has refs of its own (a bisect, `refs/worktree/*`), which would go with it.
+    OwnRefs,
+    /// Detached, and no branch, tag or remote ref holds its commit.
+    CommitsOnlyHere,
+    /// Nothing else holds it: only git's record would go.
+    Gone,
 }
 
 /// A git operation under way in a working tree.
@@ -1106,7 +1208,7 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
         | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateBeginDelete"
         | "migrateResync" | "stopAgent" | "startRefactor" | "resumeRefactor" | "mergeRefactor"
-        | "discardRefactor" | "removeWorktree" => true,
+        | "discardRefactor" | "removeWorktree" | "checkWorktree" | "pruneWorktree" => true,
         "ping" | "listRepos" | "usage" | "hookInfo" | "installHook" | "uninstallHook"
         | "shutdown" | "migratePending" => false,
         _ => {
@@ -1204,6 +1306,7 @@ mod tests {
             refactor: Some(refactor_info()),
             worktree_of: None,
             worktree: None,
+            missing_worktrees: vec![],
         }
     }
 
@@ -1262,6 +1365,7 @@ mod tests {
             refactor: None,
             worktree_of: None,
             worktree: None,
+            missing_worktrees: vec![],
         }
     }
 
@@ -1489,11 +1593,45 @@ mod tests {
             ),
             (
                 r#"{"id":1,"method":"removeWorktree","params":{"path":"/x"}}"#,
-                Method::RemoveWorktree { path: "/x".into() },
+                Method::RemoveWorktree {
+                    path: "/x".into(),
+                    ignored: None,
+                },
+            ),
+            (
+                r#"{"id":1,"method":"removeWorktree","params":{"path":"/x","ignored":["target/",".env"]}}"#,
+                Method::RemoveWorktree {
+                    path: "/x".into(),
+                    ignored: Some(vec!["target/".into(), ".env".into()]),
+                },
+            ),
+            (
+                r#"{"id":1,"method":"checkWorktree","params":{"path":"/x"}}"#,
+                Method::CheckWorktree { path: "/x".into() },
+            ),
+            (
+                r#"{"id":1,"method":"pruneWorktree","params":{"repo":"/r","path":"/x"}}"#,
+                Method::PruneWorktree {
+                    repo: "/r".into(),
+                    path: "/x".into(),
+                },
             ),
         ] {
             assert_eq!(parse_request(line).unwrap().method, method, "{line}");
         }
+        // The app sends `ignored` only when it has the confirm's list.
+        let remove = |ignored| Method::RemoveWorktree {
+            path: "/x".into(),
+            ignored,
+        };
+        assert_eq!(
+            serde_json::to_value(remove(None)).unwrap(),
+            json!({"method": "removeWorktree", "params": {"path": "/x"}})
+        );
+        assert_eq!(
+            serde_json::to_value(remove(Some(vec!["target/".into()]))).unwrap(),
+            json!({"method": "removeWorktree", "params": {"path": "/x", "ignored": ["target/"]}})
+        );
         let err = parse_request(r#"{"id":2,"method":"mergeRefactor","params":{}}"#).unwrap_err();
         assert_eq!(err.error.code, code::INVALID_PARAMS);
 
@@ -1998,6 +2136,7 @@ mod tests {
                 op: GitOperation::CherryPick,
             },
             removable: false,
+            checkable: false,
         });
         let value = round_trip(&linked);
         assert_eq!(value["worktreeOf"], "/home/dev/projects/aurora-notes");
@@ -2012,7 +2151,8 @@ mod tests {
                 "release": "v1.4.0",
                 "ignored": [".env", "target/"],
                 "status": {"kind": "operation", "op": "cherryPick"},
-                "removable": false
+                "removable": false,
+                "checkable": false
             })
         );
         for (status, wire) in [
@@ -2059,6 +2199,91 @@ mod tests {
     }
 
     #[test]
+    fn worktree_check_and_missing_worktrees_have_their_wire_shapes() {
+        // An older helper's worktree facts, without `checkable`, still read.
+        let old = json!({
+            "locked": false,
+            "operation": null,
+            "untrackedChecked": false,
+            "onlyHere": 0,
+            "merged": null,
+            "release": null,
+            "ignored": [],
+            "status": {"kind": "unchecked"},
+            "removable": false
+        });
+        let back: WorktreeInfo = serde_json::from_value(old).unwrap();
+        assert!(!back.checkable);
+        let check = Reply::WorktreeCheck(WorktreeCheck {
+            status: WorktreeStatus::Pushed,
+            removable: true,
+            ignored: vec!["node_modules/".into()],
+        });
+        assert_eq!(
+            round_trip(&check),
+            json!({"status": {"kind": "pushed"}, "removable": true, "ignored": ["node_modules/"]})
+        );
+
+        let mut main = empty_snapshot();
+        main.missing_worktrees = vec![
+            MissingWorktree {
+                path: "/home/dev/projects/aurora-notes-old".into(),
+                branch: Some("old-cards".into()),
+                status: MissingWorktreeStatus::Gone,
+                cleanable: true,
+            },
+            MissingWorktree {
+                path: "/home/dev/projects/aurora-notes-spike".into(),
+                branch: None,
+                status: MissingWorktreeStatus::Moved {
+                    to: "/home/dev/projects/spikes/aurora-notes-spike".into(),
+                },
+                cleanable: false,
+            },
+        ];
+        let value = round_trip(&main);
+        assert_eq!(
+            value["missingWorktrees"],
+            json!([
+                {
+                    "path": "/home/dev/projects/aurora-notes-old",
+                    "branch": "old-cards",
+                    "status": {"kind": "gone"},
+                    "cleanable": true
+                },
+                {
+                    "path": "/home/dev/projects/aurora-notes-spike",
+                    "status": {
+                        "kind": "moved",
+                        "to": "/home/dev/projects/spikes/aurora-notes-spike"
+                    },
+                    "cleanable": false
+                }
+            ])
+        );
+        for (status, wire) in [
+            (MissingWorktreeStatus::Locked, json!({"kind": "locked"})),
+            (
+                MissingWorktreeStatus::DriveNotAttached,
+                json!({"kind": "driveNotAttached"}),
+            ),
+            (MissingWorktreeStatus::OwnRefs, json!({"kind": "ownRefs"})),
+            (
+                MissingWorktreeStatus::CommitsOnlyHere,
+                json!({"kind": "commitsOnlyHere"}),
+            ),
+            (MissingWorktreeStatus::Gone, json!({"kind": "gone"})),
+        ] {
+            assert_eq!(round_trip(&status), wire);
+        }
+        // Left out when empty, and read as empty when absent.
+        let empty = serde_json::to_value(empty_snapshot()).unwrap();
+        assert!(empty.get("missingWorktrees").is_none());
+        let back: RepoSnapshot = serde_json::from_value(empty).unwrap();
+        assert!(back.missing_worktrees.is_empty());
+    }
+
+    #[test]
     fn events_round_trip() {
         let changed = Event::RepoChanged(Box::new(snapshot()));
         let value = round_trip(&changed);
@@ -2071,6 +2296,30 @@ mod tests {
         assert_eq!(
             round_trip(&removed),
             json!({"event": "repoRemoved", "data": {"path": "/home/dev/projects/aurora-notes"}})
+        );
+
+        // The end of a worktree job: `error` only when it was refused.
+        let done = Event::WorktreeJobDone {
+            path: "/home/dev/projects/aurora-notes-wide".into(),
+            error: None,
+        };
+        assert_eq!(
+            round_trip(&done),
+            json!({"event": "worktreeJobDone", "data": {"path": "/home/dev/projects/aurora-notes-wide"}})
+        );
+        let refused = Event::WorktreeJobDone {
+            path: "/home/dev/projects/aurora-notes-wide".into(),
+            error: Some("This worktree has uncommitted changes.".into()),
+        };
+        assert_eq!(
+            round_trip(&refused),
+            json!({
+                "event": "worktreeJobDone",
+                "data": {
+                    "path": "/home/dev/projects/aurora-notes-wide",
+                    "error": "This worktree has uncommitted changes."
+                }
+            })
         );
 
         let session = Event::SessionChanged(SessionChange {

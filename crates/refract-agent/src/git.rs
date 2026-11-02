@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use refract_core::language::main_language;
 use refract_core::protocol::{GitOperation, LastCommit};
 use refract_core::sessions::is_windows_mount;
-use refract_core::worktree::{derive_worktree_status, WorktreeFacts, MAX_ONLY_HERE};
+use refract_core::worktree::{derive_worktree_status, MissingFacts, WorktreeFacts, MAX_ONLY_HERE};
 
 use crate::scan;
 
@@ -124,6 +124,23 @@ pub struct HeadInfo {
     pub tracked_dirs: Vec<String>,
     /// The ref facts of a linked worktree; `None` for every other repo.
     pub worktree: Option<WorktreeRefs>,
+    /// For a main checkout: its linked worktrees whose folder is gone (see
+    /// [`read_missing`]). Empty for every other repo.
+    pub missing: Vec<Missing>,
+}
+
+/// A linked worktree whose folder is gone while git still lists it (spec §10.2).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Missing {
+    /// Its path as `git worktree list` gives it.
+    pub path: PathBuf,
+    /// Its branch, without `refs/heads/`; `None` when detached.
+    pub branch: Option<String>,
+    /// Its admin dir, `<common>/worktrees/<name>`.
+    pub admin: PathBuf,
+    /// What git and the file system say; `moved_to` is left empty here, as only the
+    /// agent knows the other repos (see [`moved_to`]).
+    pub facts: MissingFacts,
 }
 
 /// Reads `git status`. Fails if git cannot run or `path` is not a repo.
@@ -149,6 +166,7 @@ pub fn read_status(path: &Path) -> io::Result<Status> {
                 changes: status.paths.len() as u32,
                 untracked_checked: !windows,
                 windows_drive: windows,
+                git_for_windows: windows && crate::worktree::made_by_git_for_windows(path),
                 ..WorktreeFacts::default()
             },
             submodules: has_submodules(path, &linked.git_dir),
@@ -166,9 +184,28 @@ pub fn worktree_on_windows_drive(path: &Path) -> bool {
     on_windows_drive(path) || crate::state::under_test_slow_prefix(path)
 }
 
+/// The changed, staged, conflicted and untracked paths in the worktree at `path`, as
+/// [`read_status`] counts them but with untracked files listed on any drive (spec
+/// §10.1). `None` when git fails. An fsmonitor is not asked: on a Windows drive it
+/// misses what Windows programs write.
+pub fn count_changes(path: &Path) -> Option<u32> {
+    let mut args = status_config(path).to_vec();
+    args.extend([
+        "-c",
+        "core.fsmonitor=false",
+        "status",
+        "--porcelain=v2",
+        "-z",
+        "--ignore-submodules=dirty",
+        untracked_arg_on(false),
+    ]);
+    let out = git(path, &args).ok()??;
+    Some(parse_status(&out).paths.len() as u32)
+}
+
 /// Reads the ref facts of the linked worktree at `path` (spec §4). Only reads git:
 /// nothing touches the network. A fact git cannot give stays empty.
-fn read_worktree_refs(path: &Path) -> WorktreeRefs {
+pub fn read_worktree_refs(path: &Path) -> WorktreeRefs {
     let merged = default_branch(path).filter(|(_, full)| is_ancestor(path, "HEAD", full));
     let release = git(path, &["tag", "--contains", "HEAD", "--sort=creatordate"])
         .ok()
@@ -257,6 +294,8 @@ pub fn ignored_paths(path: &Path) -> Option<Vec<String>> {
     let out = git(
         path,
         &[
+            "-c",
+            "core.fsmonitor=false",
             "status",
             "--porcelain",
             "-z",
@@ -365,13 +404,26 @@ pub fn operation(git_dir: &Path) -> Option<GitOperation> {
 /// Commits on HEAD that no remote-tracking ref (of any remote) has, at most
 /// [`MAX_ONLY_HERE`]. `None` when git cannot count them (no commits).
 pub fn only_here(path: &Path) -> Option<u32> {
+    only_here_at(path, "HEAD")
+}
+
+/// Like [`only_here`], for the commit `rev` instead of HEAD.
+pub fn only_here_at(path: &Path, rev: &str) -> Option<u32> {
     let max = format!("--max-count={MAX_ONLY_HERE}");
     let out = git(
         path,
-        &["rev-list", "--count", &max, "HEAD", "--not", "--remotes"],
+        &["rev-list", "--count", &max, rev, "--not", "--remotes"],
     )
     .ok()??;
     String::from_utf8_lossy(&out).trim().parse().ok()
+}
+
+/// The commit HEAD of the repo at `path` points at; `None` when it has none or git
+/// fails.
+pub fn head_commit(path: &Path) -> Option<String> {
+    let out = git(path, &["rev-parse", "--verify", "-q", "HEAD"]).ok()??;
+    let head = String::from_utf8_lossy(&out).trim().to_owned();
+    (!head.is_empty()).then_some(head)
 }
 
 /// The default branch, as its name and the full ref to compare with: the target of
@@ -414,10 +466,7 @@ pub fn parse_ignored_paths(out: &[u8]) -> Vec<String> {
 pub fn top_level(paths: &[String]) -> Vec<String> {
     let mut entries: Vec<String> = Vec::new();
     for path in paths {
-        let top = match path.split_once('/') {
-            Some((first, _)) => format!("{first}/"),
-            None => path.clone(),
-        };
+        let top = top_entry(path);
         if !entries.contains(&top) {
             entries.push(top);
             if entries.len() == MAX_IGNORED {
@@ -426,6 +475,15 @@ pub fn top_level(paths: &[String]) -> Vec<String> {
         }
     }
     entries
+}
+
+/// The top-level entry of an ignored path: a directory, or a path inside one, is its
+/// first component with a trailing `/`.
+pub fn top_entry(path: &str) -> String {
+    match path.split_once('/') {
+        Some((first, _)) => format!("{first}/"),
+        None => path.to_owned(),
+    }
 }
 
 /// Config for `git status` in `repo`.
@@ -592,7 +650,221 @@ pub fn read_head_unless(path: &Path, cancel: &AtomicBool) -> io::Result<HeadInfo
         off_origin,
         tracked_dirs: dirs.into_iter().collect(),
         worktree: scan::linked(path).map(|_| read_worktree_refs(path)),
+        missing: read_missing(path),
     })
+}
+
+/// The linked worktrees of the main checkout at `main` whose folder is gone, from
+/// `git worktree list --porcelain`: entries git marks prunable, and locked ones (which
+/// git never marks prunable), whose path does not exist. Refactor worktrees are left
+/// out. Empty without running git when `main` is no main checkout or has no linked
+/// worktrees, and when git fails.
+pub fn read_missing(main: &Path) -> Vec<Missing> {
+    let common = main.join(".git");
+    let has_linked = std::fs::symlink_metadata(&common).is_ok_and(|m| m.is_dir())
+        && std::fs::read_dir(common.join("worktrees")).is_ok_and(|mut d| d.next().is_some());
+    if !has_linked {
+        return Vec::new();
+    }
+    let Ok(list) = crate::refactor::worktrees(main) else {
+        return Vec::new();
+    };
+    let mounts = std::fs::read_to_string("/proc/mounts").ok();
+    list.iter()
+        .skip(1)
+        .filter_map(|w| missing_entry(main, &common, w, mounts.as_deref()))
+        .collect()
+}
+
+/// The entry `w` of the worktree list of the main checkout at `main` (whose git dir is
+/// `common`) as a missing worktree, when its folder is gone and git would prune it or it
+/// is locked; `None` otherwise, for a refactor worktree, and when no admin dir names it.
+/// `mounts` is `/proc/mounts`, when it could be read.
+pub(crate) fn missing_entry(
+    main: &Path,
+    common: &Path,
+    w: &crate::refactor::Worktree,
+    mounts: Option<&str>,
+) -> Option<Missing> {
+    if !is_gone(&w.path) || !(w.prunable || w.locked) || scan::is_refactor_worktree(&w.path) {
+        return None;
+    }
+    let admin = admin_dir(common, &w.path)?;
+    let locked = w.locked || is_locked(&admin);
+    let drive_not_attached = match mounts {
+        Some(mounts) => drive_missing(mounts, &w.path),
+        None => under_drive_mounts(&w.path),
+    };
+    let own_refs = has_files(&admin.join("refs"));
+    // Left false when an earlier row keeps the entry anyway, which saves a walk of the
+    // history on every HEAD refresh.
+    let commits_only_here = !(locked || drive_not_attached || own_refs) && {
+        // A branch whose ref is gone holds nothing, so it counts as detached.
+        let on_branch = w.branch.as_ref().is_some_and(|b| {
+            git(
+                main,
+                &["rev-parse", "--verify", "-q", &format!("refs/heads/{b}")],
+            )
+            .is_ok_and(|o| o.is_some())
+        });
+        !on_branch
+            && match w.head.as_deref() {
+                // All zeros: no commit at all, so none to lose.
+                Some(head) if head.bytes().all(|b| b == b'0') => false,
+                Some(head) => !held_by_a_ref(main, head),
+                None => true,
+            }
+    };
+    Some(Missing {
+        path: w.path.clone(),
+        branch: w.branch.clone(),
+        facts: MissingFacts {
+            locked,
+            drive_not_attached,
+            moved_to: None,
+            own_refs,
+            commits_only_here,
+        },
+        admin,
+    })
+}
+
+/// True when nothing is at `path`: only "not found" counts. Any other error (a folder
+/// above it that cannot be read, a network drive that stopped answering) leaves it
+/// unknown, so the entry is not taken for gone.
+pub fn is_gone(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == io::ErrorKind::NotFound)
+}
+
+/// The admin dir in `<common>/worktrees/` whose `gitdir` names the worktree at `path`.
+fn admin_dir(common: &Path, path: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(common.join("worktrees")).ok()?;
+    entries.flatten().map(|e| e.path()).find(|admin| {
+        std::fs::read_to_string(admin.join("gitdir")).is_ok_and(|text| {
+            let dot_git = admin.join(scan::from_windows_path(text.trim()));
+            dot_git
+                .parent()
+                .is_some_and(|folder| crate::refactor::same_dir(&scan::normalize(folder), path))
+        })
+    })
+}
+
+/// True when a branch, tag or remote-tracking ref of the repo at `repo` contains
+/// `commit`. False when git fails, as for a commit that is gone.
+///
+/// The answer only changes with the refs, so it is kept per repo and commit with the
+/// refs it was found from, and git walks the history again only once they moved.
+fn held_by_a_ref(repo: &Path, commit: &str) -> bool {
+    type Held = std::collections::HashMap<(PathBuf, String), (Vec<u8>, bool)>;
+    static HELD: std::sync::Mutex<Option<Held>> = std::sync::Mutex::new(None);
+    let tips = git(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname) %(refname)",
+            "refs/heads",
+            "refs/tags",
+            "refs/remotes",
+        ],
+    )
+    .ok()
+    .flatten();
+    let key = (repo.to_owned(), commit.to_owned());
+    if let Some(tips) = &tips {
+        let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((seen, held)) = held.as_ref().and_then(|h| h.get(&key)) {
+            if seen == tips {
+                return *held;
+            }
+        }
+    }
+    let held = contains(repo, commit);
+    if let Some(tips) = tips {
+        let mut cache = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = cache.get_or_insert_with(Held::new);
+        if cache.len() >= 64 {
+            cache.clear();
+        }
+        cache.insert(key, (tips, held));
+    }
+    held
+}
+
+/// See [`held_by_a_ref`]: asks git, every time.
+fn contains(repo: &Path, commit: &str) -> bool {
+    git(
+        repo,
+        &[
+            "for-each-ref",
+            "--count=1",
+            "--format=%(refname)",
+            "--contains",
+            commit,
+            "refs/heads",
+            "refs/tags",
+            "refs/remotes",
+        ],
+    )
+    .is_ok_and(|out| out.is_some_and(|o| !o.trim_ascii().is_empty()))
+}
+
+/// True when the folder `dir` holds a file at any depth, without following symlinks.
+fn has_files(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| match e.file_type() {
+        Ok(t) if t.is_dir() => has_files(&e.path()),
+        _ => true,
+    })
+}
+
+/// The known repo in `known` whose git dir is `admin` (by real path): where the folder
+/// of a missing worktree with that admin dir was moved to. A move to somewhere Refract
+/// does not search (outside the roots, deeper than the depth) is not seen, so that entry
+/// reads as gone and can be cleaned up; `git worktree repair` there still finds the
+/// branch, though the worktree must be added again.
+pub fn moved_to<'a>(admin: &Path, known: impl IntoIterator<Item = &'a PathBuf>) -> Option<PathBuf> {
+    let admin = std::fs::canonicalize(admin).ok()?;
+    known.into_iter().find_map(|repo| {
+        let git_dir = scan::git_dir(repo)?;
+        (std::fs::canonicalize(git_dir).ok()? == admin).then(|| repo.clone())
+    })
+}
+
+/// Whether `path`, under `/mnt/`, `/media/` or `/run/media/`, is on a drive that is
+/// not attached: no mount in `mounts` (as `/proc/mounts` lists them) holds it other than
+/// `/` and the bare folders drives are mounted in (`/mnt`, `/mnt/wsl`, `/media`, `/run`,
+/// `/run/media` and `/run/media/<user>`; `/run` is a tmpfs of its own on most systems).
+/// Always false for a path under none of them.
+pub fn drive_missing(mounts: &str, path: &Path) -> bool {
+    if !under_drive_mounts(path) {
+        return false;
+    }
+    !mounts.lines().any(|line| {
+        let Some(point) = line.split(' ').nth(1) else {
+            return false;
+        };
+        let point = unescape_mount(point);
+        !holds_drives(&point) && path.starts_with(&point)
+    })
+}
+
+/// True for a path under `/mnt/`, `/media/` or `/run/media/`, where drives are mounted.
+fn under_drive_mounts(path: &Path) -> bool {
+    is_windows_mount(&path.to_string_lossy())
+        || path.starts_with("/media/")
+        || path.starts_with("/run/media/")
+}
+
+/// True for `/` and the bare folders drives are mounted in (see [`drive_missing`]).
+fn holds_drives(point: &str) -> bool {
+    matches!(
+        point,
+        "/" | "/mnt" | "/mnt/wsl" | "/media" | "/run" | "/run/media"
+    ) || point
+        .strip_prefix("/run/media/")
+        .is_some_and(|user| !user.is_empty() && !user.contains('/'))
 }
 
 /// Drops credentials from a remote URL so they never go on the wire.
@@ -877,6 +1149,55 @@ none /mnt/wsl tmpfs rw,relatime 0 0
             assert_eq!(drvfs_holds(mounts, Path::new(path)), drvfs, "{path}");
         }
         assert!(!on_windows_drive(Path::new("/home/dev/projects/kelp-cli")));
+    }
+
+    #[test]
+    fn a_drive_is_attached_when_a_mount_of_its_own_holds_the_path() {
+        let mounts = "\
+none / ext4 rw,relatime 0 0
+none /mnt tmpfs rw,relatime 0 0
+none /mnt/wsl tmpfs rw,relatime 0 0
+C:\\134 /mnt/c 9p rw,noatime,aname=drvfs;path=C:\\;uid=1000;gid=1000,cache=0x5 0 0
+/dev/sdd1 /mnt/wsl/kelp\\040disk ext4 rw,relatime 0 0
+";
+        for (path, missing) in [
+            ("/mnt/c/Users/dev/tidepool-api-wide", false),
+            ("/mnt/wsl/kelp disk/kelp-cli-spike", false),
+            ("/mnt/e/aurora-notes-old", true),
+            ("/mnt/wsl/aurora-notes-old", true),
+            ("/mnt/cache/tidepool-api", true),
+            ("/home/dev/projects/kelp-cli-old", false),
+        ] {
+            assert_eq!(drive_missing(mounts, Path::new(path)), missing, "{path}");
+        }
+        assert!(drive_missing(
+            "",
+            Path::new("/mnt/c/Users/dev/tidepool-api")
+        ));
+    }
+
+    #[test]
+    fn removable_drives_are_attached_when_a_mount_of_their_own_holds_the_path() {
+        let mounts = "\
+/dev/sda2 / ext4 rw,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev 0 0
+tmpfs /media tmpfs rw,relatime 0 0
+/dev/sdb1 /media/kelp\\040stick vfat rw,relatime 0 0
+tmpfs /run/media/dev tmpfs rw,relatime 0 0
+/dev/sdc1 /run/media/dev/AURORA ext4 rw,relatime 0 0
+";
+        for (path, missing) in [
+            ("/media/kelp stick/kelp-cli-spike", false),
+            ("/media/old-stick/kelp-cli-spike", true),
+            ("/run/media/dev/AURORA/aurora-notes-old", false),
+            ("/run/media/dev/BACKUP/aurora-notes-old", true),
+            ("/run/media/sam/AURORA/aurora-notes-old", true),
+            ("/run/user/1000/aurora-notes-old", false),
+            ("/home/dev/media/kelp-cli-old", false),
+        ] {
+            assert_eq!(drive_missing(mounts, Path::new(path)), missing, "{path}");
+        }
+        assert!(drive_missing("", Path::new("/media/old-stick/kelp-cli")));
     }
 
     #[test]

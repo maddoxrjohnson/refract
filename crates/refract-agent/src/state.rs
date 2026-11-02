@@ -10,11 +10,12 @@ use refract_core::classify::{classify_report, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
 use refract_core::protocol::{
-    Event, RefactorInfo, RemoteId, RepoSnapshot, SessionChange, SessionInfo, WorktreeInfo,
+    Event, MissingWorktree, RefactorInfo, RemoteId, RepoSnapshot, SessionChange, SessionInfo,
+    WorktreeInfo,
 };
 use refract_core::sessions::{path_within, paths_match};
 use refract_core::transcript::SessionSummary;
-use refract_core::worktree::{derive_worktree_status, WorktreeFacts};
+use refract_core::worktree::{derive_missing_status, derive_worktree_status, WorktreeFacts};
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
@@ -153,6 +154,15 @@ impl Agent {
         self.config.hidden.retain(|p| p != repo);
     }
 
+    /// Forgets the repo at `path`, as when git dropped its worktree but its folder is
+    /// still there: the event that says so, when it was known.
+    pub fn drop_repo(&mut self, path: &Path) -> Option<Event> {
+        self.repos.remove(path)?;
+        Some(Event::RepoRemoved {
+            path: path_str(path),
+        })
+    }
+
     /// Stops reporting `repo` from the next [`Agent::rescan`] on.
     pub fn hide(&mut self, repo: PathBuf) {
         if !self.config.hidden.contains(&repo) {
@@ -236,6 +246,25 @@ impl Agent {
 
     /// Re-reads parts of one repo and returns the events describing what changed.
     pub fn refresh(&mut self, path: &Path, what: Refresh) -> Vec<Event> {
+        self.refresh_reading(path, what, true)
+    }
+
+    /// Re-reads the status of the worktree at `path`, with its ignored entries read again
+    /// rather than kept from the last read (see [`git::finish_worktree_from`]), and
+    /// returns the events describing what changed: after a removal was refused for new
+    /// ignored files, so the next confirm lists them.
+    pub fn refresh_ignored(&mut self, path: &Path) -> Vec<Event> {
+        let what = Refresh {
+            status: true,
+            head: false,
+            sessions: false,
+        };
+        self.refresh_reading(path, what, false)
+    }
+
+    /// [`Agent::refresh`]; `keep_ignored` takes the ignored entries from the last read
+    /// when neither the status nor HEAD changed.
+    fn refresh_reading(&mut self, path: &Path, what: Refresh, keep_ignored: bool) -> Vec<Event> {
         let Some(old) = self.repos.get(path) else {
             return Vec::new();
         };
@@ -256,8 +285,10 @@ impl Agent {
                 Err(e) => eprintln!("refract-agent: git in {}: {e}", path.display()),
             }
         }
-        if what.status || what.head {
+        if (what.status || what.head) && keep_ignored {
             git::finish_worktree_from(path, &mut status, &head, (&old.status, &old.head));
+        } else if what.status || what.head {
+            git::finish_worktree(path, &mut status, &head);
         }
         let old_snapshot = old.snapshot.clone();
         if what.sessions {
@@ -308,6 +339,12 @@ impl Agent {
             .cloned()
             .collect();
         let mut events = Vec::new();
+        // Main checkouts whose worktrees come or go: their missing worktrees change.
+        let mut mains: Vec<PathBuf> = removed
+            .iter()
+            .chain(&replaced)
+            .filter_map(|p| Some(self.repos.get(p)?.status.worktree.as_ref()?.main.clone()))
+            .collect();
         for path in &removed {
             self.repos.remove(path);
             events.push(Event::RepoRemoved {
@@ -343,6 +380,17 @@ impl Agent {
         }
         let mut moved = self.update_masses();
         if !inserted.is_empty() || !removed.is_empty() {
+            mains.extend(
+                inserted.iter().filter_map(|p| {
+                    Some(self.repos.get(p)?.status.worktree.as_ref()?.main.clone())
+                }),
+            );
+            for main in mains {
+                let main = self.known_form(&main);
+                if self.reread_missing(&main) {
+                    moved.push(main);
+                }
+            }
             moved.extend(self.resolve_worktrees());
             moved.sort();
             moved.dedup();
@@ -579,6 +627,7 @@ impl Agent {
         snapshot.mass = mass;
         snapshot.refactor = self.refactors.get(&path).cloned();
         self.set_worktree(&path, &status, &head, &mut snapshot);
+        self.set_missing(&head, &mut snapshot);
         self.repos.insert(
             path,
             RepoState {
@@ -616,14 +665,74 @@ impl Agent {
         snapshot.worktree = Some(worktree_info(&facts, &worktree.ignored));
     }
 
+    /// Sets the missing worktrees of `snapshot` from `head`, the HEAD facts of a main
+    /// checkout: each with its status (spec §10.2), moved when a known repo's git dir is
+    /// its admin dir. Those of Refract's refactors are left out.
+    fn set_missing(&self, head: &HeadInfo, snapshot: &mut RepoSnapshot) {
+        let refactors: Vec<&str> = self
+            .refactors
+            .values()
+            .map(|r| r.worktree.as_str())
+            .collect();
+        // Only a linked worktree's git dir can be an admin dir.
+        let linked: Vec<&PathBuf> = self
+            .repos
+            .iter()
+            .filter(|(_, r)| r.status.worktree.is_some())
+            .map(|(p, _)| p)
+            .collect();
+        snapshot.missing_worktrees = head
+            .missing
+            .iter()
+            .filter(|m| {
+                let path = path_str(&m.path);
+                !refactors.iter().any(|w| paths_match(w, &path))
+            })
+            .map(|m| {
+                let mut facts = m.facts.clone();
+                facts.moved_to =
+                    git::moved_to(&m.admin, linked.iter().copied()).map(|p| path_str(&p));
+                let (status, cleanable) = derive_missing_status(&facts);
+                MissingWorktree {
+                    path: path_str(&m.path),
+                    branch: m.branch.clone(),
+                    status,
+                    cleanable,
+                }
+            })
+            .collect();
+    }
+
+    /// Reads the missing worktrees of the main checkout at `main` again, when it is
+    /// known, as when one of its tracked worktrees was dropped or added. Returns whether
+    /// its snapshot changed.
+    fn reread_missing(&mut self, main: &Path) -> bool {
+        let Some(repo) = self.repos.get(main) else {
+            return false;
+        };
+        let missing = git::read_missing(main);
+        if missing == repo.head.missing {
+            return false;
+        }
+        let mut head = repo.head.clone();
+        head.missing = missing;
+        let mut snapshot = repo.snapshot.clone();
+        self.set_missing(&head, &mut snapshot);
+        let repo = self.repos.get_mut(main).expect("known repo");
+        repo.head = head;
+        let changed = snapshot != repo.snapshot;
+        repo.snapshot = snapshot;
+        changed
+    }
+
     /// Sets the worktree parts of every snapshot again, once a batch of repos is in: a
-    /// worktree's main repo, or a repo inside it, may have come in after it. Returns the
-    /// repos whose snapshot changed.
+    /// worktree's main repo, or a repo inside it, or the repo a missing worktree moved
+    /// to, may have come in after it. Returns the repos whose snapshot changed.
     fn resolve_worktrees(&mut self) -> Vec<PathBuf> {
         let paths: Vec<PathBuf> = self
             .repos
             .iter()
-            .filter(|(_, r)| r.status.worktree.is_some())
+            .filter(|(_, r)| r.status.worktree.is_some() || !r.head.missing.is_empty())
             .map(|(p, _)| p.clone())
             .collect();
         let mut changed = Vec::new();
@@ -631,6 +740,7 @@ impl Agent {
             let repo = &self.repos[&path];
             let mut snapshot = repo.snapshot.clone();
             self.set_worktree(&path, &repo.status, &repo.head, &mut snapshot);
+            self.set_missing(&repo.head, &mut snapshot);
             if snapshot != self.repos[&path].snapshot {
                 self.repos.get_mut(&path).expect("known repo").snapshot = snapshot;
                 changed.push(path);
@@ -900,12 +1010,13 @@ pub fn build_snapshot(
         refactor: None,
         worktree_of: None,
         worktree: None,
+        missing_worktrees: Vec::new(),
     }
 }
 
 /// The snapshot part of a linked worktree's facts, with its status worked out.
 fn worktree_info(facts: &WorktreeFacts, ignored: &[String]) -> WorktreeInfo {
-    let (status, removable) = derive_worktree_status(facts);
+    let (status, removable, checkable) = derive_worktree_status(facts);
     WorktreeInfo {
         locked: facts.locked,
         operation: facts.operation,
@@ -921,6 +1032,7 @@ fn worktree_info(facts: &WorktreeFacts, ignored: &[String]) -> WorktreeInfo {
         },
         status,
         removable,
+        checkable,
     }
 }
 

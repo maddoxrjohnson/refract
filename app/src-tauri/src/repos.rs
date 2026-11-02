@@ -2,13 +2,14 @@
 //! a folder outside the helper's roots. The helper does the work (`cloneRepo`,
 //! `addRepo`) and reports the repo with `repoChanged`; these commands only ask it.
 //! Merging and discarding a repo's refactor go the same way (`mergeRefactor`,
-//! `discardRefactor`), as does removing a linked worktree (`removeWorktree`); starting
-//! a refactor is a launch (see `launch.rs`).
+//! `discardRefactor`), as do removing a linked worktree (`removeWorktree`), checking one
+//! on a Windows drive (`checkWorktree`) and cleaning up one whose folder is gone
+//! (`pruneWorktree`); starting a refactor is a launch (see `launch.rs`).
 
 use std::time::Duration;
 
 use refract_client::RequestError;
-use refract_core::protocol::{check_clone, code, MergeOutcome, Method, Reply};
+use refract_core::protocol::{check_clone, code, MergeOutcome, Method, Reply, WorktreeCheck};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
@@ -20,9 +21,10 @@ const CLONE_TIMEOUT: Duration = Duration::from_secs(11 * 60);
 /// How long `add_repo` waits: git runs once and the roots are searched again, which is
 /// slow under `/mnt/`.
 const ADD_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long `merge_refactor`, `discard_refactor` and `remove_worktree` wait: the helper
-/// runs them on a worker, and a rebase, or removing a worktree that holds installed
-/// dependencies, can take a while.
+/// How long `merge_refactor`, `discard_refactor`, `remove_worktree`, `check_worktree`
+/// and `prune_worktree` wait: the helper runs them on a worker, and a rebase, removing a
+/// worktree that holds installed dependencies, or listing every file of one on a Windows
+/// drive, can take a while.
 const REFACTOR_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 /// The parts of the interface's `RemoteRepo` a clone needs; the rest is ignored.
@@ -53,7 +55,7 @@ pub enum RepoErrorKind {
     NotARepo,
     /// The helper refused or failed to merge or discard a refactor.
     Refactor,
-    /// The helper refused to remove a worktree; the message names why.
+    /// The helper refused to remove, check or clean up a worktree; the message names why.
     Worktree,
     /// A merge or discard is still running in the helper after the wait.
     Pending,
@@ -176,14 +178,49 @@ pub async fn discard_refactor(app: AppHandle, path: String) -> Result<(), RepoEr
 }
 
 /// Removes the linked worktree at `path` with `git worktree remove`, keeping its branch.
-/// The helper refuses, saying why, when anything in it could be lost.
+/// The helper refuses, saying why, when anything in it could be lost, or when it has an
+/// ignored entry the confirm did not show (`ignored`, the list it showed).
 #[tauri::command]
-pub async fn remove_worktree(app: AppHandle, path: String) -> Result<(), RepoError> {
-    match request(app, Method::RemoveWorktree { path }, REFACTOR_TIMEOUT).await? {
+pub async fn remove_worktree(
+    app: AppHandle,
+    path: String,
+    ignored: Option<Vec<String>>,
+) -> Result<(), RepoError> {
+    match request(
+        app,
+        Method::RemoveWorktree { path, ignored },
+        REFACTOR_TIMEOUT,
+    )
+    .await?
+    {
         Ok(Reply::Done) => Ok(()),
         Ok(other) => Err(RepoError::unexpected("removeWorktree", &other)),
         Err(RequestError::Timeout) => Err(RepoError::still_running()),
         Err(err) => Err(RepoError::agent("Cannot remove the worktree", err)),
+    }
+}
+
+/// Reads the linked worktree at `path` with its untracked and ignored files listed, as
+/// for a worktree on a Windows drive whose snapshot leaves them unchecked. Read-only.
+#[tauri::command]
+pub async fn check_worktree(app: AppHandle, path: String) -> Result<WorktreeCheck, RepoError> {
+    match request(app, Method::CheckWorktree { path }, REFACTOR_TIMEOUT).await? {
+        Ok(Reply::WorktreeCheck(check)) => Ok(check),
+        Ok(other) => Err(RepoError::unexpected("checkWorktree", &other)),
+        Err(RequestError::Timeout) => Err(RepoError::still_running()),
+        Err(err) => Err(RepoError::agent("Cannot check the worktree", err)),
+    }
+}
+
+/// Drops git's record of the missing worktree `path` of the main repo `repo`, keeping
+/// its branch. The helper refuses, saying why, when anything could be lost.
+#[tauri::command]
+pub async fn prune_worktree(app: AppHandle, repo: String, path: String) -> Result<(), RepoError> {
+    match request(app, Method::PruneWorktree { repo, path }, REFACTOR_TIMEOUT).await? {
+        Ok(Reply::Done) => Ok(()),
+        Ok(other) => Err(RepoError::unexpected("pruneWorktree", &other)),
+        Err(RequestError::Timeout) => Err(RepoError::still_running()),
+        Err(err) => Err(RepoError::agent("Cannot clean up the worktree", err)),
     }
 }
 

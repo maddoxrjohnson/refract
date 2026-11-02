@@ -117,6 +117,8 @@ pub fn run() {
             repos::merge_refactor,
             repos::discard_refactor,
             repos::remove_worktree,
+            repos::check_worktree,
+            repos::prune_worktree,
             widgets::hook_info,
             widgets::install_hook,
             widgets::uninstall_hook,

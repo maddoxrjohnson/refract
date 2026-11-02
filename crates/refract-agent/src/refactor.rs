@@ -25,7 +25,7 @@ use refract_core::classify::{classify_report, LiveState, SessionState};
 use refract_core::launch::folder_uri;
 use refract_core::protocol::{
     code, ErrorBody, Event, LaunchMode, LaunchTicket, MergeBlock, MergeBlockReason, MergeOutcome,
-    RefactorCommit, RefactorInfo, RefactorState, Reply,
+    RefactorCommit, RefactorInfo, RefactorState, Reply, WorktreeCheck,
 };
 use refract_core::refactor::{self as rules, ResultFile};
 use refract_core::sessions::{path_within, paths_match};
@@ -126,6 +126,13 @@ pub struct Refactors {
     busy: BTreeSet<PathBuf>,
     /// When every refactor was last looked at by [`Refactors::poll`].
     last_full: Option<DateTime<Utc>>,
+    /// Events to send after a job's answer and its other events (see
+    /// [`Refactors::take_events`]): those of a refused job that still changed something
+    /// (a worktree git removed halfway), then [`Event::WorktreeJobDone`].
+    after: Vec<Event>,
+    /// Repos dropped by a job that the search will not report removed, whose watches
+    /// should go (see [`Refactors::take_dropped`]).
+    dropped: Vec<PathBuf>,
 }
 
 type Fail = ErrorBody;
@@ -177,6 +184,11 @@ enum Kind {
     Discard(Record),
     /// A linked worktree's removal, serialised with the refactor jobs of its main repo.
     RemoveWorktree(Box<worktree::Removal>),
+    /// A linked worktree's check (`checkWorktree`), serialised the same way: on a Windows
+    /// drive it reads every file, which takes long enough to overlap another job.
+    CheckWorktree(Box<worktree::Check>),
+    /// Dropping a missing worktree's record, serialised with the main repo's jobs.
+    PruneWorktree(Box<worktree::Prune>),
 }
 
 /// What a [`Job`] did.
@@ -184,6 +196,9 @@ enum Kind {
 pub struct Done {
     repo: PathBuf,
     kind: DoneKind,
+    /// For a `removeWorktree` or `pruneWorktree` job, the path the app sent, which
+    /// [`Event::WorktreeJobDone`] names.
+    worktree_job: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -191,7 +206,9 @@ enum DoneKind {
     Started(Result<Box<Started>, Fail>),
     Merged(Result<Merged, Fail>),
     Discarded(Result<(), Fail>),
-    WorktreeRemoved(Result<(), Fail>),
+    WorktreeRemoved(worktree::Removed),
+    WorktreeChecked(Result<WorktreeCheck, Fail>),
+    WorktreePruned(Result<(), Fail>),
     Failed(Fail),
 }
 
@@ -223,8 +240,25 @@ impl Job {
         &self.repo
     }
 
+    /// For a `removeWorktree` or `pruneWorktree` job, the path the app sent.
+    pub fn worktree_job(&self) -> Option<PathBuf> {
+        match &self.kind {
+            Kind::RemoveWorktree(removal) => Some(removal.path.clone()),
+            Kind::PruneWorktree(prune) => Some(prune.path.clone()),
+            _ => None,
+        }
+    }
+
+    /// True for a job that only reads (`checkWorktree`): it can run beside the others,
+    /// on a thread of its own, while the busy set still keeps other jobs of its repo
+    /// from starting.
+    pub fn read_only(&self) -> bool {
+        matches!(self.kind, Kind::CheckWorktree(_))
+    }
+
     /// Runs the job: git and files only, no agent state.
     pub fn run(self) -> Done {
+        let worktree_job = self.worktree_job();
         let kind = match &self.kind {
             Kind::Start { focus, launch_dir } => {
                 DoneKind::Started(self.start(focus.as_deref(), launch_dir).map(Box::new))
@@ -232,10 +266,13 @@ impl Job {
             Kind::Merge(record, idle) => DoneKind::Merged(self.merge(record, idle)),
             Kind::Discard(record) => DoneKind::Discarded(self.discard(record)),
             Kind::RemoveWorktree(removal) => DoneKind::WorktreeRemoved(worktree::remove(removal)),
+            Kind::CheckWorktree(check) => DoneKind::WorktreeChecked(worktree::check(check)),
+            Kind::PruneWorktree(prune) => DoneKind::WorktreePruned(worktree::prune(prune)),
         };
         Done {
             repo: self.repo,
             kind,
+            worktree_job,
         }
     }
 
@@ -544,17 +581,22 @@ impl Job {
 }
 
 impl Done {
-    /// True for a worktree removal that worked, after which the repos should be searched
-    /// again so the worktree goes.
+    /// True for a worktree removal that worked, or that git did halfway, after which the
+    /// repos should be searched again so the worktree goes.
     pub fn removed_worktree(&self) -> bool {
-        matches!(self.kind, DoneKind::WorktreeRemoved(Ok(())))
+        matches!(
+            self.kind,
+            DoneKind::WorktreeRemoved(worktree::Removed::Done | worktree::Removed::Half { .. })
+        )
     }
 
-    /// A job for `repo` that could not run, or panicked.
-    pub fn failed(repo: PathBuf, why: impl Into<String>) -> Done {
+    /// A job for `repo` that could not run, or panicked; `worktree_job` is what
+    /// [`Job::worktree_job`] gave for it.
+    pub fn failed(repo: PathBuf, worktree_job: Option<PathBuf>, why: impl Into<String>) -> Done {
         Done {
             repo,
             kind: DoneKind::Failed(fail(why)),
+            worktree_job,
         }
     }
 }
@@ -666,7 +708,21 @@ impl Refactors {
             entries,
             busy: BTreeSet::new(),
             last_full: None,
+            after: Vec::new(),
+            dropped: Vec::new(),
         }
+    }
+
+    /// The events of a refused job that still changed something, once its answer is
+    /// sent.
+    pub fn take_events(&mut self) -> Vec<Event> {
+        std::mem::take(&mut self.after)
+    }
+
+    /// The repos the last job dropped from the agent's state without a search (a
+    /// worktree git removed halfway), so their watches can go.
+    pub fn take_dropped(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.dropped)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -947,6 +1003,7 @@ impl Refactors {
         &mut self,
         agent: &Agent,
         path: &str,
+        ignored: Option<Vec<String>>,
         now: DateTime<Utc>,
     ) -> Result<Job, Fail> {
         let given = PathBuf::from(path);
@@ -969,11 +1026,7 @@ impl Refactors {
             });
         let removal = worktree::Removal {
             path: given,
-            refactor_worktrees: self
-                .entries
-                .values()
-                .map(|e| PathBuf::from(&e.record.worktree))
-                .collect(),
+            refactor_worktrees: self.refactor_worktrees(),
             refactor_repos: self
                 .entries
                 .iter()
@@ -982,20 +1035,102 @@ impl Refactors {
             known_repos: agent.repo_paths().cloned().collect(),
             agent_live,
             refactor_dir: Some(self.worktrees_dir.clone()),
+            ignored,
         };
         Ok(self.job(repo, now, Kind::RemoveWorktree(Box::new(removal))))
     }
 
-    /// Takes in what a job did, and returns the reply and the events for the repo.
+    /// Checks a check of the linked worktree at `path` (`checkWorktree`, spec §10.1), and
+    /// returns the job that reads it. Keyed by its main repo, like a removal.
+    pub fn check_worktree(
+        &mut self,
+        agent: &Agent,
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job, Fail> {
+        let given = PathBuf::from(path);
+        let main = worktree::main_of(&given)?;
+        let repo = agent.known_form(&main);
+        if self.busy.contains(&repo) {
+            return Err(worktree::refuse(
+                "This repo is busy with another action; try again in a moment.",
+            ));
+        }
+        let check = worktree::Check {
+            path: given,
+            refactor_worktrees: self.refactor_worktrees(),
+            known_repos: agent.repo_paths().cloned().collect(),
+            refactor_dir: Some(self.worktrees_dir.clone()),
+        };
+        Ok(self.job(repo, now, Kind::CheckWorktree(Box::new(check))))
+    }
+
+    /// Checks dropping the record of the missing worktree `path` of the main repo `repo`
+    /// (`pruneWorktree`, spec §10.2), and returns the job that checks every rule again and
+    /// drops it. Keyed by the main repo, like a removal.
+    pub fn prune_worktree(
+        &mut self,
+        agent: &Agent,
+        repo: &str,
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Job, Fail> {
+        let repo = PathBuf::from(repo);
+        if agent.repo(&repo).is_none() || scan::linked(&repo).is_some() {
+            return Err(worktree::refuse("Not a main checkout Refract knows."));
+        }
+        if self.busy.contains(&repo) {
+            return Err(worktree::refuse(
+                "This repo is busy with another action; try again in a moment.",
+            ));
+        }
+        let prune = worktree::Prune {
+            repo: repo.clone(),
+            path: PathBuf::from(path),
+            refactor_worktrees: self.refactor_worktrees(),
+            known_repos: agent.repo_paths().cloned().collect(),
+            refactor_dir: Some(self.worktrees_dir.clone()),
+        };
+        Ok(self.job(repo, now, Kind::PruneWorktree(Box::new(prune))))
+    }
+
+    /// The worktrees of Refract's refactors, from their records.
+    fn refactor_worktrees(&self) -> Vec<PathBuf> {
+        self.entries
+            .values()
+            .map(|e| PathBuf::from(&e.record.worktree))
+            .collect()
+    }
+
+    /// Takes in what a job did, and returns the reply and the events for the repo. A
+    /// `removeWorktree` or `pruneWorktree` job also leaves [`Event::WorktreeJobDone`]
+    /// for [`Refactors::take_events`], whatever came of it.
     pub fn finish(
         &mut self,
         agent: &mut Agent,
         done: Done,
         now: DateTime<Utc>,
     ) -> Result<(Reply, Vec<Event>), Fail> {
-        let repo = done.repo;
+        let worktree_job = done.worktree_job;
+        let result = self.finish_kind(agent, done.repo, done.kind, now);
+        if let Some(path) = worktree_job {
+            self.after.push(Event::WorktreeJobDone {
+                path: path_str(&path),
+                error: result.as_ref().err().map(|e| e.message.clone()),
+            });
+        }
+        result
+    }
+
+    fn finish_kind(
+        &mut self,
+        agent: &mut Agent,
+        repo: PathBuf,
+        kind: DoneKind,
+        now: DateTime<Utc>,
+    ) -> Result<(Reply, Vec<Event>), Fail> {
         self.busy.remove(&repo);
-        match done.kind {
+        match kind {
             DoneKind::Started(Ok(started)) => {
                 self.entries.insert(
                     repo.clone(),
@@ -1072,21 +1207,37 @@ impl Refactors {
             }
             // The main repo, when known, is sent again whether or not its snapshot moved;
             // the caller searches the repos again, which drops the worktree.
-            DoneKind::WorktreeRemoved(Ok(())) => {
-                let mut events = agent.refresh(&repo, Refresh::ALL);
-                let main = path_str(&repo);
-                let sent = events
-                    .iter()
-                    .any(|e| matches!(e, Event::RepoChanged(s) if s.path == main));
-                if let Some(state) = agent.repo(&repo).filter(|_| !sent) {
-                    events.push(Event::RepoChanged(Box::new(state.snapshot.clone())));
+            DoneKind::WorktreeRemoved(worktree::Removed::Done)
+            | DoneKind::WorktreePruned(Ok(())) => Ok((Reply::Done, main_again(agent, &repo))),
+            // Refused, but the worktree is gone for git all the same: the same events go
+            // after the refusal.
+            // The folder may still look like a repo, so the search would keep it: it is
+            // dropped here.
+            DoneKind::WorktreeRemoved(worktree::Removed::Half { path, refused }) => {
+                let path = agent.known_form(&path);
+                if let Some(removed) = agent.drop_repo(&path) {
+                    self.after.push(removed);
+                    self.dropped.push(path);
                 }
-                Ok((Reply::Done, events))
+                self.after.extend(main_again(agent, &repo));
+                Err(refused)
             }
+            // Refused for ignored entries the confirm did not show, which the snapshot
+            // may not have (it keeps them while the status is unchanged): the worktree is
+            // read again, ignored entries included, and sent after the refusal, before
+            // `worktreeJobDone`, so the next confirm lists them.
+            DoneKind::WorktreeRemoved(worktree::Removed::NewIgnored { path, refused }) => {
+                let path = agent.known_form(&path);
+                self.after.extend(agent.refresh_ignored(&path));
+                Err(refused)
+            }
+            DoneKind::WorktreeChecked(Ok(check)) => Ok((Reply::WorktreeCheck(check), Vec::new())),
             DoneKind::Started(Err(e))
             | DoneKind::Merged(Err(e))
             | DoneKind::Discarded(Err(e))
-            | DoneKind::WorktreeRemoved(Err(e))
+            | DoneKind::WorktreeRemoved(worktree::Removed::Refused(e))
+            | DoneKind::WorktreeChecked(Err(e))
+            | DoneKind::WorktreePruned(Err(e))
             | DoneKind::Failed(e) => Err(e),
         }
     }
@@ -1935,6 +2086,20 @@ pub fn overlap(dirty: &[String], changed: &[String]) -> Vec<String> {
     clash
 }
 
+/// The events after a worktree of the main repo `repo` went, or its record: the main
+/// repo, when known, read again and sent whether or not its snapshot moved.
+fn main_again(agent: &mut Agent, repo: &Path) -> Vec<Event> {
+    let mut events = agent.refresh(repo, Refresh::ALL);
+    let main = path_str(repo);
+    let sent = events
+        .iter()
+        .any(|e| matches!(e, Event::RepoChanged(s) if s.path == main));
+    if let Some(state) = agent.repo(repo).filter(|_| !sent) {
+        events.push(Event::RepoChanged(Box::new(state.snapshot.clone())));
+    }
+    events
+}
+
 /// One entry of `git worktree list --porcelain`.
 #[derive(Debug, Clone)]
 pub(crate) struct Worktree {
@@ -1945,6 +2110,8 @@ pub(crate) struct Worktree {
     pub(crate) locked: bool,
     /// Git would prune it: its folder or `.git` file is gone.
     pub(crate) prunable: bool,
+    /// The commit checked out, as git lists it (all zeros for a branch with no commit).
+    pub(crate) head: Option<String>,
 }
 
 /// The repo's worktrees, the main one first.
@@ -1964,9 +2131,12 @@ pub(crate) fn worktrees(repo: &Path) -> io::Result<Vec<Worktree>> {
                 branch: None,
                 locked: false,
                 prunable: false,
+                head: None,
             });
         } else if let Some(last) = list.last_mut() {
-            if let Some(branch) = line.strip_prefix("branch refs/heads/") {
+            if let Some(head) = line.strip_prefix("HEAD ") {
+                last.head = Some(head.to_owned());
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/") {
                 last.branch = Some(branch.to_owned());
             } else if line == "locked" || line.starts_with("locked ") {
                 last.locked = true;

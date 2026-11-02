@@ -213,7 +213,7 @@ pub fn from_windows_path(path: &str) -> PathBuf {
 }
 
 /// `path` with `.` and `..` components resolved by name, not through the file system.
-fn normalize(path: &Path) -> PathBuf {
+pub(crate) fn normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for part in path.components() {
         match part {

@@ -166,3 +166,97 @@ accent dot when any of them is ready to remove.
 - Build/dependency folders (node_modules, target, dist, build, .venv, venv, __pycache__, .next, .gradle) aren't
   searched for nested repos (budget); nested worktrees there are still caught via the worktree list.
 - Refactor adoption only goes into the main checkout. Windows-git worktrees (C:/ gitdir) are skipped in discovery.
+
+## 10. v1.1: Remove on Windows drives, clean up missing folders (2026-11-01)
+
+Two items from §8 come in: Remove on `/mnt` worktrees, and cleaning up worktree entries whose folder is
+gone. Branch delete, squash-merge detection and the rest of §8 stay out.
+
+### 10.1 Remove on Windows drives (`/mnt/*` drvfs)
+
+Why it was out: listing untracked and ignored files on drvfs is slow (seconds to minutes), so the
+snapshot never reads them there (row 6, "Changes not checked"). v1.1 reads them **on demand**, once,
+when the user asks.
+
+- **core:** `derive_worktree_status` also returns `checkable`: on a Windows drive, untracked files not
+  listed, and the status the same facts would get with `untracked_checked = true` is row 8-10 (holds_repo /
+  too_many_ignored are unknown there and left false). `removable` stays false on a Windows drive.
+- **protocol:** `WorktreeInfo.checkable: bool` (serde default false). New method
+  `checkWorktree { path }` → `WorktreeCheck { status: WorktreeStatus, removable: bool, ignored: string[] }`.
+  It reads the facts the way a Linux-side worktree gets them (untracked listed, ignored entries up to
+  `MAX_IGNORED`, nested-repo search) on any drive, and derives with `windows_drive = false`. Read-only;
+  runs on the helper's job worker (one job per repo, like `removeWorktree`). Refused with
+  `WORKTREE_REFUSED` for a non-linked path or a refactor worktree. Tauri command `check_worktree`, same
+  5-minute timeout as `remove_worktree`.
+- **removeWorktree rule 3 becomes:** refuse when the worktree's `.git` file or its admin `gitdir` file
+  holds a Windows path (`X:/` or `X:\`), i.e. Git for Windows made or repaired it: "This worktree was made
+  by Git for Windows; remove it from Windows." Otherwise a Windows-drive worktree goes through every other
+  rule unchanged (the full untracked status runs, slowly, at execution time).
+- **Half-removed on Windows.** A Windows program holding a file open makes `git worktree remove` fail
+  partway; git still drops the admin dir. After any failed `worktree remove` the helper re-reads the
+  worktree list. If the entry is gone, the worktree is dropped (`repoRemoved`, main repo `repoChanged`) and
+  the refusal says: "Git removed the worktree, but a Windows program had files open, so some are still in
+  <path>. Close it and delete the folder." Nothing is retried or deleted by Refract.
+- **app:** a row with `checkable` (and no agent, no refactor) shows **Check…** where Remove… would be.
+  Click → "Checking files on the Windows drive…" (button disabled) → the check's result replaces the row's
+  label until that worktree's next snapshot. If `removable`, the usual confirm opens with the check's
+  `ignored` list; Remove then calls `removeWorktree` as today. A refused check shows its message like a
+  refused Remove.
+
+### 10.2 Missing-folder entries
+
+Today a worktree whose folder is gone simply vanishes from the panel, while git keeps its entry (and the
+branch stays checked out there, so `git switch <branch>` elsewhere fails). v1.1 lists those entries under
+their main repo and offers **Clean up**, which drops only git's bookkeeping.
+
+Facts (main repo, read with its ref facts and whenever a tracked worktree is dropped): each non-main entry of
+`git worktree list --porcelain` marked `prunable`, minus refactor worktrees (§3). Per entry: `path`,
+`branch` (short name, or none when detached), `locked`, and the derived status.
+
+Status, first match wins:
+
+| # | Condition | Label | Clean up |
+|---|---|---|---|
+| m1 | `locked` | Folder is gone · Locked | no |
+| m2 | path under `/mnt/` and no mount other than `/`, `/mnt`, `/mnt/wsl` holds it (by `/proc/mounts`) | Folder is gone · Drive not attached | no |
+| m3 | a repo Refract knows has this entry's admin dir as its git dir (the folder was moved) | Moved to `<path>` (hint: run `git worktree repair` there) | no |
+| m4 | the entry has its own refs (anything under `<admin>/refs/`, e.g. bisect or `refs/worktree/*`) | Folder is gone · Has its own refs | no |
+| m5 | detached, and no branch, tag or remote ref contains its HEAD (`for-each-ref --contains <head> --count=1` prints nothing) | Folder is gone · Its commits would be lost | no |
+| m6 | otherwise | Folder is gone | yes |
+
+- **protocol:** `RepoSnapshot.missingWorktrees: MissingWorktree[]` (serde default empty, skipped when
+  empty), `MissingWorktree { path, branch?: string, status: MissingWorktreeStatus, cleanable: bool }`,
+  `MissingWorktreeStatus` tagged by `kind`: `locked | driveNotAttached | moved { to } | ownRefs |
+  commitsOnlyHere | gone`. New method `pruneWorktree { repo, path }` (`repo` = main repo's snapshot path,
+  `path` = the entry's path as listed) → `null`. Tauri command `prune_worktree`.
+- **pruneWorktree data-safety rules** (re-checked at execution, app's view ignored; refusals use
+  `WORKTREE_REFUSED` with the rule in words; nothing changed on refusal):
+  1. `repo` is a known non-bare main repo and `path` is a non-main, `prunable` entry of its
+     `git worktree list --porcelain`, matched by the listed path.
+  2. Not a refactor worktree (refactor dir or a refactor record).
+  3. `path` does not exist (`symlink_metadata` fails). If it reappeared: "The folder is back."
+  4. m1-m5 all false.
+  5. Runs `git -C <repo> worktree remove <path>` (no `--force`; on a missing folder git only deletes the
+     admin dir, checked on git 2.43). Never `worktree prune` (it drops every entry at once), never `rm`.
+  6. Never deletes, moves or resets the branch. One job per repo, shared with the other git jobs.
+  On success the main repo's snapshot is sent again without the entry.
+- **app:** the Worktrees section appears when a repo has folded worktrees or missing entries. Missing rows
+  come after the live ones: folder (muted), branch, label, and **Clean up…** when `cleanable`. Its inline
+  confirm reads "Forget this worktree? Only git's record of it goes; branch `<b>` stays." with Clean up /
+  Keep it. The gem mark is unchanged (it counts checkouts that exist).
+- **demo:** the demo repo with worktrees gains a `/mnt/c/...` worktree (checkable; its check comes back
+  `Pushed` with ignored `node_modules/`) and one missing entry (cleanable, branch kept), both working in
+  DemoBackend.
+
+### 10.3 Tests
+
+- core: `checkable` for each row (true only for Windows-drive + otherwise rows 8-10); the missing-entry
+  derivation for m1-m6 and precedence; the mount rule from `/proc/mounts` text.
+- helper (real git, `TEST_SLOW_PREFIX` stands in for drvfs): snapshot of a slow-prefix worktree is
+  `unchecked` + `checkable`; `checkWorktree` finds untracked, ignored and a nested repo; `removeWorktree`
+  succeeds on a clean slow-prefix worktree and refuses one with a Windows `gitdir`; missing entries listed
+  for a deleted folder; `pruneWorktree` refuses locked, moved, own refs, detached-only, folder back, refactor,
+  and succeeds keeping the branch.
+- app (Vitest): Check… flow (busy, result label, confirm with check's ignored, refusal); missing rows,
+  labels, Clean up confirm and call.
+- e2e (demo): Check → Remove on the `/mnt` worktree; Clean up on the missing entry.

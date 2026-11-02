@@ -10,9 +10,12 @@
 //! the channel for this thread to write, and a sixth runs `cloneRepo` clones one at a
 //! time, sending each result back for this thread to report and answer. A seventh keeps
 //! token usage totals up to date (see [`crate::usage`]). An eighth runs the git work of
-//! `startRefactor`, `mergeRefactor`, `discardRefactor` and `removeWorktree` one job at a
-//! time, sending each result back for this thread to take in and answer (see
-//! [`crate::refactor`] and [`crate::worktree`]). Each migration runs on a
+//! `startRefactor`, `mergeRefactor`, `discardRefactor`, `removeWorktree` and
+//! `pruneWorktree` one job at a time, sending each result back for this thread to take
+//! in and answer (see [`crate::refactor`] and [`crate::worktree`]). Each read-only
+//! `checkWorktree` runs on a thread of its own instead, which on a Windows drive takes
+//! minutes: the busy set keeps it from overlapping another job of its main repo, and it
+//! holds up no other repo's jobs. Each migration runs on a
 //! thread of its own (see [`crate::migrate`]), sending its responses and events back
 //! through the channel; this thread only routes requests to it and updates the config
 //! when one finishes.
@@ -738,12 +741,26 @@ impl<W: Write> Server<W> {
                 let discarded = self.refactors.discard(&mut self.agent, &path, Utc::now());
                 return self.run_refactor(id, discarded.map(Step::Run));
             }
-            Method::RemoveWorktree { path } => {
+            Method::RemoveWorktree { path, ignored } => {
                 self.ensure_loaded()?;
-                let removal = self
-                    .refactors
-                    .remove_worktree(&self.agent, &path, Utc::now());
+                let removal =
+                    self.refactors
+                        .remove_worktree(&self.agent, &path, ignored, Utc::now());
                 return self.run_refactor(id, removal.map(Step::Run));
+            }
+            Method::CheckWorktree { path } => {
+                self.ensure_loaded()?;
+                let check = self
+                    .refactors
+                    .check_worktree(&self.agent, &path, Utc::now());
+                return self.run_refactor(id, check.map(Step::Run));
+            }
+            Method::PruneWorktree { repo, path } => {
+                self.ensure_loaded()?;
+                let prune = self
+                    .refactors
+                    .prune_worktree(&self.agent, &repo, &path, Utc::now());
+                return self.run_refactor(id, prune.map(Step::Run));
             }
             Method::Migrate(params) => {
                 // Any of the two folders within, or holding, one of another migration's.
@@ -1720,9 +1737,24 @@ impl<W: Write> Server<W> {
     }
 
     /// Queues `job` for the refactor thread, starting it on first use. Jobs run one at a
-    /// time and each result arrives as [`Msg::Refactored`]. If the thread cannot start,
-    /// the job fails at once.
+    /// time and each result arrives as [`Msg::Refactored`]; a read-only job runs on a
+    /// thread of its own instead (see [`refactor::Job::read_only`]). If the thread
+    /// cannot start, the job fails at once.
     fn start_refactor_job(&mut self, id: Id, job: refactor::Job) -> io::Result<()> {
+        if job.read_only() {
+            let (answer, repo) = (id.clone(), job.repo().to_owned());
+            let tx = self.tx.clone();
+            let started = std::thread::Builder::new()
+                .name("worktree-check".into())
+                .spawn(move || run_refactor_jobs(std::iter::once((id, job)), &tx));
+            if let Err(e) = started {
+                let why = format!("cannot start the check's thread: {e}");
+                let done = refactor::Done::failed(repo, None, why);
+                let finished = self.refactors.finish(&mut self.agent, done, Utc::now());
+                return self.answer_refactor(answer, finished);
+            }
+            return Ok(());
+        }
         let (id, job) = match &self.refactor_jobs {
             Some(jobs) => match jobs.send((id, job)) {
                 Ok(()) => return Ok(()),
@@ -1739,6 +1771,7 @@ impl<W: Write> Server<W> {
         if let Err(e) = started {
             let done = refactor::Done::failed(
                 job.repo().to_owned(),
+                job.worktree_job(),
                 format!("cannot start the refactor thread: {e}"),
             );
             let finished = self.refactors.finish(&mut self.agent, done, Utc::now());
@@ -1750,8 +1783,9 @@ impl<W: Write> Server<W> {
         Ok(())
     }
 
-    /// Answers a refactor request, then sends the events it caused. The refactors are
-    /// looked at again on the timer from now on, which may now run faster.
+    /// Answers a refactor request, then sends the events it caused, those of a refusal
+    /// that still changed something included. The refactors are looked at again on the
+    /// timer from now on, which may now run faster.
     fn answer_refactor(
         &mut self,
         id: Id,
@@ -1761,10 +1795,15 @@ impl<W: Write> Server<W> {
         match result {
             Ok((reply, events)) => {
                 self.send(&Response::ok(id, reply))?;
-                self.send_all(&events)
+                self.send_all(&events)?;
             }
-            Err(e) => self.send(&Response::err(id, e.code, e.message)),
+            Err(e) => self.send(&Response::err(id, e.code, e.message))?,
         }
+        let after = self.refactors.take_events();
+        self.send_all(&after)?;
+        let dropped = self.refactors.take_dropped();
+        self.forget_repos(&dropped);
+        Ok(())
     }
 
     /// Arms the refactor timer once the repos are loaded and some refactor exists.
@@ -1848,11 +1887,11 @@ fn run_clone_jobs(
 /// The refactor thread: runs each job and sends what it did to the main thread, until
 /// either side goes away. A job that panics fails with "internal error" and the thread
 /// goes on to the next.
-fn run_refactor_jobs(jobs: Receiver<(Id, refactor::Job)>, tx: &SyncSender<Msg>) {
+fn run_refactor_jobs(jobs: impl IntoIterator<Item = (Id, refactor::Job)>, tx: &SyncSender<Msg>) {
     for (id, job) in jobs {
-        let repo = job.repo().to_owned();
+        let (repo, worktree_job) = (job.repo().to_owned(), job.worktree_job());
         let done = catch_unwind(AssertUnwindSafe(|| job.run()))
-            .unwrap_or_else(|_| refactor::Done::failed(repo, "internal error"));
+            .unwrap_or_else(|_| refactor::Done::failed(repo, worktree_job, "internal error"));
         if tx.send(Msg::Refactored { id, done }).is_err() {
             return;
         }

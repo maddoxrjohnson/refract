@@ -1,7 +1,8 @@
 //! Linked worktrees end to end, over temporary repos with a bare remote: the facts and
 //! status in their snapshots, how they are found, which repo gets their sessions, and
 //! `removeWorktree` refusing for each data-safety rule and succeeding on a clean, pushed
-//! one. All repo names are invented.
+//! one; `checkWorktree` and removal on a Windows drive (the test prefix stands in for
+//! one), and missing worktrees with `pruneWorktree`. All repo names are invented.
 
 mod common;
 
@@ -668,6 +669,14 @@ fn remove_worktree_refuses_for_each_rule_and_removes_a_clean_pushed_one() {
     let on_drive = drive.join("harbor-notes-drive");
     add_worktree(&main, &on_drive, "drive");
 
+    // Git for Windows writes Windows paths into the admin dir's `gitdir`.
+    let by_windows = wt("by-windows");
+    add_worktree(&main, &by_windows, "by-windows");
+    write(
+        &main.join(".git/worktrees/harbor-notes-by-windows/gitdir"),
+        "C:/Users/dev/harbor-notes-by-windows/.git\n",
+    );
+
     let locked = wt("locked");
     add_worktree(&main, &locked, "locked");
     git(&main, &["worktree", "lock", locked.to_str().unwrap()]);
@@ -735,6 +744,8 @@ fn remove_worktree_refuses_for_each_rule_and_removes_a_clean_pushed_one() {
         false
     );
     assert_eq!(drive_snapshot["result"]["worktree"]["removable"], false);
+    assert_eq!(drive_snapshot["result"]["worktree"]["checkable"], true);
+    write(&on_drive.join("scratch.txt"), "untracked\n");
 
     // 1. Not a linked worktree: the main checkout, a plain folder, a missing path.
     assert_eq!(helper.refusal(&main), "Not a linked worktree.");
@@ -752,10 +763,15 @@ fn remove_worktree_refuses_for_each_rule_and_removes_a_clean_pushed_one() {
         helper.refusal(&refactor),
         "Refract's own refactor worktrees are removed from the Refactor section."
     );
-    // 3. A Windows drive.
+    // 3. Made by Git for Windows. A Windows drive itself is no reason: there the full
+    // status runs, and finds the untracked file the snapshot did not list.
+    assert_eq!(
+        helper.refusal(&by_windows),
+        "This worktree was made by Git for Windows; remove it from Windows."
+    );
     assert_eq!(
         helper.refusal(&on_drive),
-        "Worktrees on Windows drives can't be removed from Refract yet."
+        "This worktree has uncommitted changes."
     );
     // 4. Locked, mid-rebase.
     assert_eq!(helper.refusal(&locked), "This worktree is locked.");
@@ -784,7 +800,14 @@ fn remove_worktree_refuses_for_each_rule_and_removes_a_clean_pushed_one() {
     }
     // Nothing refused was changed.
     for path in [
-        &refactor, &on_drive, &locked, &rebasing, &dirty, &only_here, &busy,
+        &refactor,
+        &on_drive,
+        &by_windows,
+        &locked,
+        &rebasing,
+        &dirty,
+        &only_here,
+        &busy,
     ] {
         assert!(path.join(".git").is_file(), "{path:?}");
     }
@@ -969,5 +992,600 @@ fn remove_worktree_refuses_what_git_would_delete_unseen() {
     ] {
         assert!(path.join(".git").is_file(), "{path:?}");
     }
+    helper.shutdown();
+}
+
+/// A helper over a home with `~/projects/harbor-notes` cloned from a bare remote, with
+/// `drive` (outside the home) read as a Windows drive.
+struct DriveFixture {
+    _tmp: tempfile::TempDir,
+    home: PathBuf,
+    root: PathBuf,
+    drive: PathBuf,
+    config: PathBuf,
+    main: PathBuf,
+}
+
+impl DriveFixture {
+    fn new() -> DriveFixture {
+        hermetic_git();
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().canonicalize().unwrap();
+        let home = base.join("home");
+        let root = home.join("projects");
+        let drive = base.join("drive");
+        let config = base.join("agent.toml");
+        write(
+            &config,
+            &format!(
+                "roots = [{:?}, {:?}]\ndepth = 3\n",
+                root.to_str().unwrap(),
+                drive.to_str().unwrap()
+            ),
+        );
+        std::fs::create_dir_all(home.join(".claude/projects")).unwrap();
+        let (bare, _seed) = remote(&base, "harbor-notes");
+        let main = root.join("harbor-notes");
+        clone(&bare, &main);
+        commit_file(
+            &main,
+            ".gitignore",
+            "target/\nnode_modules/\nscratch/\n",
+            "Ignore build output",
+        );
+        git(&main, &["push", "-q", "origin", "main"]);
+        DriveFixture {
+            _tmp: tmp,
+            home,
+            root,
+            drive,
+            config,
+            main,
+        }
+    }
+
+    fn spawn(&self) -> Helper {
+        Helper::spawn(
+            &self.home,
+            &self.config,
+            &[("REFRACT_AGENT_TEST_SLOW_PREFIX", self.drive.as_path())],
+        )
+    }
+}
+
+impl Helper {
+    /// Sends a request expected to be refused with `WORKTREE_REFUSED`, and returns the
+    /// message.
+    #[track_caller]
+    fn refused(&mut self, method: &str, params: Value) -> String {
+        let reply = self.request(method, params);
+        assert_eq!(reply["error"]["code"], 9, "{reply}");
+        reply["error"]["message"].as_str().unwrap().to_owned()
+    }
+
+    fn missing(&mut self, main: &Path) -> Vec<Value> {
+        let snapshot = self.request("getRepo", json!({"path": main}));
+        snapshot["result"]["missingWorktrees"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+
+#[test]
+fn worktrees_on_a_windows_drive_are_checked_on_demand_and_removed() {
+    let f = DriveFixture::new();
+    let main = &f.main;
+    let on_drive = |name: &str| f.drive.join(format!("harbor-notes-{name}"));
+
+    let clean = on_drive("clean");
+    pushed_worktree(main, &clean, "clean");
+    write(&clean.join("node_modules/dep/index.js"), "// dep\n");
+
+    let untracked = on_drive("untracked");
+    pushed_worktree(main, &untracked, "untracked");
+
+    let holder = on_drive("holder");
+    pushed_worktree(main, &holder, "holder");
+    init_repo(&holder.join("scratch/vendored"));
+
+    // An edit git hides counts as a change.
+    let hiding = on_drive("hiding");
+    pushed_worktree(main, &hiding, "hiding");
+    git(
+        &hiding,
+        &["update-index", "--skip-worktree", "src/hiding.rs"],
+    );
+    write(&hiding.join("src/hiding.rs"), "// edited\n");
+
+    // Git for Windows repaired this one: its admin dir names it by a Windows path.
+    let by_windows = on_drive("by-windows");
+    pushed_worktree(main, &by_windows, "by-windows");
+    write(
+        &main.join(".git/worktrees/harbor-notes-by-windows/gitdir"),
+        "D:/harbor-notes-by-windows/.git\n",
+    );
+
+    let refactor = f
+        .home
+        .join("projects/.refract-worktrees/harbor-notes-20261101-0900");
+    add_worktree(main, &refactor, "refactor/20261101-0900");
+
+    let mut helper = f.spawn();
+    for path in [&clean, &untracked, &holder] {
+        let snapshot = helper.request("getRepo", json!({"path": path}));
+        let worktree = &snapshot["result"]["worktree"];
+        assert_eq!(worktree["status"], json!({"kind": "unchecked"}), "{path:?}");
+        assert_eq!(worktree["removable"], false, "{path:?}");
+        assert_eq!(worktree["checkable"], true, "{path:?}");
+    }
+    let snapshot = helper.request("getRepo", json!({"path": by_windows}));
+    assert_eq!(
+        snapshot["result"]["worktree"]["checkable"], false,
+        "{snapshot}"
+    );
+    assert_eq!(
+        helper.refused("checkWorktree", json!({"path": by_windows})),
+        "This worktree was made by Git for Windows; remove it from Windows."
+    );
+    // The test prefix lists untracked files in the status; write this one after the
+    // snapshot, as a Windows drive would not have shown it.
+    write(&untracked.join("notes/todo.txt"), "todo\n");
+
+    let check = helper.request("checkWorktree", json!({"path": clean}));
+    assert_eq!(
+        check["result"],
+        json!({"status": {"kind": "pushed"}, "removable": true, "ignored": ["node_modules/"]}),
+        "{check}"
+    );
+    let check = helper.request("checkWorktree", json!({"path": untracked}));
+    assert_eq!(
+        check["result"],
+        json!({"status": {"kind": "changes", "count": 1}, "removable": false, "ignored": []}),
+        "{check}"
+    );
+    let check = helper.request("checkWorktree", json!({"path": holder}));
+    assert_eq!(
+        check["result"],
+        json!({"status": {"kind": "holdsRepo"}, "removable": false, "ignored": []}),
+        "{check}"
+    );
+    let check = helper.request("checkWorktree", json!({"path": hiding}));
+    assert_eq!(
+        check["result"],
+        json!({"status": {"kind": "changes", "count": 1}, "removable": false, "ignored": []}),
+        "{check}"
+    );
+    assert_eq!(
+        helper.refused("checkWorktree", json!({"path": main})),
+        "Not a linked worktree."
+    );
+    assert_eq!(
+        helper.refused("checkWorktree", json!({"path": refactor})),
+        "Refract's own refactor worktrees are removed from the Refactor section."
+    );
+    // Checking changed nothing.
+    assert!(untracked.join("notes/todo.txt").is_file());
+    assert!(holder.join("scratch/vendored/.git").is_dir());
+
+    // A clean worktree on the drive goes; its branch stays.
+    helper.events.clear();
+    let reply = helper.request("removeWorktree", json!({"path": clean}));
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    assert!(!clean.exists());
+    assert!(branch_exists(main, "clean"));
+    assert_eq!(
+        helper.refused("removeWorktree", json!({"path": untracked})),
+        "This worktree has uncommitted changes."
+    );
+    helper.shutdown();
+}
+
+#[test]
+fn a_worktree_git_removed_halfway_is_dropped_and_said_so() {
+    let f = DriveFixture::new();
+    let stuck = f.drive.join("harbor-notes-stuck");
+    pushed_worktree(&f.main, &stuck, "stuck");
+    // A folder git cannot empty, as a Windows program holding a file open makes it.
+    let held = stuck.join("target/held");
+    write(&held.join("app.exe"), "bin\n");
+    let mode = |dir: &Path, mode: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    mode(&held, 0o555);
+
+    let mut helper = f.spawn();
+    helper.events.clear();
+    let message = helper.refused("removeWorktree", json!({"path": stuck}));
+    mode(&held, 0o755);
+    assert_eq!(
+        message,
+        format!(
+            "Git removed the worktree, but a Windows program had files open, so some are \
+             still in {}. Close it and delete the folder.",
+            stuck.display()
+        )
+    );
+    assert!(held.join("app.exe").is_file());
+    assert!(branch_exists(&f.main, "stuck"));
+    let paths = helper.paths();
+    assert!(
+        !paths.contains(&stuck.to_str().unwrap().to_owned()),
+        "{paths:?}"
+    );
+    let removed = helper
+        .events
+        .iter()
+        .any(|e| e["event"] == "repoRemoved" && e["data"]["path"] == stuck.to_str().unwrap());
+    assert!(removed, "{:?}", helper.events);
+    let main_changed = helper
+        .events
+        .iter()
+        .any(|e| e["event"] == "repoChanged" && e["data"]["path"] == f.main.to_str().unwrap());
+    assert!(main_changed, "{:?}", helper.events);
+    helper.shutdown();
+}
+
+#[test]
+fn missing_worktrees_are_listed_and_cleaned_up_only_when_nothing_is_lost() {
+    let f = DriveFixture::new();
+    let main = &f.main;
+    let wt = |name: &str| f.root.join(format!("harbor-notes-{name}"));
+    let delete = |path: &Path| std::fs::remove_dir_all(path).unwrap();
+
+    let gone = wt("gone");
+    pushed_worktree(main, &gone, "gone");
+    delete(&gone);
+
+    let locked = wt("locked");
+    add_worktree(main, &locked, "locked");
+    git(main, &["worktree", "lock", locked.to_str().unwrap()]);
+    delete(&locked);
+
+    let moved = wt("moved");
+    add_worktree(main, &moved, "moved");
+    let moved_to = f.root.join("spikes/harbor-notes-moved");
+    std::fs::create_dir_all(moved_to.parent().unwrap()).unwrap();
+    std::fs::rename(&moved, &moved_to).unwrap();
+
+    let own_refs = wt("own-refs");
+    add_worktree(main, &own_refs, "own-refs");
+    git(&own_refs, &["update-ref", "refs/worktree/keep", "HEAD"]);
+    delete(&own_refs);
+
+    let lost = wt("lost");
+    git(
+        main,
+        &["worktree", "add", "-q", "--detach", lost.to_str().unwrap()],
+    );
+    commit_file(&lost, "src/lost.rs", "// lost\n", "Add lost");
+    delete(&lost);
+
+    let detached = wt("detached");
+    git(
+        main,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "--detach",
+            detached.to_str().unwrap(),
+            "origin/main",
+        ],
+    );
+    delete(&detached);
+
+    let back = wt("back");
+    pushed_worktree(main, &back, "back");
+    delete(&back);
+
+    let refactor = f
+        .home
+        .join("projects/.refract-worktrees/harbor-notes-20261101-0900");
+    add_worktree(main, &refactor, "refactor/20261101-0900");
+    delete(&refactor);
+
+    let mut helper = f.spawn();
+    let missing = helper.missing(main);
+    let entry = |path: &Path| {
+        missing
+            .iter()
+            .find(|m| m["path"] == path.to_str().unwrap())
+            .unwrap_or_else(|| panic!("{path:?} not in {missing:?}"))
+            .clone()
+    };
+    assert_eq!(
+        entry(&gone),
+        json!({"path": gone, "branch": "gone", "status": {"kind": "gone"}, "cleanable": true})
+    );
+    assert_eq!(entry(&locked)["status"], json!({"kind": "locked"}));
+    assert_eq!(
+        entry(&moved)["status"],
+        json!({"kind": "moved", "to": moved_to})
+    );
+    assert_eq!(entry(&own_refs)["status"], json!({"kind": "ownRefs"}));
+    assert_eq!(entry(&lost)["status"], json!({"kind": "commitsOnlyHere"}));
+    assert!(entry(&lost).get("branch").is_none());
+    assert_eq!(entry(&detached)["status"], json!({"kind": "gone"}));
+    for path in [&locked, &moved, &own_refs, &lost] {
+        assert_eq!(entry(path)["cleanable"], false, "{path:?}");
+    }
+    assert!(
+        !missing
+            .iter()
+            .any(|m| m["path"].as_str().unwrap().contains(".refract-worktrees")),
+        "{missing:?}"
+    );
+    assert_eq!(missing.len(), 7, "{missing:?}");
+
+    let prune = |helper: &mut Helper, path: &Path| {
+        helper.refused("pruneWorktree", json!({"repo": main, "path": path}))
+    };
+    assert_eq!(prune(&mut helper, &locked), "This worktree is locked.");
+    assert_eq!(
+        prune(&mut helper, &moved),
+        format!(
+            "This worktree was moved to {}; run `git worktree repair` there.",
+            moved_to.display()
+        )
+    );
+    assert_eq!(
+        prune(&mut helper, &own_refs),
+        "This worktree has refs of its own (such as a bisect), which would go with it."
+    );
+    assert_eq!(
+        prune(&mut helper, &lost),
+        "Its commits are on no branch, tag or remote, so they would be lost."
+    );
+    assert_eq!(
+        prune(&mut helper, &refactor),
+        "Refract's own refactor worktrees are removed from the Refactor section."
+    );
+    assert_eq!(
+        prune(&mut helper, main),
+        "Git does not list this worktree as missing."
+    );
+    assert_eq!(
+        helper.refused("pruneWorktree", json!({"repo": moved_to, "path": gone})),
+        "Not a main checkout Refract knows."
+    );
+    std::fs::create_dir_all(&back).unwrap();
+    assert_eq!(prune(&mut helper, &back), "The folder is back.");
+    // Nothing refused was changed.
+    let admin = |name: &str| main.join(".git/worktrees").join(name);
+    for name in [
+        "harbor-notes-locked",
+        "harbor-notes-moved",
+        "harbor-notes-own-refs",
+        "harbor-notes-lost",
+        "harbor-notes-back",
+    ] {
+        assert!(admin(name).is_dir(), "{name}");
+    }
+
+    // Only git's record of a gone one goes: its branch and the other records stay.
+    helper.events.clear();
+    let reply = helper.request("pruneWorktree", json!({"repo": main, "path": gone}));
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    assert!(!admin("harbor-notes-gone").exists());
+    assert!(branch_exists(main, "gone"));
+    assert!(admin("harbor-notes-locked").is_dir());
+    assert!(admin("harbor-notes-detached").is_dir());
+    helper.paths();
+    let sent = helper
+        .events
+        .iter()
+        .find(|e| e["event"] == "repoChanged" && e["data"]["path"] == main.to_str().unwrap())
+        .unwrap_or_else(|| panic!("no repoChanged for main in {:?}", helper.events));
+    let listed: Vec<&str> = sent["data"]["missingWorktrees"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap())
+        .collect();
+    assert!(!listed.contains(&gone.to_str().unwrap()), "{listed:?}");
+    // The one whose folder is back is no longer listed as missing either.
+    assert!(!listed.contains(&back.to_str().unwrap()), "{listed:?}");
+    assert_eq!(listed.len(), 5, "{listed:?}");
+    helper.shutdown();
+}
+
+#[test]
+fn a_dropped_worktree_shows_up_as_missing() {
+    let f = DriveFixture::new();
+    let wide = f.root.join("harbor-notes-wide");
+    pushed_worktree(&f.main, &wide, "wide");
+    let mut helper = f.spawn();
+    assert!(helper.missing(&f.main).is_empty());
+    std::fs::remove_dir_all(&wide).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let missing = helper.missing(&f.main);
+        if missing.iter().any(|m| m["path"] == wide.to_str().unwrap()) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "never listed: {missing:?}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    helper.shutdown();
+}
+
+/// A folder made unreadable (mode 000) until dropped, as an unreadable parent or a
+/// network drive that stopped answering leaves a worktree's folder.
+struct Unreadable(PathBuf);
+
+impl Unreadable {
+    fn new(dir: &Path) -> Unreadable {
+        set_mode(dir, 0o000);
+        Unreadable(dir.to_owned())
+    }
+}
+
+impl Drop for Unreadable {
+    fn drop(&mut self) {
+        set_mode(&self.0, 0o755);
+    }
+}
+
+fn set_mode(dir: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn a_folder_that_cannot_be_looked_at_is_not_taken_for_gone() {
+    let f = DriveFixture::new();
+    let away = f.home.join("away");
+    let wt = away.join("harbor-notes-away");
+    pushed_worktree(&f.main, &wt, "away");
+    let guard = Unreadable::new(&away);
+    if std::fs::read_dir(&away).is_ok() {
+        eprintln!("skipped: this user reads folders whatever their mode");
+        return;
+    }
+    let mut helper = f.spawn();
+    // Git lists it as prunable, but the folder may well be there.
+    let missing = helper.missing(&f.main);
+    assert!(missing.is_empty(), "{missing:?}");
+    let message = helper.refused("pruneWorktree", json!({"repo": f.main, "path": wt}));
+    assert!(
+        message.starts_with("Can't tell whether the folder is there: "),
+        "{message}"
+    );
+    drop(guard);
+    assert!(f.main.join(".git/worktrees/harbor-notes-away").is_dir());
+    assert!(wt.join(".git").is_file());
+    helper.shutdown();
+}
+
+#[test]
+fn a_removal_is_refused_when_ignored_files_appeared_since_the_confirm() {
+    let f = DriveFixture::new();
+    let built = f.root.join("harbor-notes-built");
+    pushed_worktree(&f.main, &built, "built");
+    write(&built.join("target/debug/app"), "bin\n");
+    let many = f.root.join("harbor-notes-many");
+    pushed_worktree(&f.main, &many, "many");
+    write(&many.join("target/debug/app"), "bin\n");
+
+    let mut helper = f.spawn();
+    let snapshot = helper.request("getRepo", json!({"path": built}));
+    assert_eq!(
+        snapshot["result"]["worktree"]["ignored"],
+        json!(["target/"]),
+        "{snapshot}"
+    );
+    // Installed after the confirm showed the list.
+    write(&built.join("node_modules/dep/index.js"), "// dep\n");
+    helper.events.clear();
+    assert_eq!(
+        helper.refused(
+            "removeWorktree",
+            json!({"path": built, "ignored": ["target/"]})
+        ),
+        "New ignored files appeared since you confirmed (node_modules/). Review the list and \
+         remove again."
+    );
+    assert!(built.join("node_modules/dep/index.js").is_file());
+    // The status did not change, so the snapshot kept its ignored list; after the refusal
+    // the worktree is read again and sent before the job's end, for the next confirm.
+    helper.paths();
+    let built_str = built.to_str().unwrap();
+    let changed = helper
+        .events
+        .iter()
+        .position(|e| e["event"] == "repoChanged" && e["data"]["path"] == built_str)
+        .expect("the worktree is sent again after the refusal");
+    let done = helper
+        .events
+        .iter()
+        .position(|e| e["event"] == "worktreeJobDone" && e["data"]["path"] == built_str)
+        .expect("the job ends with an event");
+    assert!(changed < done, "{:?}", helper.events);
+    let ignored = helper.events[changed]["data"]["worktree"]["ignored"].clone();
+    assert_eq!(ignored, json!(["node_modules/", "target/"]), "{ignored}");
+    let snapshot = helper.request("getRepo", json!({"path": built}));
+    assert_eq!(snapshot["result"]["worktree"]["ignored"], ignored);
+    let reply = helper.request("removeWorktree", json!({"path": built, "ignored": ignored}));
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    assert!(!built.exists());
+
+    // A confirm of 9 entries said "and more", so nothing is compared.
+    let shown: Vec<String> = (0..9).map(|n| format!("cache-{n}/")).collect();
+    let reply = helper.request("removeWorktree", json!({"path": many, "ignored": shown}));
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    assert!(!many.exists());
+    helper.shutdown();
+}
+
+#[test]
+fn every_worktree_job_ends_with_an_event_saying_how_it_went() {
+    let f = DriveFixture::new();
+    let main = &f.main;
+    let wt = |name: &str| f.root.join(format!("harbor-notes-{name}"));
+    let ready = wt("ready");
+    pushed_worktree(main, &ready, "ready");
+    let dirty = wt("dirty");
+    pushed_worktree(main, &dirty, "dirty");
+    write(&dirty.join("notes/todo.txt"), "todo\n");
+    let gone = wt("gone");
+    pushed_worktree(main, &gone, "gone");
+    std::fs::remove_dir_all(&gone).unwrap();
+    let lost = wt("lost");
+    git(
+        main,
+        &["worktree", "add", "-q", "--detach", lost.to_str().unwrap()],
+    );
+    commit_file(&lost, "src/lost.rs", "// lost\n", "Add lost");
+    std::fs::remove_dir_all(&lost).unwrap();
+
+    let mut helper = f.spawn();
+    helper.events.clear();
+    let reply = helper.request("removeWorktree", json!({"path": ready}));
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    // The event comes after the answer.
+    assert!(
+        !helper
+            .events
+            .iter()
+            .any(|e| e["event"] == "worktreeJobDone"),
+        "{:?}",
+        helper.events
+    );
+    assert_eq!(
+        helper.refused("removeWorktree", json!({"path": dirty})),
+        "This worktree has uncommitted changes."
+    );
+    let reply = helper.request("pruneWorktree", json!({"repo": main, "path": gone}));
+    assert_eq!(reply["result"], Value::Null, "{reply}");
+    assert_eq!(
+        helper.refused("pruneWorktree", json!({"repo": main, "path": lost})),
+        "Its commits are on no branch, tag or remote, so they would be lost."
+    );
+    // Refused before any job ran: answered at once, with no event.
+    assert_eq!(
+        helper.refused("removeWorktree", json!({"path": main})),
+        "Not a linked worktree."
+    );
+    helper.paths();
+    let done: Vec<&Value> = helper
+        .events
+        .iter()
+        .filter(|e| e["event"] == "worktreeJobDone")
+        .map(|e| &e["data"])
+        .collect();
+    assert_eq!(
+        done,
+        [
+            &json!({"path": ready}),
+            &json!({"path": dirty, "error": "This worktree has uncommitted changes."}),
+            &json!({"path": gone}),
+            &json!({
+                "path": lost,
+                "error": "Its commits are on no branch, tag or remote, so they would be lost."
+            }),
+        ]
+    );
     helper.shutdown();
 }
