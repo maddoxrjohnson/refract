@@ -15,7 +15,7 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::classify::HookStatus;
+use crate::classify::{HookReport, HookStatus};
 
 /// One Claude Code hook event the script runs for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,8 +105,8 @@ pub fn command(script: &str, status: HookStatus, status_dir: &str) -> String {
 }
 
 /// What one status file says:
-/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600]}`.
-/// Files from scripts before `pids` was added have none.
+/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600],"starts":[4242,4100,3900]}`.
+/// Files from scripts before `pids` was added have neither array.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StatusFile {
     pub status: HookStatus,
@@ -120,6 +120,27 @@ pub struct StatusFile {
     /// the hook is among them.
     #[serde(default)]
     pub pids: Vec<u32>,
+    /// When each of `pids` started, in clock ticks after boot (field 22 of
+    /// `/proc/<pid>/stat`), in the same order.
+    #[serde(default)]
+    pub starts: Vec<u64>,
+}
+
+impl StatusFile {
+    /// The report it makes: the first [`crate::classify::HOOK_PIDS`] ancestors, and
+    /// their starts only when there is one for each pid.
+    pub fn report(&self) -> HookReport {
+        let mut report = HookReport::new(self.status, self.at);
+        for (slot, &pid) in report.pids.iter_mut().zip(&self.pids) {
+            *slot = pid;
+        }
+        if self.starts.len() == self.pids.len() {
+            for (slot, &start) in report.starts.iter_mut().zip(&self.starts) {
+                *slot = start;
+            }
+        }
+        report
+    }
 }
 
 /// Parses a status file. `None` when it is not one (empty, cut short, unknown status).
@@ -423,6 +444,28 @@ mod tests {
         assert_eq!(file.status, HookStatus::Working);
         assert_eq!(file.at, Some(1_793_661_784));
         assert_eq!(file.pids, [123, 122, 100, 1]);
+        assert!(file.starts.is_empty());
+        let file = parse_status_file(
+            br#"{"status":"working","at":9,"pids":[812,640,600,500],"starts":[44,43,42,41]}"#,
+        )
+        .unwrap();
+        assert_eq!(file.starts, [44, 43, 42, 41]);
+        // The report keeps the nearest three, with their starts.
+        let report = file.report();
+        assert_eq!(report.pids, [812, 640, 600]);
+        assert_eq!(report.starts, [44, 43, 42]);
+        assert_eq!(
+            report.ancestors().collect::<Vec<_>>(),
+            [(812, 44), (640, 43), (600, 42)]
+        );
+        // Starts that do not match the pids one for one are not used.
+        let file =
+            parse_status_file(br#"{"status":"working","at":9,"pids":[812,640],"starts":[44]}"#)
+                .unwrap();
+        assert!(file.report().has_pids());
+        assert_eq!(file.report().ancestors().count(), 0);
+        let old = parse_status_file(br#"{"status":"working","at":9}"#).unwrap();
+        assert!(!old.report().has_pids());
         let empty = parse_status_file(br#"{"status":"finished","at":5,"pids":[]}"#).unwrap();
         assert!(empty.pids.is_empty());
         assert_eq!(

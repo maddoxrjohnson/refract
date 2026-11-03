@@ -268,6 +268,7 @@ fn install_run_and_uninstall_the_status_hook() {
         assert!(written["at"].as_i64().unwrap() > 1_700_000_000);
         let pids = written["pids"].as_array().unwrap();
         assert!(!pids.is_empty() && pids.iter().all(|p| p.as_u64().is_some_and(|p| p > 1)));
+        assert_eq!(written["starts"].as_array().unwrap().len(), pids.len());
         agent.event(event, |e| {
             e["event"] == "sessionChanged"
                 && e["data"]["session"]["id"] == SESSION_ID
@@ -356,56 +357,89 @@ fn install_run_and_uninstall_the_status_hook() {
     assert!(agent.child.wait().unwrap().success());
 }
 
-#[test]
-fn the_script_records_the_pids_of_its_ancestors() {
-    let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("sessions");
+/// Field 22 of `/proc/<pid>/stat`: when `pid` started, in clock ticks after boot.
+fn start_ticks(pid: u32) -> u64 {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+    let (_, rest) = stat.rsplit_once(')').unwrap();
+    rest.split_whitespace().nth(19).unwrap().parse().unwrap()
+}
+
+/// The numbers of the JSON array `key` in `text`, checked to be written as digits only.
+fn numbers(text: &str, key: &str) -> Vec<u64> {
+    let list = text
+        .split(&format!("\"{key}\":["))
+        .nth(1)
+        .and_then(|rest| rest.split(']').next())
+        .unwrap_or_else(|| panic!("no {key} in {text}"));
+    assert!(
+        list.chars().all(|c| c.is_ascii_digit() || c == ','),
+        "{text}"
+    );
+    let written: Value = serde_json::from_str(text).unwrap();
+    written[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_u64().unwrap())
+        .collect()
+}
+
+/// Runs the script with the installed command's shape through `shell -c`, so the
+/// script is not the shell's last command and runs as its child, and checks the
+/// ancestors it wrote. Returns the shell's command name.
+fn check_ancestors(shell: &Path, dir: &Path) -> String {
     let script: PathBuf = [env!("CARGO_MANIFEST_DIR"), "src", "status-hook.sh"]
         .iter()
         .collect();
-    // Shaped like the installed command, so the script is not the shell's last command
-    // and runs as its child.
     let command = format!(
         "[ -f '{0}' ] && sh '{0}' working '{1}' || cat >/dev/null; exit 0",
         script.display(),
         dir.display()
     );
-    let mut child = Command::new("sh")
+    let mut child = Command::new(shell)
         .args(["-c", &command])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let shell = child.id();
+    let pid = child.id();
+    // The shell waits on its input, so it is still there to be read.
+    let ticks = start_ticks(pid);
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
     let mut stdin = child.stdin.take().unwrap();
-    stdin
-        .write_all(&hook_input("PostToolUse", tmp.path()))
-        .unwrap();
+    stdin.write_all(&hook_input("PostToolUse", dir)).unwrap();
     drop(stdin);
     let out = child.wait_with_output().unwrap();
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
     let text = std::fs::read_to_string(dir.join(format!("{SESSION_ID}.json"))).unwrap();
-    let list = text.split("\"pids\":[").nth(1).unwrap().split(']').next();
-    let list = list.unwrap();
-    assert!(
-        list.chars().all(|c| c.is_ascii_digit() || c == ','),
-        "{text}"
-    );
-    let written: Value = serde_json::from_str(&text).unwrap();
-    let pids: Vec<u64> = written["pids"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|p| p.as_u64().unwrap())
-        .collect();
+    let pids = numbers(&text, "pids");
+    let starts = numbers(&text, "starts");
     // The shell that ran the command, then this test, which started it.
     assert_eq!(
         pids[..2],
-        [u64::from(shell), u64::from(std::process::id())],
+        [u64::from(pid), u64::from(std::process::id())],
         "{text}"
     );
-    assert!(pids.len() <= 4 && pids.iter().all(|&p| p > 1), "{text}");
+    assert_eq!(
+        starts[..2],
+        [ticks, start_ticks(std::process::id())],
+        "{text}"
+    );
+    assert_eq!(pids.len(), starts.len(), "{text}");
+    assert!(pids.len() <= 3 && pids.iter().all(|&p| p > 1), "{text}");
+    comm.trim_end().to_owned()
+}
+
+#[test]
+fn the_script_records_its_ancestors_and_their_starts() {
+    let tmp = tempfile::tempdir().unwrap();
+    check_ancestors(Path::new("sh"), &tmp.path().join("plain"));
+    // A parent whose command name holds spaces and parentheses.
+    let odd = tmp.path().join("a) b (c");
+    let sh = std::fs::canonicalize("/bin/sh").unwrap();
+    std::os::unix::fs::symlink(&sh, &odd).unwrap();
+    assert_eq!(check_ancestors(&odd, &tmp.path().join("odd")), "a) b (c");
 }
 
 #[test]

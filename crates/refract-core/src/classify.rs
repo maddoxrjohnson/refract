@@ -15,17 +15,22 @@ pub enum HookStatus {
     Ended,
 }
 
-/// The most pids a [`HookReport`] keeps.
-pub const HOOK_PIDS: usize = 4;
+/// The most ancestors a [`HookReport`] keeps. Claude Code runs the hook command
+/// through `sh -c`, so the `claude` process that ran it is the second; a third leaves
+/// room for one more shell, and a nested `claude` (run from a session's Bash tool) has
+/// its parent `claude` fourth, out of reach.
+pub const HOOK_PIDS: usize = 3;
 
 /// A status hook report: the status, when the script wrote it, in Unix seconds, and
-/// the pids of the script's ancestors, nearest first (0 for none), one of which is the
-/// `claude` process that ran the hook.
+/// the script's ancestors, nearest first, one of which is the `claude` process that ran
+/// the hook. `pids[i]` started `starts[i]` clock ticks after boot (field 22 of
+/// `/proc/<pid>/stat`); 0 is none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HookReport {
     pub status: HookStatus,
     pub at: Option<i64>,
     pub pids: [u32; HOOK_PIDS],
+    pub starts: [u64; HOOK_PIDS],
 }
 
 impl HookReport {
@@ -35,12 +40,24 @@ impl HookReport {
             status,
             at,
             pids: [0; HOOK_PIDS],
+            starts: [0; HOOK_PIDS],
         }
     }
 
-    /// The recorded pids, nearest ancestor first.
-    pub fn pids(&self) -> impl Iterator<Item = u32> + '_ {
-        self.pids.iter().copied().filter(|&pid| pid != 0)
+    /// True when the script that wrote it recorded pids at all; an install from before
+    /// then does not.
+    pub fn has_pids(&self) -> bool {
+        self.pids.iter().any(|&pid| pid != 0)
+    }
+
+    /// The recorded ancestors with their start ticks, nearest first. A pid without a
+    /// start is left out, since it could be a later process given the same pid.
+    pub fn ancestors(&self) -> impl Iterator<Item = (u32, u64)> + '_ {
+        self.pids
+            .iter()
+            .copied()
+            .zip(self.starts.iter().copied())
+            .filter(|&(pid, start)| pid != 0 && start != 0)
     }
 }
 

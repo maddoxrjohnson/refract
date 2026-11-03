@@ -454,12 +454,7 @@ fn read_status(path: &Path) -> Option<HookReport> {
         .take(4096)
         .read_to_end(&mut bytes)
         .ok()?;
-    let file = hook::parse_status_file(&bytes)?;
-    let mut report = HookReport::new(file.status, file.at);
-    for (slot, pid) in report.pids.iter_mut().zip(file.pids) {
-        *slot = pid;
-    }
-    Some(report)
+    Some(hook::parse_status_file(&bytes)?.report())
 }
 
 #[cfg(test)]
@@ -574,17 +569,17 @@ mod tests {
         fs::write(dir.join(&name), r#"{"status":"waitingOnUser"}"#).unwrap();
         update_statuses(dir, &mut statuses, [&name]);
         assert_eq!(statuses[ID], report(HookStatus::WaitingOnUser, None));
-        // Pids are kept, the first four only.
+        // Pids and their starts are kept, the first three only.
         fs::write(
             dir.join(&name),
-            r#"{"status":"working","at":18,"pids":[812,640,600,500,1]}"#,
+            r#"{"status":"working","at":18,"pids":[812,640,600,500],"starts":[9,8,7,6]}"#,
         )
         .unwrap();
         update_statuses(dir, &mut statuses, [&name]);
-        assert_eq!(statuses[ID].pids, [812, 640, 600, 500]);
+        assert_eq!(statuses[ID].pids, [812, 640, 600]);
         assert_eq!(
-            statuses[ID].pids().collect::<Vec<_>>(),
-            [812, 640, 600, 500]
+            statuses[ID].ancestors().collect::<Vec<_>>(),
+            [(812, 9), (640, 8), (600, 7)]
         );
         fs::remove_file(dir.join(&name)).unwrap();
         update_statuses(dir, &mut statuses, [&name]);

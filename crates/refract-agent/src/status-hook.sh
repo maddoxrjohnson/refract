@@ -3,11 +3,12 @@
 # `sh status-hook.sh <status> <status dir>` with the hook's JSON on stdin. It writes
 # <status dir>/<session_id>.json (without an absolute status dir,
 # ${XDG_STATE_HOME:-~/.local/state}/refract/sessions/<session_id>.json) as
-# {"status":"working","event":"UserPromptSubmit","at":<unix seconds>,"pids":[...]},
-# through a temporary file so readers never see half of it. `pids` are the script's
-# ancestors from its parent up, at most 4 and above pid 1, read from /proc/<pid>/stat:
-# Claude Code runs the hook command through a shell, so the claude process that ran it
-# is among them, which tells which session a process runs after /clear or /resume. It
+# {"status":"working","event":"UserPromptSubmit","at":<unix seconds>,"pids":[...],
+# "starts":[...]}, through a temporary file so readers never see half of it. `pids` are
+# the script's ancestors from its parent up, at most 3 and above pid 1, and `starts`
+# when each started, in clock ticks after boot, both read from /proc/<pid>/stat: Claude
+# Code runs the hook command through a shell, so the claude process that ran it is
+# among them, which tells which session a process runs after /clear or /resume. It
 # prints nothing and always exits 0, so Claude never sees it and a failure never
 # blocks a session.
 {
@@ -43,27 +44,35 @@
         esac
         ;;
     esac
-    # Field 4 (ppid) of /proc/<pid>/stat, counted after the last `)`: the command name
-    # before it may hold spaces and parentheses.
+    # Fields of /proc/<pid>/stat after the last `)` (the command name before it may
+    # hold spaces and parentheses), from field 3: field 4 is the parent and field 22
+    # the start. A function has its own positional parameters, so $1 and $2 stay.
+    stat_fields() {
+        ppid=${2:-}
+        start=${20:-}
+    }
     pids=
+    starts=
     pid=${PPID:-}
     n=0
-    while [ "$n" -lt 4 ]; do
+    while [ "$n" -lt 3 ]; do
         case $pid in
         '' | *[!0-9]*) break ;;
         esac
         [ "$pid" -gt 1 ] || break
         read -r stat <"/proc/$pid/stat" || break
+        stat_fields ${stat##*)}
+        case $start in
+        '' | *[!0-9]*) break ;;
+        esac
         pids=${pids:+$pids,}$pid
+        starts=${starts:+$starts,}$start
         n=$((n + 1))
-        rest=${stat##*)}
-        rest=${rest# }
-        rest=${rest#* }
-        pid=${rest%% *}
+        pid=$ppid
     done
     mkdir -p "$dir" || exit 0
     tmp=$dir/.$id.$$.tmp
-    if printf '{"status":"%s","event":"%s","at":%s,"pids":[%s]}\n' "$status" "$event" "$(date +%s)" "$pids" >"$tmp"; then
+    if printf '{"status":"%s","event":"%s","at":%s,"pids":[%s],"starts":[%s]}\n' "$status" "$event" "$(date +%s)" "$pids" "$starts" >"$tmp"; then
         mv -f "$tmp" "$dir/$id.json" || rm -f "$tmp"
     else
         rm -f "$tmp"

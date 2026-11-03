@@ -19,7 +19,7 @@ use refract_core::worktree::{derive_missing_status, derive_worktree_status, Work
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
-use crate::procs::{self, ClaudeProcess, LiveProcess, SessionTimes};
+use crate::procs::{self, ClaudeProcess, HookRuns, LiveProcess, SessionTimes};
 use crate::scan;
 use crate::sessions::SessionReader;
 use crate::subagents;
@@ -117,6 +117,8 @@ pub struct Agent {
     procs: Vec<ClaudeProcess>,
     /// Every status the status hook reported, by session id.
     hooks: HashMap<String, HookReport>,
+    /// What `hooks` says about `procs`, worked out again when either changes.
+    hook_runs: HookRuns,
     /// Each repo's refactor, by repo path, as [`crate::refactor`] last worked it out.
     refactors: HashMap<PathBuf, RefactorInfo>,
     /// What live sessions' transcripts said about their background work.
@@ -133,6 +135,7 @@ impl Agent {
             repos: BTreeMap::new(),
             procs: Vec::new(),
             hooks: HashMap::new(),
+            hook_runs: HookRuns::default(),
             refactors: HashMap::new(),
             subagents: subagents::Tracker::default(),
         }
@@ -205,7 +208,7 @@ impl Agent {
         if loaded.is_empty() {
             return Vec::new();
         }
-        self.procs = procs::scan();
+        self.scan_procs();
         let mut inserted = Vec::new();
         for (path, git) in loaded {
             match git {
@@ -234,9 +237,9 @@ impl Agent {
     /// `/proc` and the repo's transcripts, so it works before the first load reaches
     /// the repo and for sessions started since the last liveness check.
     pub fn live_process(&mut self, path: &Path, id: &str) -> Option<LiveProcess> {
-        self.procs = procs::scan();
+        self.scan_procs();
         let sessions = self.read_sessions(path);
-        live_set(&self.procs, path, &sessions, &self.hooks).remove(id)?
+        live_set(&self.procs, path, &sessions, &self.hook_runs).remove(id)?
     }
 
     /// All snapshots, sorted by path.
@@ -293,10 +296,11 @@ impl Agent {
         let old_snapshot = old.snapshot.clone();
         if what.sessions {
             self.procs = procs::scan();
+            self.hook_runs = HookRuns::new(&self.procs, &self.hooks);
         }
         let (sessions, live, background) = if what.sessions {
             let sessions = self.read_sessions(path);
-            let live = live_set(&self.procs, path, &sessions, &self.hooks);
+            let live = live_set(&self.procs, path, &sessions, &self.hook_runs);
             let background = self.background_for(path, &live);
             (sessions, live, background)
         } else {
@@ -359,7 +363,7 @@ impl Agent {
             .filter(|p| !self.repos.contains_key(p))
             .collect();
         if !added.is_empty() {
-            self.procs = procs::scan();
+            self.scan_procs();
         }
         let mut inserted = Vec::new();
         for (path, git) in added.iter().zip(read_git_parallel(&added)) {
@@ -421,17 +425,25 @@ impl Agent {
         &self.hooks
     }
 
+    /// Scans `/proc` for `claude` processes again, and works out what the hook says
+    /// about them.
+    fn scan_procs(&mut self) {
+        self.procs = procs::scan();
+        self.hook_runs = HookRuns::new(&self.procs, &self.hooks);
+    }
+
     /// Takes in the status hook's statuses and returns events for the sessions whose
     /// state changed with them. The pids in them say which session a process runs (see
     /// [`procs::live_sessions`]), so which sessions are live is worked out again, from
     /// the processes last scanned.
     pub fn set_hooks(&mut self, hooks: HashMap<String, HookReport>) -> Vec<Event> {
         self.hooks = hooks;
+        self.hook_runs = HookRuns::new(&self.procs, &self.hooks);
         let stale: Vec<(PathBuf, HashMap<String, Option<LiveProcess>>)> = self
             .repos
             .iter()
             .filter_map(|(p, r)| {
-                let live = live_set(&self.procs, p, &r.sessions, &self.hooks);
+                let live = live_set(&self.procs, p, &r.sessions, &self.hook_runs);
                 (hooks_for(&self.hooks, &r.sessions) != r.hooks || live != r.live)
                     .then(|| (p.clone(), live))
             })
@@ -477,7 +489,7 @@ impl Agent {
     /// are counted again too, since work falls silent without any file changing (see
     /// [`subagents::STALE_AFTER`]).
     pub fn recheck_live(&mut self, now: DateTime<Utc>) -> Vec<Event> {
-        self.procs = procs::scan();
+        self.scan_procs();
         let watched: Vec<PathBuf> = self
             .repos
             .iter()
@@ -487,7 +499,7 @@ impl Agent {
         let mut events = Vec::new();
         for path in watched {
             let repo = &self.repos[&path];
-            let live = live_set(&self.procs, &path, &repo.sessions, &self.hooks);
+            let live = live_set(&self.procs, &path, &repo.sessions, &self.hook_runs);
             if live == repo.live {
                 continue;
             }
@@ -604,7 +616,7 @@ impl Agent {
 
     fn insert(&mut self, path: PathBuf, status: Status, head: HeadInfo) {
         let sessions = self.read_sessions(&path);
-        let live = live_set(&self.procs, &path, &sessions, &self.hooks);
+        let live = live_set(&self.procs, &path, &sessions, &self.hook_runs);
         let background = self.background_for(&path, &live);
         self.store(path, status, head, sessions, live, background);
     }
@@ -932,7 +944,7 @@ fn live_set(
     procs: &[ClaudeProcess],
     repo: &Path,
     sessions: &[SessionSummary],
-    hooks: &HashMap<String, HookReport>,
+    hooks: &HookRuns,
 ) -> HashMap<String, Option<LiveProcess>> {
     procs::live_sessions(procs, &path_str(repo), &session_times(sessions), hooks)
 }
@@ -1409,10 +1421,11 @@ mod tests {
             cwd: path_str(&repo),
             session_id: Some(old.to_owned()),
             started: None,
+            start_ticks: Some(4242),
             refract_folder: None,
         }];
         let sessions = agent.reader.read_repo(&path_str(&repo));
-        let live = live_set(&agent.procs, &repo, &sessions, &agent.hooks);
+        let live = live_set(&agent.procs, &repo, &sessions, &agent.hook_runs);
         let (status, head) = (Status::default(), HeadInfo::default());
         agent.store(repo.clone(), status, head, sessions, live, HashMap::new());
         let live_ids = |agent: &Agent| {
@@ -1424,6 +1437,7 @@ mod tests {
 
         let mut working = HookReport::new(HookStatus::Working, Some(Utc::now().timestamp()));
         working.pids[..2].copy_from_slice(&[900, 812]);
+        working.starts[..2].copy_from_slice(&[4300, 4242]);
         let events = agent.set_hooks([(new.to_owned(), working)].into());
         assert!(!events.is_empty());
         assert_eq!(live_ids(&agent), [new]);

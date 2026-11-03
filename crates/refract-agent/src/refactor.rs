@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::launch;
-use crate::procs::{self, ClaudeProcess, LiveProcess};
+use crate::procs::{self, ClaudeProcess, HookRuns, LiveProcess};
 use crate::scan;
 use crate::state::{path_str, Agent, Refresh};
 use crate::worktree;
@@ -1476,13 +1476,24 @@ impl Refactors {
     }
 }
 
-/// The session process `p` runs: the one its hook last reported (after `/clear` or
-/// `/resume` it no longer runs the one it names), or else the one it names. `by_hook`
-/// is [`procs::hook_sessions`].
-fn runs_session<'a>(by_hook: &'a HashMap<u32, String>, p: &'a ClaudeProcess) -> Option<&'a str> {
-    by_hook
-        .get(&p.pid)
-        .map(String::as_str)
+/// The session process `p` runs, as [`procs::live_sessions`] worked it out into
+/// `claimed`; for a process it did not tie to a session there, the one its hook last
+/// reported (after `/clear` or `/resume` it no longer runs the one it names), or else
+/// the one it names (a fresh `--session-id` with no transcript yet).
+fn runs_session<'a>(
+    claimed: &'a HashMap<String, Option<LiveProcess>>,
+    hooks: &'a HookRuns,
+    p: &'a ClaudeProcess,
+) -> Option<&'a str> {
+    claimed
+        .iter()
+        .find(|(_, process)| {
+            process
+                .as_ref()
+                .is_some_and(|q| q.pid == p.pid && q.started == p.started)
+        })
+        .map(|(id, _)| id.as_str())
+        .or_else(|| hooks.session(p.pid))
         .or(p.session_id.as_deref())
 }
 
@@ -1563,9 +1574,9 @@ fn look(
     let worktree = entry.record.worktree.as_str();
     let sessions = agent.reader_mut().read_repo(worktree);
     let times = crate::state::session_times(&sessions);
-    let claimed = procs::live_sessions(procs, worktree, &times, agent.hooks());
-    let by_hook = procs::hook_sessions(procs, agent.hooks());
-    let runs = |p| runs_session(&by_hook, p);
+    let hook_runs = HookRuns::new(procs, agent.hooks());
+    let claimed = procs::live_sessions(procs, worktree, &times, &hook_runs);
+    let runs = |p| runs_session(&claimed, &hook_runs, p);
     // A fresh `--session-id` process has no transcript yet, but names the session.
     let named = !id.is_empty() && procs.iter().any(|p| runs(p) == Some(id));
     let ours = !id.is_empty() && (named || claimed.contains_key(id));
@@ -2219,6 +2230,87 @@ pub(crate) fn same_dir(a: &Path, b: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_agent_that_ran_clear_is_another_live_session_in_the_worktree() {
+        use refract_core::classify::{HookReport, HookStatus};
+        let tmp = tempfile::tempdir().unwrap();
+        let worktree = "/home/dev/refract-worktrees/tidepool-api-a1";
+        let (old, new) = (
+            "6a1d2c3e-0000-4000-8000-0000000000a1",
+            "6a1d2c3e-0000-4000-8000-0000000000a2",
+        );
+        let project = tmp
+            .path()
+            .join("-home-dev-refract-worktrees-tidepool-api-a1");
+        fs::create_dir_all(&project).unwrap();
+        for (id, hour) in [(old, "09"), (new, "10")] {
+            let line = format!(
+                "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"{worktree}\",\
+                 \"timestamp\":\"2026-11-01T{hour}:00:00Z\",\"message\":{{\"role\":\"user\",\
+                 \"content\":\"split the tide tables\"}}}}\n"
+            );
+            fs::write(project.join(format!("{id}.jsonl")), line).unwrap();
+        }
+        let mut agent = Agent::new(crate::config::Config {
+            roots: vec![],
+            extra: vec![],
+            hidden: vec![],
+            depth: 1,
+            claude_projects: tmp.path().to_owned(),
+            limits_file: tmp.path().join("usage-state.json"),
+        });
+        let now = Utc::now();
+        let entry = Entry {
+            id: "a1".into(),
+            record: Record {
+                repo: "/home/dev/projects/tidepool-api".into(),
+                worktree: worktree.into(),
+                branch: "refract/split-tides".into(),
+                base_commit: "0123456".into(),
+                target_branch: "main".into(),
+                session_id: old.into(),
+                request_id: String::new(),
+                focus: None,
+                created_at: now,
+                launched_at: None,
+                adopted: false,
+                blocked: None,
+                blocked_head: None,
+                leftover: false,
+                leftover_reason: None,
+            },
+            git_dir: None,
+            info: None,
+            live_ids: Vec::new(),
+            waiting: false,
+        };
+        // The refactor's agent, `claude --resume <old>`, ran /clear and works on `new`.
+        let procs = [ClaudeProcess {
+            pid: 812,
+            cwd: worktree.into(),
+            session_id: Some(old.into()),
+            started: None,
+            start_ticks: Some(4242),
+            refract_folder: None,
+        }];
+        let before = look(&entry, &mut agent, &procs, IDLE_QUIET, now);
+        assert!(before.live && before.busy());
+        assert_eq!(before.live_ids, [old]);
+        assert!(matches!(before.state, Some(SessionState::Live(_))));
+
+        let mut working = HookReport::new(HookStatus::Working, Some(now.timestamp()));
+        working.pids[..2].copy_from_slice(&[900, 812]);
+        working.starts[..2].copy_from_slice(&[4300, 4242]);
+        agent.set_hooks([(new.to_owned(), working)].into());
+        let after = look(&entry, &mut agent, &procs, IDLE_QUIET, now);
+        // The recorded session no longer runs, but another `claude` in the worktree
+        // does, so the refactor stays live and busy: merge, discard and resume wait.
+        assert!(after.live && after.busy());
+        assert!(!after.idle);
+        assert_eq!(after.live_ids, [new]);
+        assert!(!matches!(after.state, Some(SessionState::Live(_))));
+    }
 
     #[test]
     fn states_follow_the_spec_table() {
