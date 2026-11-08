@@ -2,7 +2,7 @@
 //! (spec §4.3).
 //!
 //! A session that isn't running is unfinished, with a [`ResumeReason`], when it was
-//! interrupted, or when it is the newest session that isn't running and it asked the
+//! interrupted or cut off by a restart, or when it is the newest session that isn't running and it asked the
 //! person a question, or was active after the last commit while the repo has
 //! uncommitted changes or unpushed commits. Enter resumes that newest session when it
 //! is unfinished and recent; its size doesn't matter.
@@ -34,6 +34,9 @@ pub struct Candidate<'a> {
     /// ([`ended_by_clear`](crate::classify::ended_by_clear)): the person moved on from
     /// it, so it is never the last conversation and never preselected.
     pub cleared: bool,
+    /// It is not running and its latest status report, from before the machine last
+    /// booted, does not say it was closed ([`cut_off`](crate::classify::cut_off)).
+    pub cut_off: bool,
 }
 
 impl Candidate<'_> {
@@ -56,12 +59,14 @@ impl Candidate<'_> {
 }
 
 /// Why a session that isn't running is worth resuming. When more than one applies, the
-/// first listed wins. On the wire: `"interrupted"`, `"askedQuestion"`, ...
+/// first listed wins. On the wire: `"interrupted"`, `"cutOff"`, `"askedQuestion"`, ...
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ResumeReason {
     /// It stopped mid-task (any session).
     Interrupted,
+    /// A restart killed it without it being closed (any session).
+    CutOff,
     /// Its last turn ended in a reply that asks the person something.
     AskedQuestion,
     /// The repo has uncommitted changes and the session was active after the last
@@ -126,11 +131,12 @@ pub enum Preselect {
 }
 
 /// Each candidate's reason to resume it, in order; `None` for running and finished
-/// sessions. Only an interrupt counts for any session; the other reasons count only for
-/// the repo's last conversation, and only when it isn't running: a running agent's own
-/// edits aren't another session's unfinished work. When the last conversation was
-/// closed by `/clear`, the person moved on: no session gets those reasons, not even an
-/// older one. The age of a session doesn't matter here.
+/// sessions. Only an interrupt or a cut-off counts for any session, also while another
+/// one runs; the other reasons count only for the repo's last conversation, and only
+/// when it isn't running: a running agent's own edits aren't another session's
+/// unfinished work. When the last conversation was closed by `/clear`, the person moved
+/// on: no session gets those reasons, not even an older one. The age of a session
+/// doesn't matter here.
 pub fn resume_reasons(candidates: &[Candidate<'_>], repo: &RepoFacts) -> Vec<Option<ResumeReason>> {
     let last = newest(candidates, |c| !c.is_empty()).filter(|&i| {
         !matches!(candidates[i].state, SessionState::Live(_)) && !candidates[i].cleared
@@ -141,6 +147,9 @@ pub fn resume_reasons(candidates: &[Candidate<'_>], repo: &RepoFacts) -> Vec<Opt
         .map(|(i, c)| {
             if matches!(c.state, SessionState::Interrupted(_)) {
                 return Some(ResumeReason::Interrupted);
+            }
+            if c.cut_off {
+                return Some(ResumeReason::CutOff);
             }
             if last != Some(i) {
                 return None;
@@ -254,6 +263,7 @@ mod tests {
             state: SessionState::Interrupted(InterruptReason::ToolCallWithoutResult),
             focusable: false,
             cleared: false,
+            cut_off: false,
         }
     }
 
@@ -263,6 +273,7 @@ mod tests {
             state: SessionState::Finished(FinishKind::Completed),
             focusable: false,
             cleared: false,
+            cut_off: false,
         }
     }
 
@@ -272,6 +283,7 @@ mod tests {
             state: SessionState::Live(live),
             focusable,
             cleared: false,
+            cut_off: false,
         }
     }
 
@@ -341,6 +353,52 @@ mod tests {
             Some(ResumeReason::Interrupted)
         );
         assert_eq!(preselect(&[interrupted(&s)], &pushed(), now()), resume("a"));
+    }
+
+    #[test]
+    fn a_session_cut_off_by_a_restart_is_offered_like_an_interrupted_one() {
+        let cut = |summary| Candidate {
+            cut_off: true,
+            ..finished(summary)
+        };
+        // Older than a finished session: not the last conversation, still offered.
+        let (older, newer) = (ended("older", 2), ended("newer", 1));
+        let candidates = [cut(&older), finished(&newer)];
+        assert_eq!(
+            resume_reasons(&candidates, &pushed()),
+            [Some(ResumeReason::CutOff), None]
+        );
+        assert_eq!(
+            preselect(&candidates, &pushed(), now()),
+            Preselect::NewAgent
+        );
+        // The newest stopped one, recent: resumed.
+        assert_eq!(preselect(&[cut(&older)], &pushed(), now()), resume("older"));
+        // Stopped mid-task too: the interrupt wins. Asked a question too: the cut-off
+        // wins.
+        let both = Candidate {
+            cut_off: true,
+            ..interrupted(&older)
+        };
+        assert_eq!(reason(both, &pushed()), Some(ResumeReason::Interrupted));
+        let asked = asking("asked", 1);
+        assert_eq!(reason(cut(&asked), &dirty()), Some(ResumeReason::CutOff));
+        // Another session running.
+        let live = ended("live", 0);
+        let candidates = [running(&live, LiveState::Working, true), cut(&older)];
+        assert_eq!(
+            resume_reasons(&candidates, &pushed()),
+            [None, Some(ResumeReason::CutOff)]
+        );
+        // The newest conversation closed by /clear.
+        let cleared = Candidate {
+            cleared: true,
+            ..finished(&newer)
+        };
+        assert_eq!(
+            resume_reasons(&[cut(&older), cleared], &pushed()),
+            [Some(ResumeReason::CutOff), None]
+        );
     }
 
     #[test]
@@ -673,6 +731,10 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ResumeReason::AskedQuestion).unwrap(),
             serde_json::json!("askedQuestion")
+        );
+        assert_eq!(
+            serde_json::to_value(ResumeReason::CutOff).unwrap(),
+            serde_json::json!("cutOff")
         );
     }
 

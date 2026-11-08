@@ -208,6 +208,24 @@ pub fn ended_by_clear(summary: &SessionSummary, hook: Option<HookReport>) -> boo
         })
 }
 
+/// A report older than this no longer marks its session [`cut_off`]: the status hook's
+/// sweep deletes such reports anyway.
+pub const CUT_OFF_MAX_AGE: i64 = 7 * 24 * 60 * 60;
+
+/// True when the session's latest report was written before the machine last booted
+/// (`boot`, Unix seconds) and does not say `ended`: Claude Code never ran `SessionEnd`,
+/// so its process died with the machine rather than being closed. A report without a
+/// time, an unknown boot time and a report [`CUT_OFF_MAX_AGE`] old or older (at `now`,
+/// Unix seconds) give false. Resuming the session writes a report after the boot, and
+/// closing it writes `ended`, so either ends it. Whether the session is live is the
+/// caller's to check.
+pub fn cut_off(hook: Option<HookReport>, boot: Option<i64>, now: i64) -> bool {
+    hook.filter(|h| h.status != HookStatus::Ended)
+        .and_then(|h| h.at)
+        .zip(boot)
+        .is_some_and(|(at, boot)| at < boot && now.saturating_sub(at) < CUT_OFF_MAX_AGE)
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -367,5 +385,35 @@ mod tests {
             classify_report(&esc, false, cleared(at), 0),
             SessionState::Finished(FinishKind::UserInterrupted)
         );
+    }
+
+    #[test]
+    fn a_report_from_before_the_boot_that_does_not_say_ended_is_cut_off() {
+        let boot = 1_773_489_600;
+        let now = boot + 3600;
+        let report = |status, at| Some(HookReport::new(status, Some(at)));
+        for status in [
+            HookStatus::Working,
+            HookStatus::WaitingOnUser,
+            HookStatus::Finished,
+        ] {
+            assert!(cut_off(report(status, boot - 1), Some(boot), now));
+            // Written after the boot: resumed since, or still running.
+            assert!(!cut_off(report(status, boot), Some(boot), now));
+            // Up to the 7-day sweep, exclusive.
+            let old = now - CUT_OFF_MAX_AGE;
+            assert!(cut_off(report(status, old + 1), Some(boot), now));
+            assert!(!cut_off(report(status, old), Some(boot), now));
+        }
+        // Closed, or nothing to go on.
+        assert!(!cut_off(
+            report(HookStatus::Ended, boot - 1),
+            Some(boot),
+            now
+        ));
+        let untimed = Some(HookReport::new(HookStatus::Finished, None));
+        assert!(!cut_off(untimed, Some(boot), now));
+        assert!(!cut_off(report(HookStatus::Finished, boot - 1), None, now));
+        assert!(!cut_off(None, Some(boot), now));
     }
 }

@@ -252,6 +252,13 @@ pub fn same_process(recorded: Option<DateTime<Utc>>, now_started: Option<DateTim
     recorded.is_some() && recorded == now_started
 }
 
+/// When the machine booted, in Unix seconds, from `/proc/stat`.
+pub fn boot_time() -> Option<i64> {
+    fs::read_to_string("/proc/stat")
+        .ok()
+        .and_then(|s| parse_btime(&s))
+}
+
 /// The `btime` line of `/proc/stat`: boot time in seconds since the epoch.
 pub fn parse_btime(stat: &str) -> Option<i64> {
     stat.lines()

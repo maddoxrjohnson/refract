@@ -97,9 +97,10 @@ describe("Picker", () => {
     setup();
     expect(screen.getAllByRole("option")[0].textContent).toContain("Resume: stopped mid-task");
     const finished = { kind: "finished", detail: "completed" } as const;
-    const at = (reason: "askedQuestion" | "uncommittedChanges" | "unpushedCommits") =>
+    const at = (reason: "cutOff" | "askedQuestion" | "uncommittedChanges" | "unpushedCommits") =>
       resumeLabel(testSession("s", finished, 1, null, 1000, reason));
-    expect([at("askedQuestion"), at("uncommittedChanges"), at("unpushedCommits")]).toEqual([
+    expect([at("cutOff"), at("askedQuestion"), at("uncommittedChanges"), at("unpushedCommits")]).toEqual([
+      "Resume: cut off by a restart",
       "Resume: asked you a question",
       "Resume: uncommitted changes",
       "Resume: unpushed commits",

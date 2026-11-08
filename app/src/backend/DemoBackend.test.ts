@@ -29,7 +29,7 @@ describe("demo repos", () => {
   it("show every resume reason, and preselect only sessions that have one", () => {
     const repos = demoRepos();
     const reasons = new Set(repos.flatMap((r) => r.sessions.map((s) => s.resumeReason)));
-    expect(reasons).toEqual(new Set([null, "interrupted", "askedQuestion", "uncommittedChanges", "unpushedCommits"]));
+    expect(reasons).toEqual(new Set([null, "interrupted", "cutOff", "askedQuestion", "uncommittedChanges", "unpushedCommits"]));
     for (const r of repos) {
       const pre = r.preselect;
       if (pre.kind !== "resume") continue;

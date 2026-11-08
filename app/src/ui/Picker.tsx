@@ -35,6 +35,7 @@ export function liveStatus(session: SessionInfo): string {
 
 const RESUME_LABELS: Record<ResumeReason, string> = {
   interrupted: "Resume: stopped mid-task",
+  cutOff: "Resume: cut off by a restart",
   askedQuestion: "Resume: asked you a question",
   uncommittedChanges: "Resume: uncommitted changes",
   unpushedCommits: "Resume: unpushed commits",

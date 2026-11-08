@@ -38,7 +38,7 @@ export type Preselect =
   | { kind: "focus"; sessionId: string };
 
 /** Why a session that isn't running is worth resuming (spec §4.3). */
-export type ResumeReason = "interrupted" | "askedQuestion" | "uncommittedChanges" | "unpushedCommits";
+export type ResumeReason = "interrupted" | "cutOff" | "askedQuestion" | "uncommittedChanges" | "unpushedCommits";
 
 export interface SessionInfo {
   id: string;

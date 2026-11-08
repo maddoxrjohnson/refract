@@ -348,6 +348,8 @@ describe("Enter and launching", () => {
     expect(resumableSession(r)).toBe(asked);
     expect(run([{ type: "launch", path: r.path }], initialNavState, ctxFor(r)).state.picker?.index).toBe(0);
     expect(repoStatus(repo("x", { sessions: [asked] })).interrupted).toBe(false);
+    const cut = { ...session("cut", 0.5, "finished"), resumeReason: "cutOff" as const };
+    expect(repoStatus(repo("x", { sessions: [cut] })).interrupted).toBe(false);
     expect(repoStatus(repo("x", { sessions: [old] })).interrupted).toBe(true);
   });
 });

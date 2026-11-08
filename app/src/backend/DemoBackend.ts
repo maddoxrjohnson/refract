@@ -129,6 +129,10 @@ const SEEDS: Seed[] = [
     changedFiles: 5,
     behind: 1,
     commit: ["Handle duplicate ledger rows", 4 * 24 * HOUR],
+    sessions: [
+      // Idle at the prompt when the machine restarted; too old to preselect.
+      session("5f0c2a1e-0000-4000-8000-00000000000b", { kind: "finished", detail: "completed" }, 3 * 24 * HOUR, "Duplicates are merged by row hash now.", 230_000, false, "cutOff"),
+    ],
     preselect: { kind: "newAgent" },
   },
   {
