@@ -8,7 +8,7 @@ import type {
   SessionInfo,
 } from "../backend/types";
 import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
-import { hostLabel, remoteUrl, repoStatus } from "../repoStatus";
+import { hostLabel, remoteUrl, repoStatus, unfinishedSessions } from "../repoStatus";
 import { StatusLine } from "./FocusLabel";
 import { firstLine, relativeTime, sessionStateLabel } from "./format";
 import { focusableSession, newAgentMode, resumableSession } from "./navigation";
@@ -177,6 +177,8 @@ export function DetailPanel({
   const running = focusableSession(repo);
   const session = lastSession(repo);
   const sessionLine = session ? firstLine(session.lastAssistantText) : null;
+  // Sessions the picker offers to resume besides the one shown here.
+  const moreToResume = unfinishedSessions(repo).filter((s) => s.id !== session?.id).length;
   const url = remote?.webUrl ?? remoteUrl(repo);
   const host = remote ? KIND_LABELS[remote.kind] : hostLabel(repo);
   const kind: RemoteKind = remote?.kind ?? (repo.remote?.host === "github.com" ? "github" : "gitlab");
@@ -329,6 +331,11 @@ export function DetailPanel({
                 )}
               </div>
               {sessionLine && <p className="rf-quote">{sessionLine}</p>}
+              {moreToResume > 0 && (
+                <div className="rf-muted">
+                  {moreToResume === 1 ? "1 more to resume" : `${moreToResume} more to resume`}
+                </div>
+              )}
             </>
           ) : (
             <div className="rf-muted">No agent sessions yet</div>

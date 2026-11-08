@@ -66,7 +66,7 @@ Shown next to the zoomed gem:
 
 - Branch, commits ahead and behind its upstream, and the number of changed files
 - Last commit message and when it was made
-- Last agent session: when it ran, whether it finished, and the first line of its final message
+- Last agent session: when it ran, whether it finished, and the first line of its final message; when other sessions are worth resuming too, "N more to resume"
 - Open pull requests (GitHub) or merge requests (GitLab), and CI status on the default branch. These are fetched from the network, cached, and refreshed about every 15 minutes or when stale.
 - Actions: **New agent** or **Resume**, **Open folder**, **Open on GitHub/GitLab**, **Hide**
 

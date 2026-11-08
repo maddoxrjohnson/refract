@@ -58,6 +58,34 @@ describe("DetailPanel", () => {
     expect(panel.textContent).not.toContain("Old news");
   });
 
+  it("counts the other sessions worth resuming besides the newest", () => {
+    const one = setup(
+      testRepo({
+        sessions: [
+          testSession("old", { kind: "interrupted", detail: "unansweredPrompt" }, 30),
+          testSession("new", { kind: "finished", detail: "completed" }, 5),
+        ],
+      }),
+    );
+    expect(one.panel.textContent).toContain("1 more to resume");
+    one.view.unmount();
+    const two = setup(
+      testRepo({
+        sessions: [
+          testSession("a", { kind: "interrupted", detail: "unansweredPrompt" }, 30),
+          testSession("b", { kind: "interrupted", detail: "apiError" }, 20),
+          testSession("new", { kind: "interrupted", detail: "apiError" }, 5),
+        ],
+      }),
+    );
+    expect(two.panel.textContent).toContain("2 more to resume");
+    two.view.unmount();
+    const none = setup(
+      testRepo({ sessions: [testSession("new", { kind: "interrupted", detail: "apiError" }, 5)] }),
+    );
+    expect(none.panel.textContent).not.toContain("more to resume");
+  });
+
   it("for a clean repo the primary action starts a new agent on Enter", () => {
     const { props } = setup();
     const primary = screen.getByRole("button", { name: /New agent/ });
