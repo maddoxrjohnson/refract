@@ -118,7 +118,7 @@ A finished reply doesn't mean the conversation is done: it may have asked you so
 | Reason | Which sessions | When |
 |---|---|---|
 | Stopped mid-task | any | It was interrupted (spec §6): an unanswered prompt, a tool call without a result, tool results without a reply, or an API error. |
-| Cut off by a restart | any | With the status hook: it was running when the machine went down. Its latest report is from before the current boot, less than 7 days old, and does not say it ended. Resuming or closing it writes a newer report, so the reason goes away. |
+| Cut off by a restart | any | With the status hook: it was running when the machine or the WSL distro restarted. Its latest report, less than 7 days old, does not say it ended and names another boot id or PID 1 start than now (a report from an older script: written before the boot time plus PID 1's start). Resuming or closing it writes a newer report, so the reason goes away. |
 | Asked you a question | the repo's last conversation | Its last turn ended in a reply that asks the person something (below). |
 | Uncommitted changes | the repo's last conversation | The repo has uncommitted changes and the session was active after the last commit (or the repo has no commits). |
 | Unpushed commits | the repo's last conversation | The branch is ahead of its upstream, or has no upstream but an origin and commits that no `origin/*` branch has, and the session was active after the last commit. A gone upstream (branch deleted on the remote) and a detached HEAD don't count. |

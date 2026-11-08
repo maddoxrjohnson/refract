@@ -77,18 +77,32 @@ Two agents ran in a repo when WSL shut down. One had finished its turn and sat i
 its transcript ends normally, the repo is clean and pushed, so it is `Finished(Completed)` with no
 resume reason and the picker does not offer it. The person expected to pick it up again.
 
-### Rule (status hook only; decided 2026-11-08: no saved state, no boot id file)
+### Rule (status hook only; decided 2026-11-08: no saved state; revised after review: boot id + init, no clock)
 
 A session is **cut off** when all hold:
-- it is not live (no process runs it);
+- it is not live (no process runs it), and its transcript has a conversation;
 - its latest status report exists and does not say `ended` (Claude Code never ran SessionEnd, so
   the process died without closing);
-- the report's `at` is before the current boot: `at < btime` (`btime` from `/proc/stat`, read once
-  at helper start; `procs.rs` already has `parse_btime`);
-- the report is under 7 days old (`now - at < 7 d`; the prune sweep deletes it after 7 days anyway).
+- the report is under 7 days old by its `at` (`now - at < 7 d`; full reads of the status directory
+  delete it after 7 days anyway; the hourly sweep does not);
+- the report is from before a restart. Not by the clock: `btime` is the shared WSL VM's boot,
+  which `wsl --terminate <distro>` keeps, and after a host sleep WSL steps the guest clock, so a
+  freshly started helper reads a later `btime` (false cut-offs). Instead:
+  - **Script** (`status-hook.sh`): appends `"boot":"<boot id>"` (`/proc/sys/kernel/random/boot_id`,
+    hex and `-` only, else empty) and `"init":<ticks>` (field 22 of `/proc/1/stat` via
+    `stat_fields`, else 0) after `reason`.
+  - **Status file / report** (core `hook.rs`, `classify.rs`): `StatusFile.boot: Option<String>`,
+    `init: Option<u64>`; `HookReport.boot: u128` (`parse_boot_id`), `init: u64`, 0 = unknown.
+  - **Helper** (`procs::current_boot`, read once in `Agent::new`): a `classify::Boot` with the
+    current boot id, PID 1 start ticks and `btime`.
+  - **Rule** (`classify::cut_off`): a report with a boot id or init is cut off when either differs
+    from the helper's (a value either side doesn't know is not compared). A report with neither
+    (older script) falls back to `at < btime + init_ticks / 100`.
 
 Without the hook, or with a report lacking `at`, nothing is cut off. Resuming the session writes a
-fresh report (after the boot), and closing it writes `ended`, so the reason goes away by itself.
+fresh report (this boot), and closing it writes `ended`, so the reason goes away by itself.
+`RepoState::refresh_preselect` recomputes the sessions' reasons as well as the preselect, so a
+cut-off lapses when its report turns 7 days old.
 
 - **Reason**: new `ResumeReason::CutOff` (wire `"cutOff"`), second in the order: interrupted >
   cutOff > askedQuestion > uncommittedChanges > unpushedCommits. Like interrupted it counts for
@@ -109,9 +123,15 @@ fresh report (after the boot), and closing it writes `ended`, so the reason goes
 
 - `resume_reasons`: cut-off older session next to a newer finished one gets `CutOff`; interrupted
   + cut_off gives `Interrupted`; cut-off while another session is live still gets `CutOff`.
-- `candidates`/snapshot (state.rs): finished session with a `finished` report before btime and no
-  process → `cutOff`, preselected Resume when newest and < 2 days; report after btime → none;
-  `ended` report → none; live → none; report older than 7 days → none; no report → none.
+- `candidates`/snapshot (state.rs): finished session with a `finished` report from another boot id
+  and no process → `cutOff`, preselected Resume when newest and < 2 days; same boot id, other init
+  (distro restart) → `cutOff`; same boot id and init, even with `at < btime` → none; `ended` →
+  none; live → none; older than 7 days → none; no report → none; old report without boot/init →
+  `btime` fallback. Empty transcript with a cut-off report → none.
+- `cut_off`/`parse_boot_id` unit tests; status file parse with and without `boot`/`init`; script
+  integration test: the file has `boot` (36-char uuid, this machine's) and `init` (> 0).
+- Agent level: `agent.boot` set directly, a cut-off session gets `cutOff` through `store`, and
+  `refresh_preselects` drops it once the report is a week old.
 - Vitest: picker label for `cutOff`; chip not shown for a cut-off finished session.
 
 ## C. Panel hint (outline)
