@@ -178,6 +178,8 @@ Refract reads the end of each session file in `~/.claude/projects/` and checks f
 - a tool call with no result,
 - an API error.
 
+With the status hook, a session closed by `/clear` (its last report says it ended with reason `clear`, written no earlier than its last entry) is not interrupted, even when its last entry is one of these.
+
 ### 6.2 With the status hook (optional, recommended)
 
 Claude Code can run a command when something happens in a session. On first run, Refract offers to add one small script to your Claude Code settings, and shows exactly what will change. The script writes a one-line status file for each session when:
