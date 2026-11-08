@@ -20,7 +20,7 @@ use std::io::Read;
 use std::path::Path;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use refract_core::classify::{HookReport, HookStatus};
+use refract_core::classify::{parse_boot_id, Boot, HookReport, HookStatus};
 use refract_core::sessions::paths_match;
 
 /// Subcommands of `claude` that are not interactive sessions.
@@ -152,7 +152,7 @@ fn is_uuid(value: &str) -> bool {
 }
 
 /// Clock ticks per second in `/proc/<pid>/stat` (`USER_HZ`).
-const TICKS_PER_SECOND: u64 = 100;
+const TICKS_PER_SECOND: u64 = refract_core::classify::TICKS_PER_SECOND;
 
 /// Field 22 (`starttime`) of a `/proc/<pid>/stat` line: clock ticks after boot. The
 /// command name in field 2 is in parentheses and may itself hold spaces and
@@ -252,11 +252,22 @@ pub fn same_process(recorded: Option<DateTime<Utc>>, now_started: Option<DateTim
     recorded.is_some() && recorded == now_started
 }
 
-/// When the machine booted, in Unix seconds, from `/proc/stat`.
-pub fn boot_time() -> Option<i64> {
-    fs::read_to_string("/proc/stat")
-        .ok()
-        .and_then(|s| parse_btime(&s))
+/// The boot this process runs in: the kernel's boot id, when PID 1 started (0 for
+/// either when it can't be read) and the boot time, from `/proc`.
+pub fn current_boot() -> Boot {
+    Boot {
+        id: fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .and_then(|id| parse_boot_id(&id))
+            .unwrap_or(0),
+        init: fs::read_to_string("/proc/1/stat")
+            .ok()
+            .and_then(|stat| parse_stat_start_ticks(&stat))
+            .unwrap_or(0),
+        btime: fs::read_to_string("/proc/stat")
+            .ok()
+            .and_then(|s| parse_btime(&s)),
+    }
 }
 
 /// The `btime` line of `/proc/stat`: boot time in seconds since the epoch.

@@ -270,6 +270,12 @@ fn install_run_and_uninstall_the_status_hook() {
         assert!(!pids.is_empty() && pids.iter().all(|p| p.as_u64().is_some_and(|p| p > 1)));
         assert_eq!(written["starts"].as_array().unwrap().len(), pids.len());
         assert_eq!(written["reason"], "");
+        // This boot's id and PID 1's start, as the helper reads them.
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").unwrap();
+        assert_eq!(written["boot"], boot_id.trim_end());
+        assert_eq!(written["boot"].as_str().unwrap().len(), 36);
+        assert_eq!(written["init"].as_u64().unwrap(), start_ticks(1));
+        assert!(written["init"].as_u64().unwrap() > 0);
         agent.event(event, |e| {
             e["event"] == "sessionChanged"
                 && e["data"]["session"]["id"] == SESSION_ID
@@ -517,7 +523,7 @@ fn the_script_records_the_reason_of_session_end() {
         assert_eq!(line["status"], "ended", "{text}");
         assert_eq!(line["reason"], written, "{reason:?}: {text}");
         assert!(
-            text.ends_with(&format!(",\"reason\":\"{written}\"}}\n")),
+            text.contains(&format!(",\"reason\":\"{written}\",\"boot\":\"")),
             "{text}"
         );
     }

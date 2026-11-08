@@ -25,7 +25,9 @@ pub const HOOK_PIDS: usize = 3;
 /// the script's ancestors, nearest first, one of which is the `claude` process that ran
 /// the hook. `pids[i]` started `starts[i]` clock ticks after boot (field 22 of
 /// `/proc/<pid>/stat`); 0 is none. `cleared` is true when the status is `Ended` with
-/// reason `clear`: the person ran `/clear`, which closed the session on purpose.
+/// reason `clear`: the person ran `/clear`, which closed the session on purpose. `boot`
+/// is the kernel's boot id that the script read ([`parse_boot_id`]) and `init` when PID
+/// 1 started, in clock ticks after boot; 0 is unknown for either.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HookReport {
     pub status: HookStatus,
@@ -33,11 +35,13 @@ pub struct HookReport {
     pub pids: [u32; HOOK_PIDS],
     pub starts: [u64; HOOK_PIDS],
     pub cleared: bool,
+    pub boot: u128,
+    pub init: u64,
 }
 
 impl HookReport {
-    /// A report without pids or a reason, as an install from before they were recorded
-    /// writes.
+    /// A report without pids, a reason or a boot, as an install from before they were
+    /// recorded writes.
     pub fn new(status: HookStatus, at: Option<i64>) -> Self {
         HookReport {
             status,
@@ -45,6 +49,8 @@ impl HookReport {
             pids: [0; HOOK_PIDS],
             starts: [0; HOOK_PIDS],
             cleared: false,
+            boot: 0,
+            init: 0,
         }
     }
 
@@ -208,22 +214,68 @@ pub fn ended_by_clear(summary: &SessionSummary, hook: Option<HookReport>) -> boo
         })
 }
 
-/// A report older than this no longer marks its session [`cut_off`]: the status hook's
-/// sweep deletes such reports anyway.
+/// A report this old or older no longer marks its session [`cut_off`]. The helper
+/// deletes reports untouched this long when it reads the whole status directory.
 pub const CUT_OFF_MAX_AGE: i64 = 7 * 24 * 60 * 60;
 
-/// True when the session's latest report was written before the machine last booted
-/// (`boot`, Unix seconds) and does not say `ended`: Claude Code never ran `SessionEnd`,
-/// so its process died with the machine rather than being closed. A report without a
-/// time, an unknown boot time and a report [`CUT_OFF_MAX_AGE`] old or older (at `now`,
-/// Unix seconds) give false. Resuming the session writes a report after the boot, and
-/// closing it writes `ended`, so either ends it. Whether the session is live is the
-/// caller's to check.
-pub fn cut_off(hook: Option<HookReport>, boot: Option<i64>, now: i64) -> bool {
-    hook.filter(|h| h.status != HookStatus::Ended)
-        .and_then(|h| h.at)
-        .zip(boot)
-        .is_some_and(|(at, boot)| at < boot && now.saturating_sub(at) < CUT_OFF_MAX_AGE)
+/// Clock ticks per second in `/proc/<pid>/stat` start times, taken as 100 as on every
+/// Linux build Refract runs on.
+pub const TICKS_PER_SECOND: u64 = 100;
+
+/// The boot the helper runs in: the kernel's boot id ([`parse_boot_id`]), when PID 1
+/// started in clock ticks after boot (0 for either is unknown), and the boot time in
+/// Unix seconds (`btime` from `/proc/stat`). A WSL distro restarted inside a running VM
+/// keeps the boot id and the boot time but gets a new PID 1.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Boot {
+    pub id: u128,
+    pub init: u64,
+    pub btime: Option<i64>,
+}
+
+/// A boot id as `/proc/sys/kernel/random/boot_id` holds it: a UUID, case and a final
+/// newline aside. `None` for anything else.
+pub fn parse_boot_id(text: &str) -> Option<u128> {
+    let text = text.trim_end();
+    let hex: String = text.chars().filter(|&c| c != '-').collect();
+    (text.len() == 36 && hex.len() == 32 && hex.chars().all(|c| c.is_ascii_hexdigit()))
+        .then(|| u128::from_str_radix(&hex, 16).ok())
+        .flatten()
+}
+
+/// True when the session's latest report does not say `ended` and was written before a
+/// restart: Claude Code never ran `SessionEnd`, so its process died with the machine or
+/// the distro rather than being closed.
+///
+/// A report that names its boot id or PID 1 start was written before a restart when
+/// either differs from `boot`'s (a side that doesn't know one doesn't compare it). The
+/// clock plays no part, as a WSL VM can keep its boot over a distro restart, and its
+/// clock (so the boot time a helper reads) moves after the host sleeps. A report from
+/// a script before those were recorded falls back to its time: before `btime` plus
+/// PID 1's start.
+///
+/// It is false for a report without a time or [`CUT_OFF_MAX_AGE`] old or older (at
+/// `now`, Unix seconds), so it lasts as long as the report. Resuming the session
+/// writes a report from this boot, and closing it writes `ended`, so either ends it.
+/// Whether the session is live is the caller's to check.
+pub fn cut_off(hook: Option<HookReport>, boot: Boot, now: i64) -> bool {
+    let Some((hook, at)) = hook
+        .filter(|h| h.status != HookStatus::Ended)
+        .and_then(|h| Some((h, h.at?)))
+    else {
+        return false;
+    };
+    if now.saturating_sub(at) >= CUT_OFF_MAX_AGE {
+        return false;
+    }
+    let differs =
+        |recorded: u128, current: u128| recorded != 0 && current != 0 && recorded != current;
+    if hook.boot != 0 || hook.init != 0 {
+        return differs(hook.boot, boot.id) || differs(hook.init.into(), boot.init.into());
+    }
+    let init_secs = i64::try_from(boot.init / TICKS_PER_SECOND).unwrap_or(i64::MAX);
+    boot.btime
+        .is_some_and(|btime| at < btime.saturating_add(init_secs))
 }
 
 #[cfg(test)]
@@ -388,32 +440,83 @@ mod tests {
     }
 
     #[test]
-    fn a_report_from_before_the_boot_that_does_not_say_ended_is_cut_off() {
-        let boot = 1_773_489_600;
-        let now = boot + 3600;
-        let report = |status, at| Some(HookReport::new(status, Some(at)));
+    fn a_report_from_another_boot_or_init_that_does_not_say_ended_is_cut_off() {
+        let btime = 1_773_489_600;
+        let now = btime + 3600;
+        let id = parse_boot_id("5346b8e5-5fc0-4caf-b9ca-2e442e237168\n").unwrap();
+        let boot = Boot {
+            id,
+            init: 5068,
+            btime: Some(btime),
+        };
+        let report = |status, at, boot_id, init| {
+            let mut report = HookReport::new(status, Some(at));
+            report.boot = boot_id;
+            report.init = init;
+            Some(report)
+        };
         for status in [
             HookStatus::Working,
             HookStatus::WaitingOnUser,
             HookStatus::Finished,
         ] {
-            assert!(cut_off(report(status, boot - 1), Some(boot), now));
-            // Written after the boot: resumed since, or still running.
-            assert!(!cut_off(report(status, boot), Some(boot), now));
-            // Up to the 7-day sweep, exclusive.
+            // This boot and init: not cut off, whatever the clock says.
+            assert!(!cut_off(report(status, btime - 60, id, 5068), boot, now));
+            // Another boot, or the same VM with the distro restarted.
+            assert!(cut_off(report(status, btime + 60, id + 1, 5068), boot, now));
+            assert!(cut_off(report(status, btime + 60, id, 9000), boot, now));
+            // Only what both sides know is compared.
+            assert!(cut_off(report(status, btime + 60, 0, 9000), boot, now));
+            assert!(!cut_off(report(status, btime - 60, 0, 5068), boot, now));
+            let unknown = Boot {
+                id: 0,
+                init: 0,
+                ..boot
+            };
+            assert!(!cut_off(
+                report(status, btime - 60, id + 1, 9000),
+                unknown,
+                now
+            ));
+            // Up to the 7-day limit, exclusive.
             let old = now - CUT_OFF_MAX_AGE;
-            assert!(cut_off(report(status, old + 1), Some(boot), now));
-            assert!(!cut_off(report(status, old), Some(boot), now));
+            assert!(cut_off(report(status, old + 1, id + 1, 5068), boot, now));
+            assert!(!cut_off(report(status, old, id + 1, 5068), boot, now));
         }
+        // A script from before boot ids: before the boot time plus PID 1's start (50 s).
+        let old_script = |at| Some(HookReport::new(HookStatus::Finished, Some(at)));
+        assert!(cut_off(old_script(btime + 49), boot, now));
+        assert!(!cut_off(old_script(btime + 50), boot, now));
+        let no_btime = Boot {
+            btime: None,
+            ..boot
+        };
+        assert!(!cut_off(old_script(btime - 60), no_btime, now));
         // Closed, or nothing to go on.
         assert!(!cut_off(
-            report(HookStatus::Ended, boot - 1),
-            Some(boot),
+            report(HookStatus::Ended, btime + 60, id + 1, 5068),
+            boot,
             now
         ));
-        let untimed = Some(HookReport::new(HookStatus::Finished, None));
-        assert!(!cut_off(untimed, Some(boot), now));
-        assert!(!cut_off(report(HookStatus::Finished, boot - 1), None, now));
-        assert!(!cut_off(None, Some(boot), now));
+        let mut untimed = report(HookStatus::Finished, 0, id + 1, 5068).unwrap();
+        untimed.at = None;
+        assert!(!cut_off(Some(untimed), boot, now));
+        assert!(!cut_off(None, boot, now));
+    }
+
+    #[test]
+    fn boot_ids_parse_as_uuids_only() {
+        assert_eq!(
+            parse_boot_id("5346B8E5-5fc0-4caf-b9ca-2e442e237168"),
+            Some(0x5346b8e5_5fc0_4caf_b9ca_2e442e237168)
+        );
+        for bad in [
+            "",
+            "5346b8e5",
+            "5346b8e5-5fc0-4caf-b9ca-2e442e23716g",
+            "5346b8e55fc04cafb9ca2e442e237168",
+        ] {
+            assert_eq!(parse_boot_id(bad), None, "{bad}");
+        }
     }
 }

@@ -15,7 +15,7 @@
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 
-use crate::classify::{HookReport, HookStatus};
+use crate::classify::{parse_boot_id, HookReport, HookStatus};
 
 /// One Claude Code hook event the script runs for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +105,10 @@ pub fn command(script: &str, status: HookStatus, status_dir: &str) -> String {
 }
 
 /// What one status file says:
-/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600],"starts":[4242,4100,3900],"reason":""}`.
-/// Files from scripts before `pids` was added have neither array, and files from
-/// scripts before `reason` was added have no reason.
+/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600],"starts":[4242,4100,3900],"reason":"","boot":"5346b8e5-5fc0-4caf-b9ca-2e442e237168","init":5068}`.
+/// Files from scripts before `pids` was added have neither array, files from scripts
+/// before `reason` was added have no reason, and files from scripts before `boot` and
+/// `init` were added have neither.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StatusFile {
     pub status: HookStatus,
@@ -130,14 +131,24 @@ pub struct StatusFile {
     /// was recorded, `Some("")` when none was found.
     #[serde(default)]
     pub reason: Option<String>,
+    /// The kernel's boot id when it was written; empty when the script could not read
+    /// it.
+    #[serde(default)]
+    pub boot: Option<String>,
+    /// When PID 1 started, in clock ticks after boot; 0 when the script could not read
+    /// it.
+    #[serde(default)]
+    pub init: Option<u64>,
 }
 
 impl StatusFile {
     /// The report it makes: the first [`crate::classify::HOOK_PIDS`] ancestors, and
     /// their starts only when there is one for each pid. It is `cleared` when the file
-    /// says `ended` with reason `clear`.
+    /// says `ended` with reason `clear`. A missing or malformed boot id gives 0.
     pub fn report(&self) -> HookReport {
         let mut report = HookReport::new(self.status, self.at);
+        report.boot = self.boot.as_deref().and_then(parse_boot_id).unwrap_or(0);
+        report.init = self.init.unwrap_or(0);
         report.cleared =
             self.status == HookStatus::Ended && self.reason.as_deref() == Some("clear");
         for (slot, &pid) in report.pids.iter_mut().zip(&self.pids) {
@@ -523,6 +534,25 @@ mod tests {
         }
         let plain = parse_status_file(br#"{"status":"ended","at":9,"reason":""}"#).unwrap();
         assert_eq!(plain.reason.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_status_file_names_its_boot_and_init() {
+        let file = parse_status_file(
+            br#"{"status":"finished","at":9,"reason":"","boot":"5346b8e5-5fc0-4caf-b9ca-2e442e237168","init":5068}"#,
+        )
+        .unwrap();
+        let report = file.report();
+        assert_eq!(report.boot, 0x5346b8e5_5fc0_4caf_b9ca_2e442e237168);
+        assert_eq!(report.init, 5068);
+        for line in [
+            &br#"{"status":"finished","at":9}"#[..],
+            br#"{"status":"finished","at":9,"boot":"","init":0}"#,
+            br#"{"status":"finished","at":9,"boot":"not-a-boot-id","init":0}"#,
+        ] {
+            let report = parse_status_file(line).unwrap().report();
+            assert_eq!((report.boot, report.init), (0, 0));
+        }
     }
 
     #[test]

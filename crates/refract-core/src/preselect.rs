@@ -34,8 +34,9 @@ pub struct Candidate<'a> {
     /// ([`ended_by_clear`](crate::classify::ended_by_clear)): the person moved on from
     /// it, so it is never the last conversation and never preselected.
     pub cleared: bool,
-    /// It is not running and its latest status report, from before the machine last
-    /// booted, does not say it was closed ([`cut_off`](crate::classify::cut_off)).
+    /// It is not running and its latest status report, from before a restart, does not
+    /// say it was closed ([`cut_off`](crate::classify::cut_off)). One with no
+    /// conversation in it has nothing to resume, so it gets no reason.
     pub cut_off: bool,
 }
 
@@ -148,7 +149,7 @@ pub fn resume_reasons(candidates: &[Candidate<'_>], repo: &RepoFacts) -> Vec<Opt
             if matches!(c.state, SessionState::Interrupted(_)) {
                 return Some(ResumeReason::Interrupted);
             }
-            if c.cut_off {
+            if c.cut_off && !c.is_empty() {
                 return Some(ResumeReason::CutOff);
             }
             if last != Some(i) {
@@ -398,6 +399,16 @@ mod tests {
         assert_eq!(
             resume_reasons(&[cut(&older), cleared], &pushed()),
             [Some(ResumeReason::CutOff), None]
+        );
+        // A transcript with no conversation in it has nothing to resume.
+        let empty = SessionSummary {
+            entry_count: 2,
+            ..ended("empty", 1)
+        };
+        assert_eq!(reason(cut(&empty), &pushed()), None);
+        assert_eq!(
+            preselect(&[cut(&empty)], &pushed(), now()),
+            Preselect::NoPicker
         );
     }
 

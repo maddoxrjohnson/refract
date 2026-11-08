@@ -6,7 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use refract_core::classify::{classify_report, cut_off, ended_by_clear, HookReport, SessionState};
+use refract_core::classify::{
+    classify_report, cut_off, ended_by_clear, Boot, HookReport, SessionState,
+};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
 use refract_core::protocol::{
@@ -82,9 +84,10 @@ impl RepoState {
     /// when it changed. The preselect depends on the time (sessions age past
     /// [`MAX_RESUME_AGE`](refract_core::preselect::MAX_RESUME_AGE)), so a snapshot
     /// built earlier can be stale even when nothing on disk moved; call this before
-    /// answering `listRepos` or `getRepo`. `boot` is when the machine booted, in Unix
-    /// seconds.
-    pub fn refresh_preselect(&mut self, now: DateTime<Utc>, boot: Option<i64>) -> bool {
+    /// answering `listRepos` or `getRepo`. The sessions' resume reasons are worked out
+    /// again with it, as a cut-off one's lasts only so long, and it returns true when
+    /// they changed too. `boot` is the boot the helper runs in.
+    pub fn refresh_preselect(&mut self, now: DateTime<Utc>, boot: Boot) -> bool {
         let candidates = candidates(
             &self.snapshot.path,
             &self.sessions,
@@ -94,12 +97,25 @@ impl RepoState {
             boot,
             now,
         );
-        let fresh = preselect(&candidates, &repo_facts(&self.status, &self.head), now);
-        if fresh == self.snapshot.preselect {
-            return false;
+        let facts = repo_facts(&self.status, &self.head);
+        let mut changed = false;
+        for (info, reason) in self
+            .snapshot
+            .sessions
+            .iter_mut()
+            .zip(resume_reasons(&candidates, &facts))
+        {
+            if info.resume_reason != reason {
+                info.resume_reason = reason;
+                changed = true;
+            }
         }
-        self.snapshot.preselect = fresh;
-        true
+        let fresh = preselect(&candidates, &facts, now);
+        if fresh != self.snapshot.preselect {
+            self.snapshot.preselect = fresh;
+            changed = true;
+        }
+        changed
     }
 
     fn wants_live_checks(&self, now: DateTime<Utc>) -> bool {
@@ -126,9 +142,9 @@ pub struct Agent {
     refactors: HashMap<PathBuf, RefactorInfo>,
     /// What live sessions' transcripts said about their background work.
     subagents: subagents::Tracker,
-    /// When the machine booted, in Unix seconds, read once: a session whose last hook
-    /// report is from before it was cut off by the restart.
-    boot: Option<i64>,
+    /// The boot the helper runs in, read once: a session whose last hook report is from
+    /// another one was cut off by a restart.
+    boot: Boot,
 }
 
 impl Agent {
@@ -144,7 +160,7 @@ impl Agent {
             hook_runs: HookRuns::default(),
             refactors: HashMap::new(),
             subagents: subagents::Tracker::default(),
-            boot: procs::boot_time(),
+            boot: procs::current_boot(),
         }
     }
 
@@ -987,8 +1003,7 @@ fn hooks_for(
 
 /// Builds a snapshot with mass 0; the caller fills in mass across repos. `hooks` holds
 /// status hook statuses by session id, `background` the number of background
-/// subagents running by live session id, and `boot` when the machine booted, in Unix
-/// seconds.
+/// subagents running by live session id, and `boot` the boot the helper runs in.
 #[allow(clippy::too_many_arguments)]
 pub fn build_snapshot(
     path: &Path,
@@ -999,7 +1014,7 @@ pub fn build_snapshot(
     hooks: &HashMap<String, HookReport>,
     background: &HashMap<String, u32>,
     now: DateTime<Utc>,
-    boot: Option<i64>,
+    boot: Boot,
 ) -> RepoSnapshot {
     let root = path_str(path);
     let dirty_paths: Vec<String> = status
@@ -1098,15 +1113,15 @@ fn session_states(
         .collect()
 }
 
-/// The repo's sessions, classified, as the preselect rule takes them. `boot` (Unix
-/// seconds) and `now` place the hook reports of sessions cut off by a restart.
+/// The repo's sessions, classified, as the preselect rule takes them. `boot`, the boot
+/// the helper runs in, and `now` tell which sessions a restart cut off.
 fn candidates<'a>(
     repo: &str,
     sessions: &'a [SessionSummary],
     live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
     background: &HashMap<String, u32>,
-    boot: Option<i64>,
+    boot: Boot,
     now: DateTime<Utc>,
 ) -> Vec<Candidate<'a>> {
     let states = session_states(sessions, live, hooks, background);
@@ -1236,7 +1251,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             Utc::now(),
-            None,
+            Boot::default(),
         )
     }
 
@@ -1273,7 +1288,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             Utc::now(),
-            None,
+            Boot::default(),
         );
         let focusable: Vec<bool> = snapshot.sessions.iter().map(|s| s.focusable).collect();
         assert_eq!(focusable, [true, false, false, false]);
@@ -1433,7 +1448,7 @@ mod tests {
                 hooks,
                 &HashMap::new(),
                 Utc::now(),
-                None,
+                Boot::default(),
             )
         };
         let interrupted = build(&HashMap::new());
@@ -1465,7 +1480,7 @@ mod tests {
                 hooks,
                 &HashMap::new(),
                 Utc::now(),
-                None,
+                Boot::default(),
             )
         };
         let snapshot = build_dirty(&[(id.to_owned(), cleared)].into());
@@ -1482,7 +1497,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             Utc::now(),
-            None,
+            Boot::default(),
         );
         assert!(unclear.sessions[0].resume_reason.is_some());
         let snapshot = build_snapshot(
@@ -1494,10 +1509,18 @@ mod tests {
             &[(id.to_owned(), cleared)].into(),
             &HashMap::new(),
             Utc::now(),
-            None,
+            Boot::default(),
         );
         assert_eq!(snapshot.sessions[0].resume_reason, None);
         assert_ne!(snapshot.preselect, Preselect::Resume(id.into()));
+    }
+
+    /// A report of `status` written at `at` in boot `id` with PID 1 started at `init`.
+    fn report_in(status: HookStatus, at: DateTime<Utc>, id: u128, init: u64) -> HookReport {
+        let mut report = HookReport::new(status, Some(at.timestamp()));
+        report.boot = id;
+        report.init = init;
+        report
     }
 
     #[test]
@@ -1505,7 +1528,11 @@ mod tests {
         const REPO: &str = "/home/dev/projects/tidepool-api";
         let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
         let now = Utc::now();
-        let boot = (now - TimeDelta::hours(1)).timestamp();
+        let boot = Boot {
+            id: 0x5346b8e5_5fc0_4caf_b9ca_2e442e237168,
+            init: 5068,
+            btime: Some((now - TimeDelta::hours(1)).timestamp()),
+        };
         // Idle at the prompt when the machine went down: the turn finished.
         let sessions = [SessionSummary {
             session_id: Some(id.into()),
@@ -1526,36 +1553,110 @@ mod tests {
                 &hooks,
                 &HashMap::new(),
                 now,
-                Some(boot),
+                boot,
             )
         };
-        let report =
-            |status, at: DateTime<Utc>| Some(HookReport::new(status, Some(at.timestamp())));
         let before = now - TimeDelta::hours(2);
+        let earlier = |status| Some(report_in(status, before, boot.id + 1, boot.init));
         let stopped = HashMap::new();
 
-        let snapshot = build(&stopped, report(HookStatus::Finished, before));
+        let snapshot = build(&stopped, earlier(HookStatus::Finished));
         let session = &snapshot.sessions[0];
         assert_eq!(session.resume_reason, Some(ResumeReason::CutOff));
         // No chip: it is still finished.
         assert_eq!(session.state, SessionState::Finished(FinishKind::Completed));
         assert_eq!(snapshot.preselect, Preselect::Resume(id.into()));
 
-        let none = |live, report| build(live, report).sessions[0].resume_reason;
-        // Written after the boot: resumed since.
-        let after = now - TimeDelta::minutes(30);
-        assert_eq!(none(&stopped, report(HookStatus::Finished, after)), None);
+        let reason = |live, report| build(live, report).sessions[0].resume_reason;
+        // The distro restarted inside the same VM.
+        let restarted = report_in(HookStatus::Finished, before, boot.id, 9000);
+        assert_eq!(
+            reason(&stopped, Some(restarted)),
+            Some(ResumeReason::CutOff)
+        );
+        // This boot, though the clock says before it: resumed since, or the clock moved.
+        let this_boot = report_in(HookStatus::Finished, before, boot.id, boot.init);
+        assert_eq!(reason(&stopped, Some(this_boot)), None);
         // Closed before the restart.
-        assert_eq!(none(&stopped, report(HookStatus::Ended, before)), None);
+        assert_eq!(reason(&stopped, earlier(HookStatus::Ended)), None);
         // Running.
         let live = [(id.to_owned(), None)].into();
-        assert_eq!(none(&live, report(HookStatus::Finished, before)), None);
-        // Older than the sweep keeps reports.
-        let old = now - TimeDelta::days(8);
-        assert_eq!(none(&stopped, report(HookStatus::Finished, old)), None);
+        assert_eq!(reason(&live, earlier(HookStatus::Finished)), None);
+        // Older than the 7 days reports are kept.
+        let old = report_in(
+            HookStatus::Finished,
+            now - TimeDelta::days(8),
+            boot.id + 1,
+            1,
+        );
+        assert_eq!(reason(&stopped, Some(old)), None);
+        // A script from before boot ids: its time against the boot time.
+        let untagged = |at| Some(HookReport::new(HookStatus::Finished, Some(at)));
+        let at = before.timestamp();
+        assert_eq!(reason(&stopped, untagged(at)), Some(ResumeReason::CutOff));
+        let after = (now - TimeDelta::minutes(30)).timestamp();
+        assert_eq!(reason(&stopped, untagged(after)), None);
         // No hook.
-        assert_eq!(none(&stopped, None), None);
+        assert_eq!(reason(&stopped, None), None);
         assert_eq!(build(&stopped, None).preselect, Preselect::NoPicker);
+    }
+
+    #[test]
+    fn the_agent_offers_a_cut_off_session_until_its_report_is_a_week_old() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = PathBuf::from("/home/dev/projects/tidepool-api");
+        let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
+        let mut agent = Agent::new(Config {
+            roots: vec![],
+            extra: vec![],
+            hidden: vec![],
+            depth: 1,
+            claude_projects: tmp.path().to_owned(),
+            limits_file: tmp.path().join("usage-state.json"),
+        });
+        let now = Utc::now();
+        agent.boot = Boot {
+            id: 0x5346b8e5_5fc0_4caf_b9ca_2e442e237168,
+            init: 5068,
+            btime: Some((now - TimeDelta::hours(1)).timestamp()),
+        };
+        let ended = now - TimeDelta::days(3);
+        let report = report_in(HookStatus::Finished, ended, agent.boot.id + 1, 5068);
+        agent.hooks.insert(id.to_owned(), report);
+        let sessions = vec![SessionSummary {
+            session_id: Some(id.into()),
+            last_timestamp: Some(ended),
+            entry_count: 2,
+            tail: Some(Tail::AssistantReply),
+            ..SessionSummary::default()
+        }];
+        // Dirty, without commits: once the cut-off lapses the changes are its reason.
+        let dirty = Status {
+            paths: vec!["src/tides.rs".into()],
+            ..Status::default()
+        };
+        let head = HeadInfo::default();
+        agent.store(
+            repo.clone(),
+            dirty,
+            head,
+            sessions,
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let reason = |agent: &Agent| agent.repos[&repo].snapshot.sessions[0].resume_reason;
+        assert_eq!(reason(&agent), Some(ResumeReason::CutOff));
+        // Too old to preselect either way.
+        assert_eq!(agent.repos[&repo].snapshot.preselect, Preselect::NewAgent);
+        assert!(agent.refresh_preselects(now).is_empty());
+
+        // The report turns a week old: the reason changes though the preselect doesn't.
+        assert_eq!(
+            agent.refresh_preselects(now + TimeDelta::days(5)),
+            std::slice::from_ref(&repo)
+        );
+        assert_eq!(reason(&agent), Some(ResumeReason::UncommittedChanges));
+        assert_eq!(agent.repos[&repo].snapshot.preselect, Preselect::NewAgent);
     }
 
     #[test]
