@@ -24,23 +24,27 @@ pub const HOOK_PIDS: usize = 3;
 /// A status hook report: the status, when the script wrote it, in Unix seconds, and
 /// the script's ancestors, nearest first, one of which is the `claude` process that ran
 /// the hook. `pids[i]` started `starts[i]` clock ticks after boot (field 22 of
-/// `/proc/<pid>/stat`); 0 is none.
+/// `/proc/<pid>/stat`); 0 is none. `cleared` is true when the status is `Ended` with
+/// reason `clear`: the person ran `/clear`, which closed the session on purpose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HookReport {
     pub status: HookStatus,
     pub at: Option<i64>,
     pub pids: [u32; HOOK_PIDS],
     pub starts: [u64; HOOK_PIDS],
+    pub cleared: bool,
 }
 
 impl HookReport {
-    /// A report without pids, as an install from before they were recorded writes.
+    /// A report without pids or a reason, as an install from before they were recorded
+    /// writes.
     pub fn new(status: HookStatus, at: Option<i64>) -> Self {
         HookReport {
             status,
             at,
             pids: [0; HOOK_PIDS],
             starts: [0; HOOK_PIDS],
+            cleared: false,
         }
     }
 
@@ -119,7 +123,8 @@ impl SessionState {
 /// running it, and the hook status if there is one.
 ///
 /// Process detection decides liveness. A hook saying `Ended` while the process still
-/// runs gives `Live(Unknown)`. When the process is gone the transcript alone decides.
+/// runs gives `Live(Unknown)`. When the process is gone the transcript alone decides
+/// (a status without a time cannot place a `/clear`; see [`classify_report`]).
 pub fn classify(summary: &SessionSummary, live: bool, hook: Option<HookStatus>) -> SessionState {
     classify_report(
         summary,
@@ -136,6 +141,10 @@ pub fn classify(summary: &SessionSummary, live: bool, hook: Option<HookStatus>) 
 /// `background` is how many background subagents and workflow runs the live session's
 /// process has running. A live session that would be idle while any run counts as working: its own
 /// turn ended, but work it started goes on. It is ignored when the session is not live.
+///
+/// A session that is not live and was [`ended_by_clear`]: the person moved on from it,
+/// so a transcript that ends mid-turn gives `Finished(Completed)` rather than
+/// `Interrupted`.
 pub fn classify_report(
     summary: &SessionSummary,
     live: bool,
@@ -147,7 +156,7 @@ pub fn classify_report(
             summary.tail == Some(Tail::UserInterrupt)
                 && at
                     .zip(summary.last_timestamp)
-                    .is_some_and(|(at, last)| last.timestamp_millis() > at * 1000)
+                    .is_some_and(|(at, last)| last.timestamp_millis() > at.saturating_mul(1000))
         };
         let state = match hook.map(|h| (h.status, h.at)) {
             Some((HookStatus::Working | HookStatus::WaitingOnUser, at))
@@ -165,7 +174,7 @@ pub fn classify_report(
         }
         return SessionState::Live(state);
     }
-    match summary.tail {
+    let state = match summary.tail {
         Some(Tail::UserPrompt) => SessionState::Interrupted(InterruptReason::UnansweredPrompt),
         Some(Tail::PendingToolUse) => {
             SessionState::Interrupted(InterruptReason::ToolCallWithoutResult)
@@ -178,7 +187,25 @@ pub fn classify_report(
         Some(Tail::AssistantReply | Tail::ToolEndedTurn) | None => {
             SessionState::Finished(FinishKind::Completed)
         }
+    };
+    if state.is_unfinished() && ended_by_clear(summary, hook) {
+        return SessionState::Finished(FinishKind::Completed);
     }
+    state
+}
+
+/// True when the session's report is `cleared` (it was closed by `/clear`) and is not
+/// older than the transcript's last line: `at` is whole seconds, so it counts up to a
+/// second after. A resumed session writes later lines and later reports, so its old
+/// `/clear` no longer counts. Without a time on either side it is false. Whether the
+/// session is live is the caller's to check.
+pub fn ended_by_clear(summary: &SessionSummary, hook: Option<HookReport>) -> bool {
+    hook.filter(|h| h.cleared)
+        .and_then(|h| h.at)
+        .zip(summary.last_timestamp)
+        .is_some_and(|(at, last)| {
+            at.saturating_add(1).saturating_mul(1000) > last.timestamp_millis()
+        })
 }
 
 #[cfg(test)]
@@ -268,6 +295,77 @@ mod tests {
         assert_eq!(
             classify_report(&interrupted, true, report(HookStatus::Working), 0),
             SessionState::Live(LiveState::Idle)
+        );
+    }
+
+    #[test]
+    fn a_session_ended_by_clear_is_not_interrupted() {
+        let at = 1_773_489_600;
+        let cleared = |at| {
+            let mut report = HookReport::new(HookStatus::Ended, Some(at));
+            report.cleared = true;
+            Some(report)
+        };
+        let summary = |tail, millis| SessionSummary {
+            tail: Some(tail),
+            last_timestamp: Utc.timestamp_millis_opt(millis).single(),
+            ..SessionSummary::default()
+        };
+        let tails = [
+            (Tail::UserPrompt, InterruptReason::UnansweredPrompt),
+            (Tail::PendingToolUse, InterruptReason::ToolCallWithoutResult),
+            (
+                Tail::UnansweredToolResult,
+                InterruptReason::ToolResultWithoutReply,
+            ),
+            (Tail::ApiError, InterruptReason::ApiError),
+        ];
+        for (tail, reason) in tails {
+            let interrupted = SessionState::Interrupted(reason);
+            // Cleared at or after the last line, within the same second too.
+            for last in [at * 1000 - 5000, at * 1000, at * 1000 + 999] {
+                assert_eq!(
+                    classify_report(&summary(tail, last), false, cleared(at), 0),
+                    SessionState::Finished(FinishKind::Completed),
+                    "{tail:?} {last}"
+                );
+            }
+            // A report older than the last line: the session was resumed since.
+            let later = summary(tail, at * 1000 + 1000);
+            assert_eq!(classify_report(&later, false, cleared(at), 0), interrupted);
+            // Ended for another reason, or with no time to place it.
+            let now = summary(tail, at * 1000);
+            assert_eq!(
+                classify_report(
+                    &now,
+                    false,
+                    Some(HookReport::new(HookStatus::Ended, Some(at))),
+                    0
+                ),
+                interrupted
+            );
+            let mut untimed = cleared(at).unwrap();
+            untimed.at = None;
+            assert_eq!(classify_report(&now, false, Some(untimed), 0), interrupted);
+            let unplaced = SessionSummary {
+                last_timestamp: None,
+                ..summary(tail, at * 1000)
+            };
+            assert_eq!(
+                classify_report(&unplaced, false, cleared(at), 0),
+                interrupted
+            );
+            // A live session is the process's to say.
+            assert_eq!(
+                classify_report(&now, true, cleared(at), 0),
+                SessionState::Live(LiveState::Unknown)
+            );
+        }
+        // A finished transcript stays as it is.
+        let esc = summary(Tail::UserInterrupt, at * 1000);
+        assert_eq!(
+            classify_report(&esc, false, cleared(at), 0),
+            SessionState::Finished(FinishKind::UserInterrupted)
         );
     }
 }

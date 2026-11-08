@@ -269,6 +269,7 @@ fn install_run_and_uninstall_the_status_hook() {
         let pids = written["pids"].as_array().unwrap();
         assert!(!pids.is_empty() && pids.iter().all(|p| p.as_u64().is_some_and(|p| p > 1)));
         assert_eq!(written["starts"].as_array().unwrap().len(), pids.len());
+        assert_eq!(written["reason"], "");
         agent.event(event, |e| {
             e["event"] == "sessionChanged"
                 && e["data"]["session"]["id"] == SESSION_ID
@@ -482,4 +483,53 @@ fn the_script_is_silent_and_succeeds_on_any_input() {
         .output()
         .unwrap();
     assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+}
+
+#[test]
+fn the_script_records_the_reason_of_session_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let script: PathBuf = [env!("CARGO_MANIFEST_DIR"), "src", "status-hook.sh"]
+        .iter()
+        .collect();
+    let dir = tmp.path().join("sessions");
+    let command = format!("sh '{}' ended '{}'", script.display(), dir.display());
+    let file = dir.join(format!("{SESSION_ID}.json"));
+    let input = |reason: Option<&str>| {
+        let mut input: Value =
+            serde_json::from_slice(&hook_input("SessionEnd", tmp.path())).unwrap();
+        if let Some(reason) = reason {
+            input["reason"] = json!(reason);
+        }
+        input.to_string().into_bytes()
+    };
+    for (reason, written) in [
+        (Some("clear"), "clear"),
+        (Some("prompt_input_exit"), "prompt_input_exit"),
+        (None, ""),
+        // Anything but letters and `_` is dropped, so the line stays valid JSON.
+        (Some("clear\",\"x\":\"1"), ""),
+        (Some("clear now"), ""),
+    ] {
+        let out = run_hook(tmp.path(), &command, &input(reason));
+        assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+        let text = std::fs::read_to_string(&file).unwrap();
+        let line: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(line["status"], "ended", "{text}");
+        assert_eq!(line["reason"], written, "{reason:?}: {text}");
+        assert!(
+            text.ends_with(&format!(",\"reason\":\"{written}\"}}\n")),
+            "{text}"
+        );
+    }
+
+    // Only an ending's reason is read: a tool's own `reason` key is not one.
+    let working = format!("sh '{}' working '{}'", script.display(), dir.display());
+    let mut tool: Value = serde_json::from_slice(&hook_input("PostToolUse", tmp.path())).unwrap();
+    tool["tool_input"] = json!({"reason": "clear"});
+    let out = run_hook(tmp.path(), &working, tool.to_string().as_bytes());
+    assert!(out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+    let text = std::fs::read_to_string(&file).unwrap();
+    let line: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(line["status"], "working", "{text}");
+    assert_eq!(line["reason"], "", "{text}");
 }

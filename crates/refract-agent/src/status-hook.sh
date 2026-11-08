@@ -4,13 +4,14 @@
 # <status dir>/<session_id>.json (without an absolute status dir,
 # ${XDG_STATE_HOME:-~/.local/state}/refract/sessions/<session_id>.json) as
 # {"status":"working","event":"UserPromptSubmit","at":<unix seconds>,"pids":[...],
-# "starts":[...]}, through a temporary file so readers never see half of it. `pids` are
-# the script's ancestors from its parent up, at most 3 and above pid 1, and `starts`
-# when each started, in clock ticks after boot, both read from /proc/<pid>/stat: Claude
-# Code runs the hook command through a shell, so the claude process that ran it is
-# among them, which tells which session a process runs after /clear or /resume. It
-# prints nothing and always exits 0, so Claude never sees it and a failure never
-# blocks a session.
+# "starts":[...],"reason":""}, through a temporary file so readers never see half of
+# it. `pids` are the script's ancestors from its parent up, at most 3 and above pid 1,
+# and `starts` when each started, in clock ticks after boot, both read from
+# /proc/<pid>/stat: Claude Code runs the hook command through a shell, so the claude
+# process that ran it is among them, which tells which session a process runs after
+# /clear or /resume. `reason`, for `ended` only, is the input's own (SessionEnd gives
+# one, such as `clear`), letters and `_` only, else empty. It prints nothing and always
+# exits 0, so Claude never sees it and a failure never blocks a session.
 {
     # Read at most 1 MiB (session_id comes first) and drain the rest, so Claude never
     # writes into a closed pipe.
@@ -33,6 +34,14 @@
     event=$(printf '%s' "$input" |
         grep -o '"hook_event_name"[[:space:]]*:[[:space:]]*"[A-Za-z]*"' | head -n 1 |
         sed 's/.*"\([A-Za-z]*\)"$/\1/')
+    # Only an ending has a reason worth reading; other events' tool input could hold a
+    # `reason` key of its own, and is not worth searching again.
+    reason=
+    if [ "$status" = ended ]; then
+        reason=$(printf '%s' "$input" |
+            grep -o '"reason"[[:space:]]*:[[:space:]]*"[A-Za-z_]*"' | head -n 1 |
+            sed 's/.*"\([A-Za-z_]*\)"$/\1/')
+    fi
     # The helper passes the directory it watches. Without one, a relative
     # XDG_STATE_HOME is ignored, as the XDG spec and refract-agent do.
     case ${2:-} in
@@ -72,7 +81,7 @@
     done
     mkdir -p "$dir" || exit 0
     tmp=$dir/.$id.$$.tmp
-    if printf '{"status":"%s","event":"%s","at":%s,"pids":[%s],"starts":[%s]}\n' "$status" "$event" "$(date +%s)" "$pids" "$starts" >"$tmp"; then
+    if printf '{"status":"%s","event":"%s","at":%s,"pids":[%s],"starts":[%s],"reason":"%s"}\n' "$status" "$event" "$(date +%s)" "$pids" "$starts" "$reason" >"$tmp"; then
         mv -f "$tmp" "$dir/$id.json" || rm -f "$tmp"
     else
         rm -f "$tmp"

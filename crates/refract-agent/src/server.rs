@@ -1483,9 +1483,11 @@ impl<W: Write> Server<W> {
     }
 
     /// Deletes ended and temporary status files while the hook is installed, then
-    /// schedules the next sweep. The deletions reach `update_statuses` through inotify,
-    /// which changes no session's state since an ended session classifies like one
-    /// without a report. Week-old files of other statuses are left to full reads.
+    /// schedules the next sweep. The deletions reach `update_statuses` through inotify.
+    /// An ended session classifies like one without a report, so they change no
+    /// session's state, except an `ended` file of a session closed by `/clear` once it
+    /// passes [`hook::CLEARED_KEEP`]: a transcript of it that ends mid-turn shows as
+    /// interrupted again. Week-old files of other statuses are left to full reads.
     fn sweep_statuses(&mut self, now: Instant) {
         self.next_sweep = now + hook::SWEEP_EVERY;
         let paths = hook::Paths::from_env();

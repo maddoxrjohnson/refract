@@ -26,12 +26,20 @@ use crate::state::path_str;
 pub const SCRIPT: &str = include_str!("status-hook.sh");
 
 /// Status files untouched this long are deleted. A live session can sit quiet for days
-/// with `finished`, so this is long.
+/// with `finished`, so this is long. An `ended` file of a session closed by `/clear` is
+/// kept for [`CLEARED_KEEP`] instead.
 pub const MAX_STATUS_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 /// An `ended` status file or a script temporary file is deleted once untouched this
 /// long; the wait keeps a fast `claude --resume` from racing the delete of its own id.
+/// An `ended` file whose reason is `clear` is the exception, kept for [`CLEARED_KEEP`].
 pub const ENDED_GRACE: Duration = Duration::from_secs(10 * 60);
+
+/// An `ended` status file whose reason is `clear` is kept this long: it is what tells a
+/// session closed by `/clear` from an interrupted one, for as long as the transcript is
+/// likely there to resume. Transcripts can outlive Claude Code's 30-day default, and
+/// the files are tiny, so this is longer.
+pub const CLEARED_KEEP: Duration = Duration::from_secs(90 * 24 * 60 * 60);
 
 /// How often the helper sweeps the status directory while it runs.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
@@ -367,8 +375,9 @@ pub fn read_statuses(dir: &Path) -> HashMap<String, HookReport> {
 /// [`ENDED_GRACE`] (a session without a report classifies the same as an ended one)
 /// and the script's temporary files older than [`ENDED_GRACE`]. With `stale`, also
 /// any status file older than [`MAX_STATUS_AGE`]: that can change a long-quiet live
-/// session's state, so only full reads ask for it. Only regular files with those
-/// names are touched.
+/// session's state, so only full reads ask for it. An `ended` file whose reason is
+/// `clear` is the exception to both: it is kept until it is older than
+/// [`CLEARED_KEEP`]. Only regular files with those names are touched.
 pub fn prune_statuses(dir: &Path, now: SystemTime, stale: bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
@@ -396,10 +405,14 @@ pub fn prune_statuses(dir: &Path, now: SystemTime, stale: bool) {
         };
         let delete = if temporary {
             age > ENDED_GRACE
+        } else if age > ENDED_GRACE {
+            match read_status(&path) {
+                Some(r) if r.cleared => age > CLEARED_KEEP,
+                Some(r) if r.status == HookStatus::Ended => true,
+                _ => stale && age > MAX_STATUS_AGE,
+            }
         } else {
-            (stale && age > MAX_STATUS_AGE)
-                || (age > ENDED_GRACE
-                    && read_status(&path).is_some_and(|r| r.status == HookStatus::Ended))
+            false
         };
         // The script replaces status files by rename, so a resumed session may have
         // written a new file since `meta` was taken; leave that one alone (this narrows
@@ -837,6 +850,39 @@ mod tests {
         assert!(fs::symlink_metadata(&link).is_ok());
         assert!(fs::symlink_metadata(&tmp_link).is_ok());
         assert!(dir.join(id(0)).is_dir());
+    }
+
+    #[test]
+    fn prune_keeps_files_of_sessions_ended_by_clear_for_90_days() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let min = |n: u64| Duration::from_secs(n * 60);
+        let day = |n: u64| Duration::from_secs(n * 24 * 60 * 60);
+        let id = |n: u8| format!("3f6c1a52-0000-4000-8000-00000000000{n}.json");
+        let cleared = r#"{"status":"ended","event":"SessionEnd","at":1,"reason":"clear"}"#;
+        let hour = write_aged(dir, &id(1), cleared, min(60));
+        let week = write_aged(dir, &id(2), cleared, day(8));
+        let months = write_aged(dir, &id(3), cleared, day(89));
+        let old = write_aged(dir, &id(6), cleared, day(91));
+        let logout = write_aged(
+            dir,
+            &id(4),
+            r#"{"status":"ended","event":"SessionEnd","at":1,"reason":"logout"}"#,
+            min(11),
+        );
+        let plain = write_aged(dir, &id(5), r#"{"status":"ended","at":1}"#, min(11));
+        let old_tmp = write_aged(dir, ".abc.123.tmp", cleared, min(11));
+
+        for stale in [false, true] {
+            prune_statuses(dir, SystemTime::now(), stale);
+            assert!(
+                hour.exists() && week.exists() && months.exists(),
+                "stale: {stale}"
+            );
+        }
+        for gone in [&old, &logout, &plain, &old_tmp] {
+            assert!(!gone.exists(), "{} should be deleted", gone.display());
+        }
     }
 
     #[test]

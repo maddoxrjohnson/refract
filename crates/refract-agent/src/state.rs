@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use chrono::{DateTime, TimeDelta, Utc};
-use refract_core::classify::{classify_report, HookReport, SessionState};
+use refract_core::classify::{classify_report, ended_by_clear, HookReport, SessionState};
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
 use refract_core::protocol::{
@@ -1100,10 +1100,16 @@ fn candidates<'a>(
     sessions
         .iter()
         .zip(states)
-        .map(|(summary, state)| Candidate {
-            summary,
-            state,
-            focusable: is_focusable(repo, summary, state, live),
+        .map(|(summary, state)| {
+            let id = summary.session_id.as_ref();
+            let cleared = !matches!(state, SessionState::Live(_))
+                && ended_by_clear(summary, id.and_then(|id| hooks.get(id).copied()));
+            Candidate {
+                summary,
+                state,
+                focusable: is_focusable(repo, summary, state, live),
+                cleared,
+            }
         })
         .collect()
 }
@@ -1191,6 +1197,7 @@ mod tests {
     use super::*;
     use refract_core::classify::{FinishKind, HookStatus, LiveState};
     use refract_core::preselect::Preselect;
+    use refract_core::transcript::Tail;
     use std::fs;
 
     fn session(id: &str, state: SessionState) -> SessionInfo {
@@ -1385,6 +1392,92 @@ mod tests {
         fs::write(&meta, done).unwrap();
         let events = agent.refresh_background(Some(&ids));
         assert_eq!(changed(&events), SessionState::Live(LiveState::Idle));
+    }
+
+    #[test]
+    fn a_session_ended_by_clear_is_not_offered_to_resume() {
+        const REPO: &str = "/home/dev/projects/tidepool-api";
+        let id = "5f0c2a9e-1b7d-4c3e-9a61-0d2e8f4b7c11";
+        let last = Utc::now() - TimeDelta::minutes(5);
+        // The prompt was cut off by a shutdown, then `claude --resume` and /clear.
+        let sessions = [SessionSummary {
+            session_id: Some(id.into()),
+            last_timestamp: Some(last),
+            entry_count: 2,
+            tail: Some(Tail::UserPrompt),
+            ..SessionSummary::default()
+        }];
+        let build = |hooks: &HashMap<String, HookReport>| {
+            build_snapshot(
+                Path::new(REPO),
+                &Status::default(),
+                &HeadInfo::default(),
+                &sessions,
+                &HashMap::new(),
+                hooks,
+                &HashMap::new(),
+                Utc::now(),
+            )
+        };
+        let interrupted = build(&HashMap::new());
+        assert!(interrupted.sessions[0].state.is_unfinished());
+        assert!(interrupted.sessions[0].resume_reason.is_some());
+        assert_eq!(interrupted.preselect, Preselect::Resume(id.into()));
+
+        let mut cleared = HookReport::new(HookStatus::Ended, Some(Utc::now().timestamp()));
+        cleared.cleared = true;
+        let snapshot = build(&[(id.to_owned(), cleared)].into());
+        let session = &snapshot.sessions[0];
+        assert_eq!(session.state, SessionState::Finished(FinishKind::Completed));
+        assert_eq!(session.resume_reason, None);
+        assert_ne!(snapshot.preselect, Preselect::Resume(id.into()));
+
+        // In a dirty repo it is not the last conversation either, so it gets no
+        // uncommitted-changes reason.
+        let dirty = Status {
+            paths: vec!["src/tides.rs".into()],
+            ..Status::default()
+        };
+        let build_dirty = |hooks: &HashMap<String, HookReport>| {
+            build_snapshot(
+                Path::new(REPO),
+                &dirty,
+                &HeadInfo::default(),
+                &sessions,
+                &HashMap::new(),
+                hooks,
+                &HashMap::new(),
+                Utc::now(),
+            )
+        };
+        let snapshot = build_dirty(&[(id.to_owned(), cleared)].into());
+        assert_eq!(snapshot.sessions[0].resume_reason, None);
+        assert_ne!(snapshot.preselect, Preselect::Resume(id.into()));
+        let mut finished = sessions[0].clone();
+        finished.tail = Some(Tail::AssistantReply);
+        let unclear = build_snapshot(
+            Path::new(REPO),
+            &dirty,
+            &HeadInfo::default(),
+            std::slice::from_ref(&finished),
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashMap::new(),
+            Utc::now(),
+        );
+        assert!(unclear.sessions[0].resume_reason.is_some());
+        let snapshot = build_snapshot(
+            Path::new(REPO),
+            &dirty,
+            &HeadInfo::default(),
+            std::slice::from_ref(&finished),
+            &HashMap::new(),
+            &[(id.to_owned(), cleared)].into(),
+            &HashMap::new(),
+            Utc::now(),
+        );
+        assert_eq!(snapshot.sessions[0].resume_reason, None);
+        assert_ne!(snapshot.preselect, Preselect::Resume(id.into()));
     }
 
     #[test]

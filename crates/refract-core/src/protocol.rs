@@ -969,7 +969,7 @@ pub struct RefactorInfo {
     /// The refactor agent's `claude` process is running.
     pub live: bool,
     /// The agent is not running and its transcript ends mid-turn, so it is worth
-    /// resuming, whatever the state.
+    /// resuming, whatever the state. A session closed by `/clear` does not count.
     #[serde(default)]
     pub interrupted: bool,
     /// Commits on the branch and not on the target, oldest first.

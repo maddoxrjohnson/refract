@@ -30,6 +30,10 @@ pub struct Candidate<'a> {
     /// Its process is known and runs in the Refract window on this repo, so a live
     /// session can be gone to.
     pub focusable: bool,
+    /// It is not running and was closed by `/clear`
+    /// ([`ended_by_clear`](crate::classify::ended_by_clear)): the person moved on from
+    /// it, so it is never the last conversation and never preselected.
+    pub cleared: bool,
 }
 
 impl Candidate<'_> {
@@ -124,11 +128,13 @@ pub enum Preselect {
 /// Each candidate's reason to resume it, in order; `None` for running and finished
 /// sessions. Only an interrupt counts for any session; the other reasons count only for
 /// the repo's last conversation, and only when it isn't running: a running agent's own
-/// edits aren't another session's unfinished work. The age of a session doesn't matter
-/// here.
+/// edits aren't another session's unfinished work. When the last conversation was
+/// closed by `/clear`, the person moved on: no session gets those reasons, not even an
+/// older one. The age of a session doesn't matter here.
 pub fn resume_reasons(candidates: &[Candidate<'_>], repo: &RepoFacts) -> Vec<Option<ResumeReason>> {
-    let last = newest(candidates, |c| !c.is_empty())
-        .filter(|&i| !matches!(candidates[i].state, SessionState::Live(_)));
+    let last = newest(candidates, |c| !c.is_empty()).filter(|&i| {
+        !matches!(candidates[i].state, SessionState::Live(_)) && !candidates[i].cleared
+    });
     candidates
         .iter()
         .enumerate()
@@ -163,7 +169,8 @@ fn newest(candidates: &[Candidate<'_>], keep: impl Fn(&Candidate<'_>) -> bool) -
         .map(|(i, _)| i)
 }
 
-/// Index of the newest candidate with a conversation that isn't running.
+/// Index of the newest candidate with a conversation that isn't running. One closed by
+/// `/clear` has no reason, so it keeps older sessions from being preselected.
 fn newest_stopped(candidates: &[Candidate<'_>]) -> Option<usize> {
     newest(candidates, |c| {
         !c.is_empty() && !matches!(c.state, SessionState::Live(_))
@@ -246,6 +253,7 @@ mod tests {
             summary,
             state: SessionState::Interrupted(InterruptReason::ToolCallWithoutResult),
             focusable: false,
+            cleared: false,
         }
     }
 
@@ -254,6 +262,7 @@ mod tests {
             summary,
             state: SessionState::Finished(FinishKind::Completed),
             focusable: false,
+            cleared: false,
         }
     }
 
@@ -262,6 +271,7 @@ mod tests {
             summary,
             state: SessionState::Live(live),
             focusable,
+            cleared: false,
         }
     }
 
@@ -761,6 +771,47 @@ mod tests {
             ..finished(&s)
         };
         assert_eq!(preselect(&[done], &pushed(), now()), Preselect::NoPicker);
+    }
+
+    #[test]
+    fn a_session_closed_by_clear_is_not_the_last_conversation() {
+        // `claude --resume x` then /clear: x stopped, the new session has no
+        // conversation yet.
+        let x = ended("x", 1);
+        let new = SessionSummary {
+            entry_count: 2,
+            ..ended("new", 0)
+        };
+        let cleared = Candidate {
+            cleared: true,
+            ..finished(&x)
+        };
+        let fresh = finished(&new);
+        for repo in [dirty(), ahead(2)] {
+            let candidates = [cleared, fresh];
+            assert_eq!(resume_reasons(&candidates, &repo), [None, None]);
+            assert_ne!(preselect(&candidates, &repo, now()), resume("x"));
+            // Without the /clear, x is the last conversation.
+            let candidates = [finished(&x), fresh];
+            assert!(resume_reasons(&candidates, &repo)[0].is_some());
+            assert_eq!(preselect(&candidates, &repo, now()), resume("x"));
+        }
+        // An older session stopped mid-task is still offered, but not preselected: the
+        // newest stopped conversation was closed on purpose.
+        let older = ended("older", 2);
+        let candidates = [interrupted(&older), cleared, fresh];
+        assert_eq!(
+            resume_reasons(&candidates, &pushed()),
+            [Some(ResumeReason::Interrupted), None, None]
+        );
+        assert_eq!(
+            preselect(&candidates, &pushed(), now()),
+            Preselect::NewAgent
+        );
+        // Nor does an older finished session inherit the repo's uncommitted changes.
+        let candidates = [finished(&older), cleared, fresh];
+        assert_eq!(resume_reasons(&candidates, &dirty()), [None, None, None]);
+        assert_eq!(preselect(&candidates, &dirty(), now()), Preselect::NewAgent);
     }
 
     #[test]

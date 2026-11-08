@@ -105,8 +105,9 @@ pub fn command(script: &str, status: HookStatus, status_dir: &str) -> String {
 }
 
 /// What one status file says:
-/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600],"starts":[4242,4100,3900]}`.
-/// Files from scripts before `pids` was added have neither array.
+/// `{"status":"working","event":"UserPromptSubmit","at":1773489600,"pids":[812,640,600],"starts":[4242,4100,3900],"reason":""}`.
+/// Files from scripts before `pids` was added have neither array, and files from
+/// scripts before `reason` was added have no reason.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct StatusFile {
     pub status: HookStatus,
@@ -124,13 +125,21 @@ pub struct StatusFile {
     /// `/proc/<pid>/stat`), in the same order.
     #[serde(default)]
     pub starts: Vec<u64>,
+    /// The reason Claude Code's `SessionEnd` gives (`clear`, `logout`,
+    /// `prompt_input_exit`, ...), read for `ended` only. `None` from a script before it
+    /// was recorded, `Some("")` when none was found.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 impl StatusFile {
     /// The report it makes: the first [`crate::classify::HOOK_PIDS`] ancestors, and
-    /// their starts only when there is one for each pid.
+    /// their starts only when there is one for each pid. It is `cleared` when the file
+    /// says `ended` with reason `clear`.
     pub fn report(&self) -> HookReport {
         let mut report = HookReport::new(self.status, self.at);
+        report.cleared =
+            self.status == HookStatus::Ended && self.reason.as_deref() == Some("clear");
         for (slot, &pid) in report.pids.iter_mut().zip(&self.pids) {
             *slot = pid;
         }
@@ -468,6 +477,8 @@ mod tests {
         assert!(!old.report().has_pids());
         let empty = parse_status_file(br#"{"status":"finished","at":5,"pids":[]}"#).unwrap();
         assert!(empty.pids.is_empty());
+        assert_eq!(empty.reason, None);
+        assert!(!empty.report().cleared);
         assert_eq!(
             parse_status_file(b"{\"status\":\"ended\"}\n")
                 .unwrap()
@@ -490,6 +501,28 @@ mod tests {
                 event.status
             );
         }
+    }
+
+    #[test]
+    fn only_an_ended_file_with_reason_clear_is_cleared() {
+        let file = parse_status_file(
+            br#"{"status":"ended","event":"SessionEnd","at":9,"pids":[812],"starts":[44],"reason":"clear"}"#,
+        )
+        .unwrap();
+        assert_eq!(file.reason.as_deref(), Some("clear"));
+        assert!(file.report().cleared);
+        for line in [
+            &br#"{"status":"ended","event":"SessionEnd","at":9,"reason":"logout"}"#[..],
+            br#"{"status":"ended","event":"SessionEnd","at":9,"reason":""}"#,
+            br#"{"status":"ended","event":"SessionEnd","at":9}"#,
+            br#"{"status":"finished","event":"Stop","at":9,"reason":"clear"}"#,
+            br#"{"status":"working","at":9,"reason":"clear"}"#,
+        ] {
+            let file = parse_status_file(line).unwrap();
+            assert!(!file.report().cleared, "{}", String::from_utf8_lossy(line));
+        }
+        let plain = parse_status_file(br#"{"status":"ended","at":9,"reason":""}"#).unwrap();
+        assert_eq!(plain.reason.as_deref(), Some(""));
     }
 
     #[test]
