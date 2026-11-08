@@ -118,6 +118,7 @@ A finished reply doesn't mean the conversation is done: it may have asked you so
 | Reason | Which sessions | When |
 |---|---|---|
 | Stopped mid-task | any | It was interrupted (spec §6): an unanswered prompt, a tool call without a result, tool results without a reply, or an API error. |
+| Cut off by a restart | any | With the status hook: it was running when the machine went down. Its latest report is from before the current boot, less than 7 days old, and does not say it ended. Resuming or closing it writes a newer report, so the reason goes away. |
 | Asked you a question | the repo's last conversation | Its last turn ended in a reply that asks the person something (below). |
 | Uncommitted changes | the repo's last conversation | The repo has uncommitted changes and the session was active after the last commit (or the repo has no commits). |
 | Unpushed commits | the repo's last conversation | The branch is ahead of its upstream, or has no upstream but an origin and commits that no `origin/*` branch has, and the session was active after the last commit. A gone upstream (branch deleted on the remote) and a detached HEAD don't count. |
@@ -129,7 +130,7 @@ A reply asks the person something when, with fenced code blocks and inline code 
 **The picker.** A launch goes straight to a new agent when the repo is clean, has no unfinished sessions and has no agent running in its Refract VS Code window. Otherwise a small picker lists:
 
 - "Go to the running agent" for each agent still running in a terminal of the Refract window on this repo (what it is doing: waiting on you, working, idle or just running; when it last wrote; the first line of its last reply),
-- each unfinished session, newest first, labelled with its reason ("Resume: stopped mid-task", "Resume: asked you a question", "Resume: uncommitted changes", "Resume: unpushed commits"), when it ran, how large it is and the first line of its last message, and
+- each unfinished session, newest first, labelled with its reason ("Resume: stopped mid-task", "Resume: cut off by a restart", "Resume: asked you a question", "Resume: uncommitted changes", "Resume: unpushed commits"), when it ran, how large it is and the first line of its last message, and
 - New agent.
 
 One option is preselected so that Enter accepts it:
@@ -145,6 +146,7 @@ Cases, for a repo with no agent running, where S is its last conversation and en
 | clean, pushed | finished, no question | none | (new agent starts) |
 | clean, pushed | reply ends asking a question | shown | Resume S: asked you a question |
 | clean, pushed | interrupted | shown | Resume S: stopped mid-task |
+| clean, pushed | finished, cut off by a restart | shown | Resume S: cut off by a restart |
 | dirty | active after the last commit | shown | Resume S: uncommitted changes |
 | dirty | ended before the last commit | shown | New agent (review prompt) |
 | clean, 2 ahead | active after the last commit | shown | Resume S: unpushed commits |
