@@ -188,9 +188,17 @@ function CodexSection({
   const [open, setOpen] = useState(false);
   const findings = codex?.findings ?? [];
   const fixable = codex?.state === "notReady" || codex?.state === "warnings";
-  // The helper picks the agent it starts, so either one being busy holds it back.
-  const busyGate = [codex?.gates.claude, codex?.gates.codex].find((g) => g?.kind === "busy");
-  const busy = busyGate?.kind === "busy" ? busyText(busyGate) : undefined;
+  // The helper picks the agent it starts, so either one being busy holds it back, and as
+  // it stops nothing first, so does an idle agent open beside it.
+  const gates = [codex?.gates.claude, codex?.gates.codex];
+  const busyGate = gates.find((g) => g?.kind === "busy");
+  const idleOther = gates.some((g) => g?.kind === "stopIdle");
+  const busy =
+    busyGate?.kind === "busy"
+      ? busyText(busyGate)
+      : idleOther
+        ? "Close the idle agent in this repo first"
+        : undefined;
   return (
     <section className="rf-section rf-codex" aria-label="Codex">
       <div className={codex ? undefined : "rf-muted"}>{codexLine(codex)}</div>

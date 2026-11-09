@@ -645,7 +645,7 @@ A briefed launch names the other session (`brief`), and the helper builds the op
 
 ### Make Codex-ready
 
-For a repo that is Not ready or has warnings, the panel's Codex line has a Make Codex-ready button (`makeCodexReady`). It launches a new agent with a fixed prompt (`codex_ready::MAKE_READY_PROMPT`): move the shared rules into `AGENTS.md`, leave `CLAUDE.md` (or `CLAUDE.local.md`) as `@AGENTS.md` plus a "Claude only" section, reword Claude-only handoff steps neutrally, give `AGENTS.md` the same git tracking as `CLAUDE.md`, never edit `.gitignore` or commit, and list what moved. It runs as Codex when Claude is over the threshold, otherwise as Claude, and the repo watch re-checks when the files change.
+For a repo that is Not ready or has warnings, the panel's Codex line has a Make Codex-ready button (`makeCodexReady`). It launches a new agent with a fixed prompt (`codex_ready::MAKE_READY_PROMPT`): move the shared rules into `AGENTS.md`, leave `CLAUDE.md` (or `CLAUDE.local.md`) as `@AGENTS.md` plus a "Claude only" section, reword Claude-only handoff steps neutrally, give `AGENTS.md` the same git tracking as `CLAUDE.md`, never edit `.gitignore` or commit, and list what moved. It runs as Codex when Claude is over the threshold, otherwise as Claude, and the repo watch re-checks when the files change. As it stops nothing first, it is refused (`AGENT_BUSY`) while the other agent is open in the repo, busy or idle.
 
 ## Usage and system stats
 

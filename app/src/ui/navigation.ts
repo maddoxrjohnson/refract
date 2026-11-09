@@ -216,6 +216,8 @@ export function busyText(gate: Extract<Gate, { kind: "busy" }>): string {
   if (gate.processUnknown && (gate.state === "idle" || gate.state === "unknown")) {
     return `Busy: ${name} is open; close it first`;
   }
+  // No status hook, or a Codex before its first message: it may be working.
+  if (gate.state === "unknown") return `Busy: ${name} is open`;
   return `Busy: ${name} is ${gate.state === "waitingOnUser" ? "waiting on you" : "working"}`;
 }
 

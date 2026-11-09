@@ -821,4 +821,8 @@ describe("busyText", () => {
     expect(busyText(busy("unknown", true))).toBe("Busy: Codex is open; close it first");
     expect(busyText(busy("working", true))).toBe("Busy: Codex is working");
   });
+
+  it("says an agent of unknown state is open", () => {
+    expect(busyText(busy("unknown"))).toBe("Busy: Codex is open");
+  });
 });

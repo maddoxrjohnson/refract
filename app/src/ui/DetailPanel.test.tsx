@@ -368,6 +368,17 @@ describe("DetailPanel remote details", () => {
       }
     });
 
+    it("holds Make Codex-ready back while an idle agent is open beside it", () => {
+      const codex = {
+        ...warnings,
+        gates: { codex: { kind: "stopIdle" as const, sessionIds: ["s1"] } },
+      };
+      setup(testRepo({ codex }), { onMakeCodexReady: vi.fn() });
+      const button = screen.getByRole("button", { name: "Make Codex-ready" });
+      expect(button).toHaveProperty("disabled", true);
+      expect(button.getAttribute("title")).toBe("Close the idle agent in this repo first");
+    });
+
     it("resumes a Codex session as Codex", () => {
       const cut = { ...testSession("c1", { kind: "interrupted", detail: "apiError" }, 1), agent: "codex" as const };
       const { props } = setup(testRepo({ sessions: [cut], preselect: { kind: "resume", sessionId: "c1" } }));

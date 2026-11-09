@@ -356,7 +356,10 @@ pub fn plan(
     if let Some(i) = newest(candidates, |c| !c.is_empty()) {
         let last = &candidates[i];
         let briefable = match last.state {
-            SessionState::Live(state) => state == LiveState::Idle,
+            // A live one the gate holds (its process unknown) can't be stopped first.
+            SessionState::Live(state) => {
+                state == LiveState::Idle && !matches!(target_gate, Gate::Busy(_))
+            }
             _ => !last.cleared && recent(last) && (nudge.is_none() || reasons[i].is_some()),
         };
         if last.agent != target && briefable {
@@ -1211,6 +1214,22 @@ mod tests {
                 process_unknown: false,
             }]
         );
+    }
+
+    #[test]
+    fn an_idle_codex_session_whose_process_is_unknown_is_not_briefed_from() {
+        // The gate holds it (it can't be stopped first), so a briefed row would only be
+        // dimmed and Enter would fall back to an unbriefed one.
+        let mine = ended("mine", 2);
+        let open = ended("open", 0);
+        let unsure = Candidate {
+            process_known: false,
+            ..codex(running(&open, LiveState::Idle, false))
+        };
+        let candidates = [interrupted(&mine), unsure];
+        let got = plan(&candidates, &pushed(), &AgentFacts::default(), now());
+        assert_eq!(got.preselect, Preselect::NewAgent);
+        assert!(got.new_agent.brief_from.is_none());
     }
 
     #[test]

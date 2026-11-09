@@ -42,8 +42,10 @@ pub const MAX_SESSIONS: usize = 20;
 pub const CODEX_HEAD_BYTES: u64 = 256 * 1024;
 
 /// How old the listing of the rollouts may get before a read lists them again, when no
-/// watch said they changed (one may have been missed, or not be set up yet).
-pub const CODEX_RELIST: Duration = Duration::from_secs(5);
+/// watch said they changed (one may have been missed, or not be set up yet). Watch events
+/// re-read just the files they name, so this is only a fallback, kept long because a
+/// listing stats every rollout ever written.
+pub const CODEX_RELIST: Duration = Duration::from_secs(60);
 
 /// What the start of a transcript says.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

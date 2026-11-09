@@ -1039,6 +1039,12 @@ impl<W: Write> Server<W> {
                     self.send(&Response::err(id, code::AGENT_BUSY, message))?;
                     return Ok(true);
                 }
+                // Unlike a picker row, the fix-up doesn't stop an idle other agent first,
+                // so one open beside it refuses too.
+                if let Some(message) = self.idle_beside(&path, agent) {
+                    self.send(&Response::err(id, code::AGENT_BUSY, message))?;
+                    return Ok(true);
+                }
                 let mode = LaunchMode::New {
                     agent,
                     prompt: Some(MAKE_READY_PROMPT.to_owned()),
@@ -1335,10 +1341,36 @@ impl<W: Write> Server<W> {
             LiveState::Idle => format!(
                 "{other} is open in this repo and Refract cannot tell which process runs it; close it before starting {this}"
             ),
-            _ => format!(
+            LiveState::Unknown => format!(
+                "{other} is open in this repo and may be working; close it before starting {this}"
+            ),
+            LiveState::Working => format!(
                 "{other} is working in this repo; wait for it to finish, or stop it in its terminal, before starting {this}"
             ),
         }))
+    }
+
+    /// For a launch that doesn't stop an idle other agent first (Make Codex-ready): why
+    /// it can't start `agent` while the other agent is open and idle in `repo`. Call
+    /// after [`Server::busy_for`], which refreshed the repo.
+    fn idle_beside(&self, path: &str, agent: AgentKind) -> Option<String> {
+        let repo = self
+            .agent
+            .repo_paths()
+            .find(|p| paths_match(&path_str(p), path))
+            .cloned()?;
+        let gate = self
+            .agent
+            .repo(&repo)
+            .and_then(|r| r.snapshot.codex.as_ref())
+            .map(|c| c.gates.of(agent).clone());
+        matches!(gate, Some(Gate::StopIdle { .. })).then(|| {
+            format!(
+                "{} is open in this repo; close it before starting {}",
+                agent.other().name(),
+                agent.name()
+            )
+        })
     }
 
     /// `stopAgent`: SIGTERM to a live session's process, unless it is working (see
