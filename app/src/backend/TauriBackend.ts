@@ -262,8 +262,8 @@ export class TauriBackend implements Backend {
     return invoke<boolean>("migrate_close_window", { path, id });
   }
 
-  migrateStopAgent(path: string, sessionId: string): Promise<void> {
-    return invoke<void>("migrate_stop_agent", { path, sessionId });
+  migrateStopAgent(path: string, sessionId: string, idleOnly?: boolean): Promise<void> {
+    return invoke<void>("migrate_stop_agent", idleOnly ? { path, sessionId, idleOnly } : { path, sessionId });
   }
 
   migrateResync(id: string): Promise<void> {

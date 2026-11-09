@@ -389,7 +389,7 @@ export function App({ backend }: { backend: Backend }) {
         const stopped: string[] = [];
         for (const id of stop) {
           try {
-            await backend.migrateStopAgent(path, id);
+            await backend.migrateStopAgent(path, id, true);
           } catch (err) {
             if (stopped.length === 0) throw err;
             const repo = repos.get(path) ?? localRepos.get(path);

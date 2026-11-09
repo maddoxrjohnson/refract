@@ -209,9 +209,14 @@ export function gateOf(repo: RepoSnapshot, agent: AgentKind): Gate {
   return repo.codex?.gates[agent] ?? { kind: "open" };
 }
 
-/** "Busy: Claude is working", or "... is waiting on you". */
+/** "Busy: Claude is working", "... is waiting on you", or, for an idle agent whose process
+ * the helper can't tell, "... is open: close it first". */
 export function busyText(gate: Extract<Gate, { kind: "busy" }>): string {
-  return `Busy: ${agentName(gate.agent)} is ${gate.state === "waitingOnUser" ? "waiting on you" : "working"}`;
+  const name = agentName(gate.agent);
+  if (gate.processUnknown && (gate.state === "idle" || gate.state === "unknown")) {
+    return `Busy: ${name} is open; close it first`;
+  }
+  return `Busy: ${name} is ${gate.state === "waitingOnUser" ? "waiting on you" : "working"}`;
 }
 
 /** One agent's New row, with Codex installed (codex spec §5). */

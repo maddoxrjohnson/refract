@@ -163,7 +163,7 @@ export interface Backend {
   /** Asks one to close (its unsaved-file prompt still shows); false when it is gone. */
   migrateCloseWindow(path: string, id: number): Promise<boolean>;
   /** Stops an agent on the repo that is finished or waiting on the user. */
-  migrateStopAgent(path: string, sessionId: string): Promise<void>;
+  migrateStopAgent(path: string, sessionId: string, idleOnly?: boolean): Promise<void>;
   /** Re-copies what changed since the report; progress and a new `migrateReady` follow. */
   migrateResync(id: string): Promise<void>;
   /**

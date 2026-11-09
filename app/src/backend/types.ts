@@ -81,7 +81,7 @@ export interface Finding {
 export type Gate =
   | { kind: "open" }
   /** The other agent is working or waiting on you: the row is dimmed. */
-  | { kind: "busy"; agent: AgentKind; sessionId: string; state: LiveState }
+  | { kind: "busy"; agent: AgentKind; sessionId: string; state: LiveState; processUnknown?: boolean }
   /** The other agent is open and idle: stop these sessions, then start. */
   | { kind: "stopIdle"; sessionIds: string[] };
 

@@ -392,6 +392,7 @@ describe("TauriBackend", () => {
     expect(await backend.migrateWindows(path)).toEqual([]);
     expect(await backend.migrateCloseWindow(path, 42)).toBe(true);
     await backend.migrateStopAgent(path, "0b7e");
+    await backend.migrateStopAgent(path, "0b7e", true);
     await backend.migrateResync("m-1");
     expect(await backend.migrateDelete("m-1", false)).toEqual(deleted);
     await backend.migrateFinish("m-1", "keep");
@@ -418,6 +419,7 @@ describe("TauriBackend", () => {
       { cmd: "migrate_windows", args: { path } },
       { cmd: "migrate_close_window", args: { path, id: 42 } },
       { cmd: "migrate_stop_agent", args: { path, sessionId: "0b7e" } },
+      { cmd: "migrate_stop_agent", args: { path, sessionId: "0b7e", idleOnly: true } },
       { cmd: "migrate_resync", args: { id: "m-1" } },
       { cmd: "migrate_delete", args: { id: "m-1", permanent: false, force: { changed: [], removed: [] } } },
       { cmd: "migrate_finish", args: { id: "m-1", action: "keep" } },

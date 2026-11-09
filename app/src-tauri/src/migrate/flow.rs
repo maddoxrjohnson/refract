@@ -185,7 +185,8 @@ pub trait MigrateHelper: Send + Sync {
     /// `migratePending`: reports still waiting, after a restart.
     fn pending(&self) -> Result<Vec<PendingMigration>, RequestError>;
     /// `stopAgent`: stops an agent that is finished or waiting on the user.
-    fn stop_agent(&self, path: &str, session_id: &str) -> Result<(), RequestError>;
+    /// With `idle_only`, the helper stops only an idle session (the picker's stop-idle row).
+    fn stop_agent(&self, path: &str, session_id: &str, idle_only: bool) -> Result<(), RequestError>;
 }
 
 fn unexpected(method: &str, reply: &Reply) -> RequestError {
@@ -269,11 +270,11 @@ impl MigrateHelper for AgentHelper<'_> {
         }
     }
 
-    fn stop_agent(&self, path: &str, session_id: &str) -> Result<(), RequestError> {
+    fn stop_agent(&self, path: &str, session_id: &str, idle_only: bool) -> Result<(), RequestError> {
         let params = StopAgentParams {
             path: path.to_owned(),
             session_id: session_id.to_owned(),
-            idle_only: false,
+            idle_only,
         };
         match self.0.request(Method::StopAgent(params), QUICK_TIMEOUT)? {
             Reply::Done => Ok(()),
@@ -625,7 +626,7 @@ mod tests {
         fn pending(&self) -> Result<Vec<PendingMigration>, RequestError> {
             Ok(Vec::new())
         }
-        fn stop_agent(&self, _: &str, _: &str) -> Result<(), RequestError> {
+        fn stop_agent(&self, _: &str, _: &str, _: bool) -> Result<(), RequestError> {
             Ok(())
         }
     }

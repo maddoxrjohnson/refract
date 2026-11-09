@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { CodexReadiness, Gate, LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
 import { DIRTY_REPO_PROMPT, repoStatus } from "../repoStatus";
 import {
+  busyText,
   initialNavState,
   matchingPaths,
   navigate,
@@ -798,5 +799,26 @@ describe("with Codex installed", () => {
     const picker = open(r);
     expect(picker.options[picker.index]).toEqual({ kind: "focus", session: live, agent: "codex" });
     expect(optionMode(picker.options[picker.index])).toEqual({ kind: "focus", sessionId: "codex-live" });
+  });
+});
+
+describe("busyText", () => {
+  const busy = (state: LiveState, processUnknown?: boolean): Extract<Gate, { kind: "busy" }> => ({
+    kind: "busy",
+    agent: "codex",
+    sessionId: "s",
+    state,
+    ...(processUnknown ? { processUnknown } : {}),
+  });
+
+  it("says what the other agent is doing", () => {
+    expect(busyText(busy("working"))).toBe("Busy: Codex is working");
+    expect(busyText(busy("waitingOnUser"))).toBe("Busy: Codex is waiting on you");
+  });
+
+  it("asks to close an idle agent whose process can't be told", () => {
+    expect(busyText(busy("idle", true))).toBe("Busy: Codex is open; close it first");
+    expect(busyText(busy("unknown", true))).toBe("Busy: Codex is open; close it first");
+    expect(busyText(busy("working", true))).toBe("Busy: Codex is working");
   });
 });

@@ -884,16 +884,18 @@ pub async fn migrate_close_window(path: String, id: u64) -> Result<bool, Migrate
     .await
 }
 
-/// Stops an agent on the repo that is finished or waiting on the user.
+/// Stops an agent on the repo that is finished or waiting on the user; with
+/// `idle_only` (the picker's "Stop the idle … agent"), only one that is idle.
 #[tauri::command]
 pub async fn migrate_stop_agent(
     app: AppHandle,
     path: String,
     session_id: String,
+    idle_only: Option<bool>,
 ) -> Result<(), MigrateError> {
     blocking(move || {
         AgentHelper(&app.state::<Agent>())
-            .stop_agent(&path, &session_id)
+            .stop_agent(&path, &session_id, idle_only.unwrap_or(false))
             .map_err(|err| MigrateError::agent("Cannot stop the agent", err))
     })
     .await

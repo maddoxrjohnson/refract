@@ -159,7 +159,7 @@ describe("App's Codex rows", () => {
     });
     await pickStopIdle(backend);
     await waitFor(() => expect(launch).toHaveBeenCalledWith(ORCHARD, { kind: "new", agent: "codex" }));
-    expect(stop).toHaveBeenCalledWith(ORCHARD, IDLE);
+    expect(stop).toHaveBeenCalledWith(ORCHARD, IDLE, true);
     expect(order).toEqual(["stop", "launch"]);
   });
 
