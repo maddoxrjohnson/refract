@@ -228,6 +228,36 @@ pub enum Method {
     /// [`Event::RepoChanged`]. Every job of this request ends with
     /// [`Event::WorktreeJobDone`].
     PruneWorktree { repo: String, path: String },
+    /// The app's settings the helper uses (see [`PrefsParams`]), sent on connect and
+    /// whenever they are saved: answered with `null`. The helper probes for Codex again
+    /// and recomputes every preselect with them, sending `repoChanged` for the repos
+    /// whose snapshot moved.
+    SetPrefs(PrefsParams),
+    /// Starts the Make Codex-ready agent on the repo at `path` (codex spec §9): a new
+    /// agent with [`crate::codex_ready::MAKE_READY_PROMPT`], as Codex when Codex is
+    /// installed and Claude's use is at or over the `codexThreshold`, otherwise as
+    /// Claude. Answered with a [`LaunchTicket`], like `prepareLaunch`.
+    MakeCodexReady { path: String },
+}
+
+/// The lowest and highest `codexThreshold` the helper takes; values outside are clamped.
+pub const CODEX_THRESHOLD_RANGE: (u32, u32) = (50, 100);
+
+/// Params of `setPrefs`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PrefsParams {
+    /// Claude's use, in whole percent, from which New Codex agent is preselected (codex
+    /// spec §2, the nudge). Clamped to [`CODEX_THRESHOLD_RANGE`].
+    pub codex_threshold: u32,
+}
+
+impl PrefsParams {
+    /// `codex_threshold` clamped to [`CODEX_THRESHOLD_RANGE`].
+    pub fn threshold(&self) -> u32 {
+        let (low, high) = CODEX_THRESHOLD_RANGE;
+        self.codex_threshold.clamp(low, high)
+    }
 }
 
 /// A request id: any JSON number or string, echoed back unchanged.
@@ -1274,7 +1304,8 @@ pub fn parse_request(line: &str) -> Result<Request, RequestError> {
         "getRepo" | "prepareLaunch" | "setupServer" | "cloneRepo" | "addRepo" | "migrate"
         | "migrateFinish" | "migrateCancel" | "migrateRecheck" | "migrateBeginDelete"
         | "migrateResync" | "stopAgent" | "startRefactor" | "resumeRefactor" | "mergeRefactor"
-        | "discardRefactor" | "removeWorktree" | "checkWorktree" | "pruneWorktree" => true,
+        | "discardRefactor" | "removeWorktree" | "checkWorktree" | "pruneWorktree" | "setPrefs"
+        | "makeCodexReady" => true,
         "ping" | "listRepos" | "usage" | "systemStats" | "hookInfo" | "installHook"
         | "uninstallHook" | "shutdown" | "migratePending" => false,
         _ => {
@@ -2730,6 +2761,39 @@ mod tests {
         );
         let missing = parse_request(r#"{"id":4,"method":"stopAgent","params":{"path":"/x"}}"#);
         assert_eq!(missing.unwrap_err().error.code, code::INVALID_PARAMS);
+
+        let prefs = parse_request(r#"{"id":5,"method":"setPrefs","params":{"codexThreshold":97}}"#)
+            .unwrap();
+        assert_eq!(
+            prefs.method,
+            Method::SetPrefs(PrefsParams {
+                codex_threshold: 97
+            })
+        );
+        let low = PrefsParams { codex_threshold: 3 };
+        assert_eq!(
+            (
+                low.threshold(),
+                PrefsParams {
+                    codex_threshold: 140
+                }
+                .threshold()
+            ),
+            (50, 100)
+        );
+        let bad =
+            parse_request(r#"{"id":6,"method":"setPrefs","params":{"codexThreshold":"high"}}"#);
+        assert_eq!(bad.unwrap_err().error.code, code::INVALID_PARAMS);
+        let ready = parse_request(
+            r#"{"id":7,"method":"makeCodexReady","params":{"path":"/home/dev/projects/kelp-cli"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ready.method,
+            Method::MakeCodexReady {
+                path: "/home/dev/projects/kelp-cli".into()
+            }
+        );
 
         let recheck = Message::Response(Response::ok(
             5,

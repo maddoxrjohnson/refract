@@ -38,6 +38,9 @@ pub struct Config {
     /// [`refract_core::limits`]), by default `usage-state.json` in Claude Code's config
     /// directory, like `claude_projects`. Only ever read.
     pub limits_file: PathBuf,
+    /// Codex CLI's home: `$CODEX_HOME`, by default `~/.codex`. Its `sessions` holds the
+    /// rollouts and `thread-writer-locks` the locks of open sessions. Only ever read.
+    pub codex_home: PathBuf,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -61,13 +64,17 @@ impl Config {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".claude"));
-        match Config::parse(&text, &home, &claude_dir, windows_desktop) {
+        let mut config = match Config::parse(&text, &home, &claude_dir, windows_desktop) {
             Ok(config) => config,
             Err(e) => {
                 eprintln!("refract-agent: ignoring {}: {e}", path.display());
                 Config::parse("", &home, &claude_dir, windows_desktop).expect("empty config")
             }
+        };
+        if let Some(codex) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+            config.codex_home = PathBuf::from(codex);
         }
+        config
     }
 
     /// Builds a config from TOML text. `desktop` is only called when the file sets no
@@ -100,6 +107,7 @@ impl Config {
                 || claude_dir.join("usage-state.json"),
                 |p| expand_home(&p, home),
             ),
+            codex_home: home.join(".codex"),
         })
     }
 }

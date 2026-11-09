@@ -1358,10 +1358,19 @@ fn background_work_keeps_a_live_session_whose_turn_ended_working() {
     agent.send(json!({"id": 2, "method": "installHook"}));
     assert_eq!(agent.response()["result"]["installed"], true);
     let state_is = |detail: &'static str| {
+        // A `repoChanged` instead when the change moves the Codex gates too (with
+        // Codex installed).
         move |e: &Value| {
-            e["event"] == "sessionChanged"
-                && e["data"]["session"]["id"] == SESSION
-                && e["data"]["session"]["state"] == json!({"kind": "live", "detail": detail})
+            let session = match e["event"].as_str() {
+                Some("sessionChanged") => Some(&e["data"]["session"]),
+                Some("repoChanged") => e["data"]["sessions"]
+                    .as_array()
+                    .and_then(|s| s.iter().find(|s| s["id"] == SESSION)),
+                _ => None,
+            };
+            session.is_some_and(|s| {
+                s["id"] == SESSION && s["state"] == json!({"kind": "live", "detail": detail})
+            })
         }
     };
     write(

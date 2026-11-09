@@ -28,7 +28,11 @@ const DEFAULT_PRICES: &str = include_str!("../../src/usage/defaultPrices.json");
 /// Reads and writes of the file happen one at a time.
 static FILE_LOCK: Mutex<()> = Mutex::new(());
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// The `codexThreshold` default and range, in percent of Claude's use (codex spec §2).
+pub const DEFAULT_CODEX_THRESHOLD: u32 = 95;
+pub const CODEX_THRESHOLD_RANGE: (u32, u32) = refract_core::protocol::CODEX_THRESHOLD_RANGE;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
     /// The GitLab instance, such as `https://gitlab.example.com`; `None` turns
@@ -46,6 +50,47 @@ pub struct Settings {
     /// following Windows.
     #[serde(deserialize_with = "lenient_theme")]
     pub theme: Theme,
+    /// Claude's 5-hour or weekly use, in percent, from which New Codex agent is
+    /// preselected. A value that is no number reads as the default; one outside
+    /// [`CODEX_THRESHOLD_RANGE`] is clamped.
+    #[serde(deserialize_with = "lenient_codex_threshold")]
+    pub codex_threshold: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Settings {
+        Settings {
+            gitlab_url: None,
+            show_forks: false,
+            show_archived: false,
+            hidden: Vec::new(),
+            cost_estimate: CostEstimate::default(),
+            theme: Theme::default(),
+            codex_threshold: DEFAULT_CODEX_THRESHOLD,
+        }
+    }
+}
+
+/// `threshold` clamped to [`CODEX_THRESHOLD_RANGE`].
+pub fn clamp_codex_threshold(threshold: u32) -> u32 {
+    let (low, high) = CODEX_THRESHOLD_RANGE;
+    threshold.clamp(low, high)
+}
+
+/// Reads `codexThreshold` as a whole percentage, rounding a fraction and clamping it to
+/// [`CODEX_THRESHOLD_RANGE`]; anything that is no number gives the default.
+fn lenient_codex_threshold<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    let (low, high) = CODEX_THRESHOLD_RANGE;
+    Ok(match value.as_f64().filter(|v| v.is_finite()) {
+        Some(v) => v.round().clamp(f64::from(low), f64::from(high)) as u32,
+        None => {
+            eprintln!("refract: the saved Codex threshold is not a number: {value}; using {DEFAULT_CODEX_THRESHOLD}");
+            DEFAULT_CODEX_THRESHOLD
+        }
+    })
 }
 
 /// What the user chose under Appearance.
@@ -237,6 +282,7 @@ pub fn normalize(settings: Settings) -> Result<Settings, SettingsError> {
         gitlab_url,
         hidden,
         cost_estimate,
+        codex_threshold: clamp_codex_threshold(settings.codex_threshold),
         ..settings
     })
 }
@@ -334,7 +380,8 @@ pub async fn settings_get(app: AppHandle) -> Result<Settings, SettingsError> {
         })
 }
 
-/// Checks and saves `settings`; the next remote listing uses them.
+/// Checks and saves `settings`; the next remote listing uses them, and the helper gets
+/// the ones it uses at once.
 #[tauri::command]
 pub async fn settings_set(app: AppHandle, settings: Settings) -> Result<(), SettingsError> {
     let settings = normalize(settings)?;
@@ -350,7 +397,9 @@ pub async fn settings_set(app: AppHandle, settings: Settings) -> Result<(), Sett
                 SettingsErrorKind::Io,
                 format!("Cannot save settings to {}: {err}", path.display()),
             )
-        })
+        })?;
+        crate::agent::send_prefs(&app, &settings);
+        Ok(())
     })
     .await
     .map_err(|err| {
@@ -379,7 +428,7 @@ mod tests {
         assert_eq!(
             wire,
             json!({"gitlabUrl": null, "showForks": false, "showArchived": false, "hidden": [],
-                "theme": "system"})
+                "theme": "system", "codexThreshold": 95})
         );
         assert_eq!(cost["enabled"], false);
         assert_eq!(
@@ -509,6 +558,24 @@ mod tests {
     }
 
     #[test]
+    fn codex_threshold_defaults_reads_leniently_and_is_clamped() {
+        // Older files have no field: the default.
+        assert_eq!(parse(r#"{"showForks": true}"#).unwrap().codex_threshold, 95);
+        assert_eq!(parse(r#"{"codexThreshold": 80}"#).unwrap().codex_threshold, 80);
+        assert_eq!(parse(r#"{"codexThreshold": 97.6}"#).unwrap().codex_threshold, 98);
+        assert_eq!(parse(r#"{"codexThreshold": 10}"#).unwrap().codex_threshold, 50);
+        assert_eq!(parse(r#"{"codexThreshold": 400}"#).unwrap().codex_threshold, 100);
+        assert_eq!(parse(r#"{"codexThreshold": "high"}"#).unwrap().codex_threshold, 95);
+        assert_eq!(parse(r#"{"codexThreshold": null}"#).unwrap().codex_threshold, 95);
+        let saved = normalize(Settings {
+            codex_threshold: 20,
+            ..Settings::default()
+        })
+        .unwrap();
+        assert_eq!(saved.codex_threshold, 50);
+    }
+
+    #[test]
     fn theme_reads_leniently() {
         assert_eq!(parse("{}").unwrap().theme, Theme::System);
         for (text, theme) in [
@@ -626,6 +693,7 @@ mod tests {
                 }],
             },
             theme: Theme::Dark,
+            codex_threshold: 80,
         };
         save_to(&path, &settings).unwrap();
         assert_eq!(load_from(&path), settings);

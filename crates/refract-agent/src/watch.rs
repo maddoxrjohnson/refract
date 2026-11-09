@@ -20,7 +20,9 @@
 //! [`crate::server::RETRY_DELAYS`]), the status hook's directory of status files, and
 //! for each live session the directories that say what background work it runs, for
 //! subagents and workflow runs starting and ending (see
-//! [`crate::subagents::watched_dirs`]).
+//! [`crate::subagents::watched_dirs`]). For Codex: its home (for `sessions` or
+//! `thread-writer-locks` appearing), its `sessions` tree of rollouts by day, and its
+//! `thread-writer-locks` directory, for sessions opening and closing.
 //!
 //! Re-watching a repo only adds and removes the directories that differ, so events
 //! already queued for unchanged watches still map to their repo. When the kernel drops a
@@ -42,6 +44,9 @@ pub const MAX_TREE_DIRS: usize = 1000;
 
 /// Most ref directories watched per repo.
 const MAX_REF_DIRS: usize = 200;
+
+/// Most directories of Codex's `sessions` tree watched: a year of days takes about 400.
+pub const MAX_CODEX_DIRS: usize = 2000;
 
 /// One raw inotify event.
 #[derive(Debug, Clone)]
@@ -81,6 +86,12 @@ pub enum Target {
     /// A directory that says what background work a live session runs, by session id
     /// (see [`crate::subagents::watched_dirs`]).
     Subagents(String),
+    /// Codex's home directory, for its `sessions` and `thread-writer-locks` appearing.
+    CodexHome,
+    /// A directory of Codex's `sessions` tree (`sessions`, a year, a month or a day).
+    CodexSessions,
+    /// Codex's `thread-writer-locks` directory.
+    CodexLocks,
 }
 
 impl Target {
@@ -114,6 +125,13 @@ pub enum Change {
     NewProjectDir(String),
     /// Something changed in a repo git could not read; it may be readable now.
     Retry(PathBuf),
+    /// A Codex rollout was written, added or removed.
+    CodexSessions,
+    /// A Codex session's lock appeared or went: it opened or closed.
+    CodexLocks,
+    /// A directory appeared in Codex's home or its `sessions` tree; its watches may need
+    /// adding.
+    CodexRewatch,
     /// Repos may have appeared or vanished.
     Rescan,
     /// Events were lost; reload everything.
@@ -363,6 +381,47 @@ impl Watcher {
         self.sync(|t| matches!(t, Target::Subagents(_)), wanted)
     }
 
+    /// Watches Codex's home at `home`, the directories of its `sessions` tree up to the
+    /// day directories (at most [`MAX_CODEX_DIRS`]) and its `thread-writer-locks`,
+    /// replacing the previous set. Missing directories are skipped; the home's watch
+    /// says when they appear.
+    pub fn watch_codex(&mut self, home: &Path) {
+        let home_mask = WatchMask::CREATE | WatchMask::MOVED_TO | WatchMask::ONLYDIR;
+        let sessions_mask = WatchMask::MODIFY
+            | WatchMask::CLOSE_WRITE
+            | WatchMask::CREATE
+            | WatchMask::DELETE
+            | WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::ONLYDIR;
+        let locks_mask = WatchMask::CREATE
+            | WatchMask::DELETE
+            | WatchMask::MOVED_TO
+            | WatchMask::MOVED_FROM
+            | WatchMask::ONLYDIR;
+        let mut wanted = vec![(home.to_owned(), home_mask, Target::CodexHome)];
+        let mut dirs = Vec::new();
+        collect_dirs_to_depth(&home.join("sessions"), 3, &mut dirs, MAX_CODEX_DIRS);
+        wanted.extend(
+            dirs.into_iter()
+                .map(|d| (d, sessions_mask, Target::CodexSessions)),
+        );
+        wanted.push((
+            home.join("thread-writer-locks"),
+            locks_mask,
+            Target::CodexLocks,
+        ));
+        self.sync(
+            |t| {
+                matches!(
+                    t,
+                    Target::CodexHome | Target::CodexSessions | Target::CodexLocks
+                )
+            },
+            wanted,
+        );
+    }
+
     /// Number of inotify watches held.
     pub fn len(&self) -> usize {
         self.targets.len()
@@ -598,6 +657,41 @@ pub fn change_for(
         Target::Subagents(id) => {
             (new_dir || name?.ends_with(".json")).then(|| Change::Background(id.clone()))
         }
+        Target::CodexHome => {
+            matches!(name?, "sessions" | "thread-writer-locks").then_some(Change::CodexRewatch)
+        }
+        Target::CodexSessions if new_dir => Some(Change::CodexRewatch),
+        Target::CodexSessions => {
+            let name = name?;
+            (name.starts_with("rollout-") && name.ends_with(".jsonl"))
+                .then_some(Change::CodexSessions)
+        }
+        Target::CodexLocks => name?.ends_with(".lock").then_some(Change::CodexLocks),
+    }
+}
+
+/// `dir` and its subdirectories down to `depth` levels below it, at most `limit` in
+/// all. A missing `dir` gives nothing.
+fn collect_dirs_to_depth(dir: &Path, depth: usize, out: &mut Vec<PathBuf>, limit: usize) {
+    if out.len() >= limit || !dir.is_dir() {
+        return;
+    }
+    out.push(dir.to_owned());
+    if depth == 0 {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut subs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    // The newest days first, so a cap drops the oldest.
+    subs.sort();
+    for sub in subs.into_iter().rev() {
+        collect_dirs_to_depth(&sub, depth - 1, out, limit);
     }
 }
 
@@ -788,6 +882,61 @@ mod tests {
             Some(Change::Rescan)
         );
         assert_eq!(change(unread, EventMask::CLOSE_WRITE, "README.md"), None);
+    }
+
+    #[test]
+    fn codex_events() {
+        let file = EventMask::CLOSE_WRITE;
+        let dir = EventMask::CREATE | EventMask::ISDIR;
+        let rollout = "rollout-2026-11-08T19-02-11-0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e.jsonl";
+        assert_eq!(
+            change(Target::CodexSessions, EventMask::MODIFY, rollout),
+            Some(Change::CodexSessions)
+        );
+        assert_eq!(change(Target::CodexSessions, file, "notes.txt"), None);
+        assert_eq!(
+            change(Target::CodexSessions, dir, "09"),
+            Some(Change::CodexRewatch)
+        );
+        assert_eq!(
+            change(
+                Target::CodexLocks,
+                EventMask::DELETE,
+                "3f6c1a52-0000-4000-8000-000000000001.lock"
+            ),
+            Some(Change::CodexLocks)
+        );
+        assert_eq!(
+            change(Target::CodexHome, dir, "sessions"),
+            Some(Change::CodexRewatch)
+        );
+        assert_eq!(change(Target::CodexHome, dir, "log"), None);
+    }
+
+    #[test]
+    fn codex_dirs_are_watched_down_to_the_days() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        fs::create_dir_all(home.join("sessions/2026/11/08")).unwrap();
+        fs::create_dir_all(home.join("sessions/2026/11/08/deeper")).unwrap();
+        let mut dirs = Vec::new();
+        collect_dirs_to_depth(&home.join("sessions"), 3, &mut dirs, MAX_CODEX_DIRS);
+        assert_eq!(dirs.len(), 4);
+        assert!(!dirs.contains(&home.join("sessions/2026/11/08/deeper")));
+        let mut capped = Vec::new();
+        collect_dirs_to_depth(&home.join("sessions"), 3, &mut capped, 2);
+        assert_eq!(capped.len(), 2);
+        let mut none = Vec::new();
+        collect_dirs_to_depth(&home.join("missing"), 3, &mut none, 10);
+        assert!(none.is_empty());
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut watcher = start(move |b| tx.send(b).is_ok()).unwrap();
+        watcher.watch_codex(home);
+        // The home and the four session directories; no lock directory yet.
+        assert_eq!(watcher.len(), 5);
+        fs::create_dir(home.join("thread-writer-locks")).unwrap();
+        watcher.watch_codex(home);
+        assert_eq!(watcher.len(), 6);
     }
 
     #[test]

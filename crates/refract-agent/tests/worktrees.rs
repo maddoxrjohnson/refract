@@ -122,6 +122,7 @@ impl Fixture {
             depth: 3,
             claude_projects: self.projects.clone(),
             limits_file: self.projects.join("usage-state.json"),
+            codex_home: self.projects.join("codex"),
         });
         agent.load_all();
         agent.snapshots()

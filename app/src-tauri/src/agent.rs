@@ -10,7 +10,7 @@ use std::time::Duration;
 use crate::process::output_with_deadline;
 use refract_client::{AgentClient, AgentStatus, Backoff, ClientEvent, RequestError, Spawn};
 use refract_core::launch::wsl_path;
-use refract_core::protocol::{self, code, Method, Reply};
+use refract_core::protocol::{self, code, Method, PrefsParams, Reply};
 use serde_json::Value;
 use tauri::path::BaseDirectory;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -24,6 +24,10 @@ pub const EVENT_EVENT: &str = "agent://event";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the helper gets to exit on its own at quit.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(2);
+/// How long `setPrefs` waits for its answer.
+const PREFS_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a helper that just started may take to show up as Tauri state, polled.
+const STATE_WAIT: Duration = Duration::from_secs(5);
 /// How long `wsl.exe --list` gets. It can hang while WSL itself starts up.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -472,6 +476,9 @@ pub fn start(app: &AppHandle) {
         move |event| {
             let result = match event {
                 ClientEvent::Status(status) => {
+                    if status == AgentStatus::Running {
+                        send_saved_prefs(&handle);
+                    }
                     crate::migrate::on_helper_status(&handle, &status);
                     crate::alerts::on_helper_status(&status);
                     crate::stats::on_helper_status(&status);
@@ -493,6 +500,50 @@ pub fn start(app: &AppHandle) {
         client,
         stopped: AtomicBool::new(false),
         distro,
+    });
+}
+
+/// The `setPrefs` params of `settings`.
+pub fn prefs_method(settings: &crate::settings::Settings) -> Method {
+    Method::SetPrefs(PrefsParams {
+        codex_threshold: settings.codex_threshold,
+    })
+}
+
+/// Sends the settings the helper uses (`setPrefs`), off the calling thread, once the
+/// helper's state is there. A failure is logged: the helper keeps its defaults.
+pub fn send_prefs(app: &AppHandle, settings: &crate::settings::Settings) {
+    let app = app.clone();
+    let method = prefs_method(settings);
+    let started = std::thread::Builder::new()
+        .name("prefs".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + STATE_WAIT;
+            loop {
+                if let Some(agent) = app.try_state::<Agent>() {
+                    if let Err(err) = agent.request(method, PREFS_TIMEOUT) {
+                        eprintln!("refract: sending settings to the helper: {err:?}");
+                    }
+                    return;
+                }
+                if std::time::Instant::now() >= deadline {
+                    eprintln!("refract: the helper is not set up; settings not sent");
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+    if let Err(err) = started {
+        eprintln!("refract: cannot send settings to the helper: {err}");
+    }
+}
+
+/// [`send_prefs`] with the saved settings, for a helper that just started.
+fn send_saved_prefs(app: &AppHandle) {
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let settings = crate::settings::load(&app);
+        send_prefs(&app, &settings);
     });
 }
 
@@ -795,6 +846,23 @@ mod tests {
         );
         assert_eq!(choose_distro(&[distro("docker-desktop", true)]), None);
         assert_eq!(choose_distro(&[]), None);
+    }
+
+    #[test]
+    fn prefs_are_sent_as_set_prefs() {
+        let settings = crate::settings::Settings {
+            codex_threshold: 88,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(protocol::Request {
+            id: 1.into(),
+            method: prefs_method(&settings),
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"id": 1, "method": "setPrefs", "params": {"codexThreshold": 88}})
+        );
     }
 
     #[test]

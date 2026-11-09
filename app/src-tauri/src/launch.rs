@@ -133,6 +133,7 @@ fn method_name(method: &Method) -> &'static str {
     match method {
         Method::StartRefactor { .. } => "startRefactor",
         Method::ResumeRefactor { .. } => "resumeRefactor",
+        Method::MakeCodexReady { .. } => "makeCodexReady",
         _ => "prepareLaunch",
     }
 }
@@ -290,6 +291,15 @@ pub async fn launch(
         path: path.clone(),
         mode,
     };
+    launch_with(app, path, method, PREPARE_TIMEOUT).await
+}
+
+/// Starts the Make Codex-ready agent on the repo at `path` (codex spec §9): the helper
+/// picks Codex when Claude is at or over the `codexThreshold` and Codex is installed,
+/// else Claude, and the repo opens in VS Code as a launch does.
+#[tauri::command]
+pub async fn make_codex_ready(app: AppHandle, path: String) -> Result<LaunchTicket, LaunchError> {
+    let method = Method::MakeCodexReady { path: path.clone() };
     launch_with(app, path, method, PREPARE_TIMEOUT).await
 }
 
@@ -742,8 +752,10 @@ mod tests {
         assert_eq!(
             new,
             LaunchMode::New {
+                agent: refract_core::protocol::AgentKind::Claude,
                 prompt: Some("hi".into()),
                 plan_mode: false,
+                brief: None,
             }
         );
         let resume: LaunchMode =
@@ -751,6 +763,7 @@ mod tests {
         assert_eq!(
             resume,
             LaunchMode::Resume {
+                agent: refract_core::protocol::AgentKind::Claude,
                 session_id: "abc".into(),
                 prompt: None,
             }

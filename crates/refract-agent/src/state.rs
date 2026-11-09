@@ -9,9 +9,12 @@ use chrono::{DateTime, TimeDelta, Utc};
 use refract_core::classify::{
     classify_report, cut_off, ended_by_clear, Boot, HookReport, SessionState,
 };
+use refract_core::codex_ready::{readiness, CodexReadiness};
+use refract_core::codex_transcript::CodexSummary;
 use refract_core::mass::{masses, MassInput};
 use refract_core::preselect::{
-    preselect, resume_reasons, Candidate, NewAgentHint, RepoFacts, Upstream,
+    live_agents, plan, resume_reasons, AgentFacts, Candidate, RepoFacts, Upstream,
+    DEFAULT_CODEX_THRESHOLD,
 };
 use refract_core::protocol::{
     AgentKind, Event, MissingWorktree, RefactorInfo, RemoteId, RepoSnapshot, SessionChange,
@@ -23,8 +26,8 @@ use refract_core::worktree::{derive_missing_status, derive_worktree_status, Work
 
 use crate::config::Config;
 use crate::git::{self, HeadInfo, Status};
-use crate::procs::{self, ClaudeProcess, HookRuns, LiveProcess, SessionTimes};
-use crate::scan;
+use crate::procs::{self, AgentProcess, CodexLock, HookRuns, LiveProcess, SessionTimes};
+use crate::scan::{self, Instructions};
 use crate::sessions::SessionReader;
 use crate::subagents;
 
@@ -63,12 +66,59 @@ impl Refresh {
     }
 }
 
+/// What the Codex parts of every snapshot depend on beyond the repo itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CodexEnv {
+    /// The Codex CLI was found (see [`crate::codex`]). While it is not, snapshots carry
+    /// no readiness and nothing preselects Codex.
+    pub installed: bool,
+    /// The app's `codexThreshold`, in percent.
+    pub threshold: f64,
+    /// Claude's highest use of its plan windows, in percent, when known
+    /// ([`refract_core::preselect::claude_peak`]).
+    pub claude_used_percent: Option<f64>,
+}
+
+impl Default for CodexEnv {
+    fn default() -> Self {
+        CodexEnv {
+            installed: false,
+            threshold: DEFAULT_CODEX_THRESHOLD,
+            claude_used_percent: None,
+        }
+    }
+}
+
+impl CodexEnv {
+    /// Claude is at or over the threshold and Codex is installed: an agent Refract
+    /// starts on its own (Make Codex-ready) runs as Codex.
+    pub fn prefers_codex(&self) -> bool {
+        self.installed
+            && self
+                .claude_used_percent
+                .is_some_and(|used| used >= self.threshold)
+    }
+}
+
+/// What a snapshot's Codex parts are built from.
+#[derive(Debug, Clone, Copy)]
+pub struct CodexInputs<'a> {
+    /// The repo's Codex sessions, newest first, live ones with no rollout yet included.
+    pub sessions: &'a [CodexSummary],
+    pub instructions: &'a Instructions,
+    pub env: CodexEnv,
+}
+
 /// One repo's raw facts and the snapshot built from them.
 #[derive(Debug, Clone)]
 pub struct RepoState {
     pub status: Status,
     pub head: HeadInfo,
     pub sessions: Vec<SessionSummary>,
+    /// The repo's Codex rollouts, newest first.
+    pub codex_sessions: Vec<CodexSummary>,
+    /// Its instruction files, read again with its status.
+    pub instructions: Instructions,
     /// Live sessions by id, with the process running each when that is certain.
     pub live: HashMap<String, Option<LiveProcess>>,
     /// Status hook statuses of this repo's sessions, by session id.
@@ -88,11 +138,19 @@ impl RepoState {
     /// built earlier can be stale even when nothing on disk moved; call this before
     /// answering `listRepos` or `getRepo`. The sessions' resume reasons are worked out
     /// again with it, as a cut-off one's lasts only so long, and it returns true when
-    /// they changed too. `boot` is the boot the helper runs in.
-    pub fn refresh_preselect(&mut self, now: DateTime<Utc>, boot: Boot) -> bool {
+    /// they changed too, as are the Codex readiness and the New row, which `env` moves.
+    /// `boot` is the boot the helper runs in.
+    pub fn refresh_preselect(&mut self, now: DateTime<Utc>, boot: Boot, env: CodexEnv) -> bool {
+        let codex = with_empty_codex(
+            &self.snapshot.path,
+            &self.sessions,
+            &self.codex_sessions,
+            &self.live,
+        );
         let candidates = candidates(
             &self.snapshot.path,
             &self.sessions,
+            &codex,
             &self.live,
             &self.hooks,
             &self.background,
@@ -112,20 +170,28 @@ impl RepoState {
                 changed = true;
             }
         }
-        let fresh = preselect(&candidates, &facts, now);
-        if fresh != self.snapshot.preselect {
-            self.snapshot.preselect = fresh;
+        let (codex, fresh) = codex_plan(&candidates, &facts, &self.instructions, env, now);
+        if fresh.preselect != self.snapshot.preselect {
+            self.snapshot.preselect = fresh.preselect;
+            changed = true;
+        }
+        if fresh.new_agent != self.snapshot.new_agent {
+            self.snapshot.new_agent = fresh.new_agent;
+            changed = true;
+        }
+        if codex != self.snapshot.codex {
+            self.snapshot.codex = codex;
             changed = true;
         }
         changed
     }
 
     fn wants_live_checks(&self, now: DateTime<Utc>) -> bool {
+        let recent =
+            |s: &SessionSummary| s.last_timestamp.is_some_and(|t| now - t < RECENT_ACTIVITY);
         !self.live.is_empty()
-            || self
-                .sessions
-                .iter()
-                .any(|s| s.last_timestamp.is_some_and(|t| now - t < RECENT_ACTIVITY))
+            || self.sessions.iter().any(recent)
+            || self.codex_sessions.iter().any(|c| recent(&c.summary))
     }
 }
 
@@ -135,7 +201,11 @@ pub struct Agent {
     config: Config,
     reader: SessionReader,
     repos: BTreeMap<PathBuf, RepoState>,
-    procs: Vec<ClaudeProcess>,
+    procs: Vec<AgentProcess>,
+    /// The Codex thread locks held open, from the same look at `/proc` as `procs`.
+    codex_locks: Vec<CodexLock>,
+    /// What the Codex parts of the snapshots depend on.
+    codex: CodexEnv,
     /// Every status the status hook reported, by session id.
     hooks: HashMap<String, HookReport>,
     /// What `hooks` says about `procs`, worked out again when either changes.
@@ -152,12 +222,15 @@ pub struct Agent {
 impl Agent {
     /// An agent with no repos loaded yet.
     pub fn new(config: Config) -> Agent {
-        let reader = SessionReader::new(config.claude_projects.clone());
+        let reader = SessionReader::new(config.claude_projects.clone())
+            .with_codex(config.codex_home.join("sessions"));
         Agent {
             config,
             reader,
             repos: BTreeMap::new(),
             procs: Vec::new(),
+            codex_locks: Vec::new(),
+            codex: CodexEnv::default(),
             hooks: HashMap::new(),
             hook_runs: HookRuns::default(),
             refactors: HashMap::new(),
@@ -264,7 +337,61 @@ impl Agent {
     pub fn live_process(&mut self, path: &Path, id: &str) -> Option<LiveProcess> {
         self.scan_procs();
         let sessions = self.read_sessions(path);
-        live_set(&self.procs, path, &sessions, &self.hook_runs).remove(id)?
+        let codex = self.read_codex(path);
+        self.live_set(path, &sessions, &codex).remove(id)?
+    }
+
+    /// What the Codex parts of the snapshots depend on now.
+    pub fn codex_env(&self) -> CodexEnv {
+        self.codex
+    }
+
+    /// Takes in what the Codex parts of the snapshots depend on, and returns the repos
+    /// whose snapshot changed with it.
+    pub fn set_codex_env(&mut self, env: CodexEnv, now: DateTime<Utc>) -> Vec<PathBuf> {
+        if env == self.codex {
+            return Vec::new();
+        }
+        self.codex = env;
+        self.refresh_preselects(now)
+    }
+
+    /// Lists the Codex rollouts again after a watch said they changed, and returns the
+    /// repos whose rollouts were added, written or removed.
+    pub fn codex_rollouts_changed(&mut self) -> Vec<PathBuf> {
+        self.reader.codex_changed();
+        let cwds = self.reader.relist_codex();
+        self.repos
+            .keys()
+            .filter(|p| {
+                let repo = path_str(p);
+                cwds.iter().any(|cwd| paths_match(cwd, &repo))
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// The repos a Codex thread lock appearing or going may concern, after a fresh look
+    /// at `/proc`: those with a `codex` process in their folder or a live Codex session.
+    pub fn codex_lock_repos(&mut self) -> Vec<PathBuf> {
+        self.scan_procs();
+        let folders: Vec<&str> = self
+            .procs
+            .iter()
+            .filter(|p| p.agent == AgentKind::Codex)
+            .map(|p| p.cwd.as_str())
+            .collect();
+        self.repos
+            .iter()
+            .filter(|(path, repo)| {
+                let root = path_str(path);
+                folders.iter().any(|cwd| paths_match(cwd, &root))
+                    || repo.snapshot.sessions.iter().any(|s| {
+                        s.agent == AgentKind::Codex && matches!(s.state, SessionState::Live(_))
+                    })
+            })
+            .map(|(p, _)| p.clone())
+            .collect()
     }
 
     /// All snapshots, sorted by path.
@@ -319,23 +446,39 @@ impl Agent {
             git::finish_worktree(path, &mut status, &head);
         }
         let old_snapshot = old.snapshot.clone();
-        if what.sessions {
-            self.procs = procs::scan();
-            self.hook_runs = HookRuns::new(&self.procs, &self.hooks);
-        }
-        let (sessions, live, background) = if what.sessions {
-            let sessions = self.read_sessions(path);
-            let live = live_set(&self.procs, path, &sessions, &self.hook_runs);
-            let background = self.background_for(path, &live);
-            (sessions, live, background)
+        let instructions = if what.status || what.head {
+            scan::read_instructions(path)
         } else {
+            old.instructions.clone()
+        };
+        let old_codex = old.codex_sessions.clone();
+        if what.sessions {
+            self.scan_procs();
+        }
+        let (sessions, codex, live, background) = if what.sessions {
+            let sessions = self.read_sessions(path);
+            let codex = self.read_codex(path);
+            let live = self.live_set(path, &sessions, &codex);
+            let background = self.background_for(path, &live);
+            (sessions, codex, live, background)
+        } else {
+            let old = &self.repos[path];
             (
                 old.sessions.clone(),
+                old_codex,
                 old.live.clone(),
                 old.background.clone(),
             )
         };
-        self.store(path.to_owned(), status, head, sessions, live, background);
+        self.store(
+            path.to_owned(),
+            status,
+            head,
+            (sessions, codex),
+            live,
+            background,
+            instructions,
+        );
         let moved = if what.head {
             self.update_masses()
         } else {
@@ -433,9 +576,10 @@ impl Agent {
     /// Recomputes every repo's preselect for `now` (see
     /// [`RepoState::refresh_preselect`]) and returns the repos whose preselect changed.
     pub fn refresh_preselects(&mut self, now: DateTime<Utc>) -> Vec<PathBuf> {
+        let (boot, env) = (self.boot, self.codex);
         self.repos
             .iter_mut()
-            .filter_map(|(path, repo)| repo.refresh_preselect(now, self.boot).then(|| path.clone()))
+            .filter_map(|(path, repo)| repo.refresh_preselect(now, boot, env).then(|| path.clone()))
             .collect()
     }
 
@@ -450,11 +594,42 @@ impl Agent {
         &self.hooks
     }
 
-    /// Scans `/proc` for `claude` processes again, and works out what the hook says
-    /// about them.
+    /// Scans `/proc` for agent processes and Codex locks again, and works out what the
+    /// hook says about them.
     fn scan_procs(&mut self) {
-        self.procs = procs::scan();
+        let scan = procs::scan_all();
+        self.procs = scan.procs;
+        self.codex_locks = scan.codex_locks;
         self.hook_runs = HookRuns::new(&self.procs, &self.hooks);
+    }
+
+    /// Which of the repo at `repo`'s sessions are live (see [`procs::live_sessions`] and
+    /// [`procs::codex_live`]), from the processes last scanned.
+    fn live_set(
+        &self,
+        repo: &Path,
+        sessions: &[SessionSummary],
+        codex: &[CodexSummary],
+    ) -> HashMap<String, Option<LiveProcess>> {
+        let root = path_str(repo);
+        let mut live = procs::live_sessions(
+            &self.procs,
+            &root,
+            &session_times(sessions),
+            &self.hook_runs,
+        );
+        let ids: Vec<&str> = codex
+            .iter()
+            .filter_map(|c| c.summary.session_id.as_deref())
+            .collect();
+        live.extend(procs::codex_live(
+            &self.procs,
+            &self.codex_locks,
+            &root,
+            &ids,
+            |id| self.reader.has_rollout(id),
+        ));
+        live
     }
 
     /// Takes in the status hook's statuses and returns events for the sessions whose
@@ -468,7 +643,7 @@ impl Agent {
             .repos
             .iter()
             .filter_map(|(p, r)| {
-                let live = live_set(&self.procs, p, &r.sessions, &self.hook_runs);
+                let live = self.live_set(p, &r.sessions, &r.codex_sessions);
                 (hooks_for(&self.hooks, &r.sessions) != r.hooks || live != r.live)
                     .then(|| (p.clone(), live))
             })
@@ -477,17 +652,26 @@ impl Agent {
         for (path, live) in stale {
             let repo = &self.repos[&path];
             let old = repo.snapshot.clone();
-            let (status, head, sessions) = (
+            let (status, head, sessions, instructions) = (
                 repo.status.clone(),
                 repo.head.clone(),
-                repo.sessions.clone(),
+                (repo.sessions.clone(), repo.codex_sessions.clone()),
+                repo.instructions.clone(),
             );
             let background = if live == repo.live {
                 repo.background.clone()
             } else {
                 self.background_for(&path, &live)
             };
-            self.store(path.clone(), status, head, sessions, live, background);
+            self.store(
+                path.clone(),
+                status,
+                head,
+                sessions,
+                live,
+                background,
+                instructions,
+            );
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
         events
@@ -524,18 +708,27 @@ impl Agent {
         let mut events = Vec::new();
         for path in watched {
             let repo = &self.repos[&path];
-            let live = live_set(&self.procs, &path, &repo.sessions, &self.hook_runs);
+            let live = self.live_set(&path, &repo.sessions, &repo.codex_sessions);
             if live == repo.live {
                 continue;
             }
             let old = repo.snapshot.clone();
-            let (status, head, sessions) = (
+            let (status, head, sessions, instructions) = (
                 repo.status.clone(),
                 repo.head.clone(),
-                repo.sessions.clone(),
+                (repo.sessions.clone(), repo.codex_sessions.clone()),
+                repo.instructions.clone(),
             );
             let background = self.background_for(&path, &live);
-            self.store(path.clone(), status, head, sessions, live, background);
+            self.store(
+                path.clone(),
+                status,
+                head,
+                sessions,
+                live,
+                background,
+                instructions,
+            );
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
         events.extend(self.recount(|r| !r.background.is_empty()));
@@ -568,12 +761,21 @@ impl Agent {
                 continue;
             }
             let old = repo.snapshot.clone();
-            let (status, head, sessions) = (
+            let (status, head, sessions, instructions) = (
                 repo.status.clone(),
                 repo.head.clone(),
-                repo.sessions.clone(),
+                (repo.sessions.clone(), repo.codex_sessions.clone()),
+                repo.instructions.clone(),
             );
-            self.store(path.clone(), status, head, sessions, live, background);
+            self.store(
+                path.clone(),
+                status,
+                head,
+                sessions,
+                live,
+                background,
+                instructions,
+            );
             events.extend(diff(&old, &self.repos[&path].snapshot));
         }
         events
@@ -603,7 +805,7 @@ impl Agent {
     /// `claude` processes.
     pub fn background_count(
         &mut self,
-        procs: &[ClaudeProcess],
+        procs: &[AgentProcess],
         cwd: &str,
         id: &str,
         process: Option<&LiveProcess>,
@@ -641,25 +843,41 @@ impl Agent {
 
     fn insert(&mut self, path: PathBuf, status: Status, head: HeadInfo) {
         let sessions = self.read_sessions(&path);
-        let live = live_set(&self.procs, &path, &sessions, &self.hook_runs);
+        let codex = self.read_codex(&path);
+        let live = self.live_set(&path, &sessions, &codex);
         let background = self.background_for(&path, &live);
-        self.store(path, status, head, sessions, live, background);
+        let instructions = scan::read_instructions(&path);
+        self.store(
+            path,
+            status,
+            head,
+            (sessions, codex),
+            live,
+            background,
+            instructions,
+        );
     }
 
+    /// Builds and keeps the repo's snapshot. `sessions` are its Claude and its Codex
+    /// sessions.
+    #[allow(clippy::too_many_arguments)]
     fn store(
         &mut self,
         path: PathBuf,
         status: Status,
         head: HeadInfo,
-        sessions: Vec<SessionSummary>,
+        sessions: (Vec<SessionSummary>, Vec<CodexSummary>),
         live: HashMap<String, Option<LiveProcess>>,
         background: HashMap<String, u32>,
+        instructions: Instructions,
     ) {
+        let (sessions, codex_sessions) = sessions;
         let old = self.repos.get(&path);
         let mass = old.map_or(0.0, |r| r.snapshot.mass);
         let id = old.map_or_else(|| scan::repo_id(&path), |r| r.id);
         let hooks = hooks_for(&self.hooks, &sessions);
-        let mut snapshot = build_snapshot(
+        let codex = with_empty_codex(&path_str(&path), &sessions, &codex_sessions, &live);
+        let mut snapshot = build_snapshot_with(
             &path,
             &status,
             &head,
@@ -669,6 +887,11 @@ impl Agent {
             &background,
             Utc::now(),
             self.boot,
+            &CodexInputs {
+                sessions: &codex,
+                instructions: &instructions,
+                env: self.codex,
+            },
         );
         snapshot.mass = mass;
         snapshot.refactor = self.refactors.get(&path).cloned();
@@ -680,6 +903,8 @@ impl Agent {
                 status,
                 head,
                 sessions,
+                codex_sessions,
+                instructions,
                 live,
                 hooks,
                 background,
@@ -821,6 +1046,11 @@ impl Agent {
             .collect();
         let nested: Vec<&str> = nested.iter().map(String::as_str).collect();
         self.reader.read_repo_within(&root, &nested)
+    }
+
+    /// Reads the Codex sessions that started in `repo`.
+    fn read_codex(&mut self, repo: &Path) -> Vec<CodexSummary> {
+        self.reader.read_codex_repo(&path_str(repo))
     }
 
     fn repo_events<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Vec<Event> {
@@ -966,15 +1196,6 @@ pub fn read_git_each(
     });
 }
 
-fn live_set(
-    procs: &[ClaudeProcess],
-    repo: &Path,
-    sessions: &[SessionSummary],
-    hooks: &HookRuns,
-) -> HashMap<String, Option<LiveProcess>> {
-    procs::live_sessions(procs, &path_str(repo), &session_times(sessions), hooks)
-}
-
 /// What [`procs::live_sessions`] needs of `sessions`.
 pub fn session_times(sessions: &[SessionSummary]) -> Vec<SessionTimes<'_>> {
     sessions
@@ -1005,7 +1226,8 @@ fn hooks_for(
 
 /// Builds a snapshot with mass 0; the caller fills in mass across repos. `hooks` holds
 /// status hook statuses by session id, `background` the number of background
-/// subagents running by live session id, and `boot` the boot the helper runs in.
+/// subagents running by live session id, and `boot` the boot the helper runs in. Codex
+/// is taken as not installed (see [`build_snapshot_with`]).
 #[allow(clippy::too_many_arguments)]
 pub fn build_snapshot(
     path: &Path,
@@ -1018,6 +1240,32 @@ pub fn build_snapshot(
     now: DateTime<Utc>,
     boot: Boot,
 ) -> RepoSnapshot {
+    let instructions = Instructions::default();
+    let codex = CodexInputs {
+        sessions: &[],
+        instructions: &instructions,
+        env: CodexEnv::default(),
+    };
+    build_snapshot_with(
+        path, status, head, sessions, live, hooks, background, now, boot, &codex,
+    )
+}
+
+/// [`build_snapshot`] with the repo's Codex sessions among its sessions, its Codex
+/// readiness (`None` while Codex is not installed) and the New row the preselect means.
+#[allow(clippy::too_many_arguments)]
+pub fn build_snapshot_with(
+    path: &Path,
+    status: &Status,
+    head: &HeadInfo,
+    sessions: &[SessionSummary],
+    live: &HashMap<String, Option<LiveProcess>>,
+    hooks: &HashMap<String, HookReport>,
+    background: &HashMap<String, u32>,
+    now: DateTime<Utc>,
+    boot: Boot,
+    codex: &CodexInputs<'_>,
+) -> RepoSnapshot {
     let root = path_str(path);
     let dirty_paths: Vec<String> = status
         .paths
@@ -1025,10 +1273,19 @@ pub fn build_snapshot(
         .map(|p| format!("{}/{p}", root.trim_end_matches('/')))
         .collect();
     // Reasons and preselect come from the same candidates and facts, so they agree.
-    let candidates = candidates(&root, sessions, live, hooks, background, boot, now);
+    let candidates = candidates(
+        &root,
+        sessions,
+        codex.sessions,
+        live,
+        hooks,
+        background,
+        boot,
+        now,
+    );
     let facts = repo_facts(status, head);
     let reasons = resume_reasons(&candidates, &facts);
-    let preselect = preselect(&candidates, &facts, now);
+    let (readiness, plan) = codex_plan(&candidates, &facts, codex.instructions, codex.env, now);
     let sessions = candidates
         .iter()
         .zip(reasons)
@@ -1048,8 +1305,8 @@ pub fn build_snapshot(
         None => (None, None),
     };
     RepoSnapshot {
-        codex: None,
-        new_agent: NewAgentHint::default(),
+        codex: readiness,
+        new_agent: plan.new_agent,
         name: path
             .file_name()
             .map_or_else(|| root.clone(), |n| n.to_string_lossy().into_owned()),
@@ -1067,7 +1324,7 @@ pub fn build_snapshot(
         commits_30d: head.commits_30d,
         mass: 0.0,
         sessions,
-        preselect,
+        preselect: plan.preselect,
         refactor: None,
         worktree_of: None,
         worktree: None,
@@ -1118,11 +1375,77 @@ fn session_states(
         .collect()
 }
 
-/// The repo's sessions, classified, as the preselect rule takes them. `boot`, the boot
-/// the helper runs in, and `now` tell which sessions a restart cut off.
+/// The repo's Codex readiness, when Codex is installed, and the preselect and New row
+/// with the hand-back and nudge rules (codex spec §5).
+fn codex_plan(
+    candidates: &[Candidate<'_>],
+    facts: &RepoFacts,
+    instructions: &Instructions,
+    env: CodexEnv,
+    now: DateTime<Utc>,
+) -> (Option<CodexReadiness>, refract_core::preselect::Plan) {
+    let ready = env.installed.then(|| {
+        let notes = instructions.note_refs();
+        readiness(&instructions.files(&notes), &live_agents(candidates))
+    });
+    let agents = AgentFacts {
+        claude_used_percent: env.claude_used_percent,
+        codex_threshold: env.threshold,
+        codex: ready.as_ref().map(|r| r.state),
+    };
+    let plan = plan(candidates, facts, &agents, now);
+    (ready, plan)
+}
+
+/// `codex`, with an empty summary added for each live Codex session in `live` that has
+/// no rollout yet (it had no message), so it shows as it runs.
+fn with_empty_codex(
+    repo: &str,
+    sessions: &[SessionSummary],
+    codex: &[CodexSummary],
+    live: &HashMap<String, Option<LiveProcess>>,
+) -> Vec<CodexSummary> {
+    let known = |id: &str| {
+        sessions
+            .iter()
+            .map(|s| &s.session_id)
+            .chain(codex.iter().map(|c| &c.summary.session_id))
+            .any(|s| s.as_deref() == Some(id))
+    };
+    let mut empty: Vec<CodexSummary> = live
+        .iter()
+        .filter(|(id, _)| !known(id))
+        .map(|(id, process)| {
+            let started = process.as_ref().and_then(|p| p.started);
+            let mut summary = CodexSummary::default();
+            summary.summary.session_id = Some(id.clone());
+            summary.summary.cwd = Some(repo.to_owned());
+            summary.summary.last_timestamp = started;
+            summary.summary.modified = started;
+            summary.head.session_id = Some(id.clone());
+            summary.head.cwd = Some(repo.to_owned());
+            summary
+        })
+        .collect();
+    if empty.is_empty() {
+        return codex.to_vec();
+    }
+    empty.sort_by(|a, b| a.summary.session_id.cmp(&b.summary.session_id));
+    let mut all = codex.to_vec();
+    all.extend(empty);
+    all.sort_by_key(|c| std::cmp::Reverse(c.summary.last_timestamp));
+    all
+}
+
+/// The repo's sessions of both agents, classified, newest first, as the preselect rule
+/// takes them. `boot`, the boot the helper runs in, and `now` tell which Claude sessions
+/// a restart cut off. A Codex session's state comes from its rollout
+/// ([`CodexSummary::state`]); Codex has no status hook or background count yet.
+#[allow(clippy::too_many_arguments)]
 fn candidates<'a>(
     repo: &str,
     sessions: &'a [SessionSummary],
+    codex: &'a [CodexSummary],
     live: &HashMap<String, Option<LiveProcess>>,
     hooks: &HashMap<String, HookReport>,
     background: &HashMap<String, u32>,
@@ -1130,7 +1453,7 @@ fn candidates<'a>(
     now: DateTime<Utc>,
 ) -> Vec<Candidate<'a>> {
     let states = session_states(sessions, live, hooks, background);
-    sessions
+    let mut all: Vec<Candidate<'a>> = sessions
         .iter()
         .zip(states)
         .map(|(summary, state)| {
@@ -1146,7 +1469,29 @@ fn candidates<'a>(
                 cut_off: stopped && cut_off(hook, boot, now.timestamp()),
             }
         })
-        .collect()
+        .collect();
+    if codex.is_empty() {
+        return all;
+    }
+    all.extend(codex.iter().map(|c| {
+        let summary = &c.summary;
+        let is_live = summary
+            .session_id
+            .as_ref()
+            .is_some_and(|id| live.contains_key(id));
+        let state = c.state(is_live);
+        Candidate {
+            agent: AgentKind::Codex,
+            summary,
+            state,
+            focusable: is_focusable(repo, summary, state, live),
+            cleared: false,
+            cut_off: false,
+        }
+    }));
+    // Stable, so each agent's own order stays as it was.
+    all.sort_by_key(|c| std::cmp::Reverse(c.summary.last_timestamp));
+    all
 }
 
 /// What the preselect rule needs to know about the repo's git state.
@@ -1305,6 +1650,130 @@ mod tests {
         assert_eq!(snapshot.preselect, Preselect::NewAgent);
     }
 
+    /// A snapshot of a repo with Claude session "a", live with `hook` as its status
+    /// hook report, and a stopped Codex session, as [`build_snapshot_with`] builds it.
+    fn codex_snapshot(env: CodexEnv, hook: HookStatus) -> RepoSnapshot {
+        const REPO: &str = "/home/dev/projects/tidepool-api";
+        let now: DateTime<Utc> = "2026-11-08T18:00:00Z".parse().unwrap();
+        let at = |m: i64| Some(now - TimeDelta::minutes(m));
+        let sessions = vec![SessionSummary {
+            session_id: Some("a".into()),
+            last_timestamp: at(1),
+            ..SessionSummary::default()
+        }];
+        let mut codex = CodexSummary::default();
+        codex.summary.session_id = Some("c".into());
+        codex.summary.last_timestamp = at(30);
+        let live: HashMap<String, Option<LiveProcess>> = [("a".to_owned(), None)].into();
+        let hooks: HashMap<String, HookReport> =
+            [("a".to_owned(), HookReport::new(hook, Some(now.timestamp())))].into();
+        let instructions = Instructions {
+            agents_md: Some("# Tidepool\n\nRun the tests.\n".into()),
+            claude_md: Some("@AGENTS.md\n".into()),
+            ..Instructions::default()
+        };
+        build_snapshot_with(
+            Path::new(REPO),
+            &Status::default(),
+            &HeadInfo::default(),
+            &sessions,
+            &live,
+            &hooks,
+            &HashMap::new(),
+            now,
+            Boot::default(),
+            &CodexInputs {
+                sessions: std::slice::from_ref(&codex),
+                instructions: &instructions,
+                env,
+            },
+        )
+    }
+
+    #[test]
+    fn readiness_is_reported_only_while_codex_is_installed() {
+        use refract_core::codex_ready::{Gate, ReadyState};
+        let installed = CodexEnv {
+            installed: true,
+            ..CodexEnv::default()
+        };
+        let snapshot = codex_snapshot(installed, HookStatus::Working);
+        let codex = snapshot.codex.as_ref().expect("readiness");
+        // Claude is working: Codex is busy, and Claude's own row is open.
+        assert_eq!(codex.state, ReadyState::Busy);
+        assert!(matches!(&codex.gates.codex, Gate::Busy(l) if l.session_id == "a"));
+        assert!(codex.gates.claude.is_open());
+        // Both agents' sessions are listed, tagged, newest first.
+        let tagged: Vec<(&str, AgentKind)> = snapshot
+            .sessions
+            .iter()
+            .map(|s| (s.id.as_str(), s.agent))
+            .collect();
+        assert_eq!(tagged, [("a", AgentKind::Claude), ("c", AgentKind::Codex)]);
+        let idle = codex_snapshot(installed, HookStatus::Finished);
+        let codex = idle.codex.as_ref().unwrap();
+        assert_eq!(codex.state, ReadyState::Ready);
+        assert_eq!(
+            codex.gates.codex,
+            Gate::StopIdle {
+                session_ids: vec!["a".into()]
+            }
+        );
+        assert!(codex_snapshot(CodexEnv::default(), HookStatus::Working)
+            .codex
+            .is_none());
+    }
+
+    #[test]
+    fn a_live_session_moving_a_codex_gate_gives_a_repo_event() {
+        let installed = CodexEnv {
+            installed: true,
+            ..CodexEnv::default()
+        };
+        let working = codex_snapshot(installed, HookStatus::Working);
+        let idle = codex_snapshot(installed, HookStatus::Finished);
+        // The app reads the gates only from `codex`, which `sessionChanged` lacks.
+        match &diff(&working, &idle)[..] {
+            [Event::RepoChanged(repo)] => assert_eq!(repo.codex, idle.codex),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Without Codex, the same change is a session event, as before.
+        let working = codex_snapshot(CodexEnv::default(), HookStatus::Working);
+        let idle = codex_snapshot(CodexEnv::default(), HookStatus::Finished);
+        let events = diff(&working, &idle);
+        assert!(
+            matches!(&events[..], [Event::SessionChanged(_)]),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn the_nudge_preselects_codex_when_claude_is_over_the_threshold() {
+        use refract_core::preselect::NewAgentReason;
+        let near = CodexEnv {
+            installed: true,
+            threshold: 90.0,
+            claude_used_percent: Some(97.4),
+        };
+        // With Claude idle, Codex is launchable and the nudge applies.
+        let snapshot = codex_snapshot(near, HookStatus::Finished);
+        assert_eq!(snapshot.new_agent.agent, AgentKind::Codex);
+        assert_eq!(
+            snapshot.new_agent.reason,
+            Some(NewAgentReason::Nudge { used_percent: 97 })
+        );
+        assert!(near.prefers_codex());
+        let below = CodexEnv {
+            claude_used_percent: Some(80.0),
+            ..near
+        };
+        assert!(!below.prefers_codex());
+        assert_eq!(
+            codex_snapshot(below, HookStatus::Finished).new_agent.agent,
+            AgentKind::Claude
+        );
+    }
+
     #[test]
     fn identical_snapshots_give_no_events() {
         assert!(diff(&snapshot(), &snapshot()).is_empty());
@@ -1391,6 +1860,7 @@ mod tests {
             depth: 1,
             claude_projects: tmp.path().to_owned(),
             limits_file: tmp.path().join("usage-state.json"),
+            codex_home: tmp.path().join("codex"),
         });
         let sessions = agent.reader.read_repo(&path_str(&repo));
         assert_eq!(sessions.len(), 1);
@@ -1406,7 +1876,15 @@ mod tests {
         let finished = HookReport::new(HookStatus::Finished, None);
         agent.hooks.insert(id.to_owned(), finished);
         let (status, head) = (Status::default(), HeadInfo::default());
-        agent.store(repo.clone(), status, head, sessions, live, HashMap::new());
+        agent.store(
+            repo.clone(),
+            status,
+            head,
+            (sessions, Vec::new()),
+            live,
+            HashMap::new(),
+            Instructions::default(),
+        );
         let state = |agent: &Agent| agent.repos[&repo].snapshot.sessions[0].state;
         assert_eq!(state(&agent), SessionState::Live(LiveState::Idle));
         let session_dir = project.join(id);
@@ -1622,6 +2100,7 @@ mod tests {
             depth: 1,
             claude_projects: tmp.path().to_owned(),
             limits_file: tmp.path().join("usage-state.json"),
+            codex_home: tmp.path().join("codex"),
         });
         let now = Utc::now();
         agent.boot = Boot {
@@ -1649,9 +2128,10 @@ mod tests {
             repo.clone(),
             dirty,
             head,
-            sessions,
+            (sessions, Vec::new()),
             HashMap::new(),
             HashMap::new(),
+            Instructions::default(),
         );
         let reason = |agent: &Agent| agent.repos[&repo].snapshot.sessions[0].resume_reason;
         assert_eq!(reason(&agent), Some(ResumeReason::CutOff));
@@ -1694,10 +2174,12 @@ mod tests {
             depth: 1,
             claude_projects: tmp.path().to_owned(),
             limits_file: tmp.path().join("usage-state.json"),
+            codex_home: tmp.path().join("codex"),
         });
         // `claude --resume <old>`, then /clear; its start time is not known, so nothing
         // but the hook can move it.
-        agent.procs = vec![ClaudeProcess {
+        agent.procs = vec![AgentProcess {
+            agent: AgentKind::Claude,
             pid: 812,
             cwd: path_str(&repo),
             session_id: Some(old.to_owned()),
@@ -1706,9 +2188,17 @@ mod tests {
             refract_folder: None,
         }];
         let sessions = agent.reader.read_repo(&path_str(&repo));
-        let live = live_set(&agent.procs, &repo, &sessions, &agent.hook_runs);
+        let live = agent.live_set(&repo, &sessions, &[]);
         let (status, head) = (Status::default(), HeadInfo::default());
-        agent.store(repo.clone(), status, head, sessions, live, HashMap::new());
+        agent.store(
+            repo.clone(),
+            status,
+            head,
+            (sessions, Vec::new()),
+            live,
+            HashMap::new(),
+            Instructions::default(),
+        );
         let live_ids = |agent: &Agent| {
             let mut ids: Vec<String> = agent.repos[&repo].live.keys().cloned().collect();
             ids.sort();

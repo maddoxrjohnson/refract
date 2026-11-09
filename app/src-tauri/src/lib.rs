@@ -90,6 +90,7 @@ pub fn run() {
             launch::start_refactor,
             launch::resume_refactor,
             launch::open_refactor,
+            launch::make_codex_ready,
             alerts::set_zoomed,
             migrate::migrate_preflight,
             migrate::migrate_start,

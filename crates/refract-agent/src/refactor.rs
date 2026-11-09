@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::git;
 use crate::launch;
-use crate::procs::{self, ClaudeProcess, HookRuns, LiveProcess};
+use crate::procs::{self, AgentProcess, HookRuns, LiveProcess};
 use crate::scan;
 use crate::state::{path_str, Agent, Refresh};
 use crate::worktree;
@@ -1491,7 +1491,7 @@ impl Refactors {
 fn runs_session<'a>(
     claimed: &'a HashMap<String, Option<LiveProcess>>,
     hooks: &'a HookRuns,
-    p: &'a ClaudeProcess,
+    p: &'a AgentProcess,
 ) -> Option<&'a str> {
     claimed
         .iter()
@@ -1506,7 +1506,7 @@ fn runs_session<'a>(
 }
 
 /// The pids of the `claude` processes running in `worktree`.
-fn inside(procs: &[ClaudeProcess], worktree: &str) -> Vec<u32> {
+fn inside(procs: &[AgentProcess], worktree: &str) -> Vec<u32> {
     procs
         .iter()
         .filter(|p| path_within(&p.cwd, worktree))
@@ -1574,7 +1574,7 @@ impl Look {
 fn look(
     entry: &Entry,
     agent: &mut Agent,
-    procs: &[ClaudeProcess],
+    procs: &[AgentProcess],
     quiet: TimeDelta,
     now: DateTime<Utc>,
 ) -> Look {
@@ -1589,7 +1589,7 @@ fn look(
     let named = !id.is_empty() && procs.iter().any(|p| runs(p) == Some(id));
     let ours = !id.is_empty() && (named || claimed.contains_key(id));
     // Any other `claude` in the worktree: what it does is not known, so it is busy.
-    let inside: Vec<&ClaudeProcess> = procs
+    let inside: Vec<&AgentProcess> = procs
         .iter()
         .filter(|p| path_within(&p.cwd, worktree))
         .collect();
@@ -1673,7 +1673,7 @@ fn look(
 fn work_out(
     entry: &mut Entry,
     agent: &mut Agent,
-    procs: &[ClaudeProcess],
+    procs: &[AgentProcess],
     distro: Option<&str>,
     times: (TimeDelta, TimeDelta),
     now: DateTime<Utc>,
@@ -2267,6 +2267,7 @@ mod tests {
             depth: 1,
             claude_projects: tmp.path().to_owned(),
             limits_file: tmp.path().join("usage-state.json"),
+            codex_home: tmp.path().join("codex"),
         });
         let now = Utc::now();
         let entry = Entry {
@@ -2294,7 +2295,8 @@ mod tests {
             waiting: false,
         };
         // The refactor's agent, `claude --resume <old>`, ran /clear and works on `new`.
-        let procs = [ClaudeProcess {
+        let procs = [AgentProcess {
+            agent: AgentKind::Claude,
             pid: 812,
             cwd: worktree.into(),
             session_id: Some(old.into()),

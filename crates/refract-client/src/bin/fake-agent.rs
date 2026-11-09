@@ -118,6 +118,9 @@ fn main() {
                     None => send(&out, &Message::Response(response)),
                 }
             }
+            Method::SetPrefs(_) => {
+                send(&out, &Message::Response(Response::ok(id, Reply::Done)));
+            }
             Method::Shutdown => {
                 send(&out, &Message::Response(Response::ok(id, Reply::Done)));
                 return;

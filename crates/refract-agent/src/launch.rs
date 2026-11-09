@@ -122,11 +122,11 @@ pub fn prepare_planned(
     )
 }
 
-/// A running `claude` process and its ancestors, or nothing once it has exited or its
+/// A running agent process and its ancestors, or nothing once it has exited or its
 /// pid has been given to a process that started later.
 fn procs_chain(process: &LiveProcess) -> Vec<u32> {
     let pid = process.pid;
-    if procs::is_claude(pid) && procs::same_process(process.started, procs::process_started(pid)) {
+    if procs::is_agent(pid) && procs::same_process(process.started, procs::process_started(pid)) {
         procs::proc_ancestors(pid)
     } else {
         Vec::new()
@@ -134,7 +134,7 @@ fn procs_chain(process: &LiveProcess) -> Vec<u32> {
 }
 
 /// [`prepare`], reading a process's ancestors with `chain`, which is empty when the
-/// process no longer runs `claude` or is not the one that was recorded.
+/// process no longer runs an agent or is not the one that was recorded.
 fn prepare_with(
     path: &str,
     mode: &LaunchMode,

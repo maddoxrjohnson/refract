@@ -34,16 +34,20 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::Utc;
-use refract_core::classify::{classify_report, LiveState, SessionState};
+use refract_core::brief::{self, BriefInput, SessionEnd};
+use refract_core::classify::{classify_report, InterruptReason, LiveState, SessionState};
+use refract_core::codex_ready::{MAKE_READY_PROMPT, MAKE_READY_TITLE};
 use refract_core::launch::wsl_path;
+use refract_core::preselect::{claude_peak, ResumeReason};
 use refract_core::protocol::{
-    code, parse_request, ErrorBody, Event, FinishAction, Hello, HookInfo, Id, LaunchMode, Method,
-    Outcome, PendingMigration, Reply, RepoList, RepoSnapshot, Response, StopAgentParams,
-    PROTOCOL_VERSION,
+    code, parse_request, AgentKind, ErrorBody, Event, FinishAction, Hello, HookInfo, Id,
+    LaunchMode, Method, Outcome, PendingMigration, Reply, RepoList, RepoSnapshot, Response,
+    StopAgentParams, PROTOCOL_VERSION,
 };
 use refract_core::sessions::{is_windows_mount, path_within, paths_match, project_dir_matches};
 use serde::Serialize;
 
+use crate::codex;
 use crate::config::{self, Config};
 use crate::hook;
 use crate::launch;
@@ -131,6 +135,8 @@ enum Msg {
         id: Id,
         done: refactor::Done,
     },
+    /// The slow Codex probe (see [`crate::codex`]) finished: whether it found Codex.
+    CodexProbed(bool),
 }
 
 /// One line of input, without its newline.
@@ -163,6 +169,10 @@ struct Pending {
     background: HashSet<String>,
     /// Repos git could not read that changed.
     retry: HashSet<PathBuf>,
+    /// Codex rollouts changed, its locks changed, or its directories need watching again.
+    codex_sessions: bool,
+    codex_locks: bool,
+    codex_rewatch: bool,
     rescan: bool,
     reload: bool,
     first: Option<Instant>,
@@ -194,6 +204,9 @@ impl Pending {
             Change::Retry(path) => {
                 self.retry.insert(path);
             }
+            Change::CodexSessions => self.codex_sessions = true,
+            Change::CodexLocks => self.codex_locks = true,
+            Change::CodexRewatch => self.codex_rewatch = true,
             Change::Rescan => self.rescan = true,
             Change::Overflow => self.reload = true,
         }
@@ -337,6 +350,8 @@ struct Server<W: Write> {
     next_refactor: Option<Instant>,
     /// Live sessions and their directories, as last watched for background agents.
     subagent_dirs: Vec<(String, PathBuf)>,
+    /// The slow Codex probe is running.
+    codex_probing: bool,
 }
 
 /// Runs the helper until `shutdown` or the end of `input`.
@@ -396,6 +411,7 @@ where
             Ok(Msg::Loaded { repos, last }) => server.loaded(repos, last)?,
             Ok(Msg::Answer(response)) => server.send(&response)?,
             Ok(Msg::Cloned { id, result }) => server.cloned(id, result)?,
+            Ok(Msg::CodexProbed(found)) => server.codex_probed(found)?,
             Ok(Msg::Migration(update)) => server.migration(update)?,
             Ok(Msg::Refactored { id, done }) => {
                 let removed = done.removed_worktree();
@@ -556,7 +572,7 @@ impl<W: Write> Server<W> {
     fn new(config: Config, out: W, watcher: Option<Watcher>, tx: SyncSender<Msg>) -> Server<W> {
         let usage = Usage::start(config.claude_projects.clone());
         let limits = LimitsFile::new(config.limits_file.clone());
-        Server {
+        let mut server = Server {
             out,
             agent: Agent::new(config),
             watcher,
@@ -582,7 +598,71 @@ impl<W: Write> Server<W> {
             refactors: Refactors::from_env(),
             next_refactor: None,
             subagent_dirs: Vec::new(),
+            codex_probing: false,
+        };
+        server.probe_codex();
+        server.read_limits();
+        server
+    }
+
+    /// Looks for the Codex CLI: the quick probe here, and when it finds nothing the slow
+    /// one on a thread of its own, which reports with [`Msg::CodexProbed`].
+    fn probe_codex(&mut self) {
+        if codex::quick_probe() {
+            self.set_codex_installed(true);
+            return;
         }
+        if self.codex_probing {
+            return;
+        }
+        let tx = self.tx.clone();
+        let started = std::thread::Builder::new()
+            .name("codex-probe".into())
+            .spawn(move || {
+                let _ = tx.send(Msg::CodexProbed(codex::shell_probe()));
+            });
+        match started {
+            Ok(_) => self.codex_probing = true,
+            Err(e) => eprintln!("refract-agent: cannot probe for Codex: {e}"),
+        }
+    }
+
+    /// Takes in the slow probe's answer and reports the repos whose snapshot moved.
+    fn codex_probed(&mut self, found: bool) -> io::Result<()> {
+        self.codex_probing = false;
+        let changed = self.set_codex_installed(found);
+        self.send_changed(changed)
+    }
+
+    /// Records whether Codex is installed; returns the repos whose snapshot moved.
+    fn set_codex_installed(&mut self, installed: bool) -> Vec<PathBuf> {
+        let env = state::CodexEnv {
+            installed,
+            ..self.agent.codex_env()
+        };
+        self.agent.set_codex_env(env, Utc::now())
+    }
+
+    /// Reads Claude's plan limits again, for the nudge; returns the repos whose
+    /// snapshot moved.
+    fn read_limits(&mut self) -> Vec<PathBuf> {
+        let now = Utc::now();
+        let env = state::CodexEnv {
+            claude_used_percent: self.limits.read().and_then(|l| claude_peak(&l, now)),
+            ..self.agent.codex_env()
+        };
+        self.agent.set_codex_env(env, now)
+    }
+
+    /// Sends a `repoChanged` for each of `paths`.
+    fn send_changed(&mut self, paths: Vec<PathBuf>) -> io::Result<()> {
+        for path in paths {
+            if let Some(repo) = self.agent.repo(&path) {
+                let event = Event::RepoChanged(Box::new(repo.snapshot.clone()));
+                self.send(&event)?;
+            }
+        }
+        Ok(())
     }
 
     /// Handles one request line. Returns false when the helper should exit.
@@ -620,7 +700,7 @@ impl<W: Write> Server<W> {
             Method::Ping => Response::ok(
                 id,
                 Reply::Hello(Hello {
-                    codex_installed: false,
+                    codex_installed: self.agent.codex_env().installed,
                     protocol_version: PROTOCOL_VERSION,
                     agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                 }),
@@ -628,6 +708,7 @@ impl<W: Write> Server<W> {
             Method::ListRepos => {
                 self.ensure_loaded()?;
                 // The list carries every preselect, so no events are needed.
+                self.read_limits();
                 self.agent.refresh_preselects(Utc::now());
                 Response::ok(
                     id,
@@ -639,6 +720,8 @@ impl<W: Write> Server<W> {
             }
             Method::GetRepo { path } => {
                 self.ensure_loaded()?;
+                let changed = self.read_limits();
+                self.send_changed(changed)?;
                 self.refresh_preselects()?;
                 match self.get_repo(id, path) {
                     Some(response) => response,
@@ -648,6 +731,7 @@ impl<W: Write> Server<W> {
             Method::PrepareLaunch { path, mode } => {
                 let distro = std::env::var("WSL_DISTRO_NAME").ok();
                 let dir = launch::launch_dir();
+                let mode = self.briefed(&path, mode);
                 let running = match &mode {
                     LaunchMode::Focus { session_id } => {
                         let repo = Path::new(path.trim_end_matches('/'));
@@ -696,9 +780,14 @@ impl<W: Write> Server<W> {
             },
             Method::Usage => {
                 let repos: Vec<String> = self.agent.repo_paths().map(|p| path_str(p)).collect();
-                let live = procs::scan().len() as u32;
+                let live = procs::scan()
+                    .iter()
+                    .filter(|p| p.agent == AgentKind::Claude)
+                    .count() as u32;
                 let mut summary = self.usage.summary(&repos, live);
                 summary.limits = self.limits.read().map(Box::new);
+                let changed = self.read_limits();
+                self.send_changed(changed)?;
                 Response::ok(id, Reply::Usage(summary))
             }
             // Only `/proc`, which is in memory: quick enough to answer in line.
@@ -881,6 +970,45 @@ impl<W: Write> Server<W> {
                 Response::ok(id, Reply::PendingMigrations(migrations))
             }
             Method::StopAgent(params) => self.stop_agent(id, &params)?,
+            Method::SetPrefs(prefs) => {
+                let env = state::CodexEnv {
+                    threshold: f64::from(prefs.threshold()),
+                    ..self.agent.codex_env()
+                };
+                let changed = self.agent.set_codex_env(env, Utc::now());
+                self.send_changed(changed)?;
+                // Settings saved: look for Codex again, as it may have been installed.
+                self.probe_codex();
+                Response::ok(id, Reply::Done)
+            }
+            Method::MakeCodexReady { path } => {
+                let changed = self.read_limits();
+                self.send_changed(changed)?;
+                let agent = if self.agent.codex_env().prefers_codex() {
+                    AgentKind::Codex
+                } else {
+                    AgentKind::Claude
+                };
+                let mode = LaunchMode::New {
+                    agent,
+                    prompt: Some(MAKE_READY_PROMPT.to_owned()),
+                    plan_mode: false,
+                    brief: None,
+                };
+                let distro = std::env::var("WSL_DISTRO_NAME").ok();
+                let dir = launch::launch_dir();
+                match launch::prepare_titled(
+                    &path,
+                    &mode,
+                    MAKE_READY_TITLE,
+                    &dir,
+                    distro.as_deref(),
+                    Utc::now(),
+                ) {
+                    Ok(ticket) => Response::ok(id, Reply::Launch(ticket)),
+                    Err(e) => Response::err(id, e.code, e.message),
+                }
+            }
             Method::Shutdown => {
                 self.send(&Response::ok(id, Reply::Done))?;
                 return Ok(false);
@@ -1038,6 +1166,83 @@ impl<W: Write> Server<W> {
             self.flush()?;
         }
         Ok(Ok(()))
+    }
+
+    /// `mode` with its brief written into its prompt: for a new agent briefed from a
+    /// session of the other agent (codex spec §8), the brief, then any prompt after it.
+    /// A session that is not found (gone since the picker showed it) gives no brief.
+    fn briefed(&mut self, path: &str, mode: LaunchMode) -> LaunchMode {
+        let LaunchMode::New {
+            agent,
+            prompt,
+            plan_mode,
+            brief: Some(from_id),
+        } = mode
+        else {
+            return mode;
+        };
+        let text = self.brief_text(path, agent, &from_id);
+        if text.is_none() {
+            eprintln!("refract-agent: no session {from_id} to brief from in {path}");
+        }
+        let prompt = match (text, prompt.filter(|p| !p.trim().is_empty())) {
+            (Some(text), Some(prompt)) => Some(format!("{text}\n\n{prompt}")),
+            (text, prompt) => text.or(prompt),
+        };
+        LaunchMode::New {
+            agent,
+            prompt,
+            plan_mode,
+            brief: None,
+        }
+    }
+
+    /// The brief for a new `target` agent picking up from session `from_id` of the repo
+    /// at `path`, the other agent's, or `None` when that session is not known.
+    fn brief_text(&self, path: &str, target: AgentKind, from_id: &str) -> Option<String> {
+        let repo = self
+            .agent
+            .repo_paths()
+            .find(|p| paths_match(&path_str(p), path))?;
+        let state = self.agent.repo(repo)?;
+        let info = state.snapshot.sessions.iter().find(|s| s.id == from_id)?;
+        let (end, last_message) = match info.agent {
+            AgentKind::Codex => {
+                let codex = state
+                    .codex_sessions
+                    .iter()
+                    .find(|c| c.summary.session_id.as_deref() == Some(from_id));
+                match codex {
+                    Some(c) => (c.session_end(), c.last_message.clone()),
+                    // Live with no message yet.
+                    None => (SessionEnd::Finished, None),
+                }
+            }
+            AgentKind::Claude => {
+                let cut_off = info.resume_reason == Some(ResumeReason::CutOff);
+                // Claude says no more than an API error; at its limit, that is the limit.
+                let at_limit = self
+                    .agent
+                    .codex_env()
+                    .claude_used_percent
+                    .is_some_and(|used| used >= 100.0);
+                let rate_limited =
+                    at_limit && info.state == SessionState::Interrupted(InterruptReason::ApiError);
+                let message = self
+                    .agent
+                    .reader()
+                    .last_reply(from_id)
+                    .or_else(|| info.last_assistant_text.clone());
+                (SessionEnd::of(info.state, cut_off, rate_limited), message)
+            }
+        };
+        Some(brief::brief(&BriefInput {
+            target,
+            from: info.agent,
+            end,
+            last_message: last_message.as_deref(),
+            handoff: state.instructions.handoff(),
+        }))
     }
 
     /// `stopAgent`: SIGTERM to a live session's process, unless it is working (see
@@ -1285,6 +1490,7 @@ impl<W: Write> Server<W> {
             walk.repos.into_iter().partition(|p| is_slow(p));
         if let Some(watcher) = &mut self.watcher {
             watcher.watch_projects_root(&fast_config.claude_projects);
+            watcher.watch_codex(&fast_config.codex_home);
             watcher.watch_scan_dirs(&walk.dirs, &[]);
             for repo in &fast {
                 prewatch(watcher, repo);
@@ -1552,12 +1758,17 @@ impl<W: Write> Server<W> {
         };
         let git_dir = scan::git_dir(repo);
         let common = git_dir.as_deref().and_then(scan::common_dir);
-        watcher.watch_repo(
-            repo,
-            git_dir.as_deref(),
-            common.as_deref(),
-            &state.head.tracked_dirs,
+        // The notes AGENTS.md names are watched like tracked directories, so a change in
+        // them re-reads the repo's Codex readiness even when git ignores them.
+        let mut dirs = state.head.tracked_dirs.clone();
+        dirs.extend(
+            state
+                .instructions
+                .note_dirs()
+                .into_iter()
+                .filter(|d| !state.head.tracked_dirs.contains(d)),
         );
+        watcher.watch_repo(repo, git_dir.as_deref(), common.as_deref(), &dirs);
         for dir in self.agent.reader().project_dirs(&path_str(repo)) {
             watcher.watch_project_dir(&dir);
         }
@@ -1663,6 +1874,23 @@ impl<W: Write> Server<W> {
             events.extend(self.agent.set_hooks(hooks));
         }
 
+        if pending.codex_rewatch {
+            if let Some(watcher) = &mut self.watcher {
+                watcher.watch_codex(&self.agent.config().codex_home);
+            }
+        }
+        // A new day directory's first rollout was written before it was watched.
+        if pending.codex_sessions || pending.codex_rewatch || pending.reload {
+            for repo in self.agent.codex_rollouts_changed() {
+                mark_sessions(&mut refresh, &repo);
+            }
+        }
+        if pending.codex_locks || pending.codex_rewatch {
+            for repo in self.agent.codex_lock_repos() {
+                mark_sessions(&mut refresh, &repo);
+            }
+        }
+
         let repos: Vec<PathBuf> = self.agent.repo_paths().cloned().collect();
         for dir in pending.new_project_dirs {
             let matching: Vec<&PathBuf> = repos
@@ -1699,8 +1927,11 @@ impl<W: Write> Server<W> {
         let refreshed: Vec<PathBuf> = order.iter().map(|(p, _)| p.clone()).collect();
         let mut rewatch = pending.rewatch;
         for (path, what) in order {
+            let notes = |agent: &Agent| agent.repo(&path).map(|r| r.instructions.note_dirs());
+            let before = notes(&self.agent);
             events.extend(self.agent.refresh(&path, what));
-            if what.head || rewatch.remove(&path) {
+            let moved = notes(&self.agent) != before;
+            if what.head || rewatch.remove(&path) || moved {
                 self.watch_repo(&path);
             }
         }
@@ -2083,6 +2314,7 @@ mod tests {
             depth: 3,
             claude_projects: projects,
             limits_file: tmp.path().join("usage-state.json"),
+            codex_home: tmp.path().join("codex"),
         };
         let (tx, _rx) = mpsc::sync_channel(CHANNEL_CAPACITY);
         let mut server = Server::new(config, Vec::new(), None, tx);
@@ -2138,6 +2370,7 @@ mod tests {
             depth: 2,
             claude_projects: "/home/dev/.claude/projects".into(),
             limits_file: "/home/dev/.claude/usage-state.json".into(),
+            codex_home: PathBuf::from("/nonexistent/codex"),
         };
         let (slow, fast) = split_slow(&config);
         assert_eq!(slow.roots, [PathBuf::from("/mnt/c/Users/dev/Desktop")]);

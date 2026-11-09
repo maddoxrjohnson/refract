@@ -149,6 +149,19 @@ fn hook_input(event: &str, cwd: &Path) -> Vec<u8> {
     .into_bytes()
 }
 
+/// The session in a `sessionChanged`, or in a `repoChanged` (sent instead when the
+/// change also moves the repo's Codex gates, with Codex installed).
+fn session_in(event: &Value) -> Option<&Value> {
+    match event["event"].as_str()? {
+        "sessionChanged" => Some(&event["data"]["session"]).filter(|s| s["id"] == SESSION_ID),
+        "repoChanged" => event["data"]["sessions"]
+            .as_array()?
+            .iter()
+            .find(|s| s["id"] == SESSION_ID),
+        _ => None,
+    }
+}
+
 /// The command installed for `event`.
 fn command_for(settings: &Value, event: &str) -> String {
     let groups = settings["hooks"][event].as_array().unwrap();
@@ -277,9 +290,7 @@ fn install_run_and_uninstall_the_status_hook() {
         assert_eq!(written["init"].as_u64().unwrap(), start_ticks(1));
         assert!(written["init"].as_u64().unwrap() > 0);
         agent.event(event, |e| {
-            e["event"] == "sessionChanged"
-                && e["data"]["session"]["id"] == SESSION_ID
-                && e["data"]["session"]["state"] == json!({"kind": "live", "detail": live})
+            session_in(e).is_some_and(|s| s["state"] == json!({"kind": "live", "detail": live}))
         });
     }
 
@@ -312,8 +323,7 @@ fn install_run_and_uninstall_the_status_hook() {
     );
     assert!(out.status.success());
     agent.event("working again", |e| {
-        e["event"] == "sessionChanged"
-            && e["data"]["session"]["state"] == json!({"kind": "live", "detail": "working"})
+        session_in(e).is_some_and(|s| s["state"] == json!({"kind": "live", "detail": "working"}))
     });
     let transcript_path = project_dir(&projects, &repo).join(format!("{SESSION_ID}.jsonl"));
     let interrupt = format!(
@@ -328,8 +338,7 @@ fn install_run_and_uninstall_the_status_hook() {
     writeln!(file, "{interrupt}").unwrap();
     drop(file);
     agent.event("interrupt", |e| {
-        e["event"] == "sessionChanged"
-            && e["data"]["session"]["state"] == json!({"kind": "live", "detail": "idle"})
+        session_in(e).is_some_and(|s| s["state"] == json!({"kind": "live", "detail": "idle"}))
     });
 
     // Uninstalling gives back the very same bytes and drops the statuses.
@@ -341,8 +350,7 @@ fn install_run_and_uninstall_the_status_hook() {
     assert!(!state.join("settings.backup.json").exists());
     assert!(!status_file.exists());
     agent.event("statuses dropped", |e| {
-        e["event"] == "sessionChanged"
-            && e["data"]["session"]["state"] == json!({"kind": "live", "detail": "unknown"})
+        session_in(e).is_some_and(|s| s["state"] == json!({"kind": "live", "detail": "unknown"}))
     });
 
     // Claude Code keeps running the commands it loaded; with the script gone they

@@ -1,10 +1,21 @@
-//! Which Claude Code sessions are running, from `/proc`.
+//! Which Claude Code and Codex CLI sessions are running, from `/proc`.
 //!
 //! The interactive CLI shows up with argv[0] `claude` (or a path ending in `/claude`),
 //! or as `node .../claude-code/cli.js` for npm installs. The same binary also runs
 //! helpers: `claude daemon ...`, and processes that rewrite their title to
 //! `claude bg-pty-host` or `claude bg-spare`; those are not sessions. A session id is
 //! only known when the command line has `--resume <id>` or `--session-id <id>`.
+//!
+//! Codex's `codex` Node script `execve`s its native binary, so a Codex session shows up
+//! with argv[0] a path ending in `/codex` and the user's arguments after it (codex spec
+//! §3). The same binary runs `codex app-server …` (the shared daemon), `codex exec …`
+//! and other subcommands, and helpers named `codex-code-mode-host` and
+//! `codex-linux-sandbox`; none of those is a session. A Codex session's id comes from
+//! `resume <id>`, or else from what the process holds open: its thread lock
+//! (`thread-writer-locks/<id>.lock`) or its rollout. Started by Refract, with
+//! `--no-daemon`, the session process holds both itself; started elsewhere, the daemon
+//! holds them, and a lock held open by any `codex` process makes its session live
+//! ([`CodexLock`], [`codex_live`]).
 //!
 //! A process's start time is `btime` from `/proc/stat` (boot time, whole seconds) plus
 //! field 22 of `/proc/<pid>/stat` (clock ticks since boot). Ticks are taken as 100 per
@@ -21,6 +32,8 @@ use std::path::Path;
 
 use chrono::{DateTime, TimeDelta, Utc};
 use refract_core::classify::{parse_boot_id, Boot, HookReport, HookStatus};
+use refract_core::codex_transcript::file_session_id;
+use refract_core::protocol::AgentKind;
 use refract_core::sessions::paths_match;
 
 /// Subcommands of `claude` that are not interactive sessions.
@@ -38,13 +51,62 @@ const NON_SESSION_SUBCOMMANDS: &[&str] = &[
     "auth",
 ];
 
-/// A running Claude Code session process.
+/// Subcommands of `codex` that are not interactive sessions. Any other first word is
+/// a prompt, as Codex reads it, except `resume` and `fork`.
+const CODEX_NON_SESSION_SUBCOMMANDS: &[&str] = &[
+    "exec",
+    "e",
+    "review",
+    "login",
+    "logout",
+    "mcp",
+    "mcp-server",
+    "app-server",
+    "app",
+    "completion",
+    "sandbox",
+    "debug",
+    "apply",
+    "a",
+    "cloud",
+    "responses-api-proxy",
+    "stdio-to-uds",
+    "features",
+    "help",
+];
+
+/// Options of `codex` (top level or `resume`) that take the next word as their value,
+/// so that word is no subcommand, prompt or session id.
+const CODEX_VALUE_OPTIONS: &[&str] = &[
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-m",
+    "--model",
+    "-c",
+    "--config",
+    "-p",
+    "--profile",
+    "-C",
+    "--cd",
+    "-i",
+    "--image",
+    "--add-dir",
+    "--enable",
+    "--disable",
+    "--local-provider",
+];
+
+/// A running Claude Code or Codex session process.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeProcess {
+pub struct AgentProcess {
     pub pid: u32,
+    pub agent: AgentKind,
     /// The process's working directory.
     pub cwd: String,
-    /// From `--resume` or `--session-id`, when given.
+    /// From `--resume` or `--session-id`, when given; for Codex from `resume <id>`, or
+    /// else the thread lock or rollout the process holds open.
     pub session_id: Option<String>,
     /// When the process started, when `/proc` says.
     pub started: Option<DateTime<Utc>>,
@@ -62,7 +124,7 @@ pub struct LiveProcess {
     pub pid: u32,
     /// When it started, to tell it from a later process given the same pid.
     pub started: Option<DateTime<Utc>>,
-    /// See [`ClaudeProcess::refract_folder`].
+    /// See [`AgentProcess::refract_folder`].
     pub refract_folder: Option<String>,
 }
 
@@ -75,24 +137,45 @@ impl LiveProcess {
     }
 }
 
-/// What a command line says, if it is a Claude Code session.
+/// What a command line says, if it is a Claude Code or Codex session.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ClaudeCommand {
+pub struct AgentCommand {
+    pub agent: AgentKind,
     pub session_id: Option<String>,
 }
 
-/// Parses a NUL-separated `/proc/<pid>/cmdline`. Returns `None` for anything that is
-/// not an interactive or print-mode Claude Code session.
-pub fn parse_cmdline(raw: &[u8]) -> Option<ClaudeCommand> {
-    let args: Vec<String> = raw
+/// The arguments of a NUL-separated `/proc/<pid>/cmdline`.
+fn split_cmdline(raw: &[u8]) -> Vec<String> {
+    let mut args: Vec<String> = raw
         .split(|&b| b == 0)
         .map(|a| String::from_utf8_lossy(a).into_owned())
         .collect();
-    let args = match args.split_last() {
-        Some((last, rest)) if last.is_empty() => rest,
-        _ => &args[..],
-    };
+    if args.last().is_some_and(String::is_empty) {
+        args.pop();
+    }
+    args
+}
+
+/// True when the command line runs Codex's native binary, whatever its subcommand
+/// (the daemon included), so what it holds open says which Codex sessions are live.
+pub fn is_codex_program(raw: &[u8]) -> bool {
+    split_cmdline(raw)
+        .first()
+        .is_some_and(|program| basename(program) == "codex")
+}
+
+/// Parses a NUL-separated `/proc/<pid>/cmdline`. Returns `None` for anything that is
+/// not an interactive or print-mode Claude Code session or an interactive Codex
+/// session.
+pub fn parse_cmdline(raw: &[u8]) -> Option<AgentCommand> {
+    let args = split_cmdline(raw);
     let program = basename(args.first()?);
+    if program == "codex" {
+        return codex_session(&args[1..]).map(|session_id| AgentCommand {
+            agent: AgentKind::Codex,
+            session_id,
+        });
+    }
     let rest = if program == "claude" {
         &args[1..]
     } else if matches!(program, "node" | "bun") || program.starts_with("node") {
@@ -114,7 +197,134 @@ pub fn parse_cmdline(raw: &[u8]) -> Option<ClaudeCommand> {
     }
     let forked = rest.iter().any(|a| a == "--fork-session");
     let session_id = if forked { None } else { session_arg(rest) };
-    Some(ClaudeCommand { session_id })
+    Some(AgentCommand {
+        agent: AgentKind::Claude,
+        session_id,
+    })
+}
+
+/// What `codex`'s arguments say: `None` when they run no interactive session, else
+/// the id `resume <id>` names, if any. A new session (a prompt or none), `fork` and
+/// `resume --last` name none. After `--` everything is the prompt.
+fn codex_session(args: &[String]) -> Option<Option<String>> {
+    let mut words = positionals(args);
+    let Some(first) = words.next() else {
+        return Some(None);
+    };
+    if first.after_dashes {
+        return Some(None);
+    }
+    match first.word {
+        "resume" => Some(
+            words
+                .next()
+                .filter(|w| !w.after_dashes && is_uuid(w.word))
+                .map(|w| w.word.to_owned()),
+        ),
+        word if CODEX_NON_SESSION_SUBCOMMANDS.contains(&word) => None,
+        _ => Some(None),
+    }
+}
+
+/// A word on a `codex` command line that is no option or option value.
+struct Positional<'a> {
+    word: &'a str,
+    /// It came after `--`, so it is part of the prompt.
+    after_dashes: bool,
+}
+
+/// The positional words of `args`, skipping options and the values of
+/// [`CODEX_VALUE_OPTIONS`].
+fn positionals(args: &[String]) -> impl Iterator<Item = Positional<'_>> {
+    let mut dashes = false;
+    let mut skip = false;
+    args.iter().filter_map(move |arg| {
+        if dashes {
+            return Some(Positional {
+                word: arg,
+                after_dashes: true,
+            });
+        }
+        if std::mem::take(&mut skip) {
+            return None;
+        }
+        if arg == "--" {
+            dashes = true;
+            return None;
+        }
+        if arg.starts_with('-') {
+            skip = CODEX_VALUE_OPTIONS.contains(&arg.as_str());
+            return None;
+        }
+        Some(Positional {
+            word: arg,
+            after_dashes: false,
+        })
+    })
+}
+
+/// What a Codex process holds open, from the targets of its `/proc/<pid>/fd` links:
+/// the ids of its thread locks (`…/thread-writer-locks/<id>.lock`) and of its rollouts
+/// (`…/rollout-<time>-<id>.jsonl`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexHeld {
+    pub locks: Vec<String>,
+    pub rollouts: Vec<String>,
+}
+
+impl CodexHeld {
+    /// Sorts `targets` into locks and rollouts; anything else is left out.
+    pub fn from_targets<P: AsRef<Path>>(targets: impl IntoIterator<Item = P>) -> CodexHeld {
+        let mut held = CodexHeld::default();
+        for target in targets {
+            let target = target.as_ref();
+            let Some(name) = target.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            let in_locks = target
+                .parent()
+                .and_then(Path::file_name)
+                .is_some_and(|d| d == "thread-writer-locks");
+            if let Some(id) = name
+                .strip_suffix(".lock")
+                .filter(|id| in_locks && is_uuid(id))
+            {
+                held.locks.push(id.to_owned());
+            } else if name.starts_with("rollout-") {
+                held.rollouts
+                    .extend(file_session_id(name).map(str::to_owned));
+            }
+        }
+        held
+    }
+
+    /// The session these say the process writes: its lock, else its rollout.
+    pub fn session_id(&self) -> Option<&str> {
+        self.locks
+            .first()
+            .or(self.rollouts.first())
+            .map(String::as_str)
+    }
+}
+
+/// What `pid` holds open, as [`CodexHeld::from_targets`] reads it.
+pub fn codex_held(pid: u32) -> CodexHeld {
+    let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return CodexHeld::default();
+    };
+    CodexHeld::from_targets(
+        entries
+            .flatten()
+            .filter_map(|e| fs::read_link(e.path()).ok()),
+    )
+}
+
+/// A Codex thread lock held open, and the `codex` process (a session, or the shared
+/// daemon) holding it: the session is live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexLock {
+    pub session_id: String,
+    pub pid: u32,
 }
 
 fn basename(path: &str) -> &str {
@@ -230,8 +440,8 @@ pub fn proc_ancestors(pid: u32) -> Vec<u32> {
     })
 }
 
-/// True when `pid` still runs a Claude Code session.
-pub fn is_claude(pid: u32) -> bool {
+/// True when `pid` still runs a Claude Code or Codex session.
+pub fn is_agent(pid: u32) -> bool {
     fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|raw| parse_cmdline(&raw).is_some())
 }
 
@@ -283,42 +493,81 @@ pub fn start_time(btime: i64, ticks: u64) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(btime, 0)?.checked_add_signed(TimeDelta::milliseconds(millis))
 }
 
-/// Lists running Claude Code sessions by walking `/proc`. Processes whose details
-/// cannot be read (other users, exited) are skipped.
-pub fn scan() -> Vec<ClaudeProcess> {
+/// What one walk of `/proc` found: the session processes of both agents, and the
+/// Codex thread locks held open.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Scan {
+    pub procs: Vec<AgentProcess>,
+    pub codex_locks: Vec<CodexLock>,
+}
+
+/// Lists running Claude Code and Codex sessions by walking `/proc`. Processes whose
+/// details cannot be read (other users, exited) are skipped.
+pub fn scan() -> Vec<AgentProcess> {
+    scan_all().procs
+}
+
+/// [`scan`], with the Codex thread locks every `codex` process holds open.
+pub fn scan_all() -> Scan {
     let me = std::process::id();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return Vec::new();
+        return Scan::default();
     };
     let btime = fs::read_to_string("/proc/stat")
         .ok()
         .and_then(|s| parse_btime(&s));
-    entries
-        .flatten()
-        .filter_map(|entry| {
-            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
-            if pid == me {
-                return None;
-            }
-            let dir = entry.path();
-            let command = parse_cmdline(&fs::read(dir.join("cmdline")).ok()?)?;
-            let cwd = fs::read_link(dir.join("cwd")).ok()?;
-            let start_ticks = fs::read_to_string(dir.join("stat"))
-                .ok()
-                .and_then(|stat| parse_stat_start_ticks(&stat));
-            let started = start_ticks
-                .zip(btime)
-                .and_then(|(ticks, btime)| start_time(btime, ticks));
-            Some(ClaudeProcess {
+    let mut scan = Scan::default();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == me {
+            continue;
+        }
+        let dir = entry.path();
+        let Ok(raw) = fs::read(dir.join("cmdline")) else {
+            continue;
+        };
+        let held = if is_codex_program(&raw) {
+            codex_held(pid)
+        } else {
+            CodexHeld::default()
+        };
+        scan.codex_locks
+            .extend(held.locks.iter().map(|id| CodexLock {
+                session_id: id.clone(),
                 pid,
-                cwd: cwd.to_string_lossy().into_owned(),
-                session_id: command.session_id,
-                started,
-                start_ticks,
-                refract_folder: refract_folder(pid),
-            })
-        })
-        .collect()
+            }));
+        let Some(command) = parse_cmdline(&raw) else {
+            continue;
+        };
+        let Ok(cwd) = fs::read_link(dir.join("cwd")) else {
+            continue;
+        };
+        let start_ticks = fs::read_to_string(dir.join("stat"))
+            .ok()
+            .and_then(|stat| parse_stat_start_ticks(&stat));
+        let started = start_ticks
+            .zip(btime)
+            .and_then(|(ticks, btime)| start_time(btime, ticks));
+        let session_id = command
+            .session_id
+            .or_else(|| held.session_id().map(str::to_owned));
+        scan.procs.push(AgentProcess {
+            pid,
+            agent: command.agent,
+            cwd: cwd.to_string_lossy().into_owned(),
+            session_id,
+            started,
+            start_ticks,
+            refract_folder: refract_folder(pid),
+        });
+    }
+    scan
 }
 
 /// What [`live_sessions`] needs to know of one session's transcript.
@@ -349,7 +598,7 @@ impl HookRuns {
     /// report saying `ended`, or without a time, leads nowhere. A process runs the
     /// session of the latest report leading to it, the greater session id at the same
     /// second.
-    pub fn new(procs: &[ClaudeProcess], hooks: &HashMap<String, HookReport>) -> HookRuns {
+    pub fn new(procs: &[AgentProcess], hooks: &HashMap<String, HookReport>) -> HookRuns {
         let mut best: HashMap<u32, (i64, &str)> = HashMap::new();
         for (id, report) in hooks {
             let Some(at) = report.at else {
@@ -359,9 +608,9 @@ impl HookRuns {
                 continue;
             }
             let process = report.ancestors().find_map(|(pid, start)| {
-                procs
-                    .iter()
-                    .find(|p| p.pid == pid && p.start_ticks == Some(start))
+                procs.iter().find(|p| {
+                    p.agent == AgentKind::Claude && p.pid == pid && p.start_ticks == Some(start)
+                })
             });
             if let Some(process) = process {
                 let key = (at, id.as_str());
@@ -389,9 +638,10 @@ impl HookRuns {
     }
 }
 
-/// Decides which of a working directory's sessions are live, and which process runs
-/// each when that is certain. `procs` are all running `claude` processes, `sessions`
-/// the transcripts in `cwd`, and `hooks` what the status hook says about `procs`.
+/// Decides which of a working directory's Claude sessions are live, and which process
+/// runs each when that is certain. `procs` are all running agent processes, of which
+/// only the `claude` ones count here, `sessions` the transcripts in `cwd`, and `hooks`
+/// what the status hook says about `procs`.
 ///
 /// A process keeps the id on its command line (`--resume X`, `--session-id X`) after
 /// `/clear` or `/resume Y` switches it to another session, so the status hook comes
@@ -424,8 +674,23 @@ impl HookRuns {
 ///    it. This needs P's start time, and no process in `cwd` naming no id left after
 ///    step 1, since that one could be running Y. Without such a report nothing moves:
 ///    a session another process ran and closed looks the same.
-pub fn live_sessions<'a>(
-    procs: &'a [ClaudeProcess],
+pub fn live_sessions(
+    procs: &[AgentProcess],
+    cwd: &str,
+    sessions: &[SessionTimes],
+    hooks: &HookRuns,
+) -> HashMap<String, Option<LiveProcess>> {
+    let claude: Vec<AgentProcess> = procs
+        .iter()
+        .filter(|p| p.agent == AgentKind::Claude)
+        .cloned()
+        .collect();
+    claude_live(&claude, cwd, sessions, hooks)
+}
+
+/// [`live_sessions`] over `claude` processes only.
+fn claude_live<'a>(
+    procs: &'a [AgentProcess],
     cwd: &str,
     sessions: &[SessionTimes],
     hooks: &HookRuns,
@@ -438,12 +703,12 @@ pub fn live_sessions<'a>(
             live.insert(id.to_owned(), Some(live_process(process)));
         }
     }
-    let open: Vec<(usize, &ClaudeProcess)> = procs
+    let open: Vec<(usize, &AgentProcess)> = procs
         .iter()
         .enumerate()
         .filter(|(_, p)| hooks.session(p.pid).is_none())
         .collect();
-    let named_in = |p: &'a ClaudeProcess| p.session_id.as_deref().filter(|id| known.contains(id));
+    let named_in = |p: &'a AgentProcess| p.session_id.as_deref().filter(|id| known.contains(id));
     // Step 2.
     for (_, process) in &open {
         if let Some(id) = named_in(process) {
@@ -452,7 +717,7 @@ pub fn live_sessions<'a>(
         }
     }
     // Step 3.
-    let mut unnamed: Vec<&ClaudeProcess> = open
+    let mut unnamed: Vec<&AgentProcess> = open
         .iter()
         .map(|(_, p)| *p)
         .filter(|p| p.session_id.is_none() && paths_match(&p.cwd, cwd))
@@ -510,13 +775,15 @@ pub fn live_sessions<'a>(
     live
 }
 
-/// The earliest start of the processes in `cwd` that name no session, for a session
-/// matched to one of several of them (see [`live_sessions`]): whichever runs it started
-/// no earlier. `None` when there is none or a start time is unknown.
-pub fn earliest_unnamed_start(procs: &[ClaudeProcess], cwd: &str) -> Option<DateTime<Utc>> {
+/// The earliest start of the `claude` processes in `cwd` that name no session, for a
+/// session matched to one of several of them (see [`live_sessions`]): whichever runs it
+/// started no earlier. `None` when there is none or a start time is unknown.
+pub fn earliest_unnamed_start(procs: &[AgentProcess], cwd: &str) -> Option<DateTime<Utc>> {
     let starts: Vec<Option<DateTime<Utc>>> = procs
         .iter()
-        .filter(|p| p.session_id.is_none() && paths_match(&p.cwd, cwd))
+        .filter(|p| {
+            p.agent == AgentKind::Claude && p.session_id.is_none() && paths_match(&p.cwd, cwd)
+        })
         .map(|p| p.started)
         .collect();
     starts
@@ -527,7 +794,68 @@ pub fn earliest_unnamed_start(procs: &[ClaudeProcess], cwd: &str) -> Option<Date
         .min()
 }
 
-fn live_process(process: &ClaudeProcess) -> LiveProcess {
+/// Decides which of a working directory's Codex sessions are live, and which process
+/// runs each when that is certain. `procs` are all running agent processes, of which
+/// only the `codex` ones count here, `locks` the thread locks held open, `sessions` the
+/// ids of the rollouts that started in `cwd`, and `has_rollout` says whether a session
+/// has a rollout anywhere.
+///
+/// 1. A session in `sessions` is live when its lock is held (by its own process or the
+///    daemon) or a `codex` process names it (`resume <id>`, or the lock or rollout it
+///    holds). That process, when there is one, runs it.
+/// 2. A `codex` process in `cwd` that names a session whose lock is held but that has
+///    no rollout yet runs a live session that has had no message yet: it is live too,
+///    with that process.
+/// 3. When exactly one live session has no process and exactly one `codex` process in
+///    `cwd` names no session (a daemon-mode session, whose lock the daemon holds), that
+///    process runs it.
+pub fn codex_live(
+    procs: &[AgentProcess],
+    locks: &[CodexLock],
+    cwd: &str,
+    sessions: &[&str],
+    has_rollout: impl Fn(&str) -> bool,
+) -> HashMap<String, Option<LiveProcess>> {
+    let codex: Vec<&AgentProcess> = procs
+        .iter()
+        .filter(|p| p.agent == AgentKind::Codex)
+        .collect();
+    let locked: HashSet<&str> = locks.iter().map(|l| l.session_id.as_str()).collect();
+    let naming = |id: &str| codex.iter().find(|p| p.session_id.as_deref() == Some(id));
+    let mut live: HashMap<String, Option<LiveProcess>> = HashMap::new();
+    // Step 1.
+    for &id in sessions {
+        let named = naming(id);
+        if named.is_some() || locked.contains(id) {
+            live.insert(id.to_owned(), named.map(|p| live_process(p)));
+        }
+    }
+    // Step 2.
+    for process in codex.iter().filter(|p| paths_match(&p.cwd, cwd)) {
+        let Some(id) = process.session_id.as_deref() else {
+            continue;
+        };
+        if locked.contains(id) && !live.contains_key(id) && !has_rollout(id) {
+            live.insert(id.to_owned(), Some(live_process(process)));
+        }
+    }
+    // Step 3.
+    let unnamed: Vec<&&AgentProcess> = codex
+        .iter()
+        .filter(|p| p.session_id.is_none() && paths_match(&p.cwd, cwd))
+        .collect();
+    let orphans: Vec<String> = live
+        .iter()
+        .filter(|(_, p)| p.is_none())
+        .map(|(id, _)| id.clone())
+        .collect();
+    if let ([process], [id]) = (unnamed.as_slice(), orphans.as_slice()) {
+        live.insert(id.clone(), Some(live_process(process)));
+    }
+    live
+}
+
+fn live_process(process: &AgentProcess) -> LiveProcess {
     LiveProcess {
         pid: process.pid,
         started: process.started,
@@ -544,16 +872,177 @@ mod tests {
     const ID2: &str = "3f6c1a52-0000-4000-8000-000000000002";
     const REPO: &str = "/home/dev/projects/tidepool-api";
 
-    fn cmd(args: &[&str]) -> Option<ClaudeCommand> {
+    fn cmd(args: &[&str]) -> Option<AgentCommand> {
         let mut raw = args.join("\0").into_bytes();
         raw.push(0);
         parse_cmdline(&raw)
     }
 
-    fn session(id: Option<&str>) -> Option<ClaudeCommand> {
-        Some(ClaudeCommand {
+    fn session(id: Option<&str>) -> Option<AgentCommand> {
+        Some(AgentCommand {
+            agent: AgentKind::Claude,
             session_id: id.map(str::to_owned),
         })
+    }
+
+    fn codex(id: Option<&str>) -> Option<AgentCommand> {
+        Some(AgentCommand {
+            agent: AgentKind::Codex,
+            session_id: id.map(str::to_owned),
+        })
+    }
+
+    const CODEX_BIN: &str =
+        "/home/dev/.nvm/versions/node/v24.1.0/lib/node_modules/@openai/codex/vendor/x86_64-unknown-linux-musl/codex/codex";
+
+    #[test]
+    fn codex_sessions_are_recognised() {
+        assert_eq!(cmd(&[CODEX_BIN]), codex(None));
+        assert_eq!(cmd(&["codex", "fix the tide tables"]), codex(None));
+        let launched = [
+            CODEX_BIN,
+            "--no-daemon",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+        ];
+        assert_eq!(cmd(&launched), codex(None));
+        let mut new = launched.to_vec();
+        new.extend(["--", "exec the plan"]);
+        assert_eq!(cmd(&new), codex(None));
+        let mut resume = launched.to_vec();
+        resume.extend(["resume", ID]);
+        assert_eq!(cmd(&resume), codex(Some(ID)));
+        assert_eq!(cmd(&["codex", "resume", ID, "and go on"]), codex(Some(ID)));
+        assert_eq!(cmd(&["codex", "-m", "exec", "resume", ID]), codex(Some(ID)));
+        assert_eq!(cmd(&["codex", "resume", "--last"]), codex(None));
+        assert_eq!(cmd(&["codex", "resume", "tide"]), codex(None));
+        assert_eq!(cmd(&["codex", "fork", ID]), codex(None));
+    }
+
+    #[test]
+    fn codex_helpers_and_the_node_wrapper_are_not_sessions() {
+        let daemon = [
+            CODEX_BIN,
+            "app-server",
+            "--listen",
+            "unix://",
+            "--managed-daemon",
+        ];
+        assert_eq!(cmd(&daemon), None);
+        assert_eq!(cmd(&["codex", "exec", "write the tests"]), None);
+        assert_eq!(cmd(&["codex", "--no-daemon", "exec", "--json", "x"]), None);
+        assert_eq!(cmd(&["codex", "login"]), None);
+        assert_eq!(cmd(&["codex", "mcp-server"]), None);
+        assert_eq!(cmd(&["codex-code-mode-host", "--port", "0"]), None);
+        assert_eq!(
+            cmd(&["/home/dev/.codex/bin/codex-linux-sandbox", "--", "ls"]),
+            None
+        );
+        assert_eq!(
+            cmd(&[
+                "node",
+                "/home/dev/.nvm/versions/node/v24.1.0/bin/codex",
+                "--no-daemon"
+            ]),
+            None
+        );
+        assert_eq!(
+            cmd(&["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js"]),
+            None
+        );
+        let raw = |args: &[&str]| args.join("\0").into_bytes();
+        assert!(is_codex_program(&raw(&daemon)));
+        assert!(is_codex_program(&raw(&["codex", "exec", "x"])));
+        assert!(!is_codex_program(&raw(&["codex-linux-sandbox"])));
+        assert!(!is_codex_program(&raw(&["claude"])));
+    }
+
+    #[test]
+    fn codex_ids_come_from_held_locks_then_rollouts() {
+        let held = CodexHeld::from_targets([
+            "/dev/pts/3",
+            "/home/dev/.codex/log/codex-tui.log",
+            "/home/dev/.codex/sessions/2026/11/08/rollout-2026-11-08T19-02-11-0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e.jsonl",
+            "/home/dev/.codex/thread-writer-locks/3f6c1a52-0000-4000-8000-000000000001.lock",
+            "/home/dev/.codex/elsewhere/3f6c1a52-0000-4000-8000-000000000002.lock",
+            "/home/dev/.codex/thread-writer-locks/not-a-uuid.lock",
+        ]);
+        assert_eq!(held.locks, [ID]);
+        assert_eq!(held.rollouts, ["0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e"]);
+        assert_eq!(held.session_id(), Some(ID));
+        let rollout_only = CodexHeld {
+            locks: Vec::new(),
+            ..held
+        };
+        assert_eq!(
+            rollout_only.session_id(),
+            Some("0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e")
+        );
+        assert_eq!(CodexHeld::default().session_id(), None);
+    }
+
+    fn codex_proc(cwd: &str, pid: u32, id: Option<&str>) -> AgentProcess {
+        AgentProcess {
+            pid,
+            agent: AgentKind::Codex,
+            ..proc(cwd, id)
+        }
+    }
+
+    fn lock(id: &str, pid: u32) -> CodexLock {
+        CodexLock {
+            session_id: id.into(),
+            pid,
+        }
+    }
+
+    #[test]
+    fn codex_sessions_are_live_by_lock_or_by_name() {
+        let none = |_: &str| false;
+        // Started by Refract: the session process holds the lock and names the session.
+        let tui = [codex_proc(REPO, 40, Some(ID))];
+        let live = codex_live(&tui, &[lock(ID, 40)], REPO, &[ID, ID2], none);
+        assert_eq!(sorted(live.clone()), [ID]);
+        assert_eq!(pid_of(&live, ID), Some(40));
+        // Daemon mode: the daemon (not a session process) holds the lock, and the one
+        // unnamed session process in the folder runs it.
+        let tui = [codex_proc(REPO, 41, None)];
+        let live = codex_live(&tui, &[lock(ID2, 9)], REPO, &[ID, ID2], none);
+        assert_eq!(sorted(live.clone()), [ID2]);
+        assert_eq!(pid_of(&live, ID2), Some(41));
+        // Two daemon-mode sessions: live, but which process runs each is not certain.
+        let tuis = [codex_proc(REPO, 41, None), codex_proc(REPO, 42, None)];
+        let live = codex_live(&tuis, &[lock(ID, 9), lock(ID2, 9)], REPO, &[ID, ID2], none);
+        assert_eq!(sorted(live.clone()), [ID, ID2]);
+        assert_eq!((pid_of(&live, ID), pid_of(&live, ID2)), (None, None));
+        // `codex resume <id>` names its session before the lock is taken.
+        let tui = [codex_proc(ELSEWHERE, 43, Some(ID2))];
+        assert_eq!(
+            pid_of(&codex_live(&tui, &[], REPO, &[ID2], none), ID2),
+            Some(43)
+        );
+        // A Claude process naming the id counts for nothing here.
+        let claude = [proc(REPO, Some(ID))];
+        assert!(codex_live(&claude, &[], REPO, &[ID], none).is_empty());
+        // Nor does a Codex process count for Claude.
+        let tui = [codex_proc(REPO, 44, None)];
+        assert!(without_hooks(&tui, REPO, &[(ID, at(9))]).is_empty());
+    }
+
+    #[test]
+    fn a_codex_session_with_no_rollout_yet_is_live_in_its_folder() {
+        let tui = [codex_proc(REPO, 40, Some(ID3))];
+        let locks = [lock(ID3, 40)];
+        let live = codex_live(&tui, &locks, REPO, &[], |_| false);
+        assert_eq!(sorted(live.clone()), [ID3]);
+        assert_eq!(pid_of(&live, ID3), Some(40));
+        // Not in another folder, nor once its rollout exists (it is listed there).
+        assert!(codex_live(&tui, &locks, ELSEWHERE, &[], |_| false).is_empty());
+        assert!(codex_live(&tui, &locks, REPO, &[], |id| id == ID3).is_empty());
+        // Nor without its lock held.
+        assert!(codex_live(&tui, &[], REPO, &[], |_| false).is_empty());
     }
 
     #[test]
@@ -624,8 +1113,9 @@ mod tests {
         assert_eq!(parse_cmdline(b""), None);
     }
 
-    fn proc(cwd: &str, id: Option<&str>) -> ClaudeProcess {
-        ClaudeProcess {
+    fn proc(cwd: &str, id: Option<&str>) -> AgentProcess {
+        AgentProcess {
+            agent: AgentKind::Claude,
             pid: 1,
             cwd: cwd.into(),
             session_id: id.map(str::to_owned),
@@ -635,8 +1125,8 @@ mod tests {
         }
     }
 
-    fn started_at(cwd: &str, hour: u32) -> ClaudeProcess {
-        ClaudeProcess {
+    fn started_at(cwd: &str, hour: u32) -> AgentProcess {
+        AgentProcess {
             started: at(hour),
             ..proc(cwd, None)
         }
@@ -665,7 +1155,7 @@ mod tests {
     }
 
     fn without_hooks(
-        procs: &[ClaudeProcess],
+        procs: &[AgentProcess],
         cwd: &str,
         pairs: &[(&str, Option<DateTime<Utc>>)],
     ) -> HashMap<String, Option<LiveProcess>> {
@@ -688,7 +1178,7 @@ mod tests {
         report
     }
 
-    fn hooks(procs: &[ClaudeProcess], reports: &[(&str, HookReport)]) -> HookRuns {
+    fn hooks(procs: &[AgentProcess], reports: &[(&str, HookReport)]) -> HookRuns {
         let reports: HashMap<String, HookReport> = reports
             .iter()
             .map(|(id, r)| ((*id).to_owned(), *r))
@@ -701,8 +1191,9 @@ mod tests {
     }
 
     /// `claude --resume <id>` as pid `pid`, started at `hour`, in `cwd`.
-    fn resumed(cwd: &str, pid: u32, id: &str, hour: u32) -> ClaudeProcess {
-        ClaudeProcess {
+    fn resumed(cwd: &str, pid: u32, id: &str, hour: u32) -> AgentProcess {
+        AgentProcess {
+            agent: AgentKind::Claude,
             pid,
             session_id: Some(id.into()),
             start_ticks: Some(ticks(pid)),
@@ -711,8 +1202,9 @@ mod tests {
     }
 
     /// `claude` naming no session as pid `pid`, started at `hour`, in `cwd`.
-    fn plain(cwd: &str, pid: u32, hour: u32) -> ClaudeProcess {
-        ClaudeProcess {
+    fn plain(cwd: &str, pid: u32, hour: u32) -> AgentProcess {
+        AgentProcess {
+            agent: AgentKind::Claude,
             pid,
             start_ticks: Some(ticks(pid)),
             ..started_at(cwd, hour)
@@ -792,7 +1284,7 @@ mod tests {
         bare.starts = [0; HOOK_PIDS];
         let live = live_sessions(&procs, REPO, &sessions, &hooks(&procs, &[(ID2, bare)]));
         assert_eq!(sorted(live), [ID]);
-        let unknown = [ClaudeProcess {
+        let unknown = [AgentProcess {
             start_ticks: None,
             ..procs[0].clone()
         }];
@@ -900,7 +1392,7 @@ mod tests {
     }
 
     /// Reports from a hook installed before pids were recorded.
-    fn old_hook(procs: &[ClaudeProcess], ids: &[&str]) -> HookRuns {
+    fn old_hook(procs: &[AgentProcess], ids: &[&str]) -> HookRuns {
         let reports: Vec<(&str, HookReport)> = ids
             .iter()
             .map(|id| (*id, report(HookStatus::Working, 5, &[])))
@@ -936,7 +1428,7 @@ mod tests {
     #[test]
     fn the_fallback_is_refused_when_it_could_be_wrong() {
         let procs = [resumed(REPO, 812, ID, 2)];
-        let check = |procs: &[ClaudeProcess], sessions: &[SessionTimes], reports: HookRuns| {
+        let check = |procs: &[AgentProcess], sessions: &[SessionTimes], reports: HookRuns| {
             let live = live_sessions(procs, REPO, sessions, &reports);
             assert!(!live.contains_key(ID2), "{live:?}");
             assert_eq!(pid_of(&live, ID), Some(812));
@@ -952,7 +1444,7 @@ mod tests {
         let older = [timed(ID, 0, 6), timed(ID2, 4, 5)];
         check(&procs, &older, old_hook(&procs, &[ID2]));
         // The process's start time is not known.
-        let unknown = [ClaudeProcess {
+        let unknown = [AgentProcess {
             started: None,
             ..procs[0].clone()
         }];
@@ -1048,16 +1540,18 @@ mod tests {
     #[test]
     fn live_sessions_keep_the_process_running_each() {
         let sessions = [(ID, at(1)), (ID2, at(5))];
-        let named = ClaudeProcess {
+        let named = AgentProcess {
+            agent: AgentKind::Claude,
             pid: 812,
             refract_folder: Some(REPO.into()),
             ..started_at(REPO, 0)
         };
-        let named = ClaudeProcess {
+        let named = AgentProcess {
             session_id: Some(ID.into()),
             ..named
         };
-        let unnamed = ClaudeProcess {
+        let unnamed = AgentProcess {
+            agent: AgentKind::Claude,
             pid: 907,
             ..proc(REPO, None)
         };
@@ -1078,11 +1572,13 @@ mod tests {
     fn a_guess_among_several_unnamed_processes_records_no_process() {
         let sessions = [(ID, at(1)), (ID2, at(5))];
         let procs = [
-            ClaudeProcess {
+            AgentProcess {
+                agent: AgentKind::Claude,
                 pid: 812,
                 ..started_at(REPO, 0)
             },
-            ClaudeProcess {
+            AgentProcess {
+                agent: AgentKind::Claude,
                 pid: 907,
                 ..started_at(REPO, 4)
             },
@@ -1094,11 +1590,13 @@ mod tests {
         // A process naming its id stays certain beside an unnamed one, which is then
         // the only unnamed one.
         let procs = [
-            ClaudeProcess {
+            AgentProcess {
+                agent: AgentKind::Claude,
                 pid: 812,
                 ..proc(REPO, Some(ID))
             },
-            ClaudeProcess {
+            AgentProcess {
+                agent: AgentKind::Claude,
                 pid: 907,
                 ..proc(REPO, None)
             },
@@ -1112,7 +1610,8 @@ mod tests {
     fn unnamed_processes_elsewhere_do_not_make_a_guess_uncertain() {
         let sessions = [(ID, at(1))];
         let procs = [
-            ClaudeProcess {
+            AgentProcess {
+                agent: AgentKind::Claude,
                 pid: 812,
                 ..proc(REPO, None)
             },
@@ -1190,7 +1689,7 @@ mod tests {
     fn this_process_has_ancestors_in_proc() {
         let me = std::process::id();
         assert_eq!(proc_ancestors(me).first(), Some(&me));
-        assert!(!is_claude(me));
+        assert!(!is_agent(me));
         assert!(process_started(me).is_some());
     }
 
@@ -1227,7 +1726,7 @@ mod tests {
     #[test]
     fn the_earliest_unnamed_start_in_a_directory() {
         const REPO: &str = "/home/dev/projects/tidepool-api";
-        let named = ClaudeProcess {
+        let named = AgentProcess {
             started: at(7),
             ..proc(REPO, Some("5e2a7c10-0000-4000-8000-0000000000a1"))
         };

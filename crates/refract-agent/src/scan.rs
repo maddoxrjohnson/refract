@@ -5,6 +5,8 @@ use std::fs;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+use refract_core::codex_ready::{self, InstructionFiles};
+
 use crate::config::Config;
 
 /// Directory names never searched: build output and dependencies.
@@ -325,9 +327,145 @@ pub fn common_dir(git_dir: &Path) -> Option<PathBuf> {
     (!target.is_empty()).then(|| git_dir.join(target))
 }
 
+/// The most bytes of an instruction or notes file read. A longer AGENTS.md is still
+/// over [`refract_core::codex_ready::MAX_AGENTS_BYTES`].
+pub const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
+
+/// A repo's instruction files, read for its Codex readiness (codex spec §4) and for a
+/// brief's handoff. A missing or unreadable file is `None`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Instructions {
+    pub agents_md: Option<String>,
+    pub claude_md: Option<String>,
+    pub claude_local_md: Option<String>,
+    /// The notes files AGENTS.md names
+    /// ([`named_notes`](refract_core::codex_ready::named_notes)) that exist, as (path
+    /// relative to the repo, contents).
+    pub notes: Vec<(String, String)>,
+}
+
+impl Instructions {
+    /// The notes as [`InstructionFiles::notes`] takes them.
+    pub fn note_refs(&self) -> Vec<(&str, &str)> {
+        self.notes
+            .iter()
+            .map(|(p, t)| (p.as_str(), t.as_str()))
+            .collect()
+    }
+
+    /// The files as [`codex_ready::readiness`] takes them, with `notes` from
+    /// [`Instructions::note_refs`]. Codex loads the AGENTS.md files from the project root
+    /// (the nearest `.git`, which is the repo's own folder) down to its working
+    /// directory, which is that folder too, so no other AGENTS.md counts.
+    pub fn files<'a>(&'a self, notes: &'a [(&'a str, &'a str)]) -> InstructionFiles<'a> {
+        InstructionFiles {
+            agents_md: self.agents_md.as_deref(),
+            claude_md: self.claude_md.as_deref(),
+            claude_local_md: self.claude_local_md.as_deref(),
+            other_agents_bytes: &[],
+            notes,
+        }
+    }
+
+    /// The handoff, for a brief: the first notes file whose name says `handoff`.
+    pub fn handoff(&self) -> Option<&str> {
+        self.notes
+            .iter()
+            .find(|(path, _)| path.to_ascii_lowercase().contains("handoff"))
+            .map(|(_, text)| text.as_str())
+    }
+
+    /// The directories, relative to the repo, that hold the notes files, so a watch
+    /// sees them change even when git ignores them.
+    pub fn note_dirs(&self) -> Vec<String> {
+        let mut dirs: Vec<String> = self
+            .notes
+            .iter()
+            .map(|(path, _)| path.rsplit_once('/').map_or("", |(dir, _)| dir).to_owned())
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        dirs
+    }
+}
+
+/// Reads `repo`'s AGENTS.md, CLAUDE.md, CLAUDE.local.md and the notes files AGENTS.md
+/// names, each up to [`MAX_INSTRUCTION_BYTES`].
+pub fn read_instructions(repo: &Path) -> Instructions {
+    let read = |name: &str| read_text(&repo.join(name));
+    let agents_md = read("AGENTS.md");
+    let notes = agents_md
+        .as_deref()
+        .map(codex_ready::named_notes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|path| {
+            let text = read(&path)?;
+            Some((path, text))
+        })
+        .collect();
+    Instructions {
+        claude_md: read("CLAUDE.md"),
+        claude_local_md: read("CLAUDE.local.md"),
+        agents_md,
+        notes,
+    }
+}
+
+/// A regular file's text, up to [`MAX_INSTRUCTION_BYTES`]; `None` when it is missing,
+/// not a file or unreadable.
+fn read_text(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    file.take(MAX_INSTRUCTION_BYTES)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn instructions_are_read_with_the_notes_agents_md_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        fs::create_dir(repo.join("notes")).unwrap();
+        fs::write(
+            repo.join("AGENTS.md"),
+            "# Kelp CLI\n\nRead `notes/HANDOFF.md` and PROGRESS.md first.\n",
+        )
+        .unwrap();
+        fs::write(repo.join("CLAUDE.md"), "@AGENTS.md\n").unwrap();
+        fs::write(repo.join("notes/HANDOFF.md"), "Next: tide tables.\n").unwrap();
+        let read = read_instructions(repo);
+        assert!(read.agents_md.as_deref().unwrap().starts_with("# Kelp CLI"));
+        assert_eq!(read.claude_md.as_deref(), Some("@AGENTS.md\n"));
+        assert_eq!(read.claude_local_md, None);
+        // PROGRESS.md is named but missing, so it is left out.
+        assert_eq!(
+            read.notes,
+            [(
+                "notes/HANDOFF.md".to_owned(),
+                "Next: tide tables.\n".to_owned()
+            )]
+        );
+        assert_eq!(read.handoff(), Some("Next: tide tables.\n"));
+        assert_eq!(read.note_dirs(), ["notes"]);
+        let notes = read.note_refs();
+        let files = read.files(&notes);
+        assert!(files.other_agents_bytes.is_empty());
+        assert_eq!(files.notes.len(), 1);
+        assert_eq!(
+            read_instructions(&repo.join("notes")),
+            Instructions::default()
+        );
+    }
 
     fn mkrepo(path: &Path) {
         fs::create_dir_all(path.join(".git")).unwrap();
@@ -341,6 +479,7 @@ mod tests {
             depth,
             claude_projects: PathBuf::from("/nonexistent"),
             limits_file: PathBuf::from("/nonexistent/usage-state.json"),
+            codex_home: PathBuf::from("/nonexistent/codex"),
         }
     }
 

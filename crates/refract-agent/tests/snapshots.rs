@@ -109,6 +109,7 @@ fn load(f: &Fixture) -> Vec<RepoSnapshot> {
         depth: 3,
         claude_projects: f.projects.clone(),
         limits_file: f.projects.join("usage-state.json"),
+        codex_home: f.projects.join("codex"),
     });
     agent.load_all();
     agent.snapshots()
@@ -275,6 +276,7 @@ fn agent_for(root: &Path, projects: &Path) -> Agent {
         depth: 3,
         claude_projects: projects.to_owned(),
         limits_file: projects.join("usage-state.json"),
+        codex_home: projects.join("codex"),
     });
     agent.load_all();
     agent

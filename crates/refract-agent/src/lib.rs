@@ -2,6 +2,7 @@
 //! sessions, watches for changes, and talks to the Windows app over stdin and stdout
 //! using the messages in [`refract_core::protocol`].
 
+pub mod codex;
 pub mod config;
 pub mod git;
 pub mod hook;
