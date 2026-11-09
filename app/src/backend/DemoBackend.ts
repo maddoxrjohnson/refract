@@ -116,7 +116,7 @@ const claudeOnly = (file: string, line: number, text: string, term: string): Fin
 // Codex as an overflow agent (.plans/codex-spec.md): one invented repo per picker state.
 const CODEX_READY: CodexReadiness = { state: "ready", findings: [], gates: {} };
 const CODEX_WARNINGS: Finding[] = [
-  claudeOnly("AGENTS.md", 14, "Ask with AskUserQuestion before changing the schema.", "askuserquestion"),
+  claudeOnly("AGENTS.md", 14, "Ask with AskUserQuestion before changing the schema.", "AskUserQuestion"),
   claudeOnly("notes/HANDOFF.md", 6, "Run /clear once the milestone is committed.", "/clear"),
 ];
 const CODEX_NOT_READY: Finding[] = [
@@ -603,11 +603,11 @@ function seededRefactor(name: string): RefactorInfo {
   };
 }
 
-/** The opening prompt the demo's pretend terminal shows for a refactor. */
 /** The demo's short stand-in for the Make Codex-ready prompt (codex spec §9). */
 export const DEMO_CODEX_READY_PROMPT =
   "Make this repository ready for Codex CLI as well as Claude Code, without changing what the instructions mean.";
 
+/** The opening prompt the demo's pretend terminal shows for a refactor. */
 export const DEMO_REFACTOR_PROMPT =
   "Refactor this repository: up to 3 behaviour-preserving refactors, one commit each.";
 
@@ -829,10 +829,6 @@ const USAGE_REPOS: [name: string, share: number][] = [
   ["ledger-sync", 0.05],
 ];
 
-/**
- * A backend with invented data. Launching only walks through the progress steps and
- * tells `onDemoLaunch` listeners, which show a pretend terminal.
- */
 /** The gates with `sessionId` taken out of any stop-idle list; an emptied one is open again. */
 function withoutStopped(gates: CodexReadiness["gates"], sessionId: string): CodexReadiness["gates"] {
   const out: CodexReadiness["gates"] = {};
@@ -848,6 +844,10 @@ function withoutStopped(gates: CodexReadiness["gates"], sessionId: string): Code
   return out;
 }
 
+/**
+ * A backend with invented data. Launching only walks through the progress steps and
+ * tells `onDemoLaunch` listeners, which show a pretend terminal.
+ */
 export class DemoBackend implements Backend {
   private repos = demoRepos();
   private progress = new Set<(step: LaunchStep) => void>();

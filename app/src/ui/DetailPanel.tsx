@@ -12,7 +12,19 @@ import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
 import { hostLabel, remoteUrl, repoStatus, unfinishedSessions } from "../repoStatus";
 import { StatusLine } from "./FocusLabel";
 import { firstLine, relativeTime, sessionStateLabel } from "./format";
-import { agentName, focusableSession, newAgentMode, resumableSession, resumeMode } from "./navigation";
+import {
+  agentName,
+  busyText,
+  focusableSession,
+  gateOf,
+  newAgentMode,
+  optionMode,
+  panelNewRow,
+  resumableSession,
+  resumeMode,
+  resumeRow,
+} from "./navigation";
+import { newLabel, resumeOptionLabel } from "./Picker";
 import "./ui.css";
 
 export interface DetailPanelProps {
@@ -21,8 +33,11 @@ export interface DetailPanelProps {
   now: number;
   /** What Enter does: dispatch navigation's `{ type: "launch" }`. */
   onPrimary(): void;
-  /** Start directly in a given mode (the New agent and Resume buttons). */
-  onLaunch(mode: LaunchMode): void;
+  /**
+   * Start directly in a given mode (the New agent and Resume buttons), first stopping the
+   * other agent's idle sessions in `stop`.
+   */
+  onLaunch(mode: LaunchMode, stop?: string[]): void;
   onOpenFolder(): void;
   onOpenUrl(url: string): void;
   onClose(): void;
@@ -173,6 +188,9 @@ function CodexSection({
   const [open, setOpen] = useState(false);
   const findings = codex?.findings ?? [];
   const fixable = codex?.state === "notReady" || codex?.state === "warnings";
+  // The helper picks the agent it starts, so either one being busy holds it back.
+  const busyGate = [codex?.gates.claude, codex?.gates.codex].find((g) => g?.kind === "busy");
+  const busy = busyGate?.kind === "busy" ? busyText(busyGate) : undefined;
   return (
     <section className="rf-section rf-codex" aria-label="Codex">
       <div className={codex ? undefined : "rf-muted"}>{codexLine(codex)}</div>
@@ -204,11 +222,18 @@ function CodexSection({
       )}
       {fixable && onMakeReady && (
         <div className="rf-row">
-          <button type="button" className="rf-button" disabled={launching} onClick={onMakeReady}>
+          <button
+            type="button"
+            className="rf-button"
+            disabled={launching || !!busy}
+            title={busy}
+            onClick={onMakeReady}
+          >
             Make Codex-ready
           </button>
         </div>
       )}
+      {fixable && onMakeReady && busy && <p className="rf-hint">{busy}</p>}
     </section>
   );
 }
@@ -252,8 +277,14 @@ export function DetailPanel({
   launching = false,
 }: DetailPanelProps) {
   const hintId = useId();
-  const direct = repo.preselect.kind === "noPicker";
+  // Enter starts Claude at once only while nothing holds it back, as navigation does.
+  const direct = repo.preselect.kind === "noPicker" && gateOf(repo, "claude").kind === "open";
   const resume = resumableSession(repo);
+  // With Codex installed, the buttons follow the picker's rows: gates, stop-idle and the hint.
+  const resumeOption = resume && repo.codex ? resumeRow(repo, resume) : null;
+  const newOption = panelNewRow(repo);
+  const start = (mode: LaunchMode, stop?: string[]) => (stop ? onLaunch(mode, stop) : onLaunch(mode));
+  const blockedReasons = [...new Set([resumeOption?.blocked, newOption?.blocked].filter((b) => !!b))];
   const running = focusableSession(repo);
   const session = lastSession(repo);
   const sessionLine = session ? firstLine(session.lastAssistantText) : null;
@@ -464,16 +495,29 @@ export function DetailPanel({
               <button
                 type="button"
                 className="rf-button"
-                onClick={() => onLaunch(resumeMode(resume))}
+                disabled={!!resumeOption?.blocked}
+                title={resumeOption?.blocked}
+                onClick={() => start(resumeMode(resume), resumeOption?.stop)}
               >
-                Resume
+                {resumeOption?.stop ? resumeOptionLabel(resumeOption) : "Resume"}
               </button>
             )}
-            <button type="button" className="rf-button" onClick={() => onLaunch(newAgentMode(repo))}>
-              New agent
+            <button
+              type="button"
+              className="rf-button"
+              disabled={!!newOption?.blocked}
+              title={newOption?.blocked}
+              onClick={() =>
+                newOption ? start(optionMode(newOption), newOption.stop) : start(newAgentMode(repo))
+              }
+            >
+              {newOption && (newOption.agent === "codex" || newOption.brief || newOption.stop)
+                ? newLabel(newOption)
+                : "New agent"}
             </button>
           </div>
         )}
+        {!direct && blockedReasons.length > 0 && <p className="rf-hint">{blockedReasons.join(" · ")}</p>}
         {secondary}
       </div>
     </aside>

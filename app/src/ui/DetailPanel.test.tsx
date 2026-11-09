@@ -240,7 +240,7 @@ describe("DetailPanel remote details", () => {
     const warnings: CodexReadiness = {
       state: "warnings",
       findings: [
-        { file: "AGENTS.md", line: 14, kind: "claudeOnly", text: "Ask with AskUserQuestion first.", term: "askuserquestion" },
+        { file: "AGENTS.md", line: 14, kind: "claudeOnly", text: "Ask with AskUserQuestion first.", term: "AskUserQuestion" },
         { file: "notes/HANDOFF.md", line: null, kind: "claudeOnly", text: "Run /clear after each step.", term: "/clear" },
       ],
       gates: {},
@@ -296,6 +296,76 @@ describe("DetailPanel remote details", () => {
       setup(testRepo({ codex: { state: "ready", findings: [], gates: {} } }), { onMakeCodexReady: vi.fn() });
       expect(screen.queryByRole("button", { name: "Make Codex-ready" })).toBeNull();
       expect(screen.queryByRole("button", { name: /findings/ })).toBeNull();
+    });
+
+    const busyFor = (agent: "claude" | "codex"): CodexReadiness => ({
+      state: agent === "codex" ? "busy" : "ready",
+      findings: [],
+      gates: { [agent]: { kind: "busy", agent: agent === "codex" ? "claude" : "codex", sessionId: "b", state: "working" } },
+    });
+
+    it("holds Resume and New agent back while their agent's gate is busy", () => {
+      const cut = testSession("k1", { kind: "interrupted", detail: "apiError" }, 1);
+      const { panel, props } = setup(
+        testRepo({ sessions: [cut], preselect: { kind: "resume", sessionId: "k1" }, codex: busyFor("claude") }),
+      );
+      const resume = screen.getByRole("button", { name: "Resume" });
+      const fresh = screen.getByRole("button", { name: "New agent" });
+      expect(resume).toHaveProperty("disabled", true);
+      expect(resume.getAttribute("title")).toBe("Busy: Codex is working");
+      expect(fresh).toHaveProperty("disabled", true);
+      expect(panel.textContent).toContain("Busy: Codex is working");
+      fireEvent.click(resume);
+      expect(props.onLaunch).not.toHaveBeenCalled();
+    });
+
+    it("resumes a Codex session while Codex is not ready", () => {
+      const cut = { ...testSession("c1", { kind: "interrupted", detail: "apiError" }, 1), agent: "codex" as const };
+      const notReady: CodexReadiness = { state: "notReady", findings: [], gates: {} };
+      setup(testRepo({ sessions: [cut], preselect: { kind: "resume", sessionId: "c1" }, codex: notReady }));
+      expect(screen.getByRole("button", { name: "Resume" })).toHaveProperty("disabled", false);
+    });
+
+    it("stops the idle other agent first from Resume and New agent", () => {
+      const cut = testSession("k1", { kind: "interrupted", detail: "apiError" }, 1);
+      const codex: CodexReadiness = { state: "ready", findings: [], gates: { claude: { kind: "stopIdle", sessionIds: ["idle-1"] } } };
+      const { props } = setup(testRepo({ sessions: [cut], preselect: { kind: "resume", sessionId: "k1" }, codex }));
+      fireEvent.click(screen.getByRole("button", { name: "Stop the idle Codex agent and resume" }));
+      expect(props.onLaunch).toHaveBeenLastCalledWith({ kind: "resume", sessionId: "k1" }, ["idle-1"]);
+      fireEvent.click(screen.getByRole("button", { name: "Stop the idle Codex agent and start Claude" }));
+      expect(props.onLaunch).toHaveBeenLastCalledWith({ kind: "new" }, ["idle-1"]);
+    });
+
+    it("starts the New agent the preselect names, briefed", () => {
+      const done = testSession("k1", { kind: "finished", detail: "completed" }, 1, null, 100_000, "uncommittedChanges");
+      const { props } = setup(
+        testRepo({
+          sessions: [done],
+          preselect: { kind: "newAgent" },
+          newAgent: { agent: "codex", briefFrom: "k1", reason: { kind: "nudge", usedPercent: 97 } },
+          codex: { state: "ready", findings: [], gates: {} },
+        }),
+      );
+      fireEvent.click(screen.getByRole("button", { name: "New Codex agent, briefed" }));
+      expect(props.onLaunch).toHaveBeenCalledWith({ kind: "new", agent: "codex", brief: "k1" });
+    });
+
+    it("opens the picker rather than starting Claude at once while Claude's gate is busy", () => {
+      const { props } = setup(testRepo({ preselect: { kind: "noPicker" }, codex: busyFor("claude") }));
+      expect(screen.getByRole("button", { name: /Launch…/ })).toBeTruthy();
+      expect(screen.getByRole("button", { name: "New agent" })).toHaveProperty("disabled", true);
+      expect(props.onLaunch).not.toHaveBeenCalled();
+    });
+
+    it("holds Make Codex-ready back while either agent is busy", () => {
+      for (const agent of ["claude", "codex"] as const) {
+        const codex = { ...busyFor(agent), state: "warnings" as const, findings: warnings.findings };
+        const { view } = setup(testRepo({ codex }), { onMakeCodexReady: vi.fn() });
+        const button = screen.getByRole("button", { name: "Make Codex-ready" });
+        expect(button).toHaveProperty("disabled", true);
+        expect(button.getAttribute("title")).toBe(`Busy: ${agent === "codex" ? "Claude" : "Codex"} is working`);
+        view.unmount();
+      }
     });
 
     it("resumes a Codex session as Codex", () => {

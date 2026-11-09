@@ -50,6 +50,7 @@ import {
   matchingPaths,
   navigate,
   newAgentMode,
+  partialStopText,
   type NavContext,
   type NavEffect,
   type NavInput,
@@ -380,14 +381,25 @@ export function App({ backend }: { backend: Backend }) {
     [repos, localRepos],
   );
   // "Stop the idle Claude agent and start Codex" (and its mirror) stops each idle session
-  // first; a refusal (it got busy) shows as the launch's failure and starts nothing.
+  // first; a refusal (it got busy) shows as the launch's failure and starts nothing. After
+  // earlier stops went through, the failure also says which sessions were stopped.
   const startLaunch = useCallback(
     (path: string, mode: LaunchMode, stop: readonly string[] = []) =>
       runLaunch(path, async () => {
-        for (const id of stop) await backend.migrateStopAgent(path, id);
+        const stopped: string[] = [];
+        for (const id of stop) {
+          try {
+            await backend.migrateStopAgent(path, id);
+          } catch (err) {
+            if (stopped.length === 0) throw err;
+            const repo = repos.get(path) ?? localRepos.get(path);
+            throw new Error(partialStopText(repo, stopped, describeError(err)));
+          }
+          stopped.push(id);
+        }
         return backend.launch(path, mode);
       }),
-    [backend, runLaunch],
+    [backend, runLaunch, repos, localRepos],
   );
 
   // Clone and launch (spec §4.4): one job with the launch, under the same guard. The zoom
@@ -663,7 +675,7 @@ export function App({ backend }: { backend: Backend }) {
           repo={zoomedRepo}
           now={now}
           onPrimary={() => send({ type: "launch" })}
-          onLaunch={(mode) => startLaunch(zoomedRepo.path, mode)}
+          onLaunch={(mode, stop) => startLaunch(zoomedRepo.path, mode, stop)}
           onOpenFolder={() => openFolder(zoomedRepo.path)}
           onOpenUrl={openUrl}
           onClose={() => send({ type: "key", key: { key: "Escape" } })}

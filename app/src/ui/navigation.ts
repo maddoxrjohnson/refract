@@ -13,7 +13,15 @@ import { DIRTY_REPO_PROMPT, focusableSessions, unfinishedSessions } from "../rep
 export type PickerOption =
   /** Go to the VS Code terminal already running a live session. */
   | { kind: "focus"; session: SessionInfo; agent?: AgentKind }
-  | { kind: "resume"; session: SessionInfo; agent?: AgentKind }
+  | {
+      kind: "resume";
+      session: SessionInfo;
+      agent?: AgentKind;
+      /** Why it can't resume now, such as "Busy: Codex is working"; the row is dimmed. */
+      blocked?: string;
+      /** The other agent's idle sessions to stop before resuming this one. */
+      stop?: string[];
+    }
   | {
       kind: "new";
       agent?: AgentKind;
@@ -196,17 +204,22 @@ export function reasonText(hint: NewAgentHint): string | undefined {
   return `${agentName(otherAgent(hint.agent ?? "claude"))} worked here last`;
 }
 
+/** The gate on starting or resuming `agent` here; open without Codex installed. */
+export function gateOf(repo: RepoSnapshot, agent: AgentKind): Gate {
+  return repo.codex?.gates[agent] ?? { kind: "open" };
+}
+
 /** "Busy: Claude is working", or "... is waiting on you". */
-function busyText(gate: Extract<Gate, { kind: "busy" }>): string {
+export function busyText(gate: Extract<Gate, { kind: "busy" }>): string {
   return `Busy: ${agentName(gate.agent)} is ${gate.state === "waitingOnUser" ? "waiting on you" : "working"}`;
 }
 
 /** One agent's New row, with Codex installed (codex spec §5). */
-function newRow(repo: RepoSnapshot, agent: AgentKind): PickerOption {
+function newRow(repo: RepoSnapshot, agent: AgentKind): Extract<PickerOption, { kind: "new" }> {
   const codex = repo.codex!;
   const hint = preselectedNew(repo);
   const ours = hint && (hint.agent ?? "claude") === agent ? hint : null;
-  const gate = codex.gates[agent] ?? { kind: "open" };
+  const gate = gateOf(repo, agent);
   const notReady = agent === "codex" && codex.state === "notReady";
   const finding = codex.findings.find((f) => f.kind !== "claudeOnly") ?? codex.findings[0];
   const blocked = notReady
@@ -228,6 +241,29 @@ function newRow(repo: RepoSnapshot, agent: AgentKind): PickerOption {
 }
 
 /**
+ * The New row the panel's New agent button starts: the agent a `newAgent` preselect names
+ * (briefed as it says), else Claude; `null` without Codex installed.
+ */
+export function panelNewRow(repo: RepoSnapshot): Extract<PickerOption, { kind: "new" }> | null {
+  return repo.codex ? newRow(repo, preselectedNew(repo)?.agent ?? "claude") : null;
+}
+
+/**
+ * A session's Resume row, with Codex installed: dimmed while its agent's gate is busy, or
+ * stopping the other agent's idle sessions first. Readiness does not block a resume.
+ */
+export function resumeRow(repo: RepoSnapshot, session: SessionInfo): Extract<PickerOption, { kind: "resume" }> {
+  const agent = session.agent ?? "claude";
+  const gate = gateOf(repo, agent);
+  return {
+    kind: "resume",
+    session,
+    agent,
+    ...(gate.kind === "busy" ? { blocked: busyText(gate) } : gate.kind === "stopIdle" ? { stop: gate.sessionIds } : {}),
+  };
+}
+
+/**
  * Running agents to go to, then unfinished sessions, each newest first, then New agent.
  * With Codex installed: New Claude agent and New Codex agent first, then the sessions of
  * both agents, each tagged with its agent.
@@ -239,7 +275,7 @@ export function pickerOptions(repo: RepoSnapshot): PickerOption[] {
       newRow(repo, "claude"),
       newRow(repo, "codex"),
       ...focusableSessions(repo).map((session): PickerOption => ({ kind: "focus", session, agent: agentOf(session) })),
-      ...unfinishedSessions(repo).map((session): PickerOption => ({ kind: "resume", session, agent: agentOf(session) })),
+      ...unfinishedSessions(repo).map((session) => resumeRow(repo, session)),
     ];
   }
   const fresh: PickerOption =
@@ -249,6 +285,20 @@ export function pickerOptions(repo: RepoSnapshot): PickerOption[] {
     ...unfinishedSessions(repo).map((session): PickerOption => ({ kind: "resume", session })),
     fresh,
   ];
+}
+
+/**
+ * The launch failure after stop-idle stopped some sessions, then was refused on another
+ * (`why`): which were stopped, and that nothing was started.
+ */
+export function partialStopText(repo: RepoSnapshot | undefined, stopped: readonly string[], why: string): string {
+  const name = (id: string) => {
+    const session = repo?.sessions.find((s) => s.id === id);
+    return `${session ? agentName(session.agent ?? "claude") : "agent"} session ${id.slice(0, 8)}`;
+  };
+  const list = stopped.map(name).join(", ");
+  const reason = /[.!?]$/.test(why) ? why : `${why}.`;
+  return `Stopped the idle ${list}, but not the next one: ${reason} Nothing was started.`;
 }
 
 /** How to resume a session: a Codex one names its agent. */
@@ -276,18 +326,24 @@ export function optionKey(option: PickerOption): string {
   return `${option.kind}:${option.session.agent ?? "claude"}:${option.session.id}`;
 }
 
+/** A dimmed row, which starts nothing. */
+export function isBlocked(option: PickerOption): boolean {
+  return option.kind !== "focus" && !!option.blocked;
+}
+
 function openPicker(repo: RepoSnapshot): PickerState {
   const options = pickerOptions(repo);
   const pre = repo.preselect;
   // The New row the preselect means (Claude's unless it names Codex), else any that can start.
   const want = preselectedNew(repo)?.agent ?? "claude";
-  const startable = (o: PickerOption) => o.kind === "new" && !o.blocked;
+  const startable = (o: PickerOption) => o.kind === "new" && !isBlocked(o);
   let index = options.findIndex((o) => startable(o) && o.kind === "new" && (o.agent ?? "claude") === want);
   if (index < 0) index = options.findIndex(startable);
   if (index < 0) index = 0;
   if (pre.kind === "resume" || pre.kind === "focus") {
+    // A dimmed resume row is never preselected, whatever an older helper says.
     const i = options.findIndex(
-      (o) => o.kind !== "new" && o.kind === pre.kind && o.session.id === pre.sessionId,
+      (o) => o.kind !== "new" && o.kind === pre.kind && o.session.id === pre.sessionId && !isBlocked(o),
     );
     if (i >= 0) index = i;
   }
@@ -380,7 +436,8 @@ function launch(state: NavState, path: string | null, ctx: NavContext): NavResul
   if (ctx.remoteOnly?.has(repo.path)) {
     return result({ ...state, picker: null }, [{ kind: "clone", key: repo.path }]);
   }
-  if (repo.preselect.kind === "noPicker") {
+  // No picker only while Claude can start at once: a busy or idle other agent opens it.
+  if (repo.preselect.kind === "noPicker" && gateOf(repo, "claude").kind === "open") {
     return result({ ...state, picker: null }, [
       { kind: "launch", path: repo.path, mode: newAgentMode(repo) },
     ]);
@@ -392,8 +449,8 @@ function accept(state: NavState, picker: PickerState, index: number): NavResult 
   const option = picker.options[index];
   if (!option) return unhandled(state);
   // A dimmed row starts nothing; the picker stays open.
-  if (option.kind === "new" && option.blocked) return result(state);
-  const stop = option.kind === "new" && option.stop ? { stop: option.stop } : {};
+  if (isBlocked(option)) return result(state);
+  const stop = option.kind !== "focus" && option.stop ? { stop: option.stop } : {};
   return result({ ...state, picker: null }, [
     { kind: "launch", path: picker.path, mode: optionMode(option), ...stop },
   ]);

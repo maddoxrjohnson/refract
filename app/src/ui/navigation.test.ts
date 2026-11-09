@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CodexReadiness, LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
+import type { CodexReadiness, Gate, LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
 import { DIRTY_REPO_PROMPT, repoStatus } from "../repoStatus";
 import {
   initialNavState,
@@ -8,6 +8,7 @@ import {
   newAgentMode,
   optionKey,
   optionMode,
+  partialStopText,
   pickerOptions,
   resumableSession,
   type NavContext,
@@ -727,6 +728,68 @@ describe("with Codex installed", () => {
     const picker = open(r);
     expect(picker.index).toBe(2);
     expect(picker.options[1]).toEqual({ kind: "new", agent: "codex" });
+  });
+
+  it("dims a resume row while its agent's gate is busy, and never preselects it", () => {
+    const r = withCodex(
+      { preselect: { kind: "resume", sessionId: "claude-old" } },
+      { ...ready, gates: { claude: { kind: "busy", agent: "codex", sessionId: "x", state: "working" } } },
+    );
+    const picker = open(r);
+    expect(picker.options[3]).toEqual({
+      kind: "resume",
+      session: claudeOld,
+      agent: "claude",
+      blocked: "Busy: Codex is working",
+    });
+    // The Codex session's gate is open: resuming it is fine.
+    expect(picker.options[2]).toEqual({ kind: "resume", session: codexCut, agent: "codex" });
+    expect(picker.index).toBe(1);
+    const res = run([{ type: "pickerAccept", index: 3 }], { ...initialNavState, picker }, ctxFor(r));
+    expect(res.effects).toEqual([]);
+    expect(res.state.picker).not.toBeNull();
+  });
+
+  it("resumes a Codex session while Codex is not ready", () => {
+    const r = withCodex({}, { state: "notReady", findings: [], gates: {} });
+    expect(pickerOptions(r)[2]).toEqual({ kind: "resume", session: codexCut, agent: "codex" });
+  });
+
+  it("stops the idle other agent before resuming", () => {
+    const r = withCodex({}, { ...ready, gates: { codex: { kind: "stopIdle", sessionIds: ["idle-1"] } } });
+    const picker = open(r);
+    expect(picker.options[2]).toEqual({ kind: "resume", session: codexCut, agent: "codex", stop: ["idle-1"] });
+    const res = run([{ type: "pickerAccept", index: 2 }], { ...initialNavState, picker }, ctxFor(r));
+    expect(res.effects).toEqual([
+      { kind: "launch", path: r.path, mode: { kind: "resume", agent: "codex", sessionId: "codex-cut" }, stop: ["idle-1"] },
+    ]);
+  });
+
+  it("opens the picker instead of launching at once while Claude's gate is not open", () => {
+    const plain = withCodex({ sessions: [], preselect: { kind: "noPicker" } });
+    const direct = run([{ type: "launch", path: plain.path }], initialNavState, ctxFor(plain));
+    expect(direct.effects).toEqual([{ kind: "launch", path: plain.path, mode: { kind: "new" } }]);
+    const gates: Gate[] = [
+      { kind: "busy", agent: "codex", sessionId: "x", state: "working" },
+      { kind: "stopIdle", sessionIds: ["idle-1"] },
+    ];
+    for (const gate of gates) {
+      const r = withCodex({ sessions: [], preselect: { kind: "noPicker" } }, { ...ready, gates: { claude: gate } });
+      const res = run([{ type: "launch", path: r.path }], initialNavState, ctxFor(r));
+      expect(res.effects).toEqual([]);
+      expect(res.state.picker?.options.map(optionKey)).toEqual(["new:claude", "new:codex"]);
+    }
+  });
+
+  it("names the sessions stop-idle stopped before a refusal", () => {
+    const idle: SessionInfo = { ...running("8d2f41c0-aaaa", 0.2, "idle"), agent: "codex" };
+    const r = withCodex({ sessions: [idle] });
+    expect(partialStopText(r, ["8d2f41c0-aaaa"], "The agent is working again.")).toBe(
+      "Stopped the idle Codex session 8d2f41c0, but not the next one: The agent is working again. Nothing was started.",
+    );
+    expect(partialStopText(r, ["8d2f41c0-aaaa", "71b3e9d2-bbbb"], "busy")).toBe(
+      "Stopped the idle Codex session 8d2f41c0, agent session 71b3e9d2, but not the next one: busy. Nothing was started.",
+    );
   });
 
   it("goes to a running Codex agent as to any other", () => {

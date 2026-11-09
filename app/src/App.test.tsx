@@ -171,4 +171,59 @@ describe("App's Codex rows", () => {
     await screen.findByText(/The agent is working again\./);
     expect(launch).not.toHaveBeenCalled();
   });
+
+  it("says which sessions it stopped when a later stop is refused, and starts nothing", async () => {
+    const backend = new TestBackend();
+    const OTHER = "7c1d93b4-0000-4000-8000-0000000000f1";
+    const orchard = (await backend.listRepos()).repos.find((r) => r.path === ORCHARD)!;
+    const stop = vi
+      .spyOn(backend, "migrateStopAgent")
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce({ kind: "busy", message: "The agent is working again." });
+    const launch = vi.spyOn(backend, "launch");
+    render(<App backend={backend} />);
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    act(() =>
+      backend.send({
+        event: "repoChanged",
+        data: { ...orchard, codex: { ...orchard.codex!, gates: { codex: { kind: "stopIdle", sessionIds: [IDLE, OTHER] } } } },
+      }),
+    );
+    for (const c of "orchard") await key(c);
+    await key("Enter");
+    await screen.findByRole("complementary", { name: "orchard-db details" });
+    await key("Enter");
+    const picker = await screen.findByRole("dialog", { name: "Start an agent in orchard-db" });
+    fireEvent.click(
+      [...picker.querySelectorAll('[role="option"]')].find((o) =>
+        o.textContent?.includes("Stop the idle Claude agent and start Codex"),
+      )!,
+    );
+    await screen.findByText(
+      /Stopped the idle Claude session 5f0c2a1e, but not the next one: The agent is working again\. Nothing was started\./,
+    );
+    expect(stop).toHaveBeenCalledTimes(2);
+    expect(launch).not.toHaveBeenCalled();
+  });
+
+  it("shows the helper's refusal of a busy agent in the launch toast", async () => {
+    const backend = await zoomDotfiles();
+    const message = "Codex is working in this repo. Wait for it to finish, or close it first.";
+    vi.spyOn(backend, "launch").mockRejectedValue({ kind: "agent", message });
+    fireEvent.click(screen.getByRole("button", { name: "New agent" }));
+    expect((await screen.findByRole("alert")).textContent).toContain(message);
+  });
+
+  it("shows a refused Make Codex-ready in the launch toast", async () => {
+    const backend = new TestBackend();
+    const message = "Claude is working in this repo. Wait for it to finish, or close it first.";
+    vi.spyOn(backend, "makeCodexReady").mockRejectedValue({ kind: "agent", message });
+    render(<App backend={backend} />);
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    for (const c of "kestrel") await key(c);
+    await key("Enter");
+    await screen.findByRole("complementary", { name: "kestrel-cli details" });
+    fireEvent.click(screen.getByRole("button", { name: "Make Codex-ready" }));
+    expect((await screen.findByRole("alert")).textContent).toContain(message);
+  });
 });

@@ -1,7 +1,7 @@
 import { useEffect, useId, useRef } from "react";
 import { firstLine, formatSize, relativeTime } from "./format";
 import type { AgentKind, ResumeReason, SessionInfo } from "../backend/types";
-import { agentName, optionKey, type PickerOption } from "./navigation";
+import { agentName, isBlocked, optionKey, type PickerOption } from "./navigation";
 import "./ui.css";
 
 export interface PickerProps {
@@ -44,6 +44,13 @@ const RESUME_LABELS: Record<ResumeReason, string> = {
 /** The label of a session's Resume row, naming why it is worth resuming. */
 export function resumeLabel(session: SessionInfo): string {
   return session.resumeReason ? RESUME_LABELS[session.resumeReason] : "Resume";
+}
+
+/** A Resume row's label: why it is worth resuming, or that it stops the other agent first. */
+export function resumeOptionLabel(option: Extract<PickerOption, { kind: "resume" }>): string {
+  if (!option.stop) return resumeLabel(option.session);
+  const other = (option.agent ?? "claude") === "codex" ? "claude" : "codex";
+  return `Stop the idle ${agentName(other)} agent and resume`;
 }
 
 /** A New row's label: "New agent" without Codex, else the agent, briefed or after stopping the other. */
@@ -104,10 +111,10 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
           <li
             key={optionKey(option)}
             id={optionId(i)}
-            className={`rf-option${option.kind === "new" && option.blocked ? " rf-option--dimmed" : ""}`}
+            className={`rf-option${isBlocked(option) ? " rf-option--dimmed" : ""}`}
             role="option"
             aria-selected={i === index}
-            aria-disabled={option.kind === "new" && option.blocked ? true : undefined}
+            aria-disabled={isBlocked(option) ? true : undefined}
             onMouseEnter={() => onMove(i)}
             onClick={() => onAccept(i)}
           >
@@ -134,7 +141,7 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
                 <div className="rf-option__head">
                   <span>
                     <Tag agent={option.agent} />
-                    {resumeLabel(option.session)}
+                    {resumeOptionLabel(option)}
                   </span>
                   <span className="rf-option__meta rf-mono">
                     {option.session.lastTimestamp
@@ -144,7 +151,7 @@ export function Picker({ repoName, options, index, now, onMove, onAccept, onClos
                   </span>
                 </div>
                 <div className="rf-option__text">
-                  {firstLine(option.session.lastAssistantText) ?? "No reply yet"}
+                  {option.blocked ?? firstLine(option.session.lastAssistantText) ?? "No reply yet"}
                 </div>
               </>
             ) : (

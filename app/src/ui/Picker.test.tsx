@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
 import type { PickerOption } from "./navigation";
-import { liveStatus, newLabel, newText, Picker, resumeLabel } from "./Picker";
+import { liveStatus, newLabel, newText, Picker, resumeLabel, resumeOptionLabel } from "./Picker";
 import { NOW, testSession } from "./testRepo";
 
 afterEach(cleanup);
@@ -140,6 +140,25 @@ describe("Picker", () => {
     expect(codex.getAttribute("aria-disabled")).toBe("true");
     expect(codex.className).toContain("rf-option--dimmed");
     expect(resume.textContent).toContain("[Codex] Resume: stopped mid-task");
+  });
+
+  it("dims a busy resume row with its reason, and labels a stop-idle one", () => {
+    const claudeCut = testSession("k1", { kind: "interrupted", detail: "apiError" }, 1, "Writing the exporter.");
+    const rows: PickerOption[] = [
+      { kind: "resume", session: claudeCut, agent: "claude", blocked: "Busy: Codex is working" },
+      { kind: "resume", session: { ...claudeCut, id: "k2" }, agent: "claude", stop: ["x"] },
+    ];
+    render(<Picker repoName="tidepool" options={rows} index={0} now={NOW} onMove={vi.fn()} onAccept={vi.fn()} onClose={vi.fn()} />);
+    const [busy, stop] = screen.getAllByRole("option");
+    expect(busy.getAttribute("aria-disabled")).toBe("true");
+    expect(busy.className).toContain("rf-option--dimmed");
+    expect(busy.textContent).toContain("Busy: Codex is working");
+    expect(busy.textContent).not.toContain("Writing the exporter.");
+    expect(stop.getAttribute("aria-disabled")).toBeNull();
+    expect(stop.textContent).toContain("[Claude] Stop the idle Codex agent and resume");
+    expect(resumeOptionLabel({ kind: "resume", session: claudeCut, agent: "codex", stop: ["x"] })).toBe(
+      "Stop the idle Claude agent and resume",
+    );
   });
 
   it("labels the stop-idle rows and leaves tags out without Codex", () => {
