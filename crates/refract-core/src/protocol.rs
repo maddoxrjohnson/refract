@@ -12,9 +12,11 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub use crate::agent::AgentKind;
 use crate::classify::SessionState;
+use crate::codex_ready::CodexReadiness;
 use crate::migrate::report::Report;
-use crate::preselect::{Preselect, ResumeReason};
+use crate::preselect::{NewAgentHint, Preselect, ResumeReason};
 use crate::usage::UsageSummary;
 
 /// Bumped whenever a message changes incompatibly.
@@ -304,6 +306,11 @@ pub struct ErrorBody {
 pub struct Hello {
     pub protocol_version: u32,
     pub agent_version: String,
+    /// `codex --version` worked when the helper last probed it. While false, the app
+    /// hides the Codex rows and the panel says "Codex not installed". An older helper
+    /// leaves it out.
+    #[serde(default)]
+    pub codex_installed: bool,
 }
 
 /// The result of `listRepos`.
@@ -327,15 +334,24 @@ pub const LAUNCH_REQUEST_VERSION: u32 = 1;
     rename_all_fields = "camelCase"
 )]
 pub enum LaunchMode {
-    /// A new agent, with an optional opening prompt, in plan mode when `plan_mode`.
+    /// A new agent, with an optional opening prompt, in plan mode when `plan_mode`
+    /// (Claude only; Codex has no plan mode and ignores it). `brief` names a session of
+    /// the other agent to pick up from: the helper builds the brief prompt
+    /// ([`crate::brief`]) from it and puts any `prompt` after the brief.
     New {
+        #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
+        agent: AgentKind,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
         #[serde(default, skip_serializing_if = "is_false")]
         plan_mode: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief: Option<String>,
     },
-    /// Resume an existing session, with an optional prompt to send it.
+    /// Resume an existing session of `agent`, with an optional prompt to send it.
     Resume {
+        #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
+        agent: AgentKind,
         session_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prompt: Option<String>,
@@ -737,6 +753,9 @@ pub struct SessionChange {
     pub session: SessionInfo,
     /// The repo's picker choice, which may change with the session.
     pub preselect: Preselect,
+    /// Which New row a [`Preselect::NewAgent`] means; see [`RepoSnapshot::new_agent`].
+    #[serde(default, skip_serializing_if = "NewAgentHint::is_plain")]
+    pub new_agent: NewAgentHint,
 }
 
 /// Anything the helper writes, as the app reads it: a response if it has an `id`,
@@ -783,6 +802,16 @@ pub struct RepoSnapshot {
     /// Sessions whose working directory is this repo, most recent first.
     pub sessions: Vec<SessionInfo>,
     pub preselect: Preselect,
+    /// Which New row [`Preselect::NewAgent`] preselects: the agent, the other agent's
+    /// session to brief from, and why. Left out for a plain New Claude agent, so an older
+    /// app reads the same preselect as before.
+    #[serde(default, skip_serializing_if = "NewAgentHint::is_plain")]
+    pub new_agent: NewAgentHint,
+    /// Whether the repo is ready for Codex, and how each agent's New row stands against
+    /// the other's live sessions. `None` when Codex is not installed or from an older
+    /// helper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexReadiness>,
     /// The repo's refactor, while it has one (see [`Method::StartRefactor`]).
     #[serde(default)]
     pub refactor: Option<RefactorInfo>,
@@ -1094,11 +1123,14 @@ pub enum MergeOutcome {
     },
 }
 
-/// One Claude Code session in a repo.
+/// One Claude Code or Codex session in a repo.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionInfo {
     pub id: String,
+    /// Left out for Claude.
+    #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
+    pub agent: AgentKind,
     pub state: SessionState,
     pub last_timestamp: Option<DateTime<Utc>>,
     /// First line of the assistant's last text reply, truncated.
@@ -1305,6 +1337,8 @@ mod tests {
 
     fn snapshot() -> RepoSnapshot {
         RepoSnapshot {
+            codex: None,
+            new_agent: NewAgentHint::default(),
             path: "/home/dev/projects/tidepool-api".into(),
             name: "tidepool-api".into(),
             origin_url: Some("git@github.com:dev/tidepool-api.git".into()),
@@ -1328,6 +1362,7 @@ mod tests {
             commits_30d: 9,
             mass: 0.625,
             sessions: vec![SessionInfo {
+                agent: AgentKind::Claude,
                 id: "3f6c1a52-0000-4000-8000-000000000001".into(),
                 state: SessionState::Interrupted(InterruptReason::ApiError),
                 last_timestamp: Some("2026-03-14T12:00:00Z".parse().unwrap()),
@@ -1380,6 +1415,8 @@ mod tests {
 
     fn empty_snapshot() -> RepoSnapshot {
         RepoSnapshot {
+            codex: None,
+            new_agent: NewAgentHint::default(),
             path: "/home/dev/projects/aurora-notes".into(),
             name: "aurora-notes".into(),
             origin_url: None,
@@ -1453,6 +1490,8 @@ mod tests {
             method: Method::PrepareLaunch {
                 path: "/home/dev/projects/tidepool-api".into(),
                 mode: LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: None,
                     plan_mode: false,
                 },
@@ -1472,6 +1511,8 @@ mod tests {
             Method::PrepareLaunch {
                 path: "/x".into(),
                 mode: LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: Some("Fix it".into()),
                     plan_mode: false,
                 }
@@ -1486,6 +1527,7 @@ mod tests {
             Method::PrepareLaunch {
                 path: "/x".into(),
                 mode: LaunchMode::Resume {
+                    agent: AgentKind::Claude,
                     session_id: "abc".into(),
                     prompt: None,
                 }
@@ -1571,8 +1613,81 @@ mod tests {
     }
 
     #[test]
+    fn codex_fields_round_trip_and_default_to_claude() {
+        let new = LaunchMode::New {
+            agent: AgentKind::Codex,
+            prompt: Some("Go on".into()),
+            plan_mode: false,
+            brief: Some("3f6c1a52-0000-4000-8000-000000000001".into()),
+        };
+        assert_eq!(
+            round_trip(&new),
+            json!({"kind": "new", "agent": "codex", "prompt": "Go on",
+                "brief": "3f6c1a52-0000-4000-8000-000000000001"})
+        );
+        let resume = LaunchMode::Resume {
+            agent: AgentKind::Codex,
+            session_id: "abc".into(),
+            prompt: None,
+        };
+        assert_eq!(
+            round_trip(&resume),
+            json!({"kind": "resume", "agent": "codex", "sessionId": "abc"})
+        );
+        // Old messages read as Claude.
+        let old: LaunchMode =
+            serde_json::from_value(json!({"kind": "resume", "sessionId": "abc"})).unwrap();
+        assert_eq!(
+            old,
+            LaunchMode::Resume {
+                agent: AgentKind::Claude,
+                session_id: "abc".into(),
+                prompt: None,
+            }
+        );
+        let hello: Hello =
+            serde_json::from_value(json!({"protocolVersion": 1, "agentVersion": "0.1.0"})).unwrap();
+        assert!(!hello.codex_installed);
+
+        let mut repo = snapshot();
+        repo.sessions[0].agent = AgentKind::Codex;
+        repo.preselect = Preselect::NewAgent;
+        repo.new_agent = crate::preselect::NewAgentHint {
+            agent: AgentKind::Claude,
+            brief_from: Some(repo.sessions[0].id.clone()),
+            reason: Some(crate::preselect::NewAgentReason::HandBack),
+        };
+        repo.codex = Some(crate::codex_ready::readiness(
+            &crate::codex_ready::InstructionFiles {
+                agents_md: Some("# Rules\n"),
+                ..Default::default()
+            },
+            &[],
+        ));
+        let value = round_trip(&repo);
+        assert_eq!(value["sessions"][0]["agent"], "codex");
+        assert_eq!(
+            value["newAgent"],
+            json!({"briefFrom": "3f6c1a52-0000-4000-8000-000000000001",
+                "reason": {"kind": "handBack"}})
+        );
+        assert_eq!(
+            value["codex"],
+            json!({"state": "ready", "findings": [], "gates": {}})
+        );
+        // A snapshot without them leaves them out, as an older app expects.
+        let value = round_trip(&snapshot());
+        for key in ["newAgent", "codex"] {
+            assert!(value.get(key).is_none(), "{key}");
+        }
+        assert!(value["sessions"][0].get("agent").is_none());
+    }
+
+    #[test]
     fn refactor_messages_round_trip() {
         let plan = LaunchMode::New {
+            agent: AgentKind::Claude,
+            brief: None,
             prompt: Some("Refactor".into()),
             plan_mode: true,
         };
@@ -1581,6 +1696,7 @@ mod tests {
             json!({"kind": "new", "prompt": "Refactor", "planMode": true})
         );
         let resume = LaunchMode::Resume {
+            agent: AgentKind::Claude,
             session_id: "abc".into(),
             prompt: Some("Continue".into()),
         };
@@ -1913,6 +2029,7 @@ mod tests {
             Reply::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
                 agent_version: "0.1.0".into(),
+                codex_installed: false,
             }),
             Reply::Repos(RepoList {
                 repos: vec![],
@@ -2141,11 +2258,13 @@ mod tests {
             Reply::Hello(Hello {
                 protocol_version: PROTOCOL_VERSION,
                 agent_version: "0.1.0".into(),
+                codex_installed: true,
             }),
         );
         assert_eq!(
             round_trip(&hello),
-            json!({"id": 1, "result": {"protocolVersion": 1, "agentVersion": "0.1.0"}})
+            json!({"id": 1, "result": {"protocolVersion": 1, "agentVersion": "0.1.0",
+                "codexInstalled": true}})
         );
 
         let repos = Response::ok(
@@ -2413,8 +2532,10 @@ mod tests {
         );
 
         let session = Event::SessionChanged(SessionChange {
+            new_agent: NewAgentHint::default(),
             repo_path: "/home/dev/projects/tidepool-api".into(),
             session: SessionInfo {
+                agent: AgentKind::Claude,
                 id: "3f6c1a52-0000-4000-8000-000000000002".into(),
                 state: SessionState::Live(LiveState::Unknown),
                 last_timestamp: None,

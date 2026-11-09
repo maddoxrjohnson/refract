@@ -108,11 +108,19 @@ A live Codex session that is focusable gives "Go to the running Codex agent", th
 focus path.
 
 ## 6. Protocol (serde defaults, no version bump)
-- `AgentKind = claude | codex`, defaulting to claude.
-- `LaunchMode::New { agent, prompt, planMode, brief? }` and `LaunchMode::Resume { agent, id }`.
-- `SessionInfo.agent`; live process `agent`.
-- `RepoSnapshot.codex?: { state, findings[] }`; helper capability `codexInstalled`.
-- Mirrors: `refract-client` types and `app/src/backend/types.ts`.
+Every new field defaults on read and is left out when default (Claude, none, open), so old messages read the same.
+- `AgentKind = "claude" | "codex"`, defaulting to claude.
+- `LaunchMode`: `{kind: "new", agent?, prompt?, planMode?, brief?: <other agent's session id>}` and
+  `{kind: "resume", agent?, sessionId, prompt?}`. Codex ignores `planMode`.
+- `SessionInfo.agent?`; live process `agent`.
+- `Hello.codexInstalled: bool` (always sent; false from an older helper).
+- `RepoSnapshot.codex?: {state: "ready"|"warnings"|"notReady"|"busy", findings: [{file, line|null, kind, text,
+  term?}], gates: {claude?: Gate, codex?: Gate}}`, `Gate = {kind: "open"} | {kind: "busy", agent, sessionId, state}
+  | {kind: "stopIdle", sessionIds}`. Left out when Codex is not installed.
+- `preselect` keeps its shape. Beside it, on `RepoSnapshot` and `sessionChanged`, `newAgent?: {agent?, briefFrom?,
+  reason?: {kind: "handBack"} | {kind: "nudge", usedPercent}}` says which New row `newAgent` means; an older app
+  reads a plain New Claude agent.
+- `refract-client` re-exports the core types (nothing to mirror); `app/src/backend/types.ts` mirrors them.
 
 ## 7. Helper
 - `launch_argv` branches on the agent. The extension stays generic (`argv[0]` is any plain program name).

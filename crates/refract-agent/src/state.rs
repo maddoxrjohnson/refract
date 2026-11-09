@@ -10,10 +10,12 @@ use refract_core::classify::{
     classify_report, cut_off, ended_by_clear, Boot, HookReport, SessionState,
 };
 use refract_core::mass::{masses, MassInput};
-use refract_core::preselect::{preselect, resume_reasons, Candidate, RepoFacts, Upstream};
+use refract_core::preselect::{
+    preselect, resume_reasons, Candidate, NewAgentHint, RepoFacts, Upstream,
+};
 use refract_core::protocol::{
-    Event, MissingWorktree, RefactorInfo, RemoteId, RepoSnapshot, SessionChange, SessionInfo,
-    WorktreeInfo,
+    AgentKind, Event, MissingWorktree, RefactorInfo, RemoteId, RepoSnapshot, SessionChange,
+    SessionInfo, WorktreeInfo,
 };
 use refract_core::sessions::{path_within, paths_match};
 use refract_core::transcript::SessionSummary;
@@ -1032,6 +1034,7 @@ pub fn build_snapshot(
         .zip(reasons)
         .map(|(c, resume_reason)| SessionInfo {
             id: c.summary.session_id.clone().unwrap_or_default(),
+            agent: c.agent,
             state: c.state,
             last_timestamp: c.summary.last_timestamp,
             last_assistant_text: c.summary.last_assistant_text.clone(),
@@ -1045,6 +1048,8 @@ pub fn build_snapshot(
         None => (None, None),
     };
     RepoSnapshot {
+        codex: None,
+        new_agent: NewAgentHint::default(),
         name: path
             .file_name()
             .map_or_else(|| root.clone(), |n| n.to_string_lossy().into_owned()),
@@ -1133,6 +1138,7 @@ fn candidates<'a>(
             let stopped = !matches!(state, SessionState::Live(_));
             let hook = id.and_then(|id| hooks.get(id).copied());
             Candidate {
+                agent: AgentKind::Claude,
                 summary,
                 state,
                 focusable: is_focusable(repo, summary, state, live),
@@ -1189,6 +1195,7 @@ pub fn diff(old: &RepoSnapshot, new: &RepoSnapshot) -> Vec<Event> {
     let rest_same = RepoSnapshot {
         sessions: Vec::new(),
         preselect: new.preselect.clone(),
+        new_agent: new.new_agent.clone(),
         ..old.clone()
     } == RepoSnapshot {
         sessions: Vec::new(),
@@ -1209,6 +1216,7 @@ pub fn diff(old: &RepoSnapshot, new: &RepoSnapshot) -> Vec<Event> {
                     repo_path: new.path.clone(),
                     session: session.clone(),
                     preselect: new.preselect.clone(),
+                    new_agent: new.new_agent.clone(),
                 })
             })
             .collect();
@@ -1231,6 +1239,7 @@ mod tests {
 
     fn session(id: &str, state: SessionState) -> SessionInfo {
         SessionInfo {
+            agent: AgentKind::Claude,
             id: id.into(),
             state,
             last_timestamp: None,

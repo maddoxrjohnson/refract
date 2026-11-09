@@ -2,7 +2,9 @@
 //! `launch_request_focus_v1.json`, which the VS Code extension's tests read too.
 
 use refract_core::launch::{launch_argv, launch_title};
-use refract_core::protocol::{FocusTarget, LaunchMode, LaunchRequest, LAUNCH_REQUEST_VERSION};
+use refract_core::protocol::{
+    AgentKind, FocusTarget, LaunchMode, LaunchRequest, LAUNCH_REQUEST_VERSION,
+};
 use serde_json::Value;
 
 const SESSION_ID: &str = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e";
@@ -33,6 +35,8 @@ fn golden_request_parses() {
     );
 
     let mode = LaunchMode::New {
+        agent: AgentKind::Claude,
+        brief: None,
         prompt: Some(PROMPT.into()),
         plan_mode: false,
     };

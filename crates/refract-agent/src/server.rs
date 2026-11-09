@@ -620,6 +620,7 @@ impl<W: Write> Server<W> {
             Method::Ping => Response::ok(
                 id,
                 Reply::Hello(Hello {
+                    codex_installed: false,
                     protocol_version: PROTOCOL_VERSION,
                     agent_version: env!("CARGO_PKG_VERSION").to_owned(),
                 }),

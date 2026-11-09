@@ -12,11 +12,20 @@
 //! offers to go to it. While one exists the picker always shows, so Enter never starts
 //! a second agent beside it by accident; when the newest one is waiting on the person,
 //! going to it is preselected.
+//!
+//! Sessions of both agents are candidates, and resume reasons apply to each whatever its
+//! agent. [`plan`] adds Codex's rules (`.plans/codex-spec.md` §5): the hand-back, where
+//! the other agent worked last and a new agent of this one is briefed from its session
+//! instead of resuming an older own one, and the nudge, where Claude is near its usage
+//! limit and New Codex agent is preselected.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::agent::AgentKind;
 use crate::classify::{LiveState, SessionState};
+use crate::codex_ready::{LiveAgent, ReadyState};
+use crate::limits::PlanLimits;
 use crate::transcript::SessionSummary;
 
 /// Sessions that ended this long ago or longer are not preselected for resume.
@@ -25,6 +34,7 @@ pub const MAX_RESUME_AGE: TimeDelta = TimeDelta::days(2);
 /// A session the picker could offer.
 #[derive(Debug, Clone, Copy)]
 pub struct Candidate<'a> {
+    pub agent: AgentKind,
     pub summary: &'a SessionSummary,
     pub state: SessionState,
     /// Its process is known and runs in the Refract window on this repo, so a live
@@ -187,13 +197,131 @@ fn newest_stopped(candidates: &[Candidate<'_>]) -> Option<usize> {
     })
 }
 
-/// Chooses the preselected picker option.
-///
-/// The rules, in order: when the newest focusable live session waits on the person, go
-/// to it; when the newest session that isn't running has a [`ResumeReason`] and ended
-/// less than [`MAX_RESUME_AGE`] ago, resume it; with no session to resume, a clean repo
-/// and no focusable live session, skip the picker; otherwise preselect New agent.
+/// The `codexThreshold` setting's default: Claude's use, as a percentage, from which the
+/// nudge preselects New Codex agent.
+pub const DEFAULT_CODEX_THRESHOLD: f64 = 95.0;
+
+/// What the hand-back and nudge rules need beyond the sessions. The default (no limits
+/// known, Codex not installed) gives today's Claude-only rules.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentFacts {
+    /// Claude's highest use of its 5-hour and weekly windows, as a percentage
+    /// ([`claude_peak`]); `None` when unknown.
+    pub claude_used_percent: Option<f64>,
+    /// The `codexThreshold` setting.
+    pub codex_threshold: f64,
+    /// The repo's Codex readiness state; `None` when Codex is not installed.
+    pub codex: Option<ReadyState>,
+}
+
+impl Default for AgentFacts {
+    fn default() -> Self {
+        AgentFacts {
+            claude_used_percent: None,
+            codex_threshold: DEFAULT_CODEX_THRESHOLD,
+            codex: None,
+        }
+    }
+}
+
+/// Claude's highest use, as a percentage, of the plan windows that haven't reset by
+/// `now`; `None` when none is left.
+pub fn claude_peak(limits: &PlanLimits, now: DateTime<Utc>) -> Option<f64> {
+    [limits.five_hour, limits.seven_day]
+        .into_iter()
+        .flatten()
+        .filter(|w| w.resets_at > now)
+        .map(|w| w.used_percent)
+        .reduce(f64::max)
+}
+
+/// Why New is preselected for a particular agent. On the wire: `{"kind": "handBack"}` or
+/// `{"kind": "nudge", "usedPercent": 97}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum NewAgentReason {
+    /// The other agent worked here last.
+    HandBack,
+    /// Claude is at `used_percent` (rounded down) of a limit, at or over the threshold.
+    Nudge { used_percent: u32 },
+}
+
+/// What a [`Preselect::NewAgent`] means beyond the old shape: which agent the
+/// preselected New row starts, the other agent's session it is briefed from, and why.
+/// The default is a plain New Claude agent. On the wire as `newAgent` beside
+/// `preselect`: `{"agent": "codex", "briefFrom": "...", "reason": {"kind": "nudge",
+/// "usedPercent": 97}}`, each field left out when default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewAgentHint {
+    #[serde(default, skip_serializing_if = "AgentKind::is_claude")]
+    pub agent: AgentKind,
+    /// The session of the other agent to brief from: pass it as `LaunchMode::New`'s
+    /// `brief`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brief_from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<NewAgentReason>,
+}
+
+impl NewAgentHint {
+    /// A plain New Claude agent, as before Codex.
+    pub fn is_plain(&self) -> bool {
+        *self == NewAgentHint::default()
+    }
+
+    /// The reason as the picker shows it: "Claude at 97%" or "Codex worked here last".
+    pub fn reason_text(&self) -> Option<String> {
+        Some(match self.reason.as_ref()? {
+            NewAgentReason::Nudge { used_percent } => format!("Claude at {used_percent}%"),
+            NewAgentReason::HandBack => format!("{} worked here last", self.agent.other().name()),
+        })
+    }
+}
+
+/// The launch decision with its New row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub preselect: Preselect,
+    /// Not plain only with [`Preselect::NewAgent`].
+    pub new_agent: NewAgentHint,
+}
+
+/// Chooses the preselected picker option for Claude-only rules: [`plan`] with default
+/// [`AgentFacts`].
 pub fn preselect(candidates: &[Candidate<'_>], repo: &RepoFacts, now: DateTime<Utc>) -> Preselect {
+    plan(candidates, repo, &AgentFacts::default(), now).preselect
+}
+
+/// Chooses the preselected picker option and its New row.
+///
+/// The agent to launch is Codex when the nudge applies (Codex is installed and Ready or
+/// with warnings, and Claude's use is at or over the threshold), otherwise Claude. The
+/// rules, in order:
+/// 1. when the newest focusable live session waits on the person, go to it;
+/// 2. hand-back: when the newest session with a conversation is the other agent's, is
+///    not closed by `/clear`, and is either live and idle or stopped less than
+///    [`MAX_RESUME_AGE`] ago (and, for the nudge, unfinished), preselect a new agent
+///    briefed from it. A busy one leaves the rules below;
+/// 3. when the newest session that isn't running is this agent's, has a
+///    [`ResumeReason`] and ended less than [`MAX_RESUME_AGE`] ago, resume it;
+/// 4. with the nudge, preselect New Codex agent;
+/// 5. with no session to resume, a clean repo and no focusable live session, skip the
+///    picker; otherwise preselect New agent.
+pub fn plan(
+    candidates: &[Candidate<'_>],
+    repo: &RepoFacts,
+    agents: &AgentFacts,
+    now: DateTime<Utc>,
+) -> Plan {
+    let plain = |preselect| Plan {
+        preselect,
+        new_agent: NewAgentHint::default(),
+    };
     let focusable = candidates
         .iter()
         .filter(|c| c.live_and_focusable())
@@ -201,27 +329,97 @@ pub fn preselect(candidates: &[Candidate<'_>], repo: &RepoFacts, now: DateTime<U
     if let Some(running) = focusable {
         if running.state == SessionState::Live(LiveState::WaitingOnUser) {
             if let Some(id) = &running.summary.session_id {
-                return Preselect::Focus(id.clone());
+                return plain(Preselect::Focus(id.clone()));
             }
         }
     }
+    let nudge = nudge_percent(agents);
+    let target = if nudge.is_some() {
+        AgentKind::Codex
+    } else {
+        AgentKind::Claude
+    };
+    let reason = match nudge {
+        Some(used_percent) => NewAgentReason::Nudge { used_percent },
+        None => NewAgentReason::HandBack,
+    };
     let reasons = resume_reasons(candidates, repo);
-    if let Some(i) = newest_stopped(candidates) {
-        let newest = candidates[i].summary;
-        let recent = newest
+    let recent = |c: &Candidate<'_>| {
+        c.summary
             .last_timestamp
-            .is_some_and(|ended| now - ended < MAX_RESUME_AGE);
-        if reasons[i].is_some() && recent {
-            if let Some(id) = &newest.session_id {
-                return Preselect::Resume(id.clone());
+            .is_some_and(|ended| now - ended < MAX_RESUME_AGE)
+    };
+    if let Some(i) = newest(candidates, |c| !c.is_empty()) {
+        let last = &candidates[i];
+        let briefable = match last.state {
+            SessionState::Live(state) => state == LiveState::Idle,
+            _ => !last.cleared && recent(last) && (nudge.is_none() || reasons[i].is_some()),
+        };
+        if last.agent != target && briefable {
+            if let Some(id) = &last.summary.session_id {
+                return Plan {
+                    preselect: Preselect::NewAgent,
+                    new_agent: NewAgentHint {
+                        agent: target,
+                        brief_from: Some(id.clone()),
+                        reason: Some(reason),
+                    },
+                };
             }
         }
+    }
+    if let Some(i) = newest_stopped(candidates) {
+        let newest = &candidates[i];
+        if newest.agent == target && reasons[i].is_some() && recent(newest) {
+            if let Some(id) = &newest.summary.session_id {
+                return plain(Preselect::Resume(id.clone()));
+            }
+        }
+    }
+    if nudge.is_some() {
+        return Plan {
+            preselect: Preselect::NewAgent,
+            new_agent: NewAgentHint {
+                agent: AgentKind::Codex,
+                brief_from: None,
+                reason: Some(reason),
+            },
+        };
     }
     if reasons.iter().all(Option::is_none) && !repo.dirty && focusable.is_none() {
-        Preselect::NoPicker
+        plain(Preselect::NoPicker)
     } else {
-        Preselect::NewAgent
+        plain(Preselect::NewAgent)
     }
+}
+
+/// Claude's use, rounded down, when the nudge applies.
+fn nudge_percent(agents: &AgentFacts) -> Option<u32> {
+    let used = agents.claude_used_percent?;
+    let ready = agents.codex.is_some_and(ReadyState::launchable);
+    (ready && used >= agents.codex_threshold).then(|| used.floor().clamp(0.0, 1000.0) as u32)
+}
+
+/// The live sessions among the candidates, newest first, as
+/// [`codex_ready::readiness`](crate::codex_ready::readiness) and
+/// [`gate`](crate::codex_ready::gate) take them.
+pub fn live_agents(candidates: &[Candidate<'_>]) -> Vec<LiveAgent> {
+    let mut live: Vec<(&Candidate<'_>, LiveAgent)> = candidates
+        .iter()
+        .filter_map(|c| match (c.state, &c.summary.session_id) {
+            (SessionState::Live(state), Some(id)) => Some((
+                c,
+                LiveAgent {
+                    agent: c.agent,
+                    session_id: id.clone(),
+                    state,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
+    live.sort_by_key(|(c, _)| std::cmp::Reverse(c.summary.last_timestamp));
+    live.into_iter().map(|(_, l)| l).collect()
 }
 
 #[cfg(test)]
@@ -260,6 +458,7 @@ mod tests {
 
     fn interrupted(summary: &SessionSummary) -> Candidate<'_> {
         Candidate {
+            agent: AgentKind::Claude,
             summary,
             state: SessionState::Interrupted(InterruptReason::ToolCallWithoutResult),
             focusable: false,
@@ -270,6 +469,7 @@ mod tests {
 
     fn finished(summary: &SessionSummary) -> Candidate<'_> {
         Candidate {
+            agent: AgentKind::Claude,
             summary,
             state: SessionState::Finished(FinishKind::Completed),
             focusable: false,
@@ -280,6 +480,7 @@ mod tests {
 
     fn running(summary: &SessionSummary, live: LiveState, focusable: bool) -> Candidate<'_> {
         Candidate {
+            agent: AgentKind::Claude,
             summary,
             state: SessionState::Live(live),
             focusable,
@@ -885,6 +1086,254 @@ mod tests {
         let candidates = [finished(&older), cleared, fresh];
         assert_eq!(resume_reasons(&candidates, &dirty()), [None, None, None]);
         assert_eq!(preselect(&candidates, &dirty(), now()), Preselect::NewAgent);
+    }
+
+    // Codex: hand-back and nudge.
+
+    fn codex(candidate: Candidate<'_>) -> Candidate<'_> {
+        Candidate {
+            agent: AgentKind::Codex,
+            ..candidate
+        }
+    }
+
+    /// Codex installed and ready, Claude at `used` percent.
+    fn claude_at(used: f64) -> AgentFacts {
+        AgentFacts {
+            claude_used_percent: Some(used),
+            codex: Some(ReadyState::Ready),
+            ..AgentFacts::default()
+        }
+    }
+
+    fn briefed(agent: AgentKind, from: &str, reason: NewAgentReason) -> Plan {
+        Plan {
+            preselect: Preselect::NewAgent,
+            new_agent: NewAgentHint {
+                agent,
+                brief_from: Some(from.into()),
+                reason: Some(reason),
+            },
+        }
+    }
+
+    #[test]
+    fn a_newer_codex_session_hands_back_to_a_briefed_claude() {
+        let stale = ended("stale", 3);
+        let worked = ended("worked", 1);
+        let candidates = [interrupted(&stale), codex(finished(&worked))];
+        let got = plan(&candidates, &pushed(), &AgentFacts::default(), now());
+        assert_eq!(
+            got,
+            briefed(AgentKind::Claude, "worked", NewAgentReason::HandBack)
+        );
+        assert_eq!(
+            got.new_agent.reason_text().as_deref(),
+            Some("Codex worked here last")
+        );
+        // Resume reasons stay per session, whatever the agent.
+        assert_eq!(
+            resume_reasons(&candidates, &dirty()),
+            [
+                Some(ResumeReason::Interrupted),
+                Some(ResumeReason::UncommittedChanges)
+            ]
+        );
+        // Even with nothing unfinished, the picker shows.
+        let got = plan(
+            &[codex(finished(&worked))],
+            &pushed(),
+            &AgentFacts::default(),
+            now(),
+        );
+        assert_eq!(got.new_agent.brief_from.as_deref(), Some("worked"));
+        // An old one doesn't.
+        let older = ended("older", 80);
+        let old = ended("old", 72);
+        let candidates = [interrupted(&older), codex(finished(&old))];
+        let got = plan(&candidates, &pushed(), &AgentFacts::default(), now());
+        assert_eq!(got.preselect, Preselect::NewAgent);
+        assert!(got.new_agent.is_plain());
+    }
+
+    #[test]
+    fn an_older_codex_session_leaves_claude_s_resume_alone() {
+        let worked = ended("worked", 3);
+        let mine = ended("mine", 1);
+        let candidates = [codex(finished(&worked)), interrupted(&mine)];
+        let got = plan(&candidates, &pushed(), &AgentFacts::default(), now());
+        assert_eq!(got.preselect, resume("mine"));
+        assert!(got.new_agent.is_plain());
+    }
+
+    #[test]
+    fn an_idle_live_codex_session_is_briefed_from_and_a_busy_one_is_not() {
+        let mine = ended("mine", 2);
+        let open = ended("open", 0);
+        let candidates = [
+            interrupted(&mine),
+            codex(running(&open, LiveState::Idle, true)),
+        ];
+        assert_eq!(
+            plan(&candidates, &pushed(), &AgentFacts::default(), now()),
+            briefed(AgentKind::Claude, "open", NewAgentReason::HandBack)
+        );
+        let candidates = [
+            interrupted(&mine),
+            codex(running(&open, LiveState::Working, true)),
+        ];
+        assert_eq!(
+            plan(&candidates, &pushed(), &AgentFacts::default(), now()).preselect,
+            resume("mine")
+        );
+        assert_eq!(
+            live_agents(&candidates),
+            [LiveAgent {
+                agent: AgentKind::Codex,
+                session_id: "open".into(),
+                state: LiveState::Working,
+            }]
+        );
+    }
+
+    #[test]
+    fn claude_near_its_limit_nudges_to_codex() {
+        let s = ended("a", 1);
+        let got = plan(&[finished(&s)], &pushed(), &claude_at(97.6), now());
+        assert_eq!(
+            got,
+            Plan {
+                preselect: Preselect::NewAgent,
+                new_agent: NewAgentHint {
+                    agent: AgentKind::Codex,
+                    brief_from: None,
+                    reason: Some(NewAgentReason::Nudge { used_percent: 97 }),
+                },
+            }
+        );
+        assert_eq!(
+            got.new_agent.reason_text().as_deref(),
+            Some("Claude at 97%")
+        );
+        // At the threshold exactly, and with warnings.
+        let facts = AgentFacts {
+            codex: Some(ReadyState::Warnings),
+            ..claude_at(95.0)
+        };
+        assert_eq!(
+            plan(&[], &pushed(), &facts, now()).new_agent.agent,
+            AgentKind::Codex
+        );
+        // Below it, not ready, busy or not installed: today's rules.
+        for facts in [
+            claude_at(94.9),
+            AgentFacts {
+                codex: Some(ReadyState::NotReady),
+                ..claude_at(99.0)
+            },
+            AgentFacts {
+                codex: Some(ReadyState::Busy),
+                ..claude_at(99.0)
+            },
+            AgentFacts {
+                codex: None,
+                ..claude_at(99.0)
+            },
+            AgentFacts {
+                claude_used_percent: None,
+                ..claude_at(99.0)
+            },
+        ] {
+            let got = plan(&[finished(&s)], &pushed(), &facts, now());
+            assert_eq!(got.preselect, Preselect::NoPicker, "{facts:?}");
+            assert!(got.new_agent.is_plain(), "{facts:?}");
+        }
+    }
+
+    #[test]
+    fn the_nudge_briefs_codex_from_an_unfinished_claude_session() {
+        let cut = ended("cut", 1);
+        let got = plan(&[interrupted(&cut)], &pushed(), &claude_at(100.0), now());
+        assert_eq!(
+            got,
+            briefed(
+                AgentKind::Codex,
+                "cut",
+                NewAgentReason::Nudge { used_percent: 100 }
+            )
+        );
+        // A finished one is not briefed from.
+        let done = ended("done", 1);
+        let got = plan(&[finished(&done)], &pushed(), &claude_at(100.0), now());
+        assert_eq!(got.new_agent.brief_from, None);
+        assert_eq!(got.new_agent.agent, AgentKind::Codex);
+        // Codex's own unfinished session, newest: resumed.
+        let mine = ended("mine", 0);
+        let candidates = [interrupted(&cut), codex(interrupted(&mine))];
+        assert_eq!(
+            plan(&candidates, &pushed(), &claude_at(100.0), now()).preselect,
+            resume("mine")
+        );
+        // Going to a waiting agent still comes first.
+        let waiting = ended("waiting", 0);
+        let candidates = [
+            interrupted(&cut),
+            running(&waiting, LiveState::WaitingOnUser, true),
+        ];
+        assert_eq!(
+            plan(&candidates, &pushed(), &claude_at(100.0), now()).preselect,
+            Preselect::Focus("waiting".into())
+        );
+    }
+
+    #[test]
+    fn claude_peak_takes_the_highest_window_that_has_not_reset() {
+        use crate::limits::LimitWindow;
+        let window = |used_percent, hours| {
+            Some(LimitWindow {
+                used_percent,
+                resets_at: now() + TimeDelta::hours(hours),
+            })
+        };
+        let limits = PlanLimits {
+            five_hour: window(40.0, 2),
+            seven_day: window(96.0, 50),
+            updated_at: now(),
+        };
+        assert_eq!(claude_peak(&limits, now()), Some(96.0));
+        let reset = PlanLimits {
+            seven_day: window(96.0, -1),
+            ..limits.clone()
+        };
+        assert_eq!(claude_peak(&reset, now()), Some(40.0));
+        let none = PlanLimits {
+            five_hour: None,
+            ..reset
+        };
+        assert_eq!(claude_peak(&none, now()), None);
+    }
+
+    #[test]
+    fn the_new_agent_hint_goes_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(NewAgentHint::default()).unwrap(),
+            serde_json::json!({})
+        );
+        let hint = briefed(
+            AgentKind::Codex,
+            "a",
+            NewAgentReason::Nudge { used_percent: 97 },
+        )
+        .new_agent;
+        assert_eq!(
+            serde_json::to_value(&hint).unwrap(),
+            serde_json::json!({"agent": "codex", "briefFrom": "a",
+                "reason": {"kind": "nudge", "usedPercent": 97}})
+        );
+        assert_eq!(
+            serde_json::to_value(NewAgentReason::HandBack).unwrap(),
+            serde_json::json!({"kind": "handBack"})
+        );
     }
 
     #[test]

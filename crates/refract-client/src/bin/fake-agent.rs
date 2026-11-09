@@ -65,6 +65,7 @@ fn main() {
         match request.method {
             Method::Ping => {
                 let hello = Hello {
+                    codex_installed: false,
                     protocol_version: PROTOCOL_VERSION,
                     agent_version: "fake".into(),
                 };

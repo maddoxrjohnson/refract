@@ -294,6 +294,7 @@ fn prune(dir: &Path, now: SystemTime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use refract_core::protocol::AgentKind;
 
     fn now() -> DateTime<Utc> {
         "2026-10-29T17:54:44.5Z".parse().unwrap()
@@ -307,6 +308,8 @@ mod tests {
         let dir = tmp.path().join("state/refract/launch");
         let path = format!("{}/", repo.to_str().unwrap());
         let mode = LaunchMode::New {
+            agent: AgentKind::Claude,
+            brief: None,
             prompt: Some("Add tide tables".into()),
             plan_mode: false,
         };
@@ -352,6 +355,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("launch");
         let mode = LaunchMode::New {
+            agent: AgentKind::Claude,
+            brief: None,
             prompt: None,
             plan_mode: false,
         };
@@ -439,6 +444,8 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let dir = tmp.path().join("state/refract/launch");
         let mode = LaunchMode::New {
+            agent: AgentKind::Claude,
+            brief: None,
             prompt: None,
             plan_mode: false,
         };
@@ -469,6 +476,7 @@ mod tests {
             "{0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e}",
         ] {
             let mode = LaunchMode::Resume {
+                agent: AgentKind::Claude,
                 session_id: bad.into(),
                 prompt: None,
             };
@@ -478,6 +486,7 @@ mod tests {
         assert!(!dir.exists());
         let id = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e";
         let mode = LaunchMode::Resume {
+            agent: AgentKind::Claude,
             session_id: id.into(),
             prompt: None,
         };

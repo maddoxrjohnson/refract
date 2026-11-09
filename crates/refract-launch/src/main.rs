@@ -18,7 +18,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use refract_core::protocol::{
-    Id, LaunchMode, LaunchTicket, Message, Method, Outcome, Reply, Request, Response,
+    AgentKind, Id, LaunchMode, LaunchTicket, Message, Method, Outcome, Reply, Request, Response,
 };
 use refract_launch::setup::{
     ensure_profile, windows_code_commit, CodeCli, Processes, Runner, WindowCloser, WindowMatch,
@@ -70,10 +70,13 @@ fn run() -> Result<(), String> {
     let repo = args.repo.ok_or(USAGE)?;
     let mode = match (args.resume, args.focus, args.prompt) {
         (None, None, prompt) => LaunchMode::New {
+            agent: AgentKind::Claude,
+            brief: None,
             prompt,
             plan_mode: false,
         },
         (Some(session_id), None, None) => LaunchMode::Resume {
+            agent: AgentKind::Claude,
             session_id,
             prompt: None,
         },

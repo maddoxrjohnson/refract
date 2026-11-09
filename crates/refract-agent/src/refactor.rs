@@ -24,8 +24,8 @@ use chrono::{DateTime, SubsecRound, TimeDelta, Utc};
 use refract_core::classify::{classify_report, LiveState, SessionState};
 use refract_core::launch::folder_uri;
 use refract_core::protocol::{
-    code, ErrorBody, Event, LaunchMode, LaunchTicket, MergeBlock, MergeBlockReason, MergeOutcome,
-    RefactorCommit, RefactorInfo, RefactorState, Reply, WorktreeCheck,
+    code, AgentKind, ErrorBody, Event, LaunchMode, LaunchTicket, MergeBlock, MergeBlockReason,
+    MergeOutcome, RefactorCommit, RefactorInfo, RefactorState, Reply, WorktreeCheck,
 };
 use refract_core::refactor::{self as rules, ResultFile};
 use refract_core::sessions::{path_within, paths_match};
@@ -334,6 +334,8 @@ impl Job {
         let result_path = path_str(&git_dir.join(rules::RESULT_FILE));
         let focus = focus.and_then(rules::clean_focus);
         let mode = LaunchMode::New {
+            agent: AgentKind::Claude,
+            brief: None,
             prompt: Some(rules::prompt(&branch, &result_path, focus.as_deref())),
             plan_mode: true,
         };
@@ -890,14 +892,18 @@ impl Refactors {
         let fix_prompt = || rules::fix_prompt(&old.branch, &old.target_branch, &result_path);
         let mode = match (&look.summary, fix) {
             (Some(_), false) => LaunchMode::Resume {
+                agent: AgentKind::Claude,
                 session_id: old.session_id.clone(),
                 prompt: Some(rules::CONTINUE_PROMPT.into()),
             },
             (Some(_), true) => LaunchMode::Resume {
+                agent: AgentKind::Claude,
                 session_id: old.session_id.clone(),
                 prompt: Some(fix_prompt()),
             },
             (None, false) => LaunchMode::New {
+                agent: AgentKind::Claude,
+                brief: None,
                 prompt: Some(rules::prompt(
                     &old.branch,
                     &result_path,
@@ -906,6 +912,8 @@ impl Refactors {
                 plan_mode: true,
             },
             (None, true) => LaunchMode::New {
+                agent: AgentKind::Claude,
+                brief: None,
                 prompt: Some(fix_prompt()),
                 plan_mode: false,
             },

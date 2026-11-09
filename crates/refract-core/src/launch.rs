@@ -2,20 +2,55 @@
 //! its terminal title, the `vscode-remote` URI of the repo folder, and the Linux path
 //! of a file the Windows app names.
 
+use crate::agent::AgentKind;
 use crate::protocol::LaunchMode;
 
+/// What every Codex launch starts with. `--no-daemon` keeps the session in the process
+/// Refract started, so that process holds the session's lock and rollout; the sandbox
+/// and approval flags are spec §2's. The model and effort come from the user's Codex
+/// config.
+pub const CODEX_ARGS: &[&str] = &[
+    "codex",
+    "--no-daemon",
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "on-request",
+];
+
 /// The command to run in the new terminal. `session_id` is the ticket's session id,
-/// which for a resume is the one being resumed. A new agent in plan mode gets
-/// `--permission-mode plan`. A prompt follows `--`, which ends `claude`'s options, so a
-/// prompt starting with `-` is not read as a flag. A focus starts nothing, so its
-/// command is empty.
+/// which for a resume is the one being resumed. A new Claude agent in plan mode gets
+/// `--permission-mode plan`. A prompt follows `--`, which ends the agent's options, so a
+/// prompt starting with `-` is not read as a flag (nor, for Codex, one such as `review`
+/// as a subcommand). A focus starts nothing, so its command is empty.
+///
+/// Codex can't be given a session id at start, so a new Codex agent ignores
+/// `session_id` (the helper learns the real one afterwards), and it has no plan mode.
+/// Its resume is `codex <flags> resume <id>`.
 pub fn launch_argv(mode: &LaunchMode, session_id: &str) -> Vec<String> {
+    let codex = || -> Vec<String> { CODEX_ARGS.iter().map(|&a| a.into()).collect() };
     let (mut argv, prompt) = match mode {
-        LaunchMode::New { prompt, plan_mode } => {
+        LaunchMode::New {
+            agent: AgentKind::Codex,
+            prompt,
+            ..
+        } => (codex(), prompt),
+        LaunchMode::New {
+            prompt, plan_mode, ..
+        } => {
             let mut argv = vec!["claude".into(), "--session-id".into(), session_id.into()];
             if *plan_mode {
                 argv.extend(["--permission-mode".into(), "plan".into()]);
             }
+            (argv, prompt)
+        }
+        LaunchMode::Resume {
+            agent: AgentKind::Codex,
+            prompt,
+            ..
+        } => {
+            let mut argv = codex();
+            argv.extend(["resume".into(), session_id.into()]);
             (argv, prompt)
         }
         LaunchMode::Resume { prompt, .. } => (
@@ -34,7 +69,15 @@ pub fn launch_argv(mode: &LaunchMode, session_id: &str) -> Vec<String> {
 /// The terminal tab's name.
 pub fn launch_title(mode: &LaunchMode) -> &'static str {
     match mode {
+        LaunchMode::New {
+            agent: AgentKind::Codex,
+            ..
+        } => "New Codex agent",
         LaunchMode::New { .. } => "New agent",
+        LaunchMode::Resume {
+            agent: AgentKind::Codex,
+            ..
+        } => "Resume Codex",
         LaunchMode::Resume { .. } => "Resume",
         LaunchMode::Focus { .. } => "Running agent",
     }
@@ -148,6 +191,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: None,
                     plan_mode: false
                 },
@@ -158,6 +203,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: Some("Add tide tables".into()),
                     plan_mode: false
                 },
@@ -168,6 +215,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: Some("--help me".into()),
                     plan_mode: false
                 },
@@ -178,6 +227,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: Some(String::new()),
                     plan_mode: false
                 },
@@ -188,6 +239,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: Some("Refactor it".into()),
                     plan_mode: true
                 },
@@ -206,6 +259,8 @@ mod tests {
         assert_eq!(
             launch_argv(
                 &LaunchMode::New {
+                    agent: AgentKind::Claude,
+                    brief: None,
                     prompt: None,
                     plan_mode: true
                 },
@@ -214,11 +269,13 @@ mod tests {
             ["claude", "--session-id", ID, "--permission-mode", "plan"]
         );
         let resume = LaunchMode::Resume {
+            agent: AgentKind::Claude,
             session_id: ID.into(),
             prompt: None,
         };
         assert_eq!(launch_argv(&resume, ID), ["claude", "--resume", ID]);
         let resume = LaunchMode::Resume {
+            agent: AgentKind::Claude,
             session_id: ID.into(),
             prompt: Some("-Continue".into()),
         };
@@ -232,14 +289,74 @@ mod tests {
         assert!(launch_argv(&focus, ID).is_empty());
     }
 
+    fn codex_new(prompt: Option<&str>, plan_mode: bool) -> LaunchMode {
+        LaunchMode::New {
+            agent: AgentKind::Codex,
+            prompt: prompt.map(str::to_owned),
+            plan_mode,
+            brief: None,
+        }
+    }
+
+    const CODEX: [&str; 6] = [
+        "codex",
+        "--no-daemon",
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "on-request",
+    ];
+
+    fn codex_argv(rest: &[&str]) -> Vec<String> {
+        CODEX.iter().chain(rest).map(|&a| a.to_owned()).collect()
+    }
+
+    #[test]
+    fn argv_for_codex() {
+        assert_eq!(launch_argv(&codex_new(None, false), ID), codex_argv(&[]));
+        assert_eq!(
+            launch_argv(&codex_new(Some("Add tide tables"), false), ID),
+            codex_argv(&["--", "Add tide tables"])
+        );
+        // A prompt that looks like a flag or a subcommand stays a prompt; plan mode is
+        // ignored; an empty prompt is left out.
+        assert_eq!(
+            launch_argv(&codex_new(Some("--help me"), true), ID),
+            codex_argv(&["--", "--help me"])
+        );
+        assert_eq!(
+            launch_argv(&codex_new(Some("review"), false), ID),
+            codex_argv(&["--", "review"])
+        );
+        assert_eq!(
+            launch_argv(&codex_new(Some(""), false), ID),
+            codex_argv(&[])
+        );
+        let resume = |prompt: Option<&str>| LaunchMode::Resume {
+            agent: AgentKind::Codex,
+            session_id: ID.into(),
+            prompt: prompt.map(str::to_owned),
+        };
+        assert_eq!(launch_argv(&resume(None), ID), codex_argv(&["resume", ID]));
+        assert_eq!(
+            launch_argv(&resume(Some("-Continue")), ID),
+            codex_argv(&["resume", ID, "--", "-Continue"])
+        );
+        assert_eq!(launch_title(&codex_new(None, false)), "New Codex agent");
+        assert_eq!(launch_title(&resume(None)), "Resume Codex");
+    }
+
     #[test]
     fn titles() {
         let new = LaunchMode::New {
+            agent: AgentKind::Claude,
             prompt: None,
             plan_mode: false,
+            brief: None,
         };
         assert_eq!(launch_title(&new), "New agent");
         let resume = LaunchMode::Resume {
+            agent: AgentKind::Claude,
             session_id: ID.into(),
             prompt: None,
         };

@@ -178,6 +178,20 @@ where
     parser.finish()
 }
 
+/// The assistant's last text reply in full, its text blocks joined by newlines, such as
+/// a brief quotes ([`crate::brief`]); `None` when the lines have none. Parse the tail.
+pub fn last_reply<I, S>(lines: I) -> Option<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut parser = Parser::default();
+    for line in lines {
+        parser.push_line(line.as_ref());
+    }
+    (!parser.reply.is_empty()).then_some(parser.reply)
+}
+
 #[derive(Default)]
 struct Parser {
     summary: SessionSummary,
@@ -434,7 +448,7 @@ fn parse_timestamp(text: &str) -> Option<DateTime<Utc>> {
 }
 
 /// First non-empty line of `text`, truncated to [`SNIPPET_MAX_CHARS`].
-fn snippet(text: &str) -> Option<String> {
+pub(crate) fn snippet(text: &str) -> Option<String> {
     let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
     if line.chars().count() <= SNIPPET_MAX_CHARS {
         return Some(line.to_owned());
@@ -652,5 +666,16 @@ mod tests {
         // A later response replaces the earlier one.
         let other = assistant("m2", "Renamed it.");
         assert!(!parse_lines([&first, &other]).asks_user);
+    }
+
+    #[test]
+    fn the_last_reply_is_read_in_full() {
+        let first = assistant("m1", "Which name do you want?");
+        let second = assistant("m1", "a. tide\nb. reef");
+        assert_eq!(
+            last_reply([&first, &second, &prompt("tide")]).as_deref(),
+            Some("Which name do you want?\na. tide\nb. reef")
+        );
+        assert_eq!(last_reply([prompt("Hi")]), None);
     }
 }
