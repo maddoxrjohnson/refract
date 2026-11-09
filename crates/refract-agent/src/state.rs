@@ -348,12 +348,55 @@ impl Agent {
 
     /// Takes in what the Codex parts of the snapshots depend on, and returns the repos
     /// whose snapshot changed with it.
+    /// Codex being found or lost reads each repo's Codex sessions and instructions again,
+    /// as neither is read while it is not installed.
     pub fn set_codex_env(&mut self, env: CodexEnv, now: DateTime<Utc>) -> Vec<PathBuf> {
         if env == self.codex {
             return Vec::new();
         }
+        let flipped = env.installed != self.codex.installed;
         self.codex = env;
-        self.refresh_preselects(now)
+        let mut changed = self.refresh_preselects(now);
+        if flipped {
+            changed.extend(self.reload_codex());
+            changed.sort();
+            changed.dedup();
+        }
+        changed
+    }
+
+    /// Reads every repo's Codex sessions, which are live, and its instructions again,
+    /// and returns the repos whose snapshot changed.
+    fn reload_codex(&mut self) -> Vec<PathBuf> {
+        self.scan_procs();
+        let paths: Vec<PathBuf> = self.repos.keys().cloned().collect();
+        let mut changed = Vec::new();
+        for path in paths {
+            let codex = self.read_codex(&path);
+            let instructions = self.read_instructions(&path);
+            let repo = &self.repos[&path];
+            let old = repo.snapshot.clone();
+            let (status, head, sessions) = (
+                repo.status.clone(),
+                repo.head.clone(),
+                repo.sessions.clone(),
+            );
+            let live = self.live_set(&path, &sessions, &codex);
+            let background = self.background_for(&path, &live);
+            self.store(
+                path.clone(),
+                status,
+                head,
+                (sessions, codex),
+                live,
+                background,
+                instructions,
+            );
+            if self.repos[&path].snapshot != old {
+                changed.push(path);
+            }
+        }
+        changed
     }
 
     /// Lists the Codex rollouts again after a watch said they changed, and returns the
@@ -361,11 +404,24 @@ impl Agent {
     pub fn codex_rollouts_changed(&mut self) -> Vec<PathBuf> {
         self.reader.codex_changed();
         let cwds = self.reader.relist_codex();
+        self.repos_holding(&cwds)
+    }
+
+    /// Looks again at the rollouts at `paths` after a watch said they changed, and
+    /// returns the repos whose rollouts were added, written or removed.
+    pub fn codex_files_changed(&mut self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let cwds = self.reader.codex_files_changed(paths);
+        self.repos_holding(&cwds)
+    }
+
+    /// The repos that hold one of `cwds`: Codex sessions in a repo's subdirectory are
+    /// its own (or a nested repo's; marking both is harmless).
+    fn repos_holding(&self, cwds: &[String]) -> Vec<PathBuf> {
         self.repos
             .keys()
             .filter(|p| {
                 let repo = path_str(p);
-                cwds.iter().any(|cwd| paths_match(cwd, &repo))
+                cwds.iter().any(|cwd| path_within(cwd, &repo))
             })
             .cloned()
             .collect()
@@ -447,7 +503,7 @@ impl Agent {
         }
         let old_snapshot = old.snapshot.clone();
         let instructions = if what.status || what.head {
-            scan::read_instructions(path)
+            self.read_instructions(path)
         } else {
             old.instructions.clone()
         };
@@ -597,7 +653,10 @@ impl Agent {
     /// Scans `/proc` for agent processes and Codex locks again, and works out what the
     /// hook says about them.
     fn scan_procs(&mut self) {
-        let scan = procs::scan_all();
+        let mut scan = procs::scan_all();
+        procs::prefer_user_locks(&mut scan.procs, &scan.codex_locks, |id| {
+            self.reader.is_hidden_rollout(id)
+        });
         self.procs = scan.procs;
         self.codex_locks = scan.codex_locks;
         self.hook_runs = HookRuns::new(&self.procs, &self.hooks);
@@ -618,6 +677,9 @@ impl Agent {
             &session_times(sessions),
             &self.hook_runs,
         );
+        if !self.codex.installed {
+            return live;
+        }
         let ids: Vec<&str> = codex
             .iter()
             .filter_map(|c| c.summary.session_id.as_deref())
@@ -846,7 +908,7 @@ impl Agent {
         let codex = self.read_codex(&path);
         let live = self.live_set(&path, &sessions, &codex);
         let background = self.background_for(&path, &live);
-        let instructions = scan::read_instructions(&path);
+        let instructions = self.read_instructions(&path);
         self.store(
             path,
             status,
@@ -1048,9 +1110,31 @@ impl Agent {
         self.reader.read_repo_within(&root, &nested)
     }
 
-    /// Reads the Codex sessions that started in `repo`.
+    /// Reads the Codex sessions that started in `repo` or a directory in it, leaving
+    /// out those of a known repo nested in it. None while Codex is not installed.
     fn read_codex(&mut self, repo: &Path) -> Vec<CodexSummary> {
-        self.reader.read_codex_repo(&path_str(repo))
+        if !self.codex.installed {
+            return Vec::new();
+        }
+        let root = path_str(repo);
+        let nested: Vec<String> = self
+            .repos
+            .keys()
+            .map(|p| path_str(p))
+            .filter(|p| !paths_match(p, &root) && path_within(p, &root))
+            .collect();
+        let nested: Vec<&str> = nested.iter().map(String::as_str).collect();
+        self.reader.read_codex_repo(&root, &nested)
+    }
+
+    /// Reads `repo`'s instruction files, for its Codex readiness; none while Codex is
+    /// not installed, so the notes they name are not watched either.
+    fn read_instructions(&self, repo: &Path) -> Instructions {
+        if self.codex.installed {
+            scan::read_instructions(repo)
+        } else {
+            Instructions::default()
+        }
     }
 
     fn repo_events<'a>(&self, paths: impl Iterator<Item = &'a PathBuf>) -> Vec<Event> {
@@ -1465,6 +1549,7 @@ fn candidates<'a>(
                 summary,
                 state,
                 focusable: is_focusable(repo, summary, state, live),
+                process_known: process_known(summary, live),
                 cleared: stopped && ended_by_clear(summary, hook),
                 cut_off: stopped && cut_off(hook, boot, now.timestamp()),
             }
@@ -1485,6 +1570,7 @@ fn candidates<'a>(
             summary,
             state,
             focusable: is_focusable(repo, summary, state, live),
+            process_known: process_known(summary, live),
             cleared: false,
             cut_off: false,
         }
@@ -1507,6 +1593,14 @@ fn repo_facts(status: &Status, head: &HeadInfo) -> RepoFacts {
             (true, Some((ahead, _))) => Upstream::Ahead(ahead),
         },
     }
+}
+
+/// True when the process running the session is known for certain.
+fn process_known(summary: &SessionSummary, live: &HashMap<String, Option<LiveProcess>>) -> bool {
+    summary
+        .session_id
+        .as_ref()
+        .is_some_and(|id| live.get(id).is_some_and(Option::is_some))
 }
 
 /// True when the session is live and its process is known and runs in a terminal of
@@ -1664,7 +1758,12 @@ mod tests {
         let mut codex = CodexSummary::default();
         codex.summary.session_id = Some("c".into());
         codex.summary.last_timestamp = at(30);
-        let live: HashMap<String, Option<LiveProcess>> = [("a".to_owned(), None)].into();
+        let process = LiveProcess {
+            pid: 4242,
+            started: at(60),
+            refract_folder: None,
+        };
+        let live: HashMap<String, Option<LiveProcess>> = [("a".to_owned(), Some(process))].into();
         let hooks: HashMap<String, HookReport> =
             [("a".to_owned(), HookReport::new(hook, Some(now.timestamp())))].into();
         let instructions = Instructions {

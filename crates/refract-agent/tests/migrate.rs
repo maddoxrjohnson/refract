@@ -35,6 +35,8 @@ impl Agent {
     fn spawn(home: &Path, config: &Path, drive: &Path, hook: Option<&Path>) -> Agent {
         let mut command = Command::new(env!("CARGO_BIN_EXE_refract-agent"));
         command
+            .env("REFRACT_CODEX_INSTALLED", "0")
+            .env_remove("CODEX_HOME")
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_CONFIG_HOME")

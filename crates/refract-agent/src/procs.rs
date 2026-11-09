@@ -207,6 +207,11 @@ pub fn parse_cmdline(raw: &[u8]) -> Option<AgentCommand> {
 /// the id `resume <id>` names, if any. A new session (a prompt or none), `fork` and
 /// `resume --last` name none. After `--` everything is the prompt.
 fn codex_session(args: &[String]) -> Option<Option<String>> {
+    // `codex --codex-run-as-apply-patch …` and the like: the binary run as a helper tool.
+    let options = args.iter().take_while(|a| *a != "--");
+    if options.into_iter().any(|a| a.starts_with("--codex-run-as")) {
+        return None;
+    }
     let mut words = positionals(args);
     let Some(first) = words.next() else {
         return Some(None);
@@ -794,6 +799,28 @@ pub fn earliest_unnamed_start(procs: &[AgentProcess], cwd: &str) -> Option<DateT
         .min()
 }
 
+/// Points each `codex` process whose session is a thread Codex spawned (`hidden` says
+/// which, from the rollouts) at another lock the process holds that is not: a session
+/// process holds its subagents' locks beside its own, and the person's thread is the
+/// one Refract shows.
+pub fn prefer_user_locks(
+    procs: &mut [AgentProcess],
+    locks: &[CodexLock],
+    hidden: impl Fn(&str) -> bool,
+) {
+    for process in procs.iter_mut().filter(|p| p.agent == AgentKind::Codex) {
+        if !process.session_id.as_deref().is_some_and(&hidden) {
+            continue;
+        }
+        let user = locks
+            .iter()
+            .find(|l| l.pid == process.pid && !hidden(&l.session_id));
+        if let Some(lock) = user {
+            process.session_id = Some(lock.session_id.clone());
+        }
+    }
+}
+
 /// Decides which of a working directory's Codex sessions are live, and which process
 /// runs each when that is certain. `procs` are all running agent processes, of which
 /// only the `codex` ones count here, `locks` the thread locks held open, `sessions` the
@@ -952,6 +979,11 @@ mod tests {
             cmd(&["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js"]),
             None
         );
+        assert_eq!(
+            cmd(&[CODEX_BIN, "--codex-run-as-apply-patch", "patch"]),
+            None
+        );
+        assert!(cmd(&["codex", "--", "--codex-run-as-x"]).is_some());
         let raw = |args: &[&str]| args.join("\0").into_bytes();
         assert!(is_codex_program(&raw(&daemon)));
         assert!(is_codex_program(&raw(&["codex", "exec", "x"])));
@@ -1029,6 +1061,19 @@ mod tests {
         // Nor does a Codex process count for Claude.
         let tui = [codex_proc(REPO, 44, None)];
         assert!(without_hooks(&tui, REPO, &[(ID, at(9))]).is_empty());
+    }
+
+    #[test]
+    fn a_process_holding_a_subagent_lock_runs_the_person_s_thread() {
+        let mut procs = [
+            codex_proc(REPO, 40, Some(ID2)),
+            codex_proc(REPO, 41, Some(ID2)),
+        ];
+        let locks = [lock(ID2, 40), lock(ID, 40), lock(ID2, 41)];
+        prefer_user_locks(&mut procs, &locks, |id| id == ID2);
+        assert_eq!(procs[0].session_id.as_deref(), Some(ID));
+        // No other lock: left as it was.
+        assert_eq!(procs[1].session_id.as_deref(), Some(ID2));
     }
 
     #[test]

@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::agent::AgentKind;
 use crate::classify::{LiveState, SessionState};
-use crate::codex_ready::{LiveAgent, ReadyState};
+use crate::codex_ready::{gate, Gate, LiveAgent, ReadyState};
 use crate::limits::PlanLimits;
 use crate::transcript::SessionSummary;
 
@@ -40,6 +40,8 @@ pub struct Candidate<'a> {
     /// Its process is known and runs in the Refract window on this repo, so a live
     /// session can be gone to.
     pub focusable: bool,
+    /// A live session's process is known for certain, so the helper can stop it.
+    pub process_known: bool,
     /// It is not running and was closed by `/clear`
     /// ([`ended_by_clear`](crate::classify::ended_by_clear)): the person moved on from
     /// it, so it is never the last conversation and never preselected.
@@ -308,10 +310,11 @@ pub fn preselect(candidates: &[Candidate<'_>], repo: &RepoFacts, now: DateTime<U
 ///    [`MAX_RESUME_AGE`] ago (and, for the nudge, unfinished), preselect a new agent
 ///    briefed from it. A busy one leaves the rules below;
 /// 3. when the newest session that isn't running is this agent's, has a
-///    [`ResumeReason`] and ended less than [`MAX_RESUME_AGE`] ago, resume it;
+///    [`ResumeReason`] and ended less than [`MAX_RESUME_AGE`] ago, and the other agent
+///    is not busy ([`gate`]), resume it;
 /// 4. with the nudge, preselect New Codex agent;
-/// 5. with no session to resume, a clean repo and no focusable live session, skip the
-///    picker; otherwise preselect New agent.
+/// 5. with no session to resume, a clean repo, no focusable live session and no live
+///    session of the other agent, skip the picker; otherwise preselect New agent.
 pub fn plan(
     candidates: &[Candidate<'_>],
     repo: &RepoFacts,
@@ -344,6 +347,7 @@ pub fn plan(
         None => NewAgentReason::HandBack,
     };
     let reasons = resume_reasons(candidates, repo);
+    let target_gate = gate(target, &live_agents(candidates));
     let recent = |c: &Candidate<'_>| {
         c.summary
             .last_timestamp
@@ -370,7 +374,8 @@ pub fn plan(
     }
     if let Some(i) = newest_stopped(candidates) {
         let newest = &candidates[i];
-        if newest.agent == target && reasons[i].is_some() && recent(newest) {
+        let other_busy = matches!(target_gate, Gate::Busy(_));
+        if newest.agent == target && reasons[i].is_some() && recent(newest) && !other_busy {
             if let Some(id) = &newest.summary.session_id {
                 return plain(Preselect::Resume(id.clone()));
             }
@@ -386,7 +391,11 @@ pub fn plan(
             },
         };
     }
-    if reasons.iter().all(Option::is_none) && !repo.dirty && focusable.is_none() {
+    if reasons.iter().all(Option::is_none)
+        && !repo.dirty
+        && focusable.is_none()
+        && target_gate.is_open()
+    {
         plain(Preselect::NoPicker)
     } else {
         plain(Preselect::NewAgent)
@@ -413,6 +422,7 @@ pub fn live_agents(candidates: &[Candidate<'_>]) -> Vec<LiveAgent> {
                     agent: c.agent,
                     session_id: id.clone(),
                     state,
+                    process_unknown: !c.process_known,
                 },
             )),
             _ => None,
@@ -462,6 +472,7 @@ mod tests {
             summary,
             state: SessionState::Interrupted(InterruptReason::ToolCallWithoutResult),
             focusable: false,
+            process_known: true,
             cleared: false,
             cut_off: false,
         }
@@ -473,6 +484,7 @@ mod tests {
             summary,
             state: SessionState::Finished(FinishKind::Completed),
             focusable: false,
+            process_known: true,
             cleared: false,
             cut_off: false,
         }
@@ -484,6 +496,7 @@ mod tests {
             summary,
             state: SessionState::Live(live),
             focusable,
+            process_known: true,
             cleared: false,
             cut_off: false,
         }
@@ -1042,6 +1055,7 @@ mod tests {
         let s = ended("a", 0);
         let done = Candidate {
             focusable: true,
+            process_known: true,
             ..finished(&s)
         };
         assert_eq!(preselect(&[done], &pushed(), now()), Preselect::NoPicker);
@@ -1178,13 +1192,15 @@ mod tests {
             plan(&candidates, &pushed(), &AgentFacts::default(), now()),
             briefed(AgentKind::Claude, "open", NewAgentReason::HandBack)
         );
+        // A busy Codex session is not briefed from, and Claude's own session is not
+        // resumed beside it either.
         let candidates = [
             interrupted(&mine),
             codex(running(&open, LiveState::Working, true)),
         ];
         assert_eq!(
             plan(&candidates, &pushed(), &AgentFacts::default(), now()).preselect,
-            resume("mine")
+            Preselect::NewAgent
         );
         assert_eq!(
             live_agents(&candidates),
@@ -1192,8 +1208,43 @@ mod tests {
                 agent: AgentKind::Codex,
                 session_id: "open".into(),
                 state: LiveState::Working,
+                process_unknown: false,
             }]
         );
+    }
+
+    #[test]
+    fn a_just_opened_codex_session_is_not_briefed_from_or_stopped() {
+        // Live with no rollout yet: its state is unknown (the person may be typing), so
+        // it is neither handed back from nor offered for stop-and-replace.
+        let opened = SessionSummary {
+            session_id: Some("opened".into()),
+            last_timestamp: Some(now()),
+            ..SessionSummary::default()
+        };
+        let candidates = [codex(running(&opened, LiveState::Unknown, false))];
+        let got = plan(&candidates, &pushed(), &AgentFacts::default(), now());
+        assert_eq!(got.preselect, Preselect::NewAgent);
+        assert!(got.new_agent.is_plain());
+        assert!(matches!(
+            gate(AgentKind::Claude, &live_agents(&candidates)),
+            Gate::Busy(_)
+        ));
+    }
+
+    #[test]
+    fn a_live_codex_session_elsewhere_keeps_the_picker() {
+        // Not focusable (another terminal), clean repo, nothing to resume: the picker
+        // still shows, so Claude is not started beside it at once.
+        let open = ended("open", 0);
+        for state in [LiveState::Working, LiveState::WaitingOnUser] {
+            let candidates = [codex(running(&open, state, false))];
+            assert_eq!(
+                preselect(&candidates, &pushed(), now()),
+                Preselect::NewAgent,
+                "{state:?}"
+            );
+        }
     }
 
     #[test]

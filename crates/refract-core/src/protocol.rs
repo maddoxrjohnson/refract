@@ -55,7 +55,9 @@ pub mod code {
     /// at that step, or that is refused there (see [`Method::MigrateBeginDelete`]).
     pub const MIGRATE_FAILED: i32 = 6;
     /// `stopAgent` named a session that is working on a turn or has background agents
-    /// or workflow runs going, so stopping it could lose work.
+    /// or workflow runs going, so stopping it could lose work. Also `prepareLaunch`
+    /// (New or Resume of an agent) or `makeCodexReady` while the other agent is busy in
+    /// the repo (its gate is busy): the message says so in words for the app to show.
     pub const AGENT_BUSY: i32 = 7;
     /// `startRefactor` was refused (detached HEAD, no commits, a refactor already under
     /// way) or failed, or `resumeRefactor`, `mergeRefactor` or `discardRefactor` named a
@@ -698,12 +700,17 @@ pub struct PendingMigration {
 /// and the transcript decides: stopped when its last turn ended, refused otherwise. A
 /// session with background agents or workflow runs going is refused with
 /// [`code::AGENT_BUSY`] whatever its state. A session with no process known for certain
-/// is refused with [`code::NOT_RUNNING`].
+/// is refused with [`code::NOT_RUNNING`]. With `idleOnly` (the stop-and-replace row,
+/// [`Gate::StopIdle`](crate::codex_ready::Gate::StopIdle)), only an idle session is
+/// stopped: one waiting on the user or of unknown state is refused with
+/// [`code::AGENT_BUSY`] too.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StopAgentParams {
     pub path: String,
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub idle_only: bool,
 }
 
 /// A step of a running migration, as the panel names it.
@@ -2757,8 +2764,14 @@ mod tests {
             Method::StopAgent(StopAgentParams {
                 path: "/mnt/c/dev/aurora-notes".into(),
                 session_id: "s-1".into(),
+                idle_only: false,
             })
         );
+        let idle = parse_request(
+            r#"{"id":3,"method":"stopAgent","params":{"path":"/x","sessionId":"s-1","idleOnly":true}}"#,
+        )
+        .unwrap();
+        assert!(matches!(idle.method, Method::StopAgent(p) if p.idle_only));
         let missing = parse_request(r#"{"id":4,"method":"stopAgent","params":{"path":"/x"}}"#);
         assert_eq!(missing.unwrap_err().error.code, code::INVALID_PARAMS);
 

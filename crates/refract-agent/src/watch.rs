@@ -89,7 +89,7 @@ pub enum Target {
     /// Codex's home directory, for its `sessions` and `thread-writer-locks` appearing.
     CodexHome,
     /// A directory of Codex's `sessions` tree (`sessions`, a year, a month or a day).
-    CodexSessions,
+    CodexSessions(PathBuf),
     /// Codex's `thread-writer-locks` directory.
     CodexLocks,
 }
@@ -125,8 +125,8 @@ pub enum Change {
     NewProjectDir(String),
     /// Something changed in a repo git could not read; it may be readable now.
     Retry(PathBuf),
-    /// A Codex rollout was written, added or removed.
-    CodexSessions,
+    /// This Codex rollout was written, added or removed.
+    CodexSessions(PathBuf),
     /// A Codex session's lock appeared or went: it opened or closed.
     CodexLocks,
     /// A directory appeared in Codex's home or its `sessions` tree; its watches may need
@@ -404,7 +404,7 @@ impl Watcher {
         collect_dirs_to_depth(&home.join("sessions"), 3, &mut dirs, MAX_CODEX_DIRS);
         wanted.extend(
             dirs.into_iter()
-                .map(|d| (d, sessions_mask, Target::CodexSessions)),
+                .map(|d| (d.clone(), sessions_mask, Target::CodexSessions(d))),
         );
         wanted.push((
             home.join("thread-writer-locks"),
@@ -415,7 +415,7 @@ impl Watcher {
             |t| {
                 matches!(
                     t,
-                    Target::CodexHome | Target::CodexSessions | Target::CodexLocks
+                    Target::CodexHome | Target::CodexSessions(_) | Target::CodexLocks
                 )
             },
             wanted,
@@ -660,11 +660,11 @@ pub fn change_for(
         Target::CodexHome => {
             matches!(name?, "sessions" | "thread-writer-locks").then_some(Change::CodexRewatch)
         }
-        Target::CodexSessions if new_dir => Some(Change::CodexRewatch),
-        Target::CodexSessions => {
+        Target::CodexSessions(_) if new_dir => Some(Change::CodexRewatch),
+        Target::CodexSessions(dir) => {
             let name = name?;
             (name.starts_with("rollout-") && name.ends_with(".jsonl"))
-                .then_some(Change::CodexSessions)
+                .then(|| Change::CodexSessions(dir.join(name)))
         }
         Target::CodexLocks => name?.ends_with(".lock").then_some(Change::CodexLocks),
     }
@@ -889,15 +889,14 @@ mod tests {
         let file = EventMask::CLOSE_WRITE;
         let dir = EventMask::CREATE | EventMask::ISDIR;
         let rollout = "rollout-2026-11-08T19-02-11-0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d8e.jsonl";
+        let day = PathBuf::from("/home/dev/.codex/sessions/2026/11/08");
+        let sessions = || Target::CodexSessions(day.clone());
         assert_eq!(
-            change(Target::CodexSessions, EventMask::MODIFY, rollout),
-            Some(Change::CodexSessions)
+            change(sessions(), EventMask::MODIFY, rollout),
+            Some(Change::CodexSessions(day.join(rollout)))
         );
-        assert_eq!(change(Target::CodexSessions, file, "notes.txt"), None);
-        assert_eq!(
-            change(Target::CodexSessions, dir, "09"),
-            Some(Change::CodexRewatch)
-        );
+        assert_eq!(change(sessions(), file, "notes.txt"), None);
+        assert_eq!(change(sessions(), dir, "09"), Some(Change::CodexRewatch));
         assert_eq!(
             change(
                 Target::CodexLocks,

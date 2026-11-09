@@ -335,7 +335,10 @@ pub const MAX_INSTRUCTION_BYTES: u64 = 1024 * 1024;
 /// brief's handoff. A missing or unreadable file is `None`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Instructions {
+    /// AGENTS.md, or AGENTS.override.md when `agents_override`.
     pub agents_md: Option<String>,
+    /// `agents_md` is AGENTS.override.md, which Codex reads in place of AGENTS.md.
+    pub agents_override: bool,
     pub claude_md: Option<String>,
     pub claude_local_md: Option<String>,
     /// The notes files AGENTS.md names
@@ -360,6 +363,7 @@ impl Instructions {
     pub fn files<'a>(&'a self, notes: &'a [(&'a str, &'a str)]) -> InstructionFiles<'a> {
         InstructionFiles {
             agents_md: self.agents_md.as_deref(),
+            agents_override: self.agents_override,
             claude_md: self.claude_md.as_deref(),
             claude_local_md: self.claude_local_md.as_deref(),
             other_agents_bytes: &[],
@@ -390,10 +394,15 @@ impl Instructions {
 }
 
 /// Reads `repo`'s AGENTS.md, CLAUDE.md, CLAUDE.local.md and the notes files AGENTS.md
-/// names, each up to [`MAX_INSTRUCTION_BYTES`].
+/// names, each up to [`MAX_INSTRUCTION_BYTES`]. A non-empty AGENTS.override.md is read in
+/// place of AGENTS.md, as Codex does. Files that resolve outside the repo (through a
+/// symlink) are left out.
 pub fn read_instructions(repo: &Path) -> Instructions {
-    let read = |name: &str| read_text(&repo.join(name));
-    let agents_md = read("AGENTS.md");
+    let root = fs::canonicalize(repo).unwrap_or_else(|_| repo.to_owned());
+    let read = |name: &str| read_text(&root, &root.join(name));
+    let over = read(codex_ready::AGENTS_OVERRIDE).filter(|t| !t.trim().is_empty());
+    let agents_override = over.is_some();
+    let agents_md = over.or_else(|| read("AGENTS.md"));
     let notes = agents_md
         .as_deref()
         .map(codex_ready::named_notes)
@@ -408,15 +417,27 @@ pub fn read_instructions(repo: &Path) -> Instructions {
         claude_md: read("CLAUDE.md"),
         claude_local_md: read("CLAUDE.local.md"),
         agents_md,
+        agents_override,
         notes,
     }
 }
 
 /// A regular file's text, up to [`MAX_INSTRUCTION_BYTES`]; `None` when it is missing,
-/// not a file or unreadable.
-fn read_text(path: &Path) -> Option<String> {
+/// not a regular file (a FIFO would block the read), unreadable, or resolves outside
+/// `root`, the repo's real path.
+fn read_text(root: &Path, path: &Path) -> Option<String> {
     use std::io::Read;
-    let file = fs::File::open(path).ok()?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let real = fs::canonicalize(path).ok()?;
+    if !real.starts_with(root) || !fs::metadata(&real).ok()?.is_file() {
+        return None;
+    }
+    // Non-blocking, in case it was swapped for a FIFO since.
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&real)
+        .ok()?;
     if !file.metadata().ok()?.is_file() {
         return None;
     }
@@ -465,6 +486,42 @@ mod tests {
             read_instructions(&repo.join("notes")),
             Instructions::default()
         );
+    }
+
+    #[test]
+    fn agents_override_is_read_in_place_of_agents_md() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path();
+        fs::write(repo.join("AGENTS.md"), "# Shared\n").unwrap();
+        fs::write(repo.join("AGENTS.override.md"), "  \n").unwrap();
+        // A blank override is not the one Codex reads.
+        let read = read_instructions(repo);
+        assert_eq!(read.agents_md.as_deref(), Some("# Shared\n"));
+        assert!(!read.agents_override);
+        fs::write(repo.join("AGENTS.override.md"), "# Local\n").unwrap();
+        let read = read_instructions(repo);
+        assert_eq!(read.agents_md.as_deref(), Some("# Local\n"));
+        assert!(read.agents_override && read.files(&[]).agents_override);
+    }
+
+    #[test]
+    fn instructions_outside_the_repo_or_not_files_are_left_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("kelp-cli");
+        fs::create_dir_all(repo.join("notes")).unwrap();
+        fs::write(tmp.path().join("secret.md"), "outside\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("secret.md"), repo.join("CLAUDE.md")).unwrap();
+        fs::write(repo.join("notes/real.md"), "inside\n").unwrap();
+        std::os::unix::fs::symlink(repo.join("notes/real.md"), repo.join("CLAUDE.local.md"))
+            .unwrap();
+        fs::write(repo.join("AGENTS.md"), "Read notes/HANDOFF.md.\n").unwrap();
+        let fifo = std::ffi::CString::new(repo.join("notes/HANDOFF.md").to_str().unwrap()).unwrap();
+        // SAFETY: mkfifo takes a NUL-terminated path and a mode.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        let read = read_instructions(&repo);
+        assert_eq!(read.claude_md, None);
+        assert_eq!(read.claude_local_md.as_deref(), Some("inside\n"));
+        assert!(read.notes.is_empty());
     }
 
     fn mkrepo(path: &Path) {

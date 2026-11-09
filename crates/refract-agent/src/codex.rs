@@ -6,8 +6,13 @@
 //! pnpm, Volta and Bun bin directories; when that finds nothing, the slow probe asks an
 //! interactive shell (`bash -ic 'command -v codex'`), with [`SHELL_TIMEOUT`], since a
 //! shell's startup files can take a while.
+//!
+//! Windows directories on `PATH` (under `/mnt/`) are skipped: the npm shim of a Windows
+//! install there does not run Codex in WSL, and each look would cross to the drive.
 
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -18,13 +23,36 @@ pub const SHELL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the shell is checked for having exited.
 const POLL: Duration = Duration::from_millis(50);
 
+/// How the helper looks for Codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Probe {
+    /// The quick probe, then the slow one.
+    Look,
+    /// A fixed answer, without looking: tests, through [`PROBE_ENV`].
+    Fixed(bool),
+}
+
+/// Set to `1` or `0` to say Codex is or is not installed without looking (for tests).
+pub const PROBE_ENV: &str = "REFRACT_CODEX_INSTALLED";
+
+impl Probe {
+    /// [`Probe::Fixed`] when [`PROBE_ENV`] is `1` or `0`, else [`Probe::Look`].
+    pub fn from_env() -> Probe {
+        match std::env::var(PROBE_ENV).as_deref() {
+            Ok("1") => Probe::Fixed(true),
+            Ok("0") => Probe::Fixed(false),
+            _ => Probe::Look,
+        }
+    }
+}
+
 /// The directories the quick probe looks in, from `HOME`, `NVM_DIR` and `PATH`, in that
 /// order of preference, without repeats.
 pub fn bin_dirs(home: Option<&Path>, nvm_dir: Option<&Path>, path: Option<&str>) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = path
         .unwrap_or_default()
         .split(':')
-        .filter(|d| d.starts_with('/'))
+        .filter(|d| d.starts_with('/') && !refract_core::sessions::is_windows_mount(d))
         .map(PathBuf::from)
         .collect();
     let nvm = nvm_dir
@@ -76,6 +104,8 @@ pub fn quick_probe() -> bool {
 
 /// The slow probe: `bash -ic 'command -v codex'` printed a path within
 /// [`SHELL_TIMEOUT`]. A shell that takes longer is killed and counts as not found.
+/// Its output is read as it comes, never waiting for the pipe to close, as a program
+/// the startup files left running may hold it open.
 pub fn shell_probe() -> bool {
     let child = Command::new("bash")
         .args(["-ic", "command -v codex"])
@@ -86,10 +116,32 @@ pub fn shell_probe() -> bool {
     let Ok(mut child) = child else {
         return false;
     };
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return false;
+    };
+    // SAFETY: fcntl on a pipe this process owns.
+    unsafe {
+        let fd = stdout.as_raw_fd();
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    let mut out = Vec::new();
+    let mut drain = |out: &mut Vec<u8>| {
+        let mut chunk = [0u8; 4096];
+        while let Ok(n) = stdout.read(&mut chunk) {
+            if n == 0 || out.len() > 64 * 1024 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+    };
     let deadline = Instant::now() + SHELL_TIMEOUT;
-    loop {
+    let status = loop {
+        drain(&mut out);
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
             _ => {
                 let _ = child.kill();
@@ -97,17 +149,18 @@ pub fn shell_probe() -> bool {
                 return false;
             }
         }
-    }
-    child
-        .wait_with_output()
-        .is_ok_and(|out| out.status.success() && printed_a_path(&out.stdout))
+    };
+    drain(&mut out);
+    status.success() && printed_a_path(&out)
 }
 
-/// `command -v` output naming a program by path; an alias or function prints no path.
+/// `command -v` output naming a program by path; an alias or function prints no path,
+/// and a Windows install under `/mnt/` does not count.
 fn printed_a_path(stdout: &[u8]) -> bool {
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .any(|line| line.trim().starts_with('/'))
+    String::from_utf8_lossy(stdout).lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('/') && !refract_core::sessions::is_windows_mount(line)
+    })
 }
 
 #[cfg(test)]
@@ -122,13 +175,18 @@ mod tests {
         for version in ["v22.4.0", "v24.1.0"] {
             fs::create_dir_all(home.join(".nvm/versions/node").join(version).join("bin")).unwrap();
         }
-        let dirs = bin_dirs(Some(home), None, Some("/usr/bin:relative:/opt/tools/bin"));
+        let dirs = bin_dirs(
+            Some(home),
+            None,
+            Some("/usr/bin:relative:/mnt/c/Users/dev/AppData/Roaming/npm:/opt/tools/bin"),
+        );
         assert_eq!(dirs[0], Path::new("/usr/bin"));
         assert_eq!(dirs[1], Path::new("/opt/tools/bin"));
         // The newest node version first.
         assert_eq!(dirs[2], home.join(".nvm/versions/node/v24.1.0/bin"));
         assert_eq!(dirs[3], home.join(".nvm/versions/node/v22.4.0/bin"));
         assert!(dirs.contains(&home.join(".npm-global/bin")));
+        assert!(!dirs.iter().any(|d| d.starts_with("/mnt")));
         assert_eq!(
             dirs.iter().filter(|d| *d == Path::new("/usr/bin")).count(),
             1
@@ -158,5 +216,8 @@ mod tests {
         ));
         assert!(!printed_a_path(b"alias codex='npx codex'\n"));
         assert!(!printed_a_path(b""));
+        assert!(!printed_a_path(
+            b"/mnt/c/Users/dev/AppData/Roaming/npm/codex\n"
+        ));
     }
 }

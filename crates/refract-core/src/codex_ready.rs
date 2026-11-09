@@ -46,13 +46,23 @@ pub const CODEX_TERMS: &[&str] = &["codex", "/new"];
 /// Words in a notes file's path that mark it as notes an agent keeps (a handoff or
 /// progress file) rather than a spec or a doc. Only those are scanned; a spec that
 /// describes `/clear` as a product feature would only give false warnings.
-pub const NOTE_HINTS: &[&str] = &["handoff", "progress", "notes", "todo", "status"];
+pub const NOTE_HINTS: &[&str] = &["handoff", "progress", "notes", "todo"];
+
+/// File names (without `.md` or `.txt`, any case) that are notes too, though too common a
+/// word to count anywhere in a path: `STATUS.md` is notes, `status-codes.md` is not.
+pub const NOTE_NAMES: &[&str] = &["status"];
+
+/// The file Codex reads in place of AGENTS.md when it is there.
+pub const AGENTS_OVERRIDE: &str = "AGENTS.override.md";
 
 /// The repo's instruction files, as the helper read them. A missing file is `None`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct InstructionFiles<'a> {
-    /// `AGENTS.md` at the repo root.
+    /// `AGENTS.md` at the repo root, or [`AGENTS_OVERRIDE`] when `agents_override`.
     pub agents_md: Option<&'a str>,
+    /// `agents_md` is [`AGENTS_OVERRIDE`], which Codex reads in place of AGENTS.md: the
+    /// findings name it, and CLAUDE.md must import or equal it.
+    pub agents_override: bool,
     /// `CLAUDE.md` at the repo root.
     pub claude_md: Option<&'a str>,
     /// `CLAUDE.local.md` at the repo root.
@@ -135,12 +145,17 @@ pub struct LiveAgent {
     pub agent: AgentKind,
     pub session_id: String,
     pub state: LiveState,
+    /// Which process runs it is not certain, so the helper cannot stop it: an idle one
+    /// is not offered for stop-and-replace, and blocks as busy ("close it first").
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub process_unknown: bool,
 }
 
 impl LiveAgent {
     /// Working, waiting on the person, or open with no status saying it is idle (a
-    /// Claude session without the status hook). Such a session could be changing the
-    /// working tree, so the other agent is not started beside it.
+    /// Claude session without the status hook, a Codex one with no conversation yet).
+    /// Such a session could be changing the working tree, so the other agent is not
+    /// started beside it.
     pub fn is_busy(&self) -> bool {
         self.state != LiveState::Idle
     }
@@ -159,8 +174,9 @@ pub enum Gate {
     /// No live session of the other agent.
     #[default]
     Open,
-    /// The other agent is busy (the newest busy session): the row is dimmed with
-    /// "Busy: <agent> is working" (or waiting on you).
+    /// The other agent is busy (the newest busy session), or idle in a process the
+    /// helper cannot stop ([`LiveAgent::process_unknown`]): the row is dimmed with
+    /// "Busy: <agent> is working" (or waiting on you, or close it first).
     Busy(LiveAgent),
     /// The other agent is open and idle: the row becomes "Stop the idle <other> agent
     /// and start <this>". The helper stops these sessions first (the Refactor stop
@@ -210,11 +226,15 @@ pub struct CodexReadiness {
 
 /// How `target`'s New row stands against the other agent's sessions in `live`: busy
 /// when any of them is busy (the newest listed first wins, so pass them newest first),
-/// otherwise stop-idle when any is open, otherwise open.
+/// then when any idle one has no certain process, otherwise stop-idle when any is open,
+/// otherwise open.
 pub fn gate(target: AgentKind, live: &[LiveAgent]) -> Gate {
     let other: Vec<&LiveAgent> = live.iter().filter(|l| l.agent != target).collect();
     if let Some(busy) = other.iter().find(|l| l.is_busy()) {
         return Gate::Busy((*busy).clone());
+    }
+    if let Some(unsure) = other.iter().find(|l| l.process_unknown) {
+        return Gate::Busy((*unsure).clone());
     }
     if other.is_empty() {
         Gate::Open
@@ -230,7 +250,7 @@ pub fn gate(target: AgentKind, live: &[LiveAgent]) -> Gate {
 pub fn readiness(files: &InstructionFiles<'_>, live: &[LiveAgent]) -> CodexReadiness {
     let mut findings = blocking_findings(files);
     if let Some(agents) = nonempty(files.agents_md) {
-        findings.extend(claude_only_lines("AGENTS.md", agents));
+        findings.extend(claude_only_lines(files.agents_name(), agents));
         for (path, text) in files.notes {
             findings.extend(claude_only_lines(path, text));
         }
@@ -255,6 +275,17 @@ pub fn readiness(files: &InstructionFiles<'_>, live: &[LiveAgent]) -> CodexReadi
     }
 }
 
+impl InstructionFiles<'_> {
+    /// The name of the file `agents_md` holds.
+    pub fn agents_name(&self) -> &'static str {
+        if self.agents_override {
+            AGENTS_OVERRIDE
+        } else {
+            "AGENTS.md"
+        }
+    }
+}
+
 fn nonempty(text: Option<&str>) -> Option<&str> {
     text.filter(|t| !t.trim().is_empty())
 }
@@ -275,17 +306,18 @@ fn blocking_findings(files: &InstructionFiles<'_>) -> Vec<Finding> {
             "No AGENTS.md at the repo root".into(),
         )];
     };
+    let name = files.agents_name();
     let mut findings = Vec::new();
     for (file, text) in [
         ("CLAUDE.md", files.claude_md),
         ("CLAUDE.local.md", files.claude_local_md),
     ] {
         if let Some(text) = text {
-            if !imports_agents_md(text) && text != files.agents_md.unwrap_or_default() {
+            if !imports(text, name) && text != agents {
                 findings.push(whole(
                     file,
                     FindingKind::ClaudeMdNotSynced,
-                    format!("{file} has no @AGENTS.md line and differs from AGENTS.md"),
+                    format!("{file} has no @{name} line and differs from {name}"),
                 ));
             }
         }
@@ -293,7 +325,7 @@ fn blocking_findings(files: &InstructionFiles<'_>) -> Vec<Finding> {
     for (n, line) in unfenced_lines(agents) {
         if is_import(line) {
             findings.push(Finding {
-                file: "AGENTS.md".into(),
+                file: name.into(),
                 line: Some(n),
                 kind: FindingKind::AtImport,
                 text: format!("Codex does not follow imports: {}", cut(line.trim())),
@@ -304,7 +336,7 @@ fn blocking_findings(files: &InstructionFiles<'_>) -> Vec<Finding> {
     let total = agents.len() as u64 + files.other_agents_bytes.iter().sum::<u64>();
     if total > MAX_AGENTS_BYTES {
         findings.push(whole(
-            "AGENTS.md",
+            name,
             FindingKind::TooLarge,
             format!(
                 "AGENTS.md files add up to {} KiB, over Codex's {} KiB",
@@ -316,11 +348,12 @@ fn blocking_findings(files: &InstructionFiles<'_>) -> Vec<Finding> {
     findings
 }
 
-/// The file has an `@AGENTS.md` (or `@./AGENTS.md`) line.
-fn imports_agents_md(text: &str) -> bool {
-    text.lines()
-        .map(str::trim)
-        .any(|l| l == "@AGENTS.md" || l == "@./AGENTS.md")
+/// The file has an `@<name>` (or `@./<name>`) line, such as `@AGENTS.md`.
+fn imports(text: &str, name: &str) -> bool {
+    text.lines().map(str::trim).any(|l| {
+        let target = l.strip_prefix('@').unwrap_or_default();
+        target.strip_prefix("./").unwrap_or(target) == name
+    })
 }
 
 /// A line that is only an `@path` import, such as `@docs/rules.md` or
@@ -349,10 +382,11 @@ fn unfenced_lines(text: &str) -> impl Iterator<Item = (u32, &str)> {
 /// The Claude-only lines of one file. Lines under a heading that says Claude only (such
 /// as `## Claude Code only`, and not naming Codex) are skipped, as is any line that names
 /// Codex too.
+/// Code fences are skipped, so a `#` line in one is no heading.
 fn claude_only_lines(file: &str, text: &str) -> Vec<Finding> {
     let mut findings = Vec::new();
     let mut claude_section: Option<usize> = None;
-    for (i, line) in text.lines().enumerate() {
+    for (n, line) in unfenced_lines(text) {
         let lower = line.to_lowercase();
         if let Some(level) = heading_level(line) {
             if claude_section.is_some_and(|l| level <= l) {
@@ -373,7 +407,7 @@ fn claude_only_lines(file: &str, text: &str) -> Vec<Finding> {
         if let Some(term) = claude_term(&lower) {
             findings.push(Finding {
                 file: file.to_owned(),
-                line: Some(i as u32 + 1),
+                line: Some(n),
                 kind: FindingKind::ClaudeOnly,
                 text: cut(line.trim()),
                 term: Some(term.to_owned()),
@@ -444,7 +478,7 @@ fn cut(line: &str) -> String {
 /// repeats, for the helper to read and pass back in [`InstructionFiles::notes`]. A name
 /// counts when it is a relative `.md` or `.txt` path inside the repo (no `/` or `~`
 /// start, no `..`, no URL) whose path contains one of the [`NOTE_HINTS`], such as
-/// `notes/HANDOFF.md` or `PROGRESS.md`. Backticks, quotes, brackets and trailing
+/// `notes/HANDOFF.md` or `PROGRESS.md`, or whose file is one of the [`NOTE_NAMES`]. Backticks, quotes, brackets and trailing
 /// punctuation around it are dropped, so `` `notes/HANDOFF.md`. `` and
 /// `[handoff](notes/HANDOFF.md)` both count.
 pub fn named_notes(agents_md: &str) -> Vec<String> {
@@ -464,12 +498,19 @@ pub fn named_notes(agents_md: &str) -> Vec<String> {
 fn is_note_path(path: &str) -> bool {
     let lower = path.to_lowercase();
     let file = lower.rsplit('/').next().unwrap_or("");
-    (lower.ends_with(".md") || lower.ends_with(".txt"))
+    let stem = file
+        .strip_suffix(".md")
+        .or_else(|| file.strip_suffix(".txt"));
+    stem.is_some()
         && !path.starts_with(['/', '~', '@'])
         && !path.contains("://")
         && !path.split('/').any(|s| s == ".." || s.is_empty())
-        && !matches!(file, "agents.md" | "claude.md" | "claude.local.md")
-        && NOTE_HINTS.iter().any(|h| lower.contains(h))
+        && !matches!(
+            file,
+            "agents.md" | "agents.override.md" | "claude.md" | "claude.local.md"
+        )
+        && (NOTE_HINTS.iter().any(|h| lower.contains(h))
+            || stem.is_some_and(|s| NOTE_NAMES.contains(&s)))
 }
 
 /// The terminal tab's name for a Make Codex-ready agent.
@@ -516,6 +557,7 @@ mod tests {
             agent,
             session_id: id.into(),
             state,
+            process_unknown: false,
         }
     }
 
@@ -582,7 +624,7 @@ mod tests {
 
     #[test]
     fn an_import_in_agents_md_is_not_ready() {
-        let agents = "# Rules\n@docs/rules.md\nMention @maddox in prose.\n```\n@not/an/import.md\n```\n@~/.claude/shared.md\n";
+        let agents = "# Rules\n@docs/rules.md\nMention @tidepool-dev in prose.\n```\n@not/an/import.md\n```\n@~/.claude/shared.md\n";
         let r = readiness(&files(agents), &[]);
         assert_eq!(r.state, ReadyState::NotReady);
         let lines: Vec<_> = r
@@ -683,6 +725,39 @@ mod tests {
     }
 
     #[test]
+    fn a_hash_line_in_a_fence_is_no_heading() {
+        let agents = "# Rules\n```sh\n# Claude only\n```\nThen run /clear.\n```\n/compact\n```\n";
+        let r = readiness(&files(agents), &[]);
+        let lines: Vec<_> = r.findings.iter().map(|f| f.line).collect();
+        assert_eq!(lines, [Some(5)]);
+    }
+
+    #[test]
+    fn agents_override_is_the_file_codex_reads() {
+        let over = InstructionFiles {
+            agents_md: Some("# Rules\nThen /clear.\n"),
+            agents_override: true,
+            claude_md: Some("@AGENTS.md\n"),
+            ..InstructionFiles::default()
+        };
+        let r = readiness(&over, &[]);
+        assert_eq!(
+            kinds(&r),
+            [FindingKind::ClaudeMdNotSynced, FindingKind::ClaudeOnly]
+        );
+        assert_eq!(
+            r.findings[0].text,
+            "CLAUDE.md has no @AGENTS.override.md line and differs from AGENTS.override.md"
+        );
+        assert_eq!(r.findings[1].file, AGENTS_OVERRIDE);
+        let synced = InstructionFiles {
+            claude_md: Some("@./AGENTS.override.md\n"),
+            ..over
+        };
+        assert_eq!(readiness(&synced, &[]).state, ReadyState::Warnings);
+    }
+
+    #[test]
     fn notes_files_are_scanned_and_blockers_come_first() {
         let notes = [(
             "notes/HANDOFF.md",
@@ -751,6 +826,17 @@ mod tests {
             live(AgentKind::Claude, "c3", LiveState::Working),
         ];
         assert!(matches!(gate(AgentKind::Codex, &mixed), Gate::Busy(l) if l.session_id == "c3"));
+        // Idle, but in a process the helper cannot stop: busy, so it is closed first.
+        let unsure = LiveAgent {
+            process_unknown: true,
+            ..idle[1].clone()
+        };
+        let both = [idle[0].clone(), unsure.clone()];
+        assert_eq!(gate(AgentKind::Codex, &both), Gate::Busy(unsure.clone()));
+        assert_eq!(
+            serde_json::to_value(&unsure).unwrap()["processUnknown"],
+            serde_json::json!(true)
+        );
         // Not ready wins over busy.
         assert_eq!(
             readiness(&InstructionFiles::default(), &working).state,
@@ -806,7 +892,8 @@ mod tests {
         let agents = "Read `notes/HANDOFF.md` first, then [progress](docs/PROGRESS.md).\n\
             Keep notes/HANDOFF.md short. See .plans/tidepool-spec.md and README.md.\n\
             Never read /etc/notes.md, ~/notes.md, ../notes.md or https://example.com/notes.md.\n\
-            CLAUDE.md and AGENTS.md are the rules; TODO.txt, \"status.md\".\n";
+            CLAUDE.md and AGENTS.md are the rules; TODO.txt, \"status.md\".\n\
+            Error codes are in docs/status-codes.md; overrides in AGENTS.override.md.\n";
         assert_eq!(
             named_notes(agents),
             [

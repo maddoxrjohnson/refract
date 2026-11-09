@@ -28,6 +28,8 @@ impl Agent {
 
     fn spawn_with(home: &Path, config: &Path, env: &[(&str, &std::ffi::OsStr)]) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
+            .env("REFRACT_CODEX_INSTALLED", "0")
+            .env_remove("CODEX_HOME")
             // Never the real state or data directories.
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
@@ -1297,6 +1299,8 @@ fn clone_repo_clones_reports_and_reuses_the_clone() {
 #[test]
 fn prints_its_version() {
     let out = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
+        .env("REFRACT_CODEX_INSTALLED", "0")
+        .env_remove("CODEX_HOME")
         .arg("--version")
         .stdin(Stdio::null())
         .output()

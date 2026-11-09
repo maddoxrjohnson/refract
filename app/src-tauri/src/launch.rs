@@ -123,6 +123,11 @@ impl LaunchError {
                 code: code::REFACTOR_FAILED,
                 message,
             } => LaunchError::new(LaunchErrorKind::Agent, message),
+            // The other agent is busy in the repo ("Claude is working in reef-maps; ...").
+            RequestError::Agent {
+                code: code::AGENT_BUSY,
+                message,
+            } => LaunchError::new(LaunchErrorKind::Agent, message),
             err => LaunchError::agent("Cannot prepare the launch", err),
         }
     }
@@ -854,5 +859,16 @@ mod tests {
             }),
             "startRefactor"
         );
+    }
+
+    #[test]
+    fn a_launch_refused_while_the_other_agent_is_busy_says_so_as_is() {
+        let message = "Codex is working in this repo; wait for it to finish, or stop it in its terminal";
+        let err = LaunchError::prepare(RequestError::Agent {
+            code: code::AGENT_BUSY,
+            message: message.into(),
+        });
+        assert_eq!(err.kind, LaunchErrorKind::Agent);
+        assert_eq!(err.message, message);
     }
 }

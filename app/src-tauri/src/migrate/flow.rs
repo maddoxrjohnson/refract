@@ -273,6 +273,7 @@ impl MigrateHelper for AgentHelper<'_> {
         let params = StopAgentParams {
             path: path.to_owned(),
             session_id: session_id.to_owned(),
+            idle_only: false,
         };
         match self.0.request(Method::StopAgent(params), QUICK_TIMEOUT)? {
             Reply::Done => Ok(()),

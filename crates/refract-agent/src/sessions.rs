@@ -6,18 +6,22 @@
 //!
 //! Codex keeps every repo's rollouts together, by day, in
 //! `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl` (codex spec §3), so they are
-//! indexed by the `cwd` their first line names: the whole tree is listed again when a
-//! watch says it changed ([`SessionReader::codex_changed`]) or the last listing is older
-//! than [`CODEX_RELIST`], and only new or changed files are read.
+//! indexed by the `cwd` their first line names. Only that first line is read for the
+//! index; the end of a rollout is read when a repo asks for its newest sessions, and
+//! after that only the lines appended since (a rollout only grows). The whole tree is
+//! listed again when a watch says it changed ([`SessionReader::codex_changed`]) or the
+//! last listing is older than [`CODEX_RELIST`]; a watch naming the files that changed
+//! looks at just those ([`SessionReader::codex_files_changed`]).
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Utc};
-use refract_core::codex_transcript::{self, CodexSummary};
+use refract_core::codex_transcript::{self, CodexHead, CodexParser, CodexSummary};
 use refract_core::sessions::{paths_match, project_dir_matches, within_deepest};
 use refract_core::transcript::{last_reply, parse_lines, SessionSummary};
 
@@ -33,8 +37,8 @@ pub const HEAD_BYTES: u64 = 64 * 1024;
 /// How many of a repo's most recent transcripts are read and reported, per agent.
 pub const MAX_SESSIONS: usize = 20;
 
-/// How much of the start of a rollout is read for its `session_meta`, which carries
-/// Codex's base instructions and can be tens of KiB long.
+/// How much of the start of a rollout is read for its first line, `session_meta`, which
+/// carries Codex's base instructions and can be tens of KiB long.
 pub const CODEX_HEAD_BYTES: u64 = 256 * 1024;
 
 /// How old the listing of the rollouts may get before a read lists them again, when no
@@ -58,11 +62,41 @@ struct Cached {
     summary: SessionSummary,
 }
 
-#[derive(Debug)]
-struct CachedRollout {
+/// What a listing says about a rollout file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RolloutStat {
     mtime: SystemTime,
     size: u64,
-    summary: CodexSummary,
+    /// A new inode under the same name is a new file.
+    ino: u64,
+}
+
+impl RolloutStat {
+    fn of(meta: &fs::Metadata) -> Option<RolloutStat> {
+        Some(RolloutStat {
+            mtime: meta.modified().ok()?,
+            size: meta.len(),
+            ino: meta.ino(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CachedRollout {
+    stat: RolloutStat,
+    /// What its first line says, with the session id from the file name when that line
+    /// names none. Read again until it names a cwd (the line was still being written).
+    head: CodexHead,
+    /// Its end as parsed so far, once a repo asked for it.
+    tail: Option<RolloutTail>,
+}
+
+/// A rollout's end, parsed up to `offset`.
+#[derive(Debug)]
+struct RolloutTail {
+    parser: CodexParser,
+    /// Just past the last complete line parsed.
+    offset: u64,
 }
 
 /// Reads and caches transcript summaries.
@@ -75,6 +109,9 @@ pub struct SessionReader {
     rollouts: HashMap<PathBuf, CachedRollout>,
     /// When the rollouts were last listed; `None` when a watch said they changed.
     codex_listed: Option<Instant>,
+    /// The starting cwds of rollouts added, changed or removed since they were last
+    /// taken ([`SessionReader::relist_codex`]).
+    codex_touched: Vec<String>,
 }
 
 impl SessionReader {
@@ -86,6 +123,7 @@ impl SessionReader {
             codex_dir: None,
             rollouts: HashMap::new(),
             codex_listed: None,
+            codex_touched: Vec::new(),
         }
     }
 
@@ -107,66 +145,133 @@ impl SessionReader {
     }
 
     /// Lists the rollouts again when they changed or the listing is stale, reading the
-    /// new and changed ones. Returns the starting cwds of the rollouts that were added,
-    /// changed or removed, for the repos whose sessions moved.
+    /// first line of new ones. Returns the starting cwds of the rollouts that were
+    /// added, changed or removed since the last call (reads in between included), for
+    /// the repos whose sessions moved.
     pub fn relist_codex(&mut self) -> Vec<String> {
-        let fresh = self
-            .codex_listed
-            .is_some_and(|at| at.elapsed() < CODEX_RELIST);
-        let Some(dir) = self.codex_dir.clone().filter(|_| !fresh) else {
+        self.relist();
+        self.take_touched()
+    }
+
+    /// Looks again at just `paths`, rollouts a watch said were written, added or
+    /// removed, and returns the starting cwds whose rollouts moved, as
+    /// [`SessionReader::relist_codex`] does.
+    pub fn codex_files_changed(&mut self, paths: &[PathBuf]) -> Vec<String> {
+        let Some(dir) = self.codex_dir.clone() else {
             return Vec::new();
         };
-        self.codex_listed = Some(Instant::now());
-        let mut files = Vec::new();
-        list_rollouts(&dir, 0, &mut files);
-        let mut touched: Vec<String> = Vec::new();
-        let listed: HashSet<&PathBuf> = files.iter().map(|(p, _, _)| p).collect();
-        self.rollouts.retain(|path, cached| {
-            let keep = listed.contains(path);
-            if !keep {
-                touched.extend(cached.summary.head.cwd.clone());
-            }
-            keep
-        });
-        for (path, mtime, size) in &files {
-            let fresh = self
-                .rollouts
-                .get(path)
-                .is_some_and(|c| c.mtime == *mtime && c.size == *size);
-            if fresh {
-                continue;
-            }
-            match self.load_rollout(path, *mtime, *size) {
-                Ok(cwd) => touched.extend(cwd),
-                Err(e) => eprintln!("refract-agent: cannot read {}: {e}", path.display()),
+        for path in paths.iter().filter(|p| p.starts_with(&dir)) {
+            let stat = fs::metadata(path)
+                .ok()
+                .filter(fs::Metadata::is_file)
+                .and_then(|m| RolloutStat::of(&m));
+            match stat {
+                Some(stat) => self.note_rollout(path, stat),
+                None => {
+                    if let Some(gone) = self.rollouts.remove(path) {
+                        self.codex_touched.extend(gone.head.cwd);
+                    }
+                }
             }
         }
+        self.take_touched()
+    }
+
+    fn take_touched(&mut self) -> Vec<String> {
+        let mut touched = std::mem::take(&mut self.codex_touched);
         touched.sort();
         touched.dedup();
         touched
     }
 
-    /// The Codex sessions that started in `repo`, newest first, at most
-    /// [`MAX_SESSIONS`], leaving out `codex exec` ones. Each summary has `session_id`,
-    /// `byte_size` and `modified` set. Lists the rollouts again first when needed (see
-    /// [`SessionReader::relist_codex`]).
-    pub fn read_codex_repo(&mut self, repo: &str) -> Vec<CodexSummary> {
-        self.relist_codex();
-        let mut out: Vec<CodexSummary> = self
+    /// Lists the rollouts again when a watch said they changed or the listing is stale.
+    fn relist(&mut self) {
+        let fresh = self
+            .codex_listed
+            .is_some_and(|at| at.elapsed() < CODEX_RELIST);
+        let Some(dir) = self.codex_dir.clone().filter(|_| !fresh) else {
+            return;
+        };
+        self.codex_listed = Some(Instant::now());
+        let mut files = Vec::new();
+        list_rollouts(&dir, 0, &mut files);
+        let listed: HashSet<&PathBuf> = files.iter().map(|(p, _)| p).collect();
+        let touched = &mut self.codex_touched;
+        self.rollouts.retain(|path, cached| {
+            let keep = listed.contains(path);
+            if !keep {
+                touched.extend(cached.head.cwd.clone());
+            }
+            keep
+        });
+        for (path, stat) in &files {
+            self.note_rollout(path, *stat);
+        }
+        // Kept until taken, which may be a while without a watch.
+        self.codex_touched.sort();
+        self.codex_touched.dedup();
+    }
+
+    /// Takes in what a listing says about the rollout at `path`. A new or changed one
+    /// counts as touched, and its first line is read when it is new, was replaced or
+    /// shrank, or named no cwd yet. Its end is read later, when asked for.
+    fn note_rollout(&mut self, path: &Path, stat: RolloutStat) {
+        if self.rollouts.get(path).is_some_and(|c| c.stat == stat) {
+            return;
+        }
+        let old = self.rollouts.remove(path);
+        if let Some(cwd) = old.as_ref().and_then(|c| c.head.cwd.clone()) {
+            self.codex_touched.push(cwd);
+        }
+        // A rollout only grows: one that shrank or is a new file is read afresh.
+        let same = old.filter(|c| c.stat.ino == stat.ino && c.stat.size <= stat.size);
+        let (head, tail) = match same {
+            Some(c) if c.head.cwd.is_some() => (c.head, c.tail),
+            same => match read_rollout_head(path) {
+                Ok(head) => (head, same.and_then(|c| c.tail)),
+                Err(e) => {
+                    eprintln!("refract-agent: cannot read {}: {e}", path.display());
+                    return;
+                }
+            },
+        };
+        self.codex_touched.extend(head.cwd.clone());
+        self.rollouts
+            .insert(path.to_owned(), CachedRollout { stat, head, tail });
+    }
+
+    /// The Codex sessions that started in `repo` or a directory in it (but not in one
+    /// of `nested`, known repos inside it, which take their own), newest first, at most
+    /// [`MAX_SESSIONS`], leaving out `codex exec` sessions and threads Codex spawned.
+    /// Each summary has `session_id`, `byte_size` and `modified` set. Lists the
+    /// rollouts again first when needed (see [`SessionReader::relist_codex`]).
+    pub fn read_codex_repo(&mut self, repo: &str, nested: &[&str]) -> Vec<CodexSummary> {
+        self.relist();
+        let mut paths: Vec<(PathBuf, SystemTime)> = self
             .rollouts
-            .values()
-            .filter(|c| !c.summary.head.is_exec())
-            .filter(|c| {
-                c.summary
-                    .head
+            .iter()
+            .filter(|(_, c)| !c.head.is_hidden())
+            .filter(|(_, c)| {
+                c.head
                     .cwd
                     .as_deref()
-                    .is_some_and(|cwd| paths_match(cwd, repo))
+                    .is_some_and(|cwd| within_deepest(cwd, repo, nested))
             })
-            .map(|c| c.summary.clone())
+            .map(|(path, c)| (path.clone(), c.stat.mtime))
             .collect();
+        paths.sort_by_key(|(_, mtime)| std::cmp::Reverse(*mtime));
+        paths.truncate(MAX_SESSIONS);
+        let mut out = Vec::new();
+        for (path, _) in paths {
+            let Some(cached) = self.rollouts.get_mut(&path) else {
+                continue;
+            };
+            match read_rollout_tail(&path, cached) {
+                Ok(()) => out.push(rollout_summary(cached)),
+                Err(e) => eprintln!("refract-agent: cannot read {}: {e}", path.display()),
+            }
+        }
         out.sort_by_key(|s| std::cmp::Reverse(s.summary.last_timestamp.or(s.summary.modified)));
-        out.truncate(MAX_SESSIONS);
         out
     }
 
@@ -174,53 +279,15 @@ impl SessionReader {
     pub fn has_rollout(&self, id: &str) -> bool {
         self.rollouts
             .values()
-            .any(|c| c.summary.head.session_id.as_deref() == Some(id))
+            .any(|c| c.head.session_id.as_deref() == Some(id))
     }
 
-    /// Reads a rollout into the cache and returns its starting cwd. A rollout only
-    /// grows, so its head is kept unless the file shrank.
-    fn load_rollout(
-        &mut self,
-        path: &Path,
-        mtime: SystemTime,
-        size: u64,
-    ) -> io::Result<Option<String>> {
-        let old = self.rollouts.remove(path).filter(|c| c.size <= size);
-        let head = match old.map(|c| c.summary.head) {
-            Some(head) if head.session_id.is_some() => head,
-            _ => {
-                let mut buf = Vec::new();
-                File::open(path)?
-                    .take(CODEX_HEAD_BYTES)
-                    .read_to_end(&mut buf)?;
-                codex_transcript::parse_head(&buf)
-            }
-        };
-        let mut summary = read_codex_window(path, size)?.with_head(&head);
-        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
-        if summary.summary.session_id.is_none() {
-            let id = name
-                .as_deref()
-                .and_then(codex_transcript::file_session_id)
-                .map(str::to_owned);
-            summary.summary.session_id.clone_from(&id);
-            summary.head.session_id = id;
-        }
-        let modified = DateTime::<Utc>::from(mtime);
-        summary.summary.modified = Some(modified);
-        if summary.summary.last_timestamp.is_none() {
-            summary.summary.last_timestamp = Some(modified);
-        }
-        let cwd = summary.head.cwd.clone();
-        self.rollouts.insert(
-            path.to_owned(),
-            CachedRollout {
-                mtime,
-                size,
-                summary,
-            },
-        );
-        Ok(cwd)
+    /// True when session `id`'s rollout, as listed so far, is one Refract leaves out: a
+    /// thread Codex spawned or an exec session.
+    pub fn is_hidden_rollout(&self, id: &str) -> bool {
+        self.rollouts
+            .values()
+            .any(|c| c.head.session_id.as_deref() == Some(id) && c.head.is_hidden())
     }
 
     /// The assistant's last reply in session `id`'s transcript, in full, from its last
@@ -405,8 +472,8 @@ fn file_session_id(path: &Path) -> Option<String> {
 }
 
 /// Lists `rollout-*.jsonl` files under `dir`, three levels of directories deep
-/// (`YYYY/MM/DD`), with their modification times and sizes.
-fn list_rollouts(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, SystemTime, u64)>) {
+/// (`YYYY/MM/DD`), with what their metadata says.
+fn list_rollouts(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, RolloutStat)>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -423,38 +490,117 @@ fn list_rollouts(dir: &Path, depth: usize, out: &mut Vec<(PathBuf, SystemTime, u
             if !(name.starts_with("rollout-") && name.ends_with(".jsonl")) {
                 continue;
             }
-            if let Some((mtime, size)) = entry
-                .metadata()
-                .ok()
-                .and_then(|m| Some((m.modified().ok()?, m.len())))
-            {
-                out.push((path, mtime, size));
+            if let Some(stat) = entry.metadata().ok().and_then(|m| RolloutStat::of(&m)) {
+                out.push((path, stat));
             }
         }
     }
 }
 
-/// Parses the last [`TAIL_BYTES`] of a rollout, or the whole file when it is smaller,
-/// growing the window as [`read_tail`] does when it holds no whole line.
-fn read_codex_window(path: &Path, size: u64) -> io::Result<CodexSummary> {
+/// Reads a rollout's first line, up to [`CODEX_HEAD_BYTES`], with the session id from
+/// the file name when the line names none.
+fn read_rollout_head(path: &Path) -> io::Result<CodexHead> {
     let mut file = File::open(path)?;
-    let size = size.min(file.metadata()?.len());
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 16 * 1024];
+    while (buf.len() as u64) < CODEX_HEAD_BYTES {
+        let n = file.read(&mut chunk)?;
+        if n == 0 {
+            break;
+        }
+        let seen = buf.len();
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(i) = buf[seen..].iter().position(|&b| b == b'\n') {
+            buf.truncate(seen + i + 1);
+            break;
+        }
+    }
+    let mut head = codex_transcript::parse_head(&buf);
+    if head.session_id.is_none() {
+        head.session_id = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(codex_transcript::file_session_id)
+            .map(str::to_owned);
+    }
+    Ok(head)
+}
+
+/// Brings a rollout's parsed end up to date. Lines appended since the last read are fed
+/// to its parser. The first read takes the last [`TAIL_BYTES`], or the whole file when
+/// smaller, and doubles the window, up to [`MAX_TAIL_BYTES`], until it holds a turn
+/// marker, so a long turn's start is seen. Only complete lines are parsed; a line still
+/// being written waits for the next read.
+fn read_rollout_tail(path: &Path, cached: &mut CachedRollout) -> io::Result<()> {
+    let mut file = File::open(path)?;
+    let size = cached.stat.size.min(file.metadata()?.len());
+    if let Some(tail) = cached.tail.as_mut().filter(|t| t.offset <= size) {
+        if tail.offset < size {
+            let buf = read_range(&mut file, tail.offset, size)?;
+            tail.offset += feed_lines(&mut tail.parser, &buf) as u64;
+        }
+        return Ok(());
+    }
     let mut window = TAIL_BYTES;
     loop {
         let start = size.saturating_sub(window);
         // From one byte early, as in `read_window`, so a line starting right at the
-        // window is kept: `parse_tail` drops the first, cut, line.
+        // window is kept: the first, cut, line is dropped.
         let from = start.saturating_sub(1);
-        file.seek(SeekFrom::Start(from))?;
-        let mut buf = Vec::with_capacity((size - from) as usize);
-        (&mut file).take(size - from).read_to_end(&mut buf)?;
-        let mut summary = codex_transcript::parse_tail(&buf, start == 0);
-        if summary.summary.entry_count > 0 || start == 0 || window >= MAX_TAIL_BYTES {
-            summary.summary = summary.summary.with_byte_size(size);
-            return Ok(summary);
+        let buf = read_range(&mut file, from, size)?;
+        let body = if start > 0 {
+            buf.iter()
+                .position(|&b| b == b'\n')
+                .map_or(buf.len(), |i| i + 1)
+        } else {
+            0
+        };
+        let mut parser = if start > 0 {
+            CodexParser::partial()
+        } else {
+            CodexParser::default()
+        };
+        let used = feed_lines(&mut parser, &buf[body..]);
+        let marked = parser.summary().end.is_some();
+        if marked || start == 0 || window >= MAX_TAIL_BYTES {
+            cached.tail = Some(RolloutTail {
+                parser,
+                offset: from + (body + used) as u64,
+            });
+            return Ok(());
         }
         window *= 2;
     }
+}
+
+/// The bytes of `file` from `from` to `to`.
+fn read_range(file: &mut File, from: u64, to: u64) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut buf = Vec::with_capacity((to - from) as usize);
+    file.take(to - from).read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Feeds the complete lines of `bytes` to `parser` and returns how many bytes they took.
+fn feed_lines(parser: &mut CodexParser, bytes: &[u8]) -> usize {
+    let used = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+    for line in String::from_utf8_lossy(&bytes[..used]).lines() {
+        parser.push_line(line);
+    }
+    used
+}
+
+/// A rollout's summary from its head and its parsed end.
+fn rollout_summary(cached: &CachedRollout) -> CodexSummary {
+    let tail = cached.tail.as_ref().map(|t| t.parser.summary());
+    let mut summary = tail.unwrap_or_default().with_head(&cached.head);
+    summary.summary = summary.summary.with_byte_size(cached.stat.size);
+    let modified = DateTime::<Utc>::from(cached.stat.mtime);
+    summary.summary.modified = Some(modified);
+    if summary.summary.last_timestamp.is_none() {
+        summary.summary.last_timestamp = Some(modified);
+    }
+    summary
 }
 
 /// A parsed tail window.
@@ -749,7 +895,7 @@ mod tests {
         fs::write(sessions.join(format!("rollout-x-{A}.jsonl")), "{}\n").unwrap();
         let mut reader =
             SessionReader::new(tmp.path().join("projects")).with_codex(sessions.clone());
-        let mine = reader.read_codex_repo(REPO);
+        let mine = reader.read_codex_repo(REPO, &[]);
         let ids: Vec<&str> = mine
             .iter()
             .filter_map(|c| c.summary.session_id.as_deref())
@@ -763,9 +909,10 @@ mod tests {
             reader.has_rollout(OTHER)
                 && !reader.has_rollout("0b7e4d2c-0000-4000-8000-000000000000")
         );
-        assert_eq!(reader.read_codex_repo(KELP).len(), 1);
-        // A listing is fresh for a while; a watch saying they changed lists again, and
-        // names the cwds whose rollouts moved.
+        assert_eq!(reader.read_codex_repo(KELP, &[]).len(), 1);
+        // The cwds read so far are named once; then a listing is fresh for a while. A
+        // watch saying they changed lists again, and names the cwds whose rollouts moved.
+        assert_eq!(reader.relist_codex(), [KELP, REPO]);
         assert!(reader.relist_codex().is_empty());
         fs::write(
             rollout_path(&sessions, "2026/11/07", B),
@@ -775,14 +922,144 @@ mod tests {
         fs::remove_file(rollout_path(&sessions, day, OTHER)).unwrap();
         reader.codex_changed();
         assert_eq!(reader.relist_codex(), [KELP, REPO]);
-        assert!(reader.read_codex_repo(KELP).is_empty());
+        assert!(reader.read_codex_repo(KELP, &[]).is_empty());
         assert_eq!(
-            reader.read_codex_repo(REPO)[0].last_message.as_deref(),
+            reader.read_codex_repo(REPO, &[])[0].last_message.as_deref(),
             Some("Now done.")
         );
         // Without a Codex directory nothing is read.
         let mut plain = SessionReader::new(tmp.path().join("projects"));
-        assert!(plain.read_codex_repo(REPO).is_empty());
+        assert!(plain.read_codex_repo(REPO, &[]).is_empty());
+    }
+
+    fn json_line(minute: u32, kind: &str, payload: serde_json::Value) -> String {
+        serde_json::json!({"timestamp": format!("2026-11-08T17:{minute:02}:00.000Z"),
+            "ordinal": minute, "type": kind, "payload": payload})
+        .to_string()
+            + "\n"
+    }
+
+    fn append(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn a_turn_longer_than_the_tail_window_is_still_working() {
+        use refract_core::classify::{LiveState, SessionState};
+        use refract_core::codex_transcript::TurnEnd;
+        const A: &str = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d91";
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("codex/sessions");
+        let path = rollout_path(&sessions, "2026/11/08", A);
+        // Started, then far more tool output than the window holds.
+        fs::write(&path, rollout(A, REPO, "cli", 5, None)).unwrap();
+        let output = serde_json::json!({"type": "function_call_output",
+            "output": "x".repeat(4000)});
+        let mut filler = String::new();
+        while (filler.len() as u64) < TAIL_BYTES * 3 {
+            filler.push_str(&json_line(6, "response_item", output.clone()));
+        }
+        append(&path, &filler);
+        let mut reader =
+            SessionReader::new(tmp.path().join("projects")).with_codex(sessions.clone());
+        let read = reader.read_codex_repo(REPO, &[]);
+        // The window grew back to the task_started.
+        assert_eq!(read[0].end, Some(TurnEnd::MidTurn));
+        assert_eq!(read[0].state(true), SessionState::Live(LiveState::Working));
+        // Appended lines are read on from where the last read stopped, the turn carried.
+        append(&path, &filler[..filler.len() / 4]);
+        append(&path, "{\"half\": ");
+        reader.codex_changed();
+        let read = reader.read_codex_repo(REPO, &[]);
+        assert_eq!(read[0].end, Some(TurnEnd::MidTurn));
+        assert_eq!(read[0].summary.malformed_lines, 0);
+        append(
+            &path,
+            &("1}\n".to_owned()
+                + &json_line(
+                    9,
+                    "event_msg",
+                    serde_json::json!({"type": "task_complete",
+                    "last_agent_message": "Charted."}),
+                )),
+        );
+        let files = [path.clone()];
+        assert_eq!(reader.codex_files_changed(&files), [REPO]);
+        let read = reader.read_codex_repo(REPO, &[]);
+        assert_eq!(read[0].end, Some(TurnEnd::Complete));
+        assert_eq!(read[0].last_message.as_deref(), Some("Charted."));
+        assert_eq!(read[0].state(true), SessionState::Live(LiveState::Idle));
+        // Rewritten as a new file: read afresh.
+        fs::remove_file(&path).unwrap();
+        fs::write(&path, rollout(A, REPO, "cli", 20, Some("Fresh."))).unwrap();
+        reader.codex_files_changed(&files);
+        let read = reader.read_codex_repo(REPO, &[]);
+        assert_eq!(read[0].last_message.as_deref(), Some("Fresh."));
+        // Gone: dropped, and its cwd named.
+        fs::remove_file(&path).unwrap();
+        assert_eq!(reader.codex_files_changed(&files), [REPO]);
+        assert!(reader.read_codex_repo(REPO, &[]).is_empty());
+    }
+
+    #[test]
+    fn a_head_read_before_its_line_was_complete_is_read_again() {
+        const A: &str = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d92";
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("codex/sessions");
+        let path = rollout_path(&sessions, "2026/11/08", A);
+        let whole = rollout(A, REPO, "cli", 5, Some("Done."));
+        fs::write(&path, &whole[..1000]).unwrap();
+        let mut reader =
+            SessionReader::new(tmp.path().join("projects")).with_codex(sessions.clone());
+        assert!(reader.read_codex_repo(REPO, &[]).is_empty());
+        // Known by the file name meanwhile.
+        assert!(reader.has_rollout(A));
+        fs::write(&path, &whole).unwrap();
+        reader.codex_changed();
+        let read = reader.read_codex_repo(REPO, &[]);
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].last_message.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn codex_sessions_in_a_subdirectory_belong_to_the_deepest_repo() {
+        const A: &str = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d93";
+        const B: &str = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d94";
+        const SUB: &str = "0b7e4d2c-5a6f-4e1b-8c9d-3f2a1b0c9d95";
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions = tmp.path().join("codex/sessions");
+        let day = "2026/11/08";
+        let nested = format!("{REPO}/vendor/charts");
+        let src = format!("{REPO}/src");
+        fs::write(
+            rollout_path(&sessions, day, A),
+            rollout(A, &src, "cli", 5, Some("a")),
+        )
+        .unwrap();
+        fs::write(
+            rollout_path(&sessions, day, B),
+            rollout(B, &nested, "cli", 6, Some("b")),
+        )
+        .unwrap();
+        // A thread Codex spawned is left out.
+        let spawned = rollout(SUB, REPO, "cli", 7, Some("s")).replacen(
+            "\"source\":\"cli\"",
+            "\"source\":\"cli\",\"thread_source\":\"subagent\"",
+            1,
+        );
+        fs::write(rollout_path(&sessions, day, SUB), spawned).unwrap();
+        let mut reader =
+            SessionReader::new(tmp.path().join("projects")).with_codex(sessions.clone());
+        let ids = |read: Vec<CodexSummary>| -> Vec<String> {
+            read.into_iter()
+                .filter_map(|c| c.summary.session_id)
+                .collect()
+        };
+        assert_eq!(ids(reader.read_codex_repo(REPO, &[&nested])), [A]);
+        assert_eq!(ids(reader.read_codex_repo(&nested, &[])), [B]);
+        assert!(reader.is_hidden_rollout(SUB) && !reader.is_hidden_rollout(A));
     }
 
     #[test]

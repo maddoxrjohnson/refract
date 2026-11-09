@@ -25,6 +25,8 @@ struct Agent {
 impl Agent {
     fn spawn(home: &Path, config: &Path) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
+            .env("REFRACT_CODEX_INSTALLED", "0")
+            .env_remove("CODEX_HOME")
             .env("HOME", home)
             .env("REFRACT_AGENT_CONFIG", config)
             .env_remove("XDG_CONFIG_HOME")

@@ -32,6 +32,8 @@ impl Agent {
     /// [`Agent::spawn`] with more environment variables, such as shorter refactor times.
     fn spawn_with(env: &Env, vars: &[(&str, &str)]) -> Agent {
         let mut child = Command::new(env!("CARGO_BIN_EXE_refract-agent"))
+            .env("REFRACT_CODEX_INSTALLED", "0")
+            .env_remove("CODEX_HOME")
             .env_remove("XDG_STATE_HOME")
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_CONFIG_HOME")

@@ -104,6 +104,8 @@ names, and continue with its next item.\n{from}'s last session {}.",
             }
         }
     }
+    // A NUL can't go in an argument, and the extension refuses a launch with one.
+    text.retain(|c| c != '\0');
     text
 }
 
@@ -170,6 +172,9 @@ diff` before continuing: it may have left work uncommitted."
             ..input(AgentKind::Claude, Some("  "), None)
         });
         assert!(text.contains("Codex's last session was cut off mid-turn.\n\nRun `git status`"));
+        // A NUL in the message is dropped.
+        let text = brief(&input(AgentKind::Claude, Some("Tide\0 tables"), None));
+        assert!(text.contains("> Tide tables\n") && !text.contains('\0'));
     }
 
     #[test]

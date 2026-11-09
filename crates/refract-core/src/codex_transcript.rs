@@ -6,8 +6,9 @@
 //! `{timestamp, ordinal, type, payload}`. What Refract reads:
 //!
 //! - `session_meta`: `payload.id` (the session id), `cwd`, `originator` (`codex-tui` or
-//!   `codex_exec`), `source` (`cli` or `exec`). It is the first line and can be tens of
-//!   KiB long, as it carries the base instructions.
+//!   `codex_exec`), `source` (`cli`, `vscode` or `exec`), `thread_source` (`user` for a
+//!   thread the person started). It is the first line and can be tens of KiB long, as
+//!   it carries the base instructions.
 //! - `event_msg` with `payload.type`: `task_started` starts a turn, `task_complete`
 //!   (with `last_agent_message`) finishes one, `turn_aborted` (with `reason`, such as
 //!   `interrupted`) ends one on Esc. Quitting writes nothing, so a turn that started with
@@ -21,6 +22,9 @@
 //! The result is the same [`SessionSummary`] Claude transcripts give, so classify and
 //! preselect take Codex sessions as they are, plus the Codex-only facts in
 //! [`CodexSummary`]. Token usage and edited files are not read.
+//!
+//! A rollout only grows, so a [`CodexParser`] can be kept and fed the lines appended
+//! since the last read, carrying the turn, rate limit and last message on.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -51,6 +55,11 @@ pub struct CodexHead {
     pub cwd: Option<String>,
     pub originator: Option<String>,
     pub source: Option<String>,
+    /// `thread_source`: `user` for a thread the person started.
+    pub thread_source: Option<String>,
+    /// `source` is an object rather than a name, as for a thread Codex spawned itself
+    /// (a subagent).
+    pub spawned: bool,
 }
 
 impl CodexHead {
@@ -58,6 +67,17 @@ impl CodexHead {
     /// picker, and Refract does too.
     pub fn is_exec(&self) -> bool {
         self.source.as_deref() == Some("exec") || self.originator.as_deref() == Some("codex_exec")
+    }
+
+    /// A thread the person did not start: `thread_source` names another source, or
+    /// Codex spawned it. Older rollouts without the field count as the person's.
+    pub fn is_spawned(&self) -> bool {
+        self.spawned || self.thread_source.as_deref().is_some_and(|t| t != "user")
+    }
+
+    /// Left out of Refract's sessions: an exec session or a spawned thread.
+    pub fn is_hidden(&self) -> bool {
+        self.is_exec() || self.is_spawned()
     }
 }
 
@@ -74,19 +94,27 @@ pub struct CodexSummary {
     pub rate_limit_reached: bool,
     /// The assistant's last message in full, up to [`MAX_MESSAGE_BYTES`], for a brief.
     pub last_message: Option<String>,
+    /// The parsed lines start partway through the rollout, so a turn may have started
+    /// before them: with no turn marker among them, the turn is unknown.
+    pub partial: bool,
 }
 
 impl CodexSummary {
     /// The session's state. Codex has no status hook yet, so a live session is working
-    /// while its last turn is open and idle otherwise. One that isn't live is classified
-    /// from its tail like a Claude session: a cut-off turn is interrupted, a finished one
-    /// completed, an aborted one interrupted by the person.
+    /// while its last turn is open, or when the lines read hold no turn marker and do not
+    /// reach the start of the rollout (the turn began before them), and idle once a turn
+    /// ended. A live session with no conversation read yet (just opened, or no rollout
+    /// yet) is unknown: the person may be typing its first prompt. One that isn't live
+    /// is classified from its tail like a Claude session: a cut-off turn is interrupted,
+    /// a finished one completed, an aborted one interrupted by the person.
     pub fn state(&self, live: bool) -> SessionState {
         if live {
-            return SessionState::Live(if self.end == Some(TurnEnd::MidTurn) {
-                LiveState::Working
-            } else {
-                LiveState::Idle
+            return SessionState::Live(match &self.end {
+                Some(TurnEnd::MidTurn) => LiveState::Working,
+                Some(_) => LiveState::Idle,
+                None if self.partial => LiveState::Working,
+                None if self.summary.tail.is_none() => LiveState::Unknown,
+                None => LiveState::Idle,
             });
         }
         classify_report(&self.summary, false, None, 0)
@@ -116,6 +144,8 @@ impl CodexSummary {
         fill(&mut self.head.cwd, &head.cwd);
         fill(&mut self.head.originator, &head.originator);
         fill(&mut self.head.source, &head.source);
+        fill(&mut self.head.thread_source, &head.thread_source);
+        self.head.spawned |= head.spawned;
         fill(&mut self.summary.session_id, &head.session_id);
         fill(&mut self.summary.cwd, &head.cwd);
         self
@@ -129,11 +159,11 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    let mut parser = Parser::default();
+    let mut parser = CodexParser::default();
     for line in lines {
         parser.push_line(line.as_ref());
     }
-    parser.finish()
+    parser.summary()
 }
 
 /// Parses the complete lines at the start of a rollout, as read from its first bytes.
@@ -179,17 +209,30 @@ pub fn file_session_id(file_name: &str) -> Option<&str> {
     shaped.then_some(id)
 }
 
-#[derive(Default)]
-struct Parser {
+/// Parses rollout lines one at a time; [`CodexParser::summary`] says what the lines so
+/// far add up to, so a parser can be kept and fed a rollout's new lines as it grows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CodexParser {
     out: CodexSummary,
     saw_user: bool,
     saw_assistant: bool,
-    /// The last assistant message, full, uncapped until the end.
+    /// The last assistant message, up to [`MAX_MESSAGE_BYTES`].
     reply: Option<String>,
+    /// The last assistant message, in full, asks the person something.
+    reply_asks: bool,
 }
 
-impl Parser {
-    fn push_line(&mut self, line: &str) {
+impl CodexParser {
+    /// A parser for lines that start partway through a rollout (see
+    /// [`CodexSummary::partial`]).
+    pub fn partial() -> CodexParser {
+        let mut parser = CodexParser::default();
+        parser.out.partial = true;
+        parser
+    }
+
+    /// Takes in one line. A line that is not a JSON object counts as malformed.
+    pub fn push_line(&mut self, line: &str) {
         let line = line.trim();
         if line.is_empty() {
             return;
@@ -238,6 +281,8 @@ impl Parser {
         set(&mut head.cwd, "cwd");
         set(&mut head.originator, "originator");
         set(&mut head.source, "source");
+        set(&mut head.thread_source, "thread_source");
+        head.spawned |= payload.get("source").is_some_and(Value::is_object);
         let s = &mut self.out.summary;
         if s.session_id.is_none() {
             s.session_id.clone_from(&head.session_id);
@@ -306,12 +351,14 @@ impl Parser {
         if let Some(line) = snippet(text) {
             self.saw_assistant = true;
             self.out.summary.last_assistant_text = Some(line);
-            self.reply = Some(text.to_owned());
+            self.reply = Some(crate::brief::cap(text, MAX_MESSAGE_BYTES));
+            self.reply_asks = asks_question(text);
         }
     }
 
-    fn finish(mut self) -> CodexSummary {
-        let out = &mut self.out;
+    /// What the lines so far add up to.
+    pub fn summary(&self) -> CodexSummary {
+        let mut out = self.out.clone();
         out.summary.tail = match &out.end {
             Some(TurnEnd::MidTurn) if out.rate_limit_reached => Some(Tail::ApiError),
             Some(TurnEnd::MidTurn) => Some(Tail::UserPrompt),
@@ -321,10 +368,9 @@ impl Parser {
             None if self.saw_user => Some(Tail::UserPrompt),
             None => None,
         };
-        out.summary.asks_user = out.summary.tail == Some(Tail::AssistantReply)
-            && self.reply.as_deref().is_some_and(asks_question);
-        out.last_message = self.reply.map(|r| crate::brief::cap(&r, MAX_MESSAGE_BYTES));
-        self.out
+        out.summary.asks_user = out.summary.tail == Some(Tail::AssistantReply) && self.reply_asks;
+        out.last_message.clone_from(&self.reply);
+        out
     }
 }
 
@@ -539,6 +585,58 @@ mod tests {
         assert!(parse_lines([meta("exec", "codex_exec")]).head.is_exec());
         assert!(parse_lines([meta("exec", "codex-tui")]).head.is_exec());
         assert!(!parse_lines([meta("cli", "codex-tui")]).head.is_exec());
+    }
+
+    #[test]
+    fn spawned_threads_are_hidden() {
+        let user = parse_lines([meta("cli", "codex-tui")]).head;
+        assert!(!user.is_hidden());
+        let mut sub = json!({"id": ID, "cwd": CWD, "originator": "codex-tui", "source": "cli",
+            "thread_source": "subagent"});
+        let head = |p: &Value| parse_lines([line(0, "session_meta", p.clone())]).head;
+        assert!(head(&sub).is_spawned() && head(&sub).is_hidden());
+        sub["thread_source"] = json!("user");
+        assert!(!head(&sub).is_hidden());
+        sub["source"] = json!({"subagent": {"thread_spawn": {"depth": 1}}});
+        assert!(head(&sub).is_hidden());
+        // The flags carry through a head merged into a tail.
+        let merged = parse_lines([message(1, "user", "Hi")]).with_head(&head(&sub));
+        assert!(merged.head.is_hidden());
+    }
+
+    #[test]
+    fn a_partial_read_with_no_marker_is_working_while_live() {
+        let mut parser = CodexParser::partial();
+        parser.push_line(&message(1, "assistant", "Still reading the tide tables."));
+        let c = parser.summary();
+        assert_eq!(c.end, None);
+        assert_eq!(c.state(true), SessionState::Live(LiveState::Working));
+        // From the start of the rollout, the same lines are an idle session.
+        let c = parse_lines([message(1, "assistant", "Done.")]);
+        assert_eq!(c.state(true), SessionState::Live(LiveState::Idle));
+        // Nothing read yet: unknown.
+        let c = parse_lines([meta("cli", "codex-tui")]);
+        assert_eq!(c.state(true), SessionState::Live(LiveState::Unknown));
+        assert_eq!(
+            CodexSummary::default().state(true),
+            SessionState::Live(LiveState::Unknown)
+        );
+    }
+
+    #[test]
+    fn a_parser_fed_in_steps_matches_one_fed_at_once() {
+        let mut lines = finished_turn();
+        lines.push(event(9, json!({"type": "task_started"})));
+        lines.push(token_count(10, json!("primary")));
+        let mut parser = CodexParser::default();
+        for (i, l) in lines.iter().enumerate() {
+            parser.push_line(l);
+            if i == 4 {
+                assert_eq!(parser.summary().end, Some(TurnEnd::MidTurn));
+            }
+        }
+        assert_eq!(parser.summary(), parse_lines(&lines));
+        assert!(parser.summary().rate_limit_reached);
     }
 
     #[test]
