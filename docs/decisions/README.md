@@ -25,5 +25,6 @@ Format: a title, a status line, then **Context**, **Decision** and **Consequence
 | 0017 | [The Banknote scene replaces Frozen shatter](0017-banknote-scene.md) | Post-M7 |
 | 0018 | [A refactor runs in its own worktree, in plan mode, and merges only on request](0018-refactor-in-a-worktree.md) | Post-M7 |
 | 0019 | [Linked worktrees fold into their repo, and Remove keeps the branch](0019-fold-worktrees-into-their-repo.md) | Post-M7 |
+| 0020 | [Codex runs as an overflow agent beside Claude, gated by AGENTS.md readiness](0020-codex-overflow-agent.md) | C1 |
 
 See also [architecture.md](../architecture.md) for how the pieces fit together.

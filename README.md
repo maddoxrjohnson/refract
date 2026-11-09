@@ -30,6 +30,7 @@ Each repo is a cut stone drawn like the engraving on a banknote, lying on a shee
 - **Enter to launch.** A VS Code window opens in WSL with only a terminal, running a new agent. If the repo is already open, that window comes forward and a new terminal tab opens there with the agent. A repo whose last conversation isn't clearly done (it stopped mid-task, was cut off by a restart, asked you a question, or left changes uncommitted or unpushed) asks whether to resume it or start fresh, and preselects the sensible choice.
 - **Refactor with one button.** Press Refactor (or Alt+R) on a zoomed repo and an agent proposes up to three behaviour-preserving refactors in a separate git worktree, in plan mode so you approve the plan first. It runs the repo's checks before and after, commits each refactor on its own branch, and the stone shows when it needs you or is ready. You review it in VS Code, then merge it into your branch (rebased and fast-forwarded, never pushed) or discard it; your working copy and running agents are untouched until the merge.
 - **Worktrees fold into their repo.** A second checkout of a repo (a `git worktree`) shows on its repo's stone, not as a stone of its own. The panel lists each one with what it still holds (uncommitted changes, commits only on this computer, merged, in a release) and what the agent there last said, and removes the folder for you once nothing can be lost (on Windows drives too, after a one-off check), or forgets one whose folder is already gone; the branch always stays.
+- **Codex as a stand-in (optional).** With Codex CLI installed in WSL, the picker also offers a Codex agent, and suggests it when Claude's 5-hour or weekly limit is nearly used up (95 % by default). The new agent is briefed on where the other one stopped, and when Claude is back it is briefed on what Codex did. The panel shows whether a repo's instructions are ready for Codex (an `AGENTS.md` that `CLAUDE.md` points to) and can launch an agent to set that up.
 - **Type to filter** by name; arrow keys move between stones.
 - **GitHub and GitLab** repos you haven't cloned appear stippled; launching one clones it into `~/projects` first.
 - **Status hook (optional).** One small script added to Claude Code's settings tells Refract when an agent is working or waiting on you. Removing it restores your settings byte for byte if nothing else changed them since it was installed; otherwise it removes only Refract's entries and leaves the rest alone.
@@ -45,6 +46,7 @@ A Tauri app on Windows draws the scene and talks to a small helper inside WSL, w
 - Windows 10 or 11 with WSL 2 (Ubuntu or another distro)
 - VS Code on Windows with the WSL extension
 - Claude Code installed inside WSL
+- Optional: Codex CLI installed inside WSL
 - Optional: the GitHub CLI (`gh`) logged in, or a token, to list GitHub repos; a token for GitLab
 
 ## Install

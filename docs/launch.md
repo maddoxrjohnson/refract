@@ -1,6 +1,6 @@
 # Launch path
 
-How a click in Refract becomes a VS Code window with a terminal running Claude Code.
+How a click in Refract becomes a VS Code window with a terminal running Claude Code (or Codex).
 
 ```
 Refract (Windows)                 refract-agent (WSL)                VS Code window (WSL remote)
@@ -39,7 +39,7 @@ Directory: `$XDG_STATE_HOME/refract/launch/`, defaulting to `~/.local/state/refr
 ```
 
 - `folder` is the repo's absolute Linux path, with no trailing slash.
-- `argv` is the command to run in the terminal. For a new agent it is `claude --session-id <uuid>`, with `--permission-mode plan` after it in plan mode (refactors use it), followed by `--` and an opening prompt if there is one. The `--` ends `claude`'s options, so a prompt that starts with `-` is not read as a flag. For a resume it is `claude --resume <session-id>`, followed by `--` and a prompt if one is given.
+- `argv` is the command to run in the terminal. For a new agent it is `claude --session-id <uuid>`, with `--permission-mode plan` after it in plan mode (refactors use it), followed by `--` and an opening prompt if there is one. The `--` ends `claude`'s options, so a prompt that starts with `-` is not read as a flag. For a resume it is `claude --resume <session-id>`, followed by `--` and a prompt if one is given. A Codex launch runs `codex` instead (see [Protocol](#protocol)); the extension runs any `argv[0]` the same way.
 - `title` names the terminal tab.
 - `focus`, present only on a focus request, names a running agent whose terminal to show. `argv` is then empty and nothing is started:
 
@@ -71,13 +71,21 @@ A window ignores requests for other folders, requests with an unknown `version` 
 {"path": "/home/me/projects/example", "mode": {"kind": "focus", "sessionId": "0b7e…"}}
 ```
 
+A new agent and a resume can name the agent: `"agent": "codex"` (left out for Claude). A new agent can also name another agent's session to brief from: `"brief": "<session id>"`.
+
+```json
+{"path": "/home/me/projects/example", "mode": {"kind": "new", "agent": "codex", "brief": "0b7e…"}}
+{"path": "/home/me/projects/example", "mode": {"kind": "resume", "agent": "codex", "sessionId": "019a…"}}
+```
+
 Result:
 
 ```json
 {"requestId": "6f1c…", "sessionId": "0b7e…", "folderUri": "vscode-remote://wsl+Ubuntu/home/me/projects/example"}
 ```
 
-- For a new agent, the helper generates `sessionId` (a random UUID v4). For a resume or a focus, it echoes the given one back. A resume or focus `sessionId` that is not a hyphenated UUID is rejected with `INVALID_PARAMS`.
+- A Codex launch's `argv` is `codex --no-daemon --sandbox workspace-write --ask-for-approval on-request`, then `resume <id>` for a resume, then `--` and the prompt if there is one ([the request file](#request-file)). Codex takes its model and effort from the user's `~/.codex/config.toml` and ignores plan mode. `--no-daemon` makes the started process hold the session's lock file, which is how the helper learns its session id ([architecture](architecture.md#which-process-runs-a-codex-session)). With `brief`, the helper puts the brief built from that session before any prompt ([architecture](architecture.md#preselect)).
+- For a new agent, the helper generates `sessionId` (a random UUID v4). Codex can't be given a session id, so for a new Codex agent it is unused and the real id is learned once the process is up. For a resume or a focus, it echoes the given one back. A resume or focus `sessionId` that is not a hyphenated UUID is rejected with `INVALID_PARAMS`.
 - A focus names a live session of the repo whose process runs in a terminal of the Refract window on exactly that folder: its environment has `REFRACT_FOLDER` equal to the repo path, ignoring a trailing slash (and ASCII case under `/mnt/`). The snapshot marks such sessions `focusable`. The helper takes the process from its last liveness check, which records a pid only when certain: the process names the session id, or it is the only process in the repo naming none. Before reading the ancestors it confirms the pid still runs `claude` and that its start time in `/proc/<pid>/stat` is the one recorded, so a pid reused by a later process is not followed. When the session is not live, its process is unknown or has exited, or it runs anywhere else, the error code is `NOT_RUNNING` (5) with a message such as "that agent is no longer running" or "that agent is not running in a Refract VS Code window on this folder", which the app shows as it is.
 - `folderUri` uses the distro from `WSL_DISTRO_NAME`. Path segments are percent-encoded.
 - The path must be an existing directory. Otherwise the error code is `REPO_NOT_FOUND`.

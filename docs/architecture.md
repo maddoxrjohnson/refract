@@ -19,7 +19,7 @@ Windows                                              WSL (Ubuntu)
         └─────────────────────────────────────────────────────────────────┘
 ```
 
-Contents: [why the split](#why-the-work-is-split-this-way) · [layout](#repository-layout) · [protocol](#protocol-between-the-app-and-the-helper) · [client](#the-apps-client) · [session state](#session-state) · [interface](#the-interface) · [scene](#the-scene) · [remote repos](#remote-repos) · [status hook](#the-status-hook) · [refactor](#refactor) · [usage and system stats](#usage-and-system-stats) · [resource use](#resource-use-while-hidden) · [build and release](#build-ci-and-release) · [privacy](#security-and-privacy). Choices that were weighed are recorded in [decisions](decisions/README.md).
+Contents: [why the split](#why-the-work-is-split-this-way) · [layout](#repository-layout) · [protocol](#protocol-between-the-app-and-the-helper) · [client](#the-apps-client) · [session state](#session-state) · [interface](#the-interface) · [scene](#the-scene) · [remote repos](#remote-repos) · [status hook](#the-status-hook) · [refactor](#refactor) · [worktrees](#worktrees) · [Codex](#codex) · [usage and system stats](#usage-and-system-stats) · [resource use](#resource-use-while-hidden) · [build and release](#build-ci-and-release) · [privacy](#security-and-privacy). Choices that were weighed are recorded in [decisions](decisions/README.md).
 
 ## Why the work is split this way
 
@@ -80,7 +80,7 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 
 | Method | Params | Result | Purpose |
 |---|---|---|---|
-| `ping` | none | `{protocolVersion, agentVersion}` | Hello |
+| `ping` | none | `{protocolVersion, agentVersion, codexInstalled}` | Hello |
 | `listRepos` | none | `{repos, loading}` | Every local repo; starts the first load if needed |
 | `getRepo` | `{path}` | one repo snapshot | One repo's snapshot |
 | `prepareLaunch` | `{path, mode}` | `{requestId, sessionId, folderUri}` | Writes the request file the VS Code extension claims ([launch.md](launch.md)) |
@@ -100,7 +100,9 @@ Types live in `crates/refract-core/src/protocol.rs`; `PROTOCOL_VERSION` is 1.
 | `migrateFinish` | `{id, action}` | `null` | Ends a migration whose report is ready: `delete` (only in the deleting state, once the original is gone, and refused when the copy is gone: then only `discard` ends it), `keep` (refused while deleting, when the copy was never placed, or is gone) or `discard` (refused while deleting, when the original folder is gone, the copy changed since its last check, or the report's `recoveredChanges` is not empty; with the copy gone it only forgets the migration, in any state, also while a `migrateFinish delete` is finishing; it then deletes the transcript copies only while their originals are there, and never once `delete` began removing the old transcripts, which it saves in the state file before it does). The state file goes only once the config is written; if that fails, the same `migrateFinish` again finishes it |
 | `migrateCancel` | `{id}` | `{ended}` | Stops a running migration. Before the copy is placed it deletes the temporary copy and the migration is gone (`ended: true`); once placed (from the first `installing` progress on), or during a re-sync, the copy stays, the step stops and a `migrateReady` saying so follows (`ended: false`). Error `6` once the report is out, or while deleting |
 | `migratePending` | none | `[{id, report, deleting, copyMissing}]` | Reports waiting for `migrateFinish`, including those from before a restart; `deleting` when only `migrateFinish delete` (or `discard`, once the copy is gone) can end it; `copyMissing` when the placed copy is gone |
-| `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` process, unless it is working or has background agents running (error `7`) |
+| `stopAgent` | `{path, sessionId}` | `null` | Sends SIGTERM to a live session's `claude` or `codex` process, unless it is working or has background agents running (error `7`) |
+| `setPrefs` | `{codexThreshold}` | `null` | The app's Codex threshold (50–100, clamped), sent on connect and after each settings save; the helper checks again whether Codex is installed and recomputes preselects ([Codex](#codex)) |
+| `makeCodexReady` | `{path}` | a launch ticket | Launches a new agent with the Make Codex-ready prompt: Codex when Claude is at or over the threshold and Codex is installed, otherwise Claude ([Codex](#codex)) |
 | `startRefactor` | `{path, focus?}` | a launch ticket for the worktree | Makes a worktree and branch from the repo's last commit and launches a plan-mode agent there ([Refactor](#refactor)). Error `8` on a detached HEAD, a repo with no commits, or when the repo already has a refactor |
 | `resumeRefactor` | `{path, fix?}` | a launch ticket | Resumes the refactor's agent; with `fix`, asks it to rebase the branch onto the target after a conflict. Error `8` while the agent runs |
 | `mergeRefactor` | `{path}` | `{outcome: "merged", commits, kept?}` or `{outcome: "blocked", reason, files}` | Rebases the branch onto its target if needed, fast-forwards the target, removes the worktree and branch. A refusal that leaves everything as it was is `blocked`, not an error. Nothing is pushed |
@@ -601,6 +603,48 @@ A worktree whose folder was deleted stays in git's list (and keeps its branch ch
 | Folder is gone | otherwise | yes |
 
 `pruneWorktree` re-checks all of this when it runs, checks the folder is still gone right before git, and runs `git -c status.showUntrackedFiles=normal -c core.fsmonitor=false worktree remove <listed path>`: on a missing folder git deletes only that entry's admin dir. It never runs `git worktree prune`, which drops every entry at once, and never touches the branch. A moved folder is only recognised when Refract knows where it went.
+
+## Codex
+
+Codex CLI can run next to Claude Code as an overflow agent: when Claude's 5-hour or weekly plan limit runs out, Codex picks up the same repo's handoff, and Claude takes over again when it has quota. Refract shows whether a repo is ready for that, launches and resumes Codex the way it does Claude, and briefs whichever agent picks up from the other. [Decision 0020](decisions/0020-codex-overflow-agent.md) records why. Everything here is off while `codex` isn't installed in WSL: no Codex rows, and the panel says "Codex not installed".
+
+### Finding Codex
+
+`codex` is usually installed with npm under nvm, so it is on `PATH` only in interactive shells. The helper (`codex.rs`) looks on `PATH`, in nvm's node versions and in the usual npm, pnpm, Volta and Bun bin directories, and only then asks `bash -ic 'command -v codex'` on a thread of its own with a 10-second limit. It checks at startup and on every `setPrefs`. `Hello.codexInstalled` reports the answer, and every `RepoSnapshot` carries `codex` exactly when Codex is installed.
+
+### Sessions
+
+Codex saves each conversation as a JSON-lines rollout under `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl` (`~/.codex` by default). The file appears with the first message, and a resume appends to it. The helper reads the head (the `session_meta` line: id, cwd, originator, source) and the tail of each rollout, caches them by modification time and size like Claude transcripts, and lists a repo's sessions whose cwd is exactly the repo. `codex exec` sessions are hidden, as Codex's own resume picker hides them. Turn markers give the state: `task_started` opens a turn, `task_complete` (with `last_agent_message`) finishes it, `turn_aborted` interrupts it, and quitting writes nothing, so a rollout whose last turn is still open and that isn't running was cut off. Codex has no status hook yet, so a live Codex session is working while a turn is open and idle otherwise. Each session is sent with `agent: "codex"`; resume reasons apply to it like to any other session.
+
+### Which process runs a Codex session
+
+By default the Codex TUI joins a shared `codex app-server` daemon, and the daemon, not the TUI, holds the rollout and the session's lock file `$CODEX_HOME/thread-writer-locks/<id>.lock`. Refract launches Codex with `--no-daemon`, so the process it starts holds both itself, and its `/proc/<pid>/fd` gives the session id as soon as the TUI is up, before the first message. A session is live while some process holds its lock or names it (`codex resume <id>`). A lock with no rollout yet is a live session that hasn't had its first message: it is listed, empty, in the holder's folder. `codex app-server`, `exec`, `login` and the like, `codex-linux-sandbox`, `codex-code-mode-host` and the node wrapper are ignored. The inotify watch covers the sessions tree (down to the day folders) and the lock folder, so a new or closed session refreshes its repo.
+
+### Readiness
+
+Codex reads `AGENTS.md`, not `CLAUDE.md`, and does not follow `@path` imports. `codex_ready::readiness` checks a repo's instruction files and its live sessions and gives a state:
+
+| State | When | Launch |
+|---|---|---|
+| Not ready | No non-empty `AGENTS.md` at the root; `CLAUDE.md` or `CLAUDE.local.md` has no `@AGENTS.md` line and isn't the same as `AGENTS.md`; `AGENTS.md` itself relies on `@path` lines; or it is over 32 KiB | blocked |
+| Busy | The other agent has a live session that is working or waiting on you (a live Claude session without the status hook counts as busy) | blocked |
+| Warnings | A line in `AGENTS.md`, or in a handoff, progress, notes, todo or status file it names by relative path, gives a Claude-only instruction: `AskUserQuestion`, `ExitPlanMode`, plan mode, `subagent_type`, `model: opus` and the like, `~/.claude/`, `/clear`, `/compact`, `.claude/skills`, the Skill tool. A line that also names Codex or `/new` is a mention, not a warning, and a section under a heading saying "Claude only" is skipped | allowed |
+| Ready | none of the above | allowed |
+
+Each finding has its `file:line`. The helper re-reads the files with each status refresh and watches the named notes' folders, so a git-ignored handoff still triggers a re-check. Readiness also carries a gate for each agent's New row (`open`, `busy`, or `stopIdle` with the idle sessions of the other agent to stop first), and a gate change goes out as `repoChanged`.
+
+### Preselect
+
+The launch picker lists "New Claude agent", "New Codex agent", then running agents and sessions of both, each tagged `[Claude]` or `[Codex]`. A New row whose gate is busy, or the Codex row of a repo that isn't ready, is dimmed with the reason. A `stopIdle` gate turns the row into "Stop the idle Claude agent and start Codex" (or the other way round), which stops those sessions through `stopAgent` (refused while one works) and then launches. Two rules join the [resume rules](#session-state), sent as `newAgent` beside `preselect: newAgent`:
+
+- **Nudge.** When Claude's higher plan-limit percentage that hasn't reset yet is at or over the threshold (Settings → Codex, 50–100 %, default 95, sent to the helper with `setPrefs`), and Codex is installed and the repo is Ready or has warnings, New Codex agent is preselected with the reason "Claude at 97%". It wins over resuming Claude's own session.
+- **Hand-back.** When the repo's newest conversation is the other agent's, wasn't cleared, and is idle or stopped within 2 days, a briefed New agent is preselected instead of resuming the older own session ("Codex worked here last").
+
+A briefed launch names the other session (`brief`), and the helper builds the opening prompt (`brief.rs`): follow AGENTS.md and the handoff it names; which agent worked last and how its session ended (cut off, rate-limited, interrupted, finished); its last message, cut to about 2 KB; run `git status` and `git diff` first; and, for a hand-back to Claude, the handoff's `Needs review: <branch>` lines.
+
+### Make Codex-ready
+
+For a repo that is Not ready or has warnings, the panel's Codex line has a Make Codex-ready button (`makeCodexReady`). It launches a new agent with a fixed prompt (`codex_ready::MAKE_READY_PROMPT`): move the shared rules into `AGENTS.md`, leave `CLAUDE.md` (or `CLAUDE.local.md`) as `@AGENTS.md` plus a "Claude only" section, reword Claude-only handoff steps neutrally, give `AGENTS.md` the same git tracking as `CLAUDE.md`, never edit `.gitignore` or commit, and list what moved. It runs as Codex when Claude is over the threshold, otherwise as Claude, and the repo watch re-checks when the files change.
 
 ## Usage and system stats
 
