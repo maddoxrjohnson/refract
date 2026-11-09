@@ -147,6 +147,7 @@ describe("TauriBackend", () => {
         prices: [{ match: "sonnet", input: 2, output: 10, cacheWrite5m: 2.5, cacheWrite1h: 4, cacheRead: 0.1 }],
       },
       theme: "dark",
+      codexThreshold: 90,
     };
     mockIPC((cmd, args) => {
       calls.push({ cmd, args });
@@ -255,6 +256,18 @@ describe("TauriBackend", () => {
       { cmd: "set_zoomed", args: { path } },
       { cmd: "set_zoomed", args: { path: null } },
     ]);
+  });
+
+  it("launches Make Codex-ready through its command", async () => {
+    const calls: Array<{ cmd: string; args: unknown }> = [];
+    const ticket = { requestId: "r-2", sessionId: "s-2", folderUri: "vscode-remote://wsl+Ubuntu/p" };
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      return ticket;
+    });
+    const path = "/home/dev/projects/reef-maps";
+    expect(await new TauriBackend().makeCodexReady(path)).toEqual(ticket);
+    expect(calls).toEqual([{ cmd: "make_codex_ready", args: { path } }]);
   });
 
   it("removes a worktree through its command and passes on a refusal", async () => {

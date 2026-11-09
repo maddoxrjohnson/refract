@@ -90,6 +90,7 @@ const DEFAULT_SETTINGS: Settings = {
   hidden: [],
   costEstimate: { enabled: false, prices: [...DEFAULT_PRICES] },
   theme: "system",
+  codexThreshold: 95,
 };
 
 /** The host name (no port) of a GitLab address, or `null` when it does not parse. */
@@ -378,8 +379,14 @@ export function App({ backend }: { backend: Backend }) {
     },
     [repos, localRepos],
   );
+  // "Stop the idle Claude agent and start Codex" (and its mirror) stops each idle session
+  // first; a refusal (it got busy) shows as the launch's failure and starts nothing.
   const startLaunch = useCallback(
-    (path: string, mode: LaunchMode) => runLaunch(path, () => backend.launch(path, mode)),
+    (path: string, mode: LaunchMode, stop: readonly string[] = []) =>
+      runLaunch(path, async () => {
+        for (const id of stop) await backend.migrateStopAgent(path, id);
+        return backend.launch(path, mode);
+      }),
     [backend, runLaunch],
   );
 
@@ -487,7 +494,7 @@ export function App({ backend }: { backend: Backend }) {
       if (e.kind === "clone") startClone(e.key);
       else if (e.kind === "refactorDialog") setRefactorFor(e.path);
       else if (e.kind === "openRefactor") void openRefactor(e.path);
-      else startLaunch(e.path, e.mode);
+      else startLaunch(e.path, e.mode, e.stop);
     }
   };
   const send = useCallback((input: NavInput) => {
@@ -666,6 +673,11 @@ export function App({ backend }: { backend: Backend }) {
           details={details.state}
           onRefreshDetails={details.refresh}
           worktrees={zoomedWorktrees}
+          launching={launchBusy}
+          onMakeCodexReady={() => {
+            if (nav.picker) send({ type: "pickerClose" });
+            runLaunch(zoomedRepo.path, () => backend.makeCodexReady(zoomedRepo.path));
+          }}
           worktreeSection={
             !zoomedRemoteOnly && (
               <WorktreesSection

@@ -1,9 +1,9 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
-import type { RemoteRepo } from "../backend/types";
+import type { CodexReadiness, RemoteRepo } from "../backend/types";
 import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
-import { DetailPanel, type DetailPanelProps } from "./DetailPanel";
+import { codexLine, DetailPanel, type DetailPanelProps } from "./DetailPanel";
 import { hoursAgo, NOW, testRepo, testSession } from "./testRepo";
 
 afterEach(cleanup);
@@ -234,5 +234,75 @@ describe("DetailPanel remote details", () => {
   it("shows the refactor section of a cloned repo", () => {
     const { panel } = setup(testRepo(), { refactor: <section aria-label="Refactor">refactor here</section> });
     expect(panel.textContent).toContain("refactor here");
+  });
+
+  describe("Codex", () => {
+    const warnings: CodexReadiness = {
+      state: "warnings",
+      findings: [
+        { file: "AGENTS.md", line: 14, kind: "claudeOnly", text: "Ask with AskUserQuestion first.", term: "askuserquestion" },
+        { file: "notes/HANDOFF.md", line: null, kind: "claudeOnly", text: "Run /clear after each step.", term: "/clear" },
+      ],
+      gates: {},
+    };
+
+    it("says how Codex stands", () => {
+      expect(codexLine(undefined)).toBe("Codex not installed");
+      expect(codexLine({ state: "ready", findings: [], gates: {} })).toBe("Codex: Ready");
+      expect(codexLine(warnings)).toBe("Codex: 2 warnings");
+      expect(codexLine({ ...warnings, findings: warnings.findings.slice(0, 1) })).toBe("Codex: 1 warning");
+      expect(codexLine({ state: "notReady", findings: [], gates: {} })).toBe("Codex: Not ready");
+      const busy = (state: "working" | "waitingOnUser"): CodexReadiness => ({
+        state: "busy",
+        findings: [],
+        gates: { codex: { kind: "busy", agent: "claude", sessionId: "s", state } },
+      });
+      expect(codexLine(busy("working"))).toBe("Codex: Busy (Claude working)");
+      expect(codexLine(busy("waitingOnUser"))).toBe("Codex: Busy (Claude waiting on you)");
+    });
+
+    it("shows Codex not installed without readiness, and no button", () => {
+      const { panel } = setup(testRepo(), { onMakeCodexReady: vi.fn() });
+      expect(panel.textContent).toContain("Codex not installed");
+      expect(screen.queryByRole("button", { name: "Make Codex-ready" })).toBeNull();
+    });
+
+    it("lists the findings on request and offers Make Codex-ready", () => {
+      const onMakeCodexReady = vi.fn();
+      const { panel } = setup(testRepo({ codex: warnings }), { onMakeCodexReady });
+      expect(panel.textContent).toContain("Codex: 2 warnings");
+      expect(panel.textContent).not.toContain("AGENTS.md:14");
+      const toggle = screen.getByRole("button", { name: "Show 2 findings" });
+      expect(toggle.getAttribute("aria-expanded")).toBe("false");
+      fireEvent.click(toggle);
+      expect(toggle.getAttribute("aria-expanded")).toBe("true");
+      const items = screen.getAllByRole("listitem").map((li) => li.textContent);
+      expect(items).toEqual(["AGENTS.md:14 Ask with AskUserQuestion first.", "notes/HANDOFF.md Run /clear after each step."]);
+      fireEvent.click(screen.getByRole("button", { name: "Hide findings" }));
+      expect(screen.queryAllByRole("listitem")).toHaveLength(0);
+      fireEvent.click(screen.getByRole("button", { name: "Make Codex-ready" }));
+      expect(onMakeCodexReady).toHaveBeenCalledOnce();
+    });
+
+    it("offers Make Codex-ready only when there is something to fix, and waits while launching", () => {
+      const notReady: CodexReadiness = {
+        state: "notReady",
+        findings: [{ file: "AGENTS.md", line: null, kind: "noAgentsMd", text: "No AGENTS.md at the repo root" }],
+        gates: {},
+      };
+      const { view } = setup(testRepo({ codex: notReady }), { onMakeCodexReady: vi.fn(), launching: true });
+      expect(screen.getByRole("button", { name: "Make Codex-ready" })).toHaveProperty("disabled", true);
+      view.unmount();
+      setup(testRepo({ codex: { state: "ready", findings: [], gates: {} } }), { onMakeCodexReady: vi.fn() });
+      expect(screen.queryByRole("button", { name: "Make Codex-ready" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /findings/ })).toBeNull();
+    });
+
+    it("resumes a Codex session as Codex", () => {
+      const cut = { ...testSession("c1", { kind: "interrupted", detail: "apiError" }, 1), agent: "codex" as const };
+      const { props } = setup(testRepo({ sessions: [cut], preselect: { kind: "resume", sessionId: "c1" } }));
+      fireEvent.click(screen.getByRole("button", { name: "Resume" }));
+      expect(props.onLaunch).toHaveBeenCalledWith({ kind: "resume", agent: "codex", sessionId: "c1" });
+    });
   });
 });

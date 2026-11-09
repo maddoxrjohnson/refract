@@ -116,6 +116,22 @@ describe("repoReducer", () => {
     expect([...state.repos.keys()]).toEqual(["/a", "/b"]);
   });
 
+  it("takes the New agent hint with the preselect", () => {
+    const a = { ...repo("/a"), sessions: [session("s1", "idle")] };
+    const newAgent = { agent: "codex" as const, reason: { kind: "nudge" as const, usedPercent: 97 } };
+    let state = run([
+      { type: "fetchStarted" },
+      { type: "listed", list: { repos: [a], loading: false } },
+      event({
+        event: "sessionChanged",
+        data: { repoPath: "/a", session: session("s1", "working"), preselect: { kind: "newAgent" }, newAgent },
+      }),
+    ]);
+    expect(state.repos.get("/a")?.newAgent).toEqual(newAgent);
+    state = repoReducer(state, changed("/a", session("s1", "idle"), { kind: "newAgent" }));
+    expect(state.repos.get("/a")?.newAgent).toBeUndefined();
+  });
+
   it("puts a session change that raced the list onto the answer, not onto old state", () => {
     const old = { ...repo("/a"), sessions: [session("s1", "working")] };
     const fresh = {

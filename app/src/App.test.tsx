@@ -130,3 +130,45 @@ describe("App's worktrees", () => {
     expect(panel.textContent).toContain("harbor-android-search");
   });
 });
+
+describe("App's Codex rows", () => {
+  const ORCHARD = "/home/demo/projects/orchard-db";
+  const IDLE = "5f0c2a1e-0000-4000-8000-0000000000e6";
+
+  async function pickStopIdle(backend: TestBackend) {
+    render(<App backend={backend} />);
+    await act(() => new Promise((r) => setTimeout(r, 50)));
+    for (const c of "orchard") await key(c);
+    await key("Enter");
+    await screen.findByRole("complementary", { name: "orchard-db details" });
+    await key("Enter");
+    const picker = await screen.findByRole("dialog", { name: "Start an agent in orchard-db" });
+    const row = [...picker.querySelectorAll('[role="option"]')].find((o) =>
+      o.textContent?.includes("Stop the idle Claude agent and start Codex"),
+    )!;
+    fireEvent.click(row);
+  }
+
+  it("stops the idle Claude agent, then starts Codex", async () => {
+    const backend = new TestBackend();
+    const order: string[] = [];
+    const stop = vi.spyOn(backend, "migrateStopAgent").mockImplementation(async () => void order.push("stop"));
+    const launch = vi.spyOn(backend, "launch").mockImplementation(async () => {
+      order.push("launch");
+      return { requestId: "r", sessionId: "s", folderUri: "vscode-remote://wsl+Demo/x" };
+    });
+    await pickStopIdle(backend);
+    await waitFor(() => expect(launch).toHaveBeenCalledWith(ORCHARD, { kind: "new", agent: "codex" }));
+    expect(stop).toHaveBeenCalledWith(ORCHARD, IDLE);
+    expect(order).toEqual(["stop", "launch"]);
+  });
+
+  it("starts nothing and says why when the agent got busy", async () => {
+    const backend = new TestBackend();
+    vi.spyOn(backend, "migrateStopAgent").mockRejectedValue({ kind: "busy", message: "The agent is working again." });
+    const launch = vi.spyOn(backend, "launch");
+    await pickStopIdle(backend);
+    await screen.findByText(/The agent is working again\./);
+    expect(launch).not.toHaveBeenCalled();
+  });
+});

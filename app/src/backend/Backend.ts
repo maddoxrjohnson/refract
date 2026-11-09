@@ -105,6 +105,13 @@ export interface Backend {
   setZoomed(path: string | null): Promise<void>;
 
   /**
+   * Starts an agent with the Make Codex-ready prompt (codex spec §9), as `launch` does
+   * (same progress, rejects with a `LaunchError`). The Rust side picks Claude, or Codex
+   * when Claude is over the threshold; the repo watch re-checks readiness as files change.
+   */
+  makeCodexReady(path: string): Promise<LaunchTicket>;
+
+  /**
    * Removes the linked worktree at `path` (its snapshot's path) with `git worktree remove`,
    * keeping its branch. The helper checks again that nothing can be lost; on success the
    * worktree goes with `repoRemoved` and its main repo gets a `repoChanged`. Rejects with

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
+import type { CodexReadiness, LiveState, Preselect, RepoSnapshot, SessionInfo } from "../backend/types";
 import { DIRTY_REPO_PROMPT, repoStatus } from "../repoStatus";
 import {
   initialNavState,
@@ -599,5 +599,141 @@ describe("worktrees folded into a gem", () => {
     // Gone with its worktree.
     r = run([{ type: "launch", path: wide.path }], zoomed, folded);
     expect(run([{ type: "sync" }], r.state, ctx).state.picker).toBeNull();
+  });
+});
+
+describe("with Codex installed", () => {
+  const ready: CodexReadiness = { state: "ready", findings: [], gates: {} };
+  const claudeOld = session("claude-old", 5);
+  const codexCut: SessionInfo = { ...session("codex-cut", 1), agent: "codex" };
+  const withCodex = (extra: Partial<RepoSnapshot> = {}, codex: CodexReadiness = ready) =>
+    ({ ...repo("dual", { sessions: [claudeOld, codexCut], preselect: { kind: "newAgent" } }), codex, ...extra }) as RepoSnapshot;
+  const ctxFor = (r: RepoSnapshot): NavContext => ({ repos: new Map([[r.path, r]]), positions: new Map() });
+  const open = (r: RepoSnapshot) => run([{ type: "launch", path: r.path }], initialNavState, ctxFor(r)).state.picker!;
+
+  it("lists both New rows first, then the sessions of both agents newest first, tagged", () => {
+    expect(pickerOptions(withCodex())).toEqual([
+      { kind: "new", agent: "claude" },
+      { kind: "new", agent: "codex" },
+      { kind: "resume", session: codexCut, agent: "codex" },
+      { kind: "resume", session: claudeOld, agent: "claude" },
+    ]);
+    expect(open(withCodex()).index).toBe(0);
+  });
+
+  it("keys options by agent and resumes a Codex session as Codex", () => {
+    const options = pickerOptions(withCodex({ changedFiles: 1 }));
+    expect(options.map(optionKey)).toEqual([
+      "new:claude",
+      "new:codex",
+      "resume:codex:codex-cut",
+      "resume:claude:claude-old",
+    ]);
+    expect(options.map(optionMode)).toEqual([
+      { kind: "new", prompt: DIRTY_REPO_PROMPT },
+      { kind: "new", agent: "codex", prompt: DIRTY_REPO_PROMPT },
+      { kind: "resume", agent: "codex", sessionId: "codex-cut" },
+      { kind: "resume", sessionId: "claude-old" },
+    ]);
+  });
+
+  it("dims the Codex row while Codex is not ready, naming the first blocking finding", () => {
+    const notReady: CodexReadiness = {
+      state: "notReady",
+      findings: [
+        { file: "notes/HANDOFF.md", line: 3, kind: "claudeOnly", text: "Run /clear.", term: "/clear" },
+        { file: "AGENTS.md", line: null, kind: "noAgentsMd", text: "No AGENTS.md at the repo root" },
+      ],
+      gates: {},
+    };
+    const r = withCodex({}, notReady);
+    expect(pickerOptions(r)[1]).toEqual({
+      kind: "new",
+      agent: "codex",
+      blocked: "Not ready: No AGENTS.md at the repo root",
+    });
+    // Enter on a dimmed row starts nothing and keeps the picker open.
+    const c = ctxFor(r);
+    const res = run([{ type: "launch", path: r.path }, { type: "pickerAccept", index: 1 }], initialNavState, c);
+    expect(res.effects).toEqual([]);
+    expect(res.handled).toBe(true);
+    expect(res.state.picker).not.toBeNull();
+  });
+
+  it("dims a row while the other agent is working or waiting on you", () => {
+    const busy = (agent: "claude" | "codex", state: LiveState): CodexReadiness => ({
+      state: agent === "claude" ? "busy" : "ready",
+      findings: [],
+      gates: { [agent === "claude" ? "codex" : "claude"]: { kind: "busy", agent, sessionId: "x", state } },
+    });
+    expect(pickerOptions(withCodex({}, busy("claude", "working")))[1]).toMatchObject({
+      blocked: "Busy: Claude is working",
+    });
+    expect(pickerOptions(withCodex({}, busy("claude", "waitingOnUser")))[1]).toMatchObject({
+      blocked: "Busy: Claude is waiting on you",
+    });
+    const codexBusy = withCodex({}, busy("codex", "working"));
+    expect(pickerOptions(codexBusy)[0]).toMatchObject({ agent: "claude", blocked: "Busy: Codex is working" });
+    // The preselect falls to the row that can start.
+    expect(open(codexBusy).index).toBe(1);
+  });
+
+  it("stops the idle other agent first", () => {
+    const r = withCodex(
+      { newAgent: { agent: "codex", reason: { kind: "nudge", usedPercent: 97 } } },
+      { ...ready, gates: { codex: { kind: "stopIdle", sessionIds: ["idle-1", "idle-2"] } } },
+    );
+    const picker = open(r);
+    expect(picker.options[1]).toEqual({ kind: "new", agent: "codex", reason: "Claude at 97%", stop: ["idle-1", "idle-2"] });
+    expect(picker.index).toBe(1);
+    const res = run([key("Enter")], { ...initialNavState, picker }, ctxFor(r));
+    expect(res.effects).toEqual([
+      { kind: "launch", path: r.path, mode: { kind: "new", agent: "codex" }, stop: ["idle-1", "idle-2"] },
+    ]);
+  });
+
+  it("preselects a briefed New Codex agent on a nudge, and sends the brief", () => {
+    const r = withCodex({
+      newAgent: { agent: "codex", briefFrom: "claude-old", reason: { kind: "nudge", usedPercent: 97 } },
+    });
+    const picker = open(r);
+    expect(picker.index).toBe(1);
+    expect(picker.options[1]).toEqual({ kind: "new", agent: "codex", brief: "claude-old", reason: "Claude at 97%" });
+    expect(picker.options[0]).toEqual({ kind: "new", agent: "claude" });
+    const res = run([key("Enter")], { ...initialNavState, picker }, ctxFor(r));
+    expect(res.effects).toEqual([
+      { kind: "launch", path: r.path, mode: { kind: "new", agent: "codex", brief: "claude-old" } },
+    ]);
+  });
+
+  it("preselects a briefed New Claude agent when Codex worked here last", () => {
+    const r = withCodex({ newAgent: { briefFrom: "codex-cut", reason: { kind: "handBack" } } });
+    const picker = open(r);
+    expect(picker.index).toBe(0);
+    expect(picker.options[0]).toEqual({
+      kind: "new",
+      agent: "claude",
+      brief: "codex-cut",
+      reason: "Codex worked here last",
+    });
+    expect(optionMode(picker.options[0])).toEqual({ kind: "new", brief: "codex-cut" });
+  });
+
+  it("ignores the New agent hint unless New is preselected", () => {
+    const r = withCodex({
+      preselect: { kind: "resume", sessionId: "codex-cut" },
+      newAgent: { agent: "codex", briefFrom: "claude-old" },
+    });
+    const picker = open(r);
+    expect(picker.index).toBe(2);
+    expect(picker.options[1]).toEqual({ kind: "new", agent: "codex" });
+  });
+
+  it("goes to a running Codex agent as to any other", () => {
+    const live: SessionInfo = { ...running("codex-live", 0.1, "working"), agent: "codex" };
+    const r = withCodex({ sessions: [live], preselect: { kind: "focus", sessionId: "codex-live" } });
+    const picker = open(r);
+    expect(picker.options[picker.index]).toEqual({ kind: "focus", session: live, agent: "codex" });
+    expect(optionMode(picker.options[picker.index])).toEqual({ kind: "focus", sessionId: "codex-live" });
   });
 });

@@ -194,6 +194,11 @@ export class TauriBackend implements Backend {
     return invoke<void>("set_zoomed", { path });
   }
 
+  /** A launch, as `launch` is. */
+  makeCodexReady(path: string): Promise<LaunchTicket> {
+    return invoke<LaunchTicket>("make_codex_ready", { path });
+  }
+
   /** Rejects with `CommandError`, as merge and discard do. */
   removeWorktree(path: string, ignored?: string[]): Promise<void> {
     return invoke<void>("remove_worktree", { path, ignored });

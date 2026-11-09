@@ -17,6 +17,7 @@ const SETTINGS: Settings = {
     prices: [{ match: "opus", input: 5, output: 25, cacheWrite5m: 6.25, cacheWrite1h: 10, cacheRead: 0.5 }],
   },
   theme: "system",
+  codexThreshold: 95,
 };
 
 function fakeBackend() {
@@ -297,5 +298,25 @@ describe("SettingsPanel", () => {
       expect(screen.getByRole("alert").textContent).toContain("at most 50 rows");
       expect((screen.getByLabelText("Row 1 input price") as HTMLInputElement).value).toBe("6");
     });
+  });
+
+  it("saves when to suggest Codex, from 50 to 100 percent", async () => {
+    const { props } = await setup();
+    const input = screen.getByLabelText("Suggest Codex when Claude has used (%)") as HTMLInputElement;
+    expect(input.value).toBe("95");
+    for (const bad of ["49", "101", "92.5", ""]) {
+      fireEvent.change(input, { target: { value: bad } });
+      await act(async () => {
+        fireEvent.submit(input.closest("form")!);
+      });
+      expect(screen.getByRole("alert").textContent).toContain("50 to 100");
+    }
+    expect(props.onChange).not.toHaveBeenCalled();
+    fireEvent.change(input, { target: { value: "90" } });
+    await act(async () => {
+      fireEvent.submit(input.closest("form")!);
+    });
+    expect(props.onChange).toHaveBeenCalledWith({ ...SETTINGS, codexThreshold: 90 });
+    expect(screen.queryByRole("alert")).toBeNull();
   });
 });

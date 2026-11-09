@@ -1,6 +1,7 @@
-import { useId, type ReactNode } from "react";
+import { useId, useState, type ReactNode } from "react";
 import type {
   CiStatus,
+  CodexReadiness,
   LaunchMode,
   RemoteKind,
   RemoteRepo,
@@ -11,7 +12,7 @@ import type { RemoteDetailsState } from "../hooks/useRemoteDetails";
 import { hostLabel, remoteUrl, repoStatus, unfinishedSessions } from "../repoStatus";
 import { StatusLine } from "./FocusLabel";
 import { firstLine, relativeTime, sessionStateLabel } from "./format";
-import { focusableSession, newAgentMode, resumableSession } from "./navigation";
+import { agentName, focusableSession, newAgentMode, resumableSession, resumeMode } from "./navigation";
 import "./ui.css";
 
 export interface DetailPanelProps {
@@ -43,6 +44,10 @@ export interface DetailPanelProps {
   worktrees?: readonly RepoSnapshot[];
   /** The Worktrees section, after Working tree (worktrees spec §1). */
   worktreeSection?: ReactNode;
+  /** Make Codex-ready: launches an agent that fixes the instructions (codex spec §9). */
+  onMakeCodexReady?(): void;
+  /** A launch is under way, so Make Codex-ready waits. */
+  launching?: boolean;
 }
 
 const CI_LABELS: Record<CiStatus, string> = {
@@ -135,6 +140,79 @@ function RemoteSection({
   );
 }
 
+/** The Codex line: "Codex: Ready", "Codex: 2 warnings", "Codex: Not ready" or "Codex: Busy (Claude working)". */
+export function codexLine(codex: CodexReadiness | undefined): string {
+  if (!codex) return "Codex not installed";
+  switch (codex.state) {
+    case "ready":
+      return "Codex: Ready";
+    case "warnings":
+      return `Codex: ${plural(codex.findings.length, "warning", "warnings")}`;
+    case "notReady":
+      return "Codex: Not ready";
+    case "busy": {
+      const gate = codex.gates.codex;
+      if (gate?.kind !== "busy") return "Codex: Busy";
+      const doing = gate.state === "waitingOnUser" ? "waiting on you" : "working";
+      return `Codex: Busy (${agentName(gate.agent)} ${doing})`;
+    }
+  }
+}
+
+/** Whether the repo is ready for Codex, its findings and Make Codex-ready (codex spec §10). */
+function CodexSection({
+  codex,
+  launching,
+  onMakeReady,
+}: {
+  codex: CodexReadiness | undefined;
+  launching: boolean;
+  onMakeReady?(): void;
+}) {
+  const listId = useId();
+  const [open, setOpen] = useState(false);
+  const findings = codex?.findings ?? [];
+  const fixable = codex?.state === "notReady" || codex?.state === "warnings";
+  return (
+    <section className="rf-section rf-codex" aria-label="Codex">
+      <div className={codex ? undefined : "rf-muted"}>{codexLine(codex)}</div>
+      {findings.length > 0 && (
+        <>
+          <button
+            type="button"
+            className="rf-link"
+            aria-expanded={open}
+            aria-controls={listId}
+            onClick={() => setOpen((o) => !o)}
+          >
+            {open ? "Hide findings" : `Show ${plural(findings.length, "finding", "findings")}`}
+          </button>
+          {open && (
+            <ul id={listId} className="rf-findings">
+              {findings.map((f, i) => (
+                <li key={i}>
+                  <span className="rf-mono">
+                    {f.file}
+                    {f.line !== null ? `:${f.line}` : ""}
+                  </span>{" "}
+                  {f.text}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+      {fixable && onMakeReady && (
+        <div className="rf-row">
+          <button type="button" className="rf-button" disabled={launching} onClick={onMakeReady}>
+            Make Codex-ready
+          </button>
+        </div>
+      )}
+    </section>
+  );
+}
+
 function upstream(repo: RepoSnapshot): string {
   if (repo.ahead === null || repo.behind === null) return "No upstream";
   if (repo.ahead === 0 && repo.behind === 0) return "Up to date";
@@ -170,6 +248,8 @@ export function DetailPanel({
   refactor = null,
   worktrees,
   worktreeSection = null,
+  onMakeCodexReady,
+  launching = false,
 }: DetailPanelProps) {
   const hintId = useId();
   const direct = repo.preselect.kind === "noPicker";
@@ -301,6 +381,8 @@ export function DetailPanel({
 
         {worktreeSection}
 
+        <CodexSection codex={repo.codex} launching={launching} onMakeReady={onMakeCodexReady} />
+
         {move}
 
         {refactor}
@@ -382,7 +464,7 @@ export function DetailPanel({
               <button
                 type="button"
                 className="rf-button"
-                onClick={() => onLaunch({ kind: "resume", sessionId: resume.id })}
+                onClick={() => onLaunch(resumeMode(resume))}
               >
                 Resume
               </button>

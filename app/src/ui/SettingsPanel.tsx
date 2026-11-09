@@ -105,7 +105,7 @@ function TokenForm({
 
 /**
  * Appearance (banknote spec §5), GitLab URL, tokens, forks and archived, hidden repos and
- * extra folders (spec §5), the usage cost estimate (spec §3.5) and the status hook (spec §6.2).
+ * extra folders (spec §5), when to suggest Codex (codex spec §2), the usage cost estimate (spec §3.5) and the status hook (spec §6.2).
  */
 export function SettingsPanel({
   backend,
@@ -120,10 +120,12 @@ export function SettingsPanel({
   const titleId = useId();
   const gitlabId = useId();
   const folderId = useId();
+  const thresholdId = useId();
   const root = useRef<HTMLDivElement>(null);
   const [creds, setCreds] = useState<Credentials | null>(null);
   const [gitlabDraft, setGitlabDraft] = useState<string | null>(null);
   const [folder, setFolder] = useState("");
+  const [thresholdDraft, setThresholdDraft] = useState<string | null>(null);
   const [notes, setNotes] = useState<Record<string, Note>>({});
   const note = (key: string, value: Note) => setNotes((n) => ({ ...n, [key]: value }));
 
@@ -173,6 +175,20 @@ export function SettingsPanel({
       if (!saved) return;
       setGitlabDraft(null);
       onRefresh();
+    });
+  };
+
+  const thresholdValue = thresholdDraft ?? String(settings?.codexThreshold ?? "");
+  const saveThreshold = (ev: FormEvent) => {
+    ev.preventDefault();
+    if (!settings) return;
+    const value = Number(thresholdValue.trim());
+    if (!thresholdValue.trim() || !Number.isInteger(value) || value < 50 || value > 100) {
+      note("codex", { tone: "error", text: "Use a whole number from 50 to 100." });
+      return;
+    }
+    void save({ ...settings, codexThreshold: value }, "codex").then((saved) => {
+      if (saved) setThresholdDraft(null);
     });
   };
 
@@ -378,6 +394,33 @@ export function SettingsPanel({
               </div>
             </form>
             <NoteLine note={notes.folder ?? null} />
+          </section>
+
+          <section className="rf-section" aria-labelledby={`${titleId}-codex`}>
+            <h3 id={`${titleId}-codex`} className="rf-section__label">
+              Codex
+            </h3>
+            <form className="rf-field" onSubmit={saveThreshold}>
+              <label htmlFor={thresholdId}>Suggest Codex when Claude has used (%)</label>
+              <div className="rf-field__row">
+                <input
+                  id={thresholdId}
+                  className="rf-input rf-mono"
+                  type="number"
+                  inputMode="numeric"
+                  min={50}
+                  max={100}
+                  step={1}
+                  value={thresholdValue}
+                  onChange={(ev) => setThresholdDraft(ev.target.value)}
+                />
+                <button type="submit" className="rf-button">
+                  Save
+                </button>
+              </div>
+            </form>
+            <p className="rf-muted rf-settings__line">Of its 5-hour or weekly limit. From 50 to 100.</p>
+            <NoteLine note={notes.codex ?? null} />
           </section>
 
           <CostSection

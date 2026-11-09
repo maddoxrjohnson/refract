@@ -1,4 +1,4 @@
-import type { AgentEvent, Preselect, RepoList, RepoSnapshot, SessionInfo } from "./backend/types";
+import type { AgentEvent, NewAgentHint, Preselect, RepoList, RepoSnapshot, SessionInfo } from "./backend/types";
 
 /**
  * The repos the interface shows, built from `listRepos` answers and helper events.
@@ -14,7 +14,7 @@ export interface RepoState {
   touched: Map<string, RepoSnapshot | null>;
   /**
    * `sessionChanged` events since the current fetch started, for paths not in `touched`.
-   * Only the sessions and preselect are newer than the answer; the rest of the repo is
+   * Only the sessions and preselect (with its New agent hint) are newer than the answer; the rest of the repo is
    * taken from it.
    */
   sessionPatches: Map<string, SessionPatch>;
@@ -23,6 +23,7 @@ export interface RepoState {
 export interface SessionPatch {
   sessions: Map<string, SessionInfo>;
   preselect: Preselect;
+  newAgent?: NewAgentHint;
 }
 
 export type RepoAction =
@@ -47,6 +48,7 @@ function patched(repo: RepoSnapshot, patch: SessionPatch): RepoSnapshot {
     ...repo,
     sessions: repo.sessions.map((s) => patch.sessions.get(s.id) ?? s),
     preselect: patch.preselect,
+    newAgent: patch.newAgent,
   };
 }
 
@@ -96,8 +98,8 @@ export function repoReducer(state: RepoState, action: RepoAction): RepoState {
         case "sessionChanged": {
           // Sent instead of `repoChanged` when only sessions' states moved (the status
           // hook's working and waiting among them); the session list itself is unchanged.
-          const { repoPath, session, preselect } = event.data;
-          const one: SessionPatch = { sessions: new Map([[session.id, session]]), preselect };
+          const { repoPath, session, preselect, newAgent } = event.data;
+          const one: SessionPatch = { sessions: new Map([[session.id, session]]), preselect, newAgent };
           const repos = new Map(state.repos);
           const shown = repos.get(repoPath);
           if (shown) repos.set(repoPath, patched(shown, one));
@@ -116,6 +118,7 @@ export function repoReducer(state: RepoState, action: RepoAction): RepoState {
           const patch: SessionPatch = {
             sessions: new Map(earlier?.sessions).set(session.id, session),
             preselect,
+            newAgent,
           };
           return {
             ...state,

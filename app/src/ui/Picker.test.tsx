@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DIRTY_REPO_PROMPT } from "../repoStatus";
 import type { PickerOption } from "./navigation";
-import { liveStatus, Picker, resumeLabel } from "./Picker";
+import { liveStatus, newLabel, newText, Picker, resumeLabel } from "./Picker";
 import { NOW, testSession } from "./testRepo";
 
 afterEach(cleanup);
@@ -121,5 +121,33 @@ describe("Picker", () => {
   it("is labelled by the repo name", () => {
     setup();
     expect(screen.getByRole("dialog", { name: "Start an agent in tidepool" })).toBeTruthy();
+  });
+
+  it("names the agent of each row with Codex installed, and dims a row that can't start", () => {
+    const codexCut = { ...testSession("c1", { kind: "interrupted", detail: "apiError" }, 1, "Smoothing the strokes."), agent: "codex" as const };
+    const rows: PickerOption[] = [
+      { kind: "new", agent: "claude", brief: "c1", reason: "Codex worked here last" },
+      { kind: "new", agent: "codex", blocked: "Not ready: No AGENTS.md at the repo root" },
+      { kind: "resume", session: codexCut, agent: "codex" },
+    ];
+    render(<Picker repoName="tidepool" options={rows} index={0} now={NOW} onMove={vi.fn()} onAccept={vi.fn()} onClose={vi.fn()} />);
+    const [claude, codex, resume] = screen.getAllByRole("option");
+    expect(claude.textContent).toContain("New Claude agent, briefed");
+    expect(claude.textContent).toContain("Codex worked here last · Picks up where Codex left off");
+    expect(claude.getAttribute("aria-disabled")).toBeNull();
+    expect(codex.textContent).toContain("New Codex agent");
+    expect(codex.textContent).toContain("Not ready: No AGENTS.md at the repo root");
+    expect(codex.getAttribute("aria-disabled")).toBe("true");
+    expect(codex.className).toContain("rf-option--dimmed");
+    expect(resume.textContent).toContain("[Codex] Resume: stopped mid-task");
+  });
+
+  it("labels the stop-idle rows and leaves tags out without Codex", () => {
+    expect(newLabel({ kind: "new", agent: "codex", stop: ["x"] })).toBe("Stop the idle Claude agent and start Codex");
+    expect(newLabel({ kind: "new", agent: "claude", stop: ["x"] })).toBe("Stop the idle Codex agent and start Claude");
+    expect(newLabel({ kind: "new" })).toBe("New agent");
+    expect(newText({ kind: "new", agent: "codex", reason: "Claude at 97%" })).toBe("Claude at 97% · A fresh session");
+    setup();
+    expect(screen.getAllByRole("option")[0].textContent).not.toContain("[Claude]");
   });
 });

@@ -17,6 +17,9 @@ export type AgentRequestError =
   | { kind: "disconnected" }
   | { kind: "notRunning" };
 
+/** Which coding agent a session or launch belongs to; missing means Claude. */
+export type AgentKind = "claude" | "codex";
+
 export type LiveState = "working" | "waitingOnUser" | "idle" | "unknown";
 export type InterruptReason =
   | "unansweredPrompt"
@@ -37,11 +40,69 @@ export type Preselect =
   /** Preselect "Go to the running agent" for this live session. */
   | { kind: "focus"; sessionId: string };
 
+/** Why New is preselected for a particular agent (codex spec §5). */
+export type NewAgentReason =
+  /** The other agent worked here last. */
+  | { kind: "handBack" }
+  /** Claude is at `usedPercent` of a limit, at or over the threshold. */
+  | { kind: "nudge"; usedPercent: number };
+
+/**
+ * Which New row a `newAgent` preselect means, beside `preselect`: the agent (Claude when
+ * missing), the other agent's session to brief from, and why. Missing for a plain New Claude agent.
+ */
+export interface NewAgentHint {
+  agent?: AgentKind;
+  /** Pass as the launch's `brief`. */
+  briefFrom?: string;
+  reason?: NewAgentReason;
+}
+
+/** How launching Codex stands; only `notReady` and `busy` block it (codex spec §4). */
+export type ReadyState = "ready" | "warnings" | "notReady" | "busy";
+
+/** What a finding is about; all but `claudeOnly` block the launch. */
+export type FindingKind = "noAgentsMd" | "claudeMdNotSynced" | "atImport" | "tooLarge" | "claudeOnly";
+
+/** One readiness finding, shown as `file:line text`. */
+export interface Finding {
+  /** Relative to the repo, such as `AGENTS.md`. */
+  file: string;
+  /** 1-based; `null` for a finding about the whole file. */
+  line: number | null;
+  kind: FindingKind;
+  /** What is wrong, or for `claudeOnly` the line itself. */
+  text: string;
+  /** The Claude-only term that matched. */
+  term?: string;
+}
+
+/** How one agent's New row stands against the other agent's live sessions. */
+export type Gate =
+  | { kind: "open" }
+  /** The other agent is working or waiting on you: the row is dimmed. */
+  | { kind: "busy"; agent: AgentKind; sessionId: string; state: LiveState }
+  /** The other agent is open and idle: stop these sessions, then start. */
+  | { kind: "stopIdle"; sessionIds: string[] };
+
+/**
+ * Whether the repo is ready for Codex, from refract-core's `CodexReadiness`. Missing when
+ * Codex is not installed. A gate left out is open.
+ */
+export interface CodexReadiness {
+  state: ReadyState;
+  /** Blocking findings first, then warnings. */
+  findings: Finding[];
+  gates: { claude?: Gate; codex?: Gate };
+}
+
 /** Why a session that isn't running is worth resuming (spec §4.3). */
 export type ResumeReason = "interrupted" | "cutOff" | "askedQuestion" | "uncommittedChanges" | "unpushedCommits";
 
 export interface SessionInfo {
   id: string;
+  /** Missing for Claude. */
+  agent?: AgentKind;
   state: SessionState;
   /** RFC 3339. */
   lastTimestamp: string | null;
@@ -261,6 +322,10 @@ export interface RepoSnapshot {
   mass: number;
   sessions: SessionInfo[];
   preselect: Preselect;
+  /** Which New row `preselect: newAgent` means; missing for a plain New Claude agent. */
+  newAgent?: NewAgentHint;
+  /** Codex readiness and the New rows' gates; missing when Codex is not installed. */
+  codex?: CodexReadiness;
   /** The repo's refactor, while it has one; missing from older helpers. */
   refactor?: RefactorInfo | null;
   /**
@@ -286,7 +351,7 @@ export type AgentEvent =
   | { event: "repoRemoved"; data: { path: string } }
   | {
       event: "sessionChanged";
-      data: { repoPath: string; session: SessionInfo; preselect: Preselect };
+      data: { repoPath: string; session: SessionInfo; preselect: Preselect; newAgent?: NewAgentHint };
     }
   | { event: "loadComplete" }
   /** A Move to WSL migration moved on. */
@@ -307,8 +372,9 @@ export interface WorktreeJobDone {
 
 /** How to start the agent, from refract-core's `LaunchMode`. */
 export type LaunchMode =
-  | { kind: "new"; prompt?: string; planMode?: boolean }
-  | { kind: "resume"; sessionId: string; prompt?: string }
+  /** `agent` is Claude when missing; `brief` names the other agent's session to pick up from. Codex ignores `planMode`. */
+  | { kind: "new"; agent?: AgentKind; prompt?: string; planMode?: boolean; brief?: string }
+  | { kind: "resume"; agent?: AgentKind; sessionId: string; prompt?: string }
   /** Show the VS Code terminal already running this live session; starts nothing. */
   | { kind: "focus"; sessionId: string };
 
@@ -409,6 +475,8 @@ export interface Settings {
   costEstimate: CostEstimate;
   /** Light, dark, or following Windows (banknote spec §5). */
   theme: ThemeSetting;
+  /** Claude's 5-hour or weekly use, in percent (50 to 100), from which New Codex agent is preselected. */
+  codexThreshold: number;
 }
 
 /** Whether the usage widget estimates cost, and at what prices. */

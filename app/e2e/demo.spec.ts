@@ -146,6 +146,45 @@ test("a repo with an agent waiting on you preselects going to it", async ({ page
   await expect(terminal).toBeHidden();
 });
 
+test("Claude near its limit preselects New Codex agent; a repo without AGENTS.md dims it", async ({ page }) => {
+  await page.keyboard.type("kestrel");
+  await page.keyboard.press("Enter");
+  const panel = page.getByRole("complementary", { name: "kestrel-cli details" });
+  await expect(panel.getByText("Codex: 2 warnings")).toBeVisible();
+  await page.keyboard.press("Enter");
+  const picker = page.getByRole("dialog", { name: "Start an agent in kestrel-cli" });
+  const options = picker.getByRole("option");
+  await expect(options.nth(0)).toContainText("New Claude agent");
+  const codex = options.nth(1);
+  await expect(codex).toContainText("New Codex agent, briefed");
+  await expect(codex).toContainText("Claude at 97%");
+  await expect(codex).toHaveAttribute("aria-selected", "true");
+  await expect(options.nth(2)).toContainText("[Claude] Resume: uncommitted changes");
+  await page.keyboard.press("Enter");
+  const terminal = page.getByRole("dialog", { name: "Simulated terminal for kestrel-cli" });
+  await expect(terminal.getByTestId("demo-terminal")).toContainText(
+    "codex --no-daemon --sandbox workspace-write --ask-for-approval on-request 'Pick up where Claude left off",
+  );
+  await terminal.getByRole("button", { name: "Close terminal (Escape)" }).click();
+  await expect(terminal).toBeHidden();
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape");
+
+  await page.keyboard.type("moss");
+  await page.keyboard.press("Enter");
+  await expect(page.getByRole("complementary", { name: "moss-garden details" }).getByText("Codex: Not ready")).toBeVisible();
+  await page.keyboard.press("Enter");
+  const moss = page.getByRole("dialog", { name: "Start an agent in moss-garden" });
+  const dimmed = moss.getByRole("option").filter({ hasText: "New Codex agent" });
+  await expect(dimmed).toHaveAttribute("aria-disabled", "true");
+  await expect(dimmed).toContainText("Not ready: No AGENTS.md at the repo root");
+  // Clicking it starts nothing (forced: Playwright waits for a disabled row to enable).
+  await dimmed.click({ force: true });
+  await expect(moss).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(moss).toBeHidden();
+});
+
 test("a refactor runs from the dialog to a merge, and another is discarded", async ({ page }) => {
   await page.keyboard.type("dotfiles");
   await page.keyboard.press("Enter");

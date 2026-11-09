@@ -3,7 +3,9 @@ import type {
   AgentEvent,
   AgentStatus,
   CiStatus,
+  CodexReadiness,
   Credentials,
+  Finding,
   GpuUsage,
   HookInfo,
   LaunchMode,
@@ -11,6 +13,7 @@ import type {
   LaunchTicket,
   MergeOutcome,
   ModelUsage,
+  NewAgentHint,
   RefactorNotice,
   PlanLimits,
   Preselect,
@@ -72,6 +75,9 @@ interface Seed {
   path?: string;
   /** A refactor already under way, for the refactor section and the stone's mark. */
   refactor?: "ready";
+  /** Codex readiness; repos without it show as if Codex were not installed. */
+  codex?: CodexReadiness;
+  newAgent?: NewAgentHint;
 }
 
 /** The demo's repo on a Windows drive. */
@@ -95,6 +101,27 @@ const session = (
   focusable,
   resumeReason: state.kind === "interrupted" ? "interrupted" : reason,
 });
+
+/** A Codex session: as `session`, tagged with its agent. */
+const codexSession = (...args: Parameters<typeof session>): SessionInfo => ({ ...session(...args), agent: "codex" });
+
+const claudeOnly = (file: string, line: number, text: string, term: string): Finding => ({
+  file,
+  line,
+  kind: "claudeOnly",
+  text,
+  term,
+});
+
+// Codex as an overflow agent (.plans/codex-spec.md): one invented repo per picker state.
+const CODEX_READY: CodexReadiness = { state: "ready", findings: [], gates: {} };
+const CODEX_WARNINGS: Finding[] = [
+  claudeOnly("AGENTS.md", 14, "Ask with AskUserQuestion before changing the schema.", "askuserquestion"),
+  claudeOnly("notes/HANDOFF.md", 6, "Run /clear once the milestone is committed.", "/clear"),
+];
+const CODEX_NOT_READY: Finding[] = [
+  { file: "AGENTS.md", line: null, kind: "noAgentsMd", text: "No AGENTS.md at the repo root" },
+];
 
 const SEEDS: Seed[] = [
   {
@@ -208,6 +235,93 @@ const SEEDS: Seed[] = [
   },
   { name: "notebook-lab", host: "gitlab.example.com", language: "Python", mass: 0.24, commit: ["Problem set 4", 3 * 24 * HOUR] },
   { name: "scratch", host: null, language: null, mass: 0.12, commit: ["wip", 40 * 24 * HOUR] },
+  // Claude at 97% of a limit and the repo has warnings: New Codex agent is preselected,
+  // briefed from Claude's unfinished session.
+  {
+    name: "kestrel-cli",
+    host: "github.com",
+    language: "Rust",
+    mass: 0.3,
+    changedFiles: 2,
+    commit: ["Parse config profiles", 2 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-0000000000e1", { kind: "finished", detail: "completed" }, 40 * 60, "Profiles parse; the merge order is next.", 310_000, false, "uncommittedChanges"),
+    ],
+    preselect: { kind: "newAgent" },
+    newAgent: { agent: "codex", briefFrom: "5f0c2a1e-0000-4000-8000-0000000000e1", reason: { kind: "nudge", usedPercent: 97 } },
+    codex: { state: "warnings", findings: CODEX_WARNINGS, gates: {} },
+  },
+  // No AGENTS.md: the Codex row is dimmed, and Make Codex-ready is offered.
+  {
+    name: "moss-garden",
+    host: "github.com",
+    language: "Python",
+    mass: 0.26,
+    commit: ["Watering schedule export", 20 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-0000000000e2", { kind: "interrupted", detail: "apiError" }, 5 * HOUR, "Writing the CSV exporter.", 120_000),
+    ],
+    preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-0000000000e2" },
+    codex: { state: "notReady", findings: CODEX_NOT_READY, gates: {} },
+  },
+  // Codex worked here last: a briefed New Claude agent instead of the stale resume.
+  {
+    name: "fernway",
+    host: "github.com",
+    language: "TypeScript",
+    mass: 0.22,
+    commit: ["Route planner caches tiles", 90 * 60],
+    sessions: [
+      codexSession("5f0c2a1e-0000-4000-8000-0000000000e3", { kind: "finished", detail: "completed" }, 80 * 60, "The tile cache is in; the planner tests pass.", 260_000),
+      session("5f0c2a1e-0000-4000-8000-0000000000e4", { kind: "interrupted", detail: "toolCallWithoutResult" }, 26 * HOUR, "Profiling the planner.", 180_000),
+    ],
+    preselect: { kind: "newAgent" },
+    newAgent: { briefFrom: "5f0c2a1e-0000-4000-8000-0000000000e3", reason: { kind: "handBack" } },
+    codex: CODEX_READY,
+  },
+  // Claude is working: the Codex row is dimmed.
+  {
+    name: "pebble-ui",
+    host: "github.com",
+    language: "TypeScript",
+    mass: 0.2,
+    commit: ["Button sizes from the scale", 6 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-0000000000e5", { kind: "live", detail: "working" }, 30, "Updating the snapshot tests.", 90_000, true),
+    ],
+    preselect: { kind: "focus", sessionId: "5f0c2a1e-0000-4000-8000-0000000000e5" },
+    codex: {
+      state: "busy",
+      findings: [],
+      gates: { codex: { kind: "busy", agent: "claude", sessionId: "5f0c2a1e-0000-4000-8000-0000000000e5", state: "working" } },
+    },
+  },
+  // Claude is open and idle: the Codex row stops it first.
+  {
+    name: "orchard-db",
+    host: "github.com",
+    language: "Go",
+    mass: 0.18,
+    commit: ["Compact the write log", 3 * HOUR],
+    sessions: [
+      session("5f0c2a1e-0000-4000-8000-0000000000e6", { kind: "live", detail: "idle" }, 15 * 60, "Compaction is committed.", 140_000, true),
+    ],
+    preselect: { kind: "focus", sessionId: "5f0c2a1e-0000-4000-8000-0000000000e6" },
+    codex: { ...CODEX_READY, gates: { codex: { kind: "stopIdle", sessionIds: ["5f0c2a1e-0000-4000-8000-0000000000e6"] } } },
+  },
+  // A Codex session cut off mid-task, resumed as Codex.
+  {
+    name: "wren-sketch",
+    host: "gitlab.example.com",
+    language: "JavaScript",
+    mass: 0.16,
+    commit: ["Pressure curves for the pen", 9 * HOUR],
+    sessions: [
+      codexSession("5f0c2a1e-0000-4000-8000-0000000000e7", { kind: "interrupted", detail: "unansweredPrompt" }, 2 * HOUR, "Smoothing the stroke ends.", 75_000),
+    ],
+    preselect: { kind: "resume", sessionId: "5f0c2a1e-0000-4000-8000-0000000000e7" },
+    codex: CODEX_READY,
+  },
   // On a Windows drive, for Move to WSL.
   {
     name: "marigold-site",
@@ -244,6 +358,8 @@ export function demoRepos(): RepoSnapshot[] {
       mass: s.mass,
       sessions: s.sessions ?? [],
       preselect: s.preselect ?? { kind: "noPicker" },
+      ...(s.newAgent ? { newAgent: s.newAgent } : {}),
+      ...(s.codex ? { codex: s.codex } : {}),
       refactor: s.refactor ? seededRefactor(s.name) : null,
     };
   });
@@ -488,6 +604,10 @@ function seededRefactor(name: string): RefactorInfo {
 }
 
 /** The opening prompt the demo's pretend terminal shows for a refactor. */
+/** The demo's short stand-in for the Make Codex-ready prompt (codex spec §9). */
+export const DEMO_CODEX_READY_PROMPT =
+  "Make this repository ready for Codex CLI as well as Claude Code, without changing what the instructions mean.";
+
 export const DEMO_REFACTOR_PROMPT =
   "Refactor this repository: up to 3 behaviour-preserving refactors, one commit each.";
 
@@ -713,6 +833,21 @@ const USAGE_REPOS: [name: string, share: number][] = [
  * A backend with invented data. Launching only walks through the progress steps and
  * tells `onDemoLaunch` listeners, which show a pretend terminal.
  */
+/** The gates with `sessionId` taken out of any stop-idle list; an emptied one is open again. */
+function withoutStopped(gates: CodexReadiness["gates"], sessionId: string): CodexReadiness["gates"] {
+  const out: CodexReadiness["gates"] = {};
+  for (const agent of ["claude", "codex"] as const) {
+    const gate = gates[agent];
+    if (gate?.kind !== "stopIdle") {
+      if (gate) out[agent] = gate;
+      continue;
+    }
+    const sessionIds = gate.sessionIds.filter((id) => id !== sessionId);
+    if (sessionIds.length > 0) out[agent] = { kind: "stopIdle", sessionIds };
+  }
+  return out;
+}
+
 export class DemoBackend implements Backend {
   private repos = demoRepos();
   private progress = new Set<(step: LaunchStep) => void>();
@@ -726,6 +861,7 @@ export class DemoBackend implements Backend {
     // On in the demo, so it shows what the estimate looks like.
     costEstimate: { enabled: true, prices: [...DEFAULT_PRICES] },
     theme: "system",
+    codexThreshold: 95,
   };
   private creds: Credentials = { github: "ghCli", gitlab: "stored" };
   private hookInstalled = false;
@@ -793,6 +929,19 @@ export class DemoBackend implements Backend {
   onAgentEvent(cb: (event: AgentEvent) => void): Unsubscribe {
     this.events.add(cb);
     return () => this.events.delete(cb);
+  }
+
+  /** Launches the fix-up as Claude, then reads the repo as ready a moment later, as the repo watch would. */
+  async makeCodexReady(path: string): Promise<LaunchTicket> {
+    const ticket = await this.launch(path, { kind: "new", prompt: DEMO_CODEX_READY_PROMPT });
+    setTimeout(() => {
+      const repo = this.repos.find((r) => r.path === path);
+      if (!repo?.codex) return;
+      const next: RepoSnapshot = { ...repo, codex: { ...repo.codex, state: "ready", findings: [] } };
+      this.repos = this.repos.map((r) => (r.path === path ? next : r));
+      this.emit({ event: "repoChanged", data: next });
+    }, 1500);
+    return ticket;
   }
 
   async launch(path: string, mode: LaunchMode): Promise<LaunchTicket> {
@@ -1394,6 +1543,8 @@ export class DemoBackend implements Backend {
       sessions: repo.sessions.map((s) =>
         s.id === sessionId ? { ...s, state: { kind: "finished", detail: "userInterrupted" } } : s,
       ),
+      // A stopped agent no longer holds up the other agent's New row.
+      ...(repo.codex ? { codex: { ...repo.codex, gates: withoutStopped(repo.codex.gates, sessionId) } } : {}),
     };
     this.repos = this.repos.map((r) => (r.path === path ? next : r));
     this.emit({ event: "repoChanged", data: next });

@@ -7,24 +7,41 @@ const TYPE_MS = 28;
 /** Pause between the command and each line of the reply. */
 const LINE_MS = 260;
 
+/** How Refract starts Codex (codex spec §3): its own process, sandboxed to the repo. */
+const CODEX = "codex --no-daemon --sandbox workspace-write --ask-for-approval on-request";
+
+/** An invented stand-in for the brief prompt the helper builds from the other agent's session. */
+function demoBrief(launch: DemoLaunch): string | null {
+  if (launch.mode.kind !== "new" || !launch.mode.brief) return null;
+  const other = launch.mode.agent === "codex" ? "Claude" : "Codex";
+  return `Pick up where ${other} left off: follow the handoff, and check git status and git diff first.`;
+}
+
 /**
  * The command the VS Code extension would run, quoted the way a shell would show it.
  * Going to a running agent runs nothing, so its command is empty.
  */
 export function demoCommand(launch: DemoLaunch): string {
   const quote = (text: string) => ` '${text.replace(/'/g, "'\\''")}'`;
-  if (launch.mode.kind === "focus") return "";
-  if (launch.mode.kind === "resume") {
-    return `claude --resume ${launch.sessionId}${launch.mode.prompt ? quote(launch.mode.prompt) : ""}`;
+  const { mode } = launch;
+  if (mode.kind === "focus") return "";
+  if (mode.kind === "resume") {
+    const prompt = mode.prompt ? quote(mode.prompt) : "";
+    return mode.agent === "codex"
+      ? `${CODEX} resume ${mode.sessionId}${prompt}`
+      : `claude --resume ${launch.sessionId}${prompt}`;
   }
-  const plan = launch.mode.planMode ? " --permission-mode plan" : "";
-  const prompt = launch.mode.prompt ? quote(launch.mode.prompt) : "";
+  const text = [demoBrief(launch), mode.prompt].filter(Boolean).join(" ");
+  const prompt = text ? quote(text) : "";
+  if (mode.agent === "codex") return `${CODEX}${prompt}`;
+  const plan = mode.planMode ? " --permission-mode plan" : "";
   return `claude --session-id ${launch.sessionId}${plan}${prompt}`;
 }
 
 /** An invented reply; nothing here comes from a real agent. */
 function demoReply(launch: DemoLaunch): string[] {
-  const header = ["✻ Claude Code (demo)", `  cwd: ~/projects/${launch.repoName}`, ""];
+  const codex = launch.mode.kind !== "focus" && launch.mode.agent === "codex";
+  const header = [codex ? ">_ Codex (demo)" : "✻ Claude Code (demo)", `  cwd: ~/projects/${launch.repoName}`, ""];
   if (launch.mode.kind === "focus") {
     return [
       ...header,
@@ -40,6 +57,13 @@ function demoReply(launch: DemoLaunch): string[] {
       ...header,
       `● Picking up the session that stopped in ${launch.repoName}.`,
       "  I'll check where it got to before running anything again.",
+    ];
+  }
+  if (demoBrief(launch)) {
+    return [
+      ...header,
+      `● Reading the handoff and the last session's state in ${launch.repoName}.`,
+      "  Checking git status and git diff before I carry on.",
     ];
   }
   if (launch.mode.planMode) {

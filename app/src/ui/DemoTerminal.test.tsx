@@ -29,6 +29,16 @@ function demoBackend() {
 }
 
 describe("demoCommand", () => {
+  it("starts and resumes Codex in its own sandboxed process, with a brief when picking up", () => {
+    const codex = "codex --no-daemon --sandbox workspace-write --ask-for-approval on-request";
+    expect(demoCommand(launch({ kind: "new", agent: "codex" }))).toBe(codex);
+    expect(demoCommand(launch({ kind: "resume", agent: "codex", sessionId: "c-1" }))).toBe(`${codex} resume c-1`);
+    expect(demoCommand(launch({ kind: "new", agent: "codex", brief: "s-1" }))).toMatch(
+      new RegExp(`^${codex} 'Pick up where Claude left off: .*git diff first\\.'$`),
+    );
+    expect(demoCommand(launch({ kind: "new", brief: "c-1" }))).toMatch(/^claude --session-id \S+ 'Pick up where Codex left off/);
+  });
+
   it("starts a new session, resumes one, and quotes a prompt for the shell", () => {
     expect(demoCommand(launch({ kind: "new" }))).toBe(`claude --session-id ${ID}`);
     expect(demoCommand(launch({ kind: "resume", sessionId: ID }))).toBe(`claude --resume ${ID}`);

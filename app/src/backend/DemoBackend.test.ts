@@ -38,6 +38,44 @@ describe("demo repos", () => {
   });
 });
 
+describe("demo Codex repos", () => {
+  const pickerStates = () => {
+    const repos = demoRepos().filter((r) => r.codex);
+    return {
+      repos,
+      states: new Set(repos.map((r) => r.codex!.state)),
+      gates: new Set(repos.flatMap((r) => Object.values(r.codex!.gates).map((g) => g.kind))),
+      reasons: new Set(repos.map((r) => r.newAgent?.reason?.kind).filter(Boolean)),
+    };
+  };
+
+  it("show each readiness state, gate and preselect reason, and a Codex session", () => {
+    const { repos, states, gates, reasons } = pickerStates();
+    expect(states).toEqual(new Set(["ready", "warnings", "notReady", "busy"]));
+    expect(gates).toEqual(new Set(["busy", "stopIdle"]));
+    expect(reasons).toEqual(new Set(["nudge", "handBack"]));
+    expect(repos.some((r) => r.sessions.some((s) => s.agent === "codex" && s.resumeReason))).toBe(true);
+    // The repos from before Codex read as if it were not installed.
+    expect(demoRepos().find((r) => r.name === "tidepool")?.codex).toBeUndefined();
+  });
+
+  it("open the stop-idle gate once the idle agent is stopped, and turn ready after Make Codex-ready", async () => {
+    vi.useFakeTimers();
+    const backend = new DemoBackend();
+    const events: AgentEvent[] = [];
+    backend.onAgentEvent((e) => events.push(e));
+    const [orchard] = (await backend.listRepos()).repos.filter((r) => r.name === "orchard-db");
+    await settle(backend.migrateStopAgent(orchard.path, orchard.sessions[0].id));
+    expect((await backend.getRepo(orchard.path)).codex?.gates).toEqual({});
+
+    const moss = (await backend.listRepos()).repos.find((r) => r.name === "moss-garden")!;
+    await settle(backend.makeCodexReady(moss.path));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect((await backend.getRepo(moss.path)).codex).toEqual({ state: "ready", findings: [], gates: {} });
+    expect(events.filter((e) => e.event === "repoChanged")).toHaveLength(2);
+  });
+});
+
 describe("DemoBackend's system stats", () => {
   it("split off a WSL share that fits inside the machine's, or none in the no-WSL mode", () => {
     vi.useFakeTimers();

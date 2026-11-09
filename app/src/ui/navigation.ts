@@ -1,4 +1,4 @@
-import type { LaunchMode, RepoSnapshot, SessionInfo } from "../backend/types";
+import type { AgentKind, Gate, LaunchMode, NewAgentHint, RepoSnapshot, SessionInfo } from "../backend/types";
 import { isRemoteKey, remoteKey } from "../projects";
 import { refactorBlocker } from "../refactors";
 import { DIRTY_REPO_PROMPT, focusableSessions, unfinishedSessions } from "../repoStatus";
@@ -6,12 +6,27 @@ import { DIRTY_REPO_PROMPT, focusableSessions, unfinishedSessions } from "../rep
 // Finding and choosing a project (spec §3.3, §4.3) as a pure state machine. Inputs are
 // pointer, click and key events; the result says what changed and which effects to run.
 
-/** One row of the launch picker. */
+/**
+ * One row of the launch picker. With Codex installed each row names the agent it starts
+ * (codex spec §5, §10); without, `agent` is left out and there is one New agent row.
+ */
 export type PickerOption =
   /** Go to the VS Code terminal already running a live session. */
-  | { kind: "focus"; session: SessionInfo }
-  | { kind: "resume"; session: SessionInfo }
-  | { kind: "new"; prompt?: string };
+  | { kind: "focus"; session: SessionInfo; agent?: AgentKind }
+  | { kind: "resume"; session: SessionInfo; agent?: AgentKind }
+  | {
+      kind: "new";
+      agent?: AgentKind;
+      prompt?: string;
+      /** The other agent's session to pick up from: a briefed launch. */
+      brief?: string;
+      /** Why the row is preselected, such as "Claude at 97%". */
+      reason?: string;
+      /** Why it can't start now, such as "Busy: Claude is working"; the row is dimmed. */
+      blocked?: string;
+      /** The other agent's idle sessions to stop before starting this one. */
+      stop?: string[];
+    };
 
 export interface PickerState {
   /** The repo being launched. */
@@ -75,7 +90,8 @@ export type NavInput =
   | { type: "rekey"; from: string; to: string };
 
 export type NavEffect =
-  | { kind: "launch"; path: string; mode: LaunchMode }
+  /** `stop`: idle sessions of the other agent to stop first, one after another. */
+  | { kind: "launch"; path: string; mode: LaunchMode; stop?: string[] }
   /** Alt+R on a repo without a refactor: open the Refactor dialog. */
   | { kind: "refactorDialog"; path: string }
   /** Alt+R on a repo with a refactor: open or raise its worktree's VS Code window. */
@@ -160,8 +176,72 @@ export function focusableSession(repo: RepoSnapshot): SessionInfo | null {
   return running[0] ?? null;
 }
 
-/** Running agents to go to, then unfinished sessions, each newest first, then New agent. */
+/** "Claude" or "Codex". */
+export function agentName(agent: AgentKind): string {
+  return agent === "codex" ? "Codex" : "Claude";
+}
+
+const otherAgent = (agent: AgentKind): AgentKind => (agent === "codex" ? "claude" : "codex");
+
+/** The New row a `newAgent` preselect means, when it is preselected. */
+function preselectedNew(repo: RepoSnapshot): NewAgentHint | null {
+  return repo.preselect.kind === "newAgent" ? (repo.newAgent ?? {}) : null;
+}
+
+/** Why a New row is preselected, as the picker shows it: "Claude at 97%" or "Codex worked here last". */
+export function reasonText(hint: NewAgentHint): string | undefined {
+  const r = hint.reason;
+  if (!r) return undefined;
+  if (r.kind === "nudge") return `Claude at ${r.usedPercent}%`;
+  return `${agentName(otherAgent(hint.agent ?? "claude"))} worked here last`;
+}
+
+/** "Busy: Claude is working", or "... is waiting on you". */
+function busyText(gate: Extract<Gate, { kind: "busy" }>): string {
+  return `Busy: ${agentName(gate.agent)} is ${gate.state === "waitingOnUser" ? "waiting on you" : "working"}`;
+}
+
+/** One agent's New row, with Codex installed (codex spec §5). */
+function newRow(repo: RepoSnapshot, agent: AgentKind): PickerOption {
+  const codex = repo.codex!;
+  const hint = preselectedNew(repo);
+  const ours = hint && (hint.agent ?? "claude") === agent ? hint : null;
+  const gate = codex.gates[agent] ?? { kind: "open" };
+  const notReady = agent === "codex" && codex.state === "notReady";
+  const finding = codex.findings.find((f) => f.kind !== "claudeOnly") ?? codex.findings[0];
+  const blocked = notReady
+    ? finding
+      ? `Not ready: ${finding.text}`
+      : "Not ready"
+    : gate.kind === "busy"
+      ? busyText(gate)
+      : undefined;
+  const reason = ours ? reasonText(ours) : undefined;
+  return {
+    kind: "new",
+    agent,
+    ...(repo.changedFiles > 0 ? { prompt: DIRTY_REPO_PROMPT } : {}),
+    ...(ours?.briefFrom ? { brief: ours.briefFrom } : {}),
+    ...(reason ? { reason } : {}),
+    ...(blocked ? { blocked } : gate.kind === "stopIdle" ? { stop: gate.sessionIds } : {}),
+  };
+}
+
+/**
+ * Running agents to go to, then unfinished sessions, each newest first, then New agent.
+ * With Codex installed: New Claude agent and New Codex agent first, then the sessions of
+ * both agents, each tagged with its agent.
+ */
 export function pickerOptions(repo: RepoSnapshot): PickerOption[] {
+  if (repo.codex) {
+    const agentOf = (s: SessionInfo): AgentKind => s.agent ?? "claude";
+    return [
+      newRow(repo, "claude"),
+      newRow(repo, "codex"),
+      ...focusableSessions(repo).map((session): PickerOption => ({ kind: "focus", session, agent: agentOf(session) })),
+      ...unfinishedSessions(repo).map((session): PickerOption => ({ kind: "resume", session, agent: agentOf(session) })),
+    ];
+  }
   const fresh: PickerOption =
     repo.changedFiles > 0 ? { kind: "new", prompt: DIRTY_REPO_PROMPT } : { kind: "new" };
   return [
@@ -171,22 +251,40 @@ export function pickerOptions(repo: RepoSnapshot): PickerOption[] {
   ];
 }
 
+/** How to resume a session: a Codex one names its agent. */
+export function resumeMode(session: SessionInfo): LaunchMode {
+  return session.agent === "codex"
+    ? { kind: "resume", agent: "codex", sessionId: session.id }
+    : { kind: "resume", sessionId: session.id };
+}
+
 /** The launch an option starts. */
 export function optionMode(option: PickerOption): LaunchMode {
   if (option.kind === "focus") return { kind: "focus", sessionId: option.session.id };
-  if (option.kind === "resume") return { kind: "resume", sessionId: option.session.id };
-  return option.prompt ? { kind: "new", prompt: option.prompt } : { kind: "new" };
+  if (option.kind === "resume") return resumeMode(option.session);
+  return {
+    kind: "new",
+    ...(option.agent === "codex" ? { agent: "codex" as const } : {}),
+    ...(option.prompt ? { prompt: option.prompt } : {}),
+    ...(option.brief ? { brief: option.brief } : {}),
+  };
 }
 
 /** A stable React key for an option, unique within one picker. */
 export function optionKey(option: PickerOption): string {
-  return option.kind === "new" ? "new" : `${option.kind}:${option.session.id}`;
+  if (option.kind === "new") return option.agent ? `new:${option.agent}` : "new";
+  return `${option.kind}:${option.session.agent ?? "claude"}:${option.session.id}`;
 }
 
 function openPicker(repo: RepoSnapshot): PickerState {
   const options = pickerOptions(repo);
   const pre = repo.preselect;
-  let index = options.length - 1;
+  // The New row the preselect means (Claude's unless it names Codex), else any that can start.
+  const want = preselectedNew(repo)?.agent ?? "claude";
+  const startable = (o: PickerOption) => o.kind === "new" && !o.blocked;
+  let index = options.findIndex((o) => startable(o) && o.kind === "new" && (o.agent ?? "claude") === want);
+  if (index < 0) index = options.findIndex(startable);
+  if (index < 0) index = 0;
   if (pre.kind === "resume" || pre.kind === "focus") {
     const i = options.findIndex(
       (o) => o.kind !== "new" && o.kind === pre.kind && o.session.id === pre.sessionId,
@@ -293,8 +391,11 @@ function launch(state: NavState, path: string | null, ctx: NavContext): NavResul
 function accept(state: NavState, picker: PickerState, index: number): NavResult {
   const option = picker.options[index];
   if (!option) return unhandled(state);
+  // A dimmed row starts nothing; the picker stays open.
+  if (option.kind === "new" && option.blocked) return result(state);
+  const stop = option.kind === "new" && option.stop ? { stop: option.stop } : {};
   return result({ ...state, picker: null }, [
-    { kind: "launch", path: picker.path, mode: optionMode(option) },
+    { kind: "launch", path: picker.path, mode: optionMode(option), ...stop },
   ]);
 }
 
