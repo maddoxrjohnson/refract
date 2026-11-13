@@ -35,6 +35,13 @@ pub const BARE_LAYOUT: &[(&str, Setting)] = &[
         "terminal.integrated.defaultLocation",
         Setting::Str("editor"),
     ),
+    // VS Code saves each terminal tab with its pty id and reattaches by id alone in
+    // WSL windows. Ids restart at 1 with the WSL server, so a saved tab can attach to
+    // another window's running agent (see docs/launch.md, "The Refract profile").
+    (
+        "terminal.integrated.enablePersistentSessions",
+        Setting::Bool(false),
+    ),
 ];
 
 /// A value in [`BARE_LAYOUT`].
@@ -252,6 +259,10 @@ mod tests {
             assert_eq!(object["workbench.activityBar.location"], "hidden");
             assert_eq!(object["workbench.statusBar.visible"], false);
             assert_eq!(object["terminal.integrated.defaultLocation"], "editor");
+            assert_eq!(
+                object["terminal.integrated.enablePersistentSessions"],
+                false
+            );
         }
         let merged = merge_bare_layout(None).unwrap().unwrap();
         let strict: Value = serde_json::from_str(&merged).unwrap();

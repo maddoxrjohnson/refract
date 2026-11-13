@@ -128,8 +128,11 @@ After a launch, Refract finds the profile there and adds any of these settings t
 | `window.commandCenter` | `false` |
 | `chat.commandCenter.enabled` | `false` |
 | `terminal.integrated.defaultLocation` | `"editor"` |
+| `terminal.integrated.enablePersistentSessions` | `false` |
 
 VS Code watches the settings file, so the layout applies even to the window that was just opened.
+
+Persistent sessions are off because they can put one window's agent in another window. VS Code saves each terminal tab with the id of its process in the WSL pty host, and when the folder opens again it reattaches by that id. In WSL windows it does not check the process id first, as it does for local terminals. Ids start again from 1 whenever the WSL VS Code server restarts, so a tab saved before a restart can attach to a terminal another window started since: the same agent then shows in both windows, and closing the tab, or the window it strayed into, kills it. The ptyhost log shows such an attach as `Persistent process reconnection "<id>"` in the second window. The cost is that reloading a Refract window ends the agents in it, as closing one does; they can be resumed from Refract.
 
 Folders remember the profile they were last opened with (`profileAssociations` in `storage.json`). Opening a folder with `--profile Refract` moves it to the Refract profile.
 
